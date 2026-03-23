@@ -116,10 +116,10 @@ float SoundManager::Volume() const { return pImpl->device.Volume(); }
 bool SoundManager::Muted() const { return pImpl->device.Muted(); }
 void SoundManager::SetMuted(bool v) {
     pImpl->device.SetMuted(v);
-    if (! Muted()) {
+    // Keep mounted streams alive across mute/unmute. Recreate the device only
+    // when audio was never initialized, such as scenes loaded while muted.
+    if (! Muted() && ! pImpl->device.IsInited()) {
         Init();
-    } else {
-        pImpl->device.UnInit();
     }
 }
 void SoundManager::SetVolume(float v) { pImpl->device.SetVolume(v); }
