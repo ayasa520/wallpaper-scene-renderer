@@ -23,6 +23,42 @@ WPPuppet::PlayMode ToPlayMode(std::string_view m) {
     assert(m == "loop");
     return WPPuppet::PlayMode::Loop;
 }
+
+int32_t SeekNextMDLVersion(fs::IBinaryStream& f, std::string_view prefix) {
+    const auto start = f.Tell();
+    const auto end = f.Size();
+    for (auto pos = start; pos + 9 <= end; ++pos) {
+        f.SeekSet(pos);
+        auto ver = ReadVersion(prefix, f);
+        if (ver > 0)
+            return ver;
+    }
+    f.SeekSet(start);
+    return 0;
+}
+
+bool SeekNextMDLSection(fs::IBinaryStream& f, std::span<const std::string_view> prefixes) {
+    const auto start = f.Tell();
+    const auto end = f.Size();
+    idx best_pos = -1;
+    for (const auto prefix : prefixes) {
+        for (auto pos = start; pos + 9 <= end; ++pos) {
+            f.SeekSet(pos);
+            auto ver = ReadVersion(prefix, f);
+            if (ver > 0) {
+                if (best_pos < 0 || pos < best_pos)
+                    best_pos = pos;
+                break;
+            }
+        }
+    }
+    if (best_pos >= 0) {
+        f.SeekSet(best_pos);
+        return true;
+    }
+    f.SeekSet(start);
+    return false;
+}
 } // namespace
 
 // bytes * size
@@ -108,6 +144,15 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     }
 
     mdl.mdls = ReadMDLVesion(f);
+    if (mdl.mdls == 0) {
+        mdl.mdls = SeekNextMDLVersion(f, "MDLS");
+        if (mdl.mdls > 0)
+            LOG_INFO("seeked forward to MDLS version %d", mdl.mdls);
+    }
+    if (mdl.mdls == 0) {
+        LOG_ERROR("failed to locate MDLS section");
+        return false;
+    }
 
     size_t bones_file_end = f.ReadUint32();
     (void)bones_file_end;
@@ -127,10 +172,9 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
         f.ReadInt32(); // unk
 
         bone.parent = f.ReadUint32();
-        assert(bone.parent < i || bone.noParent());
-        if (bone.parent >= i && ! bone.noParent()) {
-            LOG_ERROR("mdl wrong bone parent index %d", bone.parent);
-            return false;
+        if (bone.parent >= i && !bone.noParent()) {
+            LOG_INFO("mdl bone %u has out-of-order parent index %u, fallback to root", i, bone.parent);
+            bone.parent = 0xFFFFFFFFu;
         }
 
         uint32_t size = f.ReadUint32();
@@ -143,6 +187,9 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
         }
 
         std::string bone_simulation_json = f.ReadStr();
+        if (i < 5) {
+            LOG_INFO("puppet bone[%u]: name='%s' parent=%u", i, name.c_str(), bone.parent);
+        }
         /*
         auto trans = bone.transform.translation();
         LOG_INFO("trans: %f %f %f", trans[0], trans[1], trans[2]);
@@ -179,6 +226,23 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
             for (uint i = 0; i < bones_num; i++) {
                 f.ReadUint32();
             }
+        }
+    }
+
+    {
+        const auto probe_pos = f.Tell();
+        bool aligned = false;
+        for (const auto prefix : { std::string_view("MDAT"), std::string_view("MDLA") }) {
+            auto ver = ReadVersion(prefix, f);
+            f.SeekSet(probe_pos);
+            if (ver > 0) {
+                aligned = true;
+                break;
+            }
+        }
+        constexpr std::array<std::string_view, 2> kAnimSections { "MDAT", "MDLA" };
+        if (!aligned && SeekNextMDLSection(f, kAnimSections)) {
+            LOG_INFO("seeked forward to %lld for MDAT/MDLA", (long long)f.Tell());
         }
     }
 
@@ -245,6 +309,12 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
 
                 uint32_t b_num = f.ReadUint32();
                 anim.bframes_array.resize(b_num);
+                LOG_INFO("puppet anim id=%d name='%s' fps=%f length=%d bones=%u",
+                         anim.id,
+                         anim.name.c_str(),
+                         anim.fps,
+                         anim.length,
+                         b_num);
                 for (auto& bframes : anim.bframes_array) {
                     f.ReadInt32();
                     uint32_t byte_size = f.ReadUint32();
@@ -268,11 +338,13 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
                 if(alt_mdl_format)
                 {
                     f.ReadUint8();
-                    f.ReadUint8();    
+                    f.ReadUint8();
+                    if (mdl.mdla >= 3)
+                        f.ReadUint8();
                 }
-                else if(mdl.mdla == 3){
-                    // In MDLA version 3 there is an extra 8-bit zero between animations.
-                    // This will cause the parser to be misaligned moving forward if we don't handle it here.
+                else if(mdl.mdla >= 3){
+                    // Newer MDLA variants insert an extra 8-bit zero between animations.
+                    // If we don't consume it here, subsequent animation ids are shifted by 8 bits.
                     f.ReadUint8();
                 }
                 else{

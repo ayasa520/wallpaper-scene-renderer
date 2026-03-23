@@ -50,6 +50,7 @@ struct ParseContext {
     i32                    ortho_w;
     i32                    ortho_h;
     fs::VFS*               vfs;
+    const ShaderValueMap*  user_properties;
 
     ShaderValueMap             global_base_uniforms;
     std::shared_ptr<SceneNode> effect_camera_node;
@@ -240,6 +241,7 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
         } else if (sstart_with(name, WE_HALF_COMPO_BUFFER_PREFIX)) {
         } else if (sstart_with(name, WE_QUARTER_COMPO_BUFFER_PREFIX)) {
         } else if (sstart_with(name, WE_FULL_COMPO_BUFFER_PREFIX)) {
+        } else if (name == "_rt_shadowAtlas") {
         } else {
             LOG_ERROR("unknown tex \"%s\"", name.c_str());
         }
@@ -325,6 +327,8 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
 
     for (usize i = 0; i < textures.size(); i++) {
         std::string name = textures.at(i);
+        if (name == "_alias_lightCookie")
+            name = "cookie/flashlight1";
         ParseSpecTexName(name, wpmat, *pWPShaderInfo);
         material.textures.push_back(name);
         material.defines.push_back("g_Texture" + std::to_string(i));
@@ -461,6 +465,39 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
     }
 }
 
+void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
+                         const WPShaderInfo& info, const ShaderValueMap* user_properties) {
+    if (!user_properties)
+        return;
+
+    for (const auto& us : wpmat.usershadervalues) {
+        const auto property_it = user_properties->find(us.second);
+        if (property_it == user_properties->end()) {
+            LOG_INFO("UserShaderValue: property '%s' not provided for uniform '%s'",
+                     us.second.c_str(), us.first.c_str());
+            continue;
+        }
+
+        std::string glname;
+        if (info.alias.count(us.first) != 0) {
+            glname = info.alias.at(us.first);
+        } else {
+            for (const auto& el : info.alias) {
+                if (el.second == us.first || el.second.substr(2) == us.first) {
+                    glname = el.second;
+                    break;
+                }
+            }
+            if (glname.empty())
+                glname = us.first;
+        }
+
+        LOG_INFO("UserShaderValue: %s -> %s (%zu)",
+                 us.second.c_str(), glname.c_str(), property_it->second.size());
+        material.customShader.constValues[glname] = property_it->second;
+    }
+}
+
 // parse
 
 void ParseCamera(ParseContext& context, wpscene::WPSceneGeneral& general) {
@@ -523,6 +560,7 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
         gb["g_TexelSizeHalf"] = std::array { 1.0f / 1920.0f / 2.0f, 1.0f / 1080.0f / 2.0f };
 
         gb["g_LightAmbientColor"] = sc.general.ambientcolor;
+        gb["g_LightSkylightColor"] = sc.general.skylightcolor;
         gb["g_NormalModelMatrix"] = ShaderValue::fromMatrix(Matrix4f::Identity());
     }
 
@@ -613,6 +651,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             wpimgobj.color[2],
             wpimgobj.alpha
         };
+        baseConstSvs["g_Color"]      = std::array<float, 3> {
+            wpimgobj.color[0],
+            wpimgobj.color[1],
+            wpimgobj.color[2]
+        };
+        baseConstSvs["g_Alpha"]      = wpimgobj.alpha;
         baseConstSvs["g_UserAlpha"]  = wpimgobj.alpha;
         baseConstSvs["g_Brightness"] = wpimgobj.brightness;
 
@@ -629,6 +673,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             return;
         };
         LoadConstvalue(material, wpimgobj.material, shaderInfo);
+        LoadUserShaderValue(material, wpimgobj.material, shaderInfo, context.user_properties);
     }
 
     for (const auto& cs : wpimgobj.material.constantshadervalues) {
@@ -864,6 +909,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 
                 // load glname from alias and load to constvalue
                 LoadConstvalue(material, wpmat, wpEffShaderInfo);
+                LoadUserShaderValue(material, wpmat, wpEffShaderInfo, context.user_properties);
                 auto spMesh = std::make_shared<SceneMesh>();
                 {
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
@@ -1098,14 +1144,16 @@ void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj,
 } // namespace
 
 std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std::string& buf,
-                                            fs::VFS& vfs, audio::SoundManager& sm) {
+                                            fs::VFS& vfs, audio::SoundManager& sm,
+                                            const ShaderValueMap* user_properties) {
     nlohmann::json json;
     if (! PARSE_JSON(buf, json)) return nullptr;
     wpscene::WPScene sc;
     sc.FromJson(json);
     //	LOG_INFO(nlohmann::json(sc).dump(4));
 
-    ParseContext context;
+    ParseContext context {};
+    context.user_properties = user_properties;
 
     std::vector<WPObjectVar> wp_objs;
 
@@ -1142,14 +1190,21 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     {
         context.scene->renderTargets[SpecTex_Default.data()] = {
             .width  = context.ortho_w,
-            .height = context.ortho_w,
+            .height = context.ortho_h,
             .bind   = { .enable = true, .screen = true },
         };
         context.scene->renderTargets[WE_MIP_MAPPED_FRAME_BUFFER.data()] = {
             .width      = context.ortho_w,
-            .height     = context.ortho_w,
+            .height     = context.ortho_h,
             .has_mipmap = true,
             .bind       = { .enable = true, .name = SpecTex_Default.data() }
+        };
+        context.scene->renderTargets["_rt_shadowAtlas"] = {
+            .width      = context.ortho_w,
+            .height     = context.ortho_h,
+            .allowReuse = true,
+            .withDepth  = true,
+            .bind       = { .enable = true, .screen = true },
         };
     }
 
@@ -1177,4 +1232,9 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     WPShaderParser::FinalGlslang();
     return context.scene;
+}
+
+std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std::string& buf,
+                                            fs::VFS& vfs, audio::SoundManager& sm) {
+    return Parse(scene_id, buf, vfs, sm, nullptr);
 }

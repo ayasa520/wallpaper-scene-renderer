@@ -21,6 +21,7 @@ void EnumateDeviceExts(const vvk::PhysicalDevice& gpu, wallpaper::Set<std::strin
 bool Device::CheckGPU(vvk::PhysicalDevice gpu, std::span<const Extension> exts, VkSurfaceKHR surface) {
     std::vector<VkDeviceQueueCreateInfo> queues;
     auto                                 props = gpu.GetQueueFamilyProperties();
+    auto                                 gpu_props = gpu.GetProperties();
 
     // check queue
     bool has_graphics_queue { false };
@@ -35,15 +36,26 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, std::span<const Extension> exts, 
         }
         index++;
     };
-    if (! has_graphics_queue) return false;
-    if (surface && ! has_present_queue) return false;
+    if (! has_graphics_queue) {
+        LOG_INFO("reject vulkan device \"%s\": missing graphics queue", gpu_props.deviceName);
+        return false;
+    }
+    if (surface && ! has_present_queue) {
+        LOG_INFO("reject vulkan device \"%s\": missing present queue", gpu_props.deviceName);
+        return false;
+    }
 
     // check exts
     Set<std::string> extensions;
     EnumateDeviceExts(gpu, extensions);
     for (auto& ext : exts) {
         if (ext.required) {
-            if (! exists(extensions, ext.name)) return false;
+            if (! exists(extensions, ext.name)) {
+                LOG_INFO("reject vulkan device \"%s\": missing extension %s",
+                         gpu_props.deviceName,
+                         ext.name.data());
+                return false;
+            }
         }
     }
     return true;

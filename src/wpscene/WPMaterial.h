@@ -24,6 +24,7 @@ public:
     std::vector<std::string>                            textures;
     std::unordered_map<std::string, int32_t>            combos;
     std::unordered_map<std::string, std::vector<float>> constantshadervalues;
+    std::unordered_map<std::string, std::string>        usershadervalues;
     std::string                                         target;
     std::vector<WPMaterialPassBindItem>                 bind;
 };
@@ -40,14 +41,15 @@ public:
     std::vector<std::string>                            textures;
     std::unordered_map<std::string, int32_t>            combos;
     std::unordered_map<std::string, std::vector<float>> constantshadervalues;
+    std::unordered_map<std::string, std::string>        usershadervalues;
 
     bool use_puppet { false };
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPassBindItem, name, index);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPass, bind, target, textures, combos,
-                                   constantshadervalues);
+                                   constantshadervalues, usershadervalues);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterial, blending, shader, textures, combos,
-                                   constantshadervalues);
+                                   constantshadervalues, usershadervalues);
 } // namespace wpscene
 } // namespace wallpaper

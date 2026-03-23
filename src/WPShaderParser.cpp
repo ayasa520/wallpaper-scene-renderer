@@ -183,7 +183,9 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                         }
                     }
                     if (defines.back()[0] != 'g') {
-                        LOG_INFO("PreShaderSrc User shadervalue not supported");
+                        LOG_INFO("PreShaderSrc User shadervalue not supported: %s %s",
+                                 defines.back().c_str(),
+                                 sv_json.dump().c_str());
                     }
                 }
             }
@@ -356,7 +358,16 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     // LOG_INFO("insert: %s", insert_str.c_str());
     // return std::regex_replace(
     //    std::regex_replace(cur.result, re_hold, insert_str), std::regex(R"(\s+\n)"), "\n");
-    return std::regex_replace(unit.src, re_hold, insert_str);
+    auto result = std::regex_replace(unit.src, re_hold, insert_str);
+
+    // Some Wallpaper Engine effect shaders survive preprocessing with an invalid scalar
+    // declaration even though the RHS is a vec2. Fix the generated GLSL before glslang sees it.
+    result = std::regex_replace(
+        result,
+        std::regex(R"(\bfloat\s+pointer\s*=\s*g_PointerPosition\.xy\s*\*\s*u_pointerSpeed\s*;)"),
+        "vec2 pointer = g_PointerPosition.xy * u_pointerSpeed;");
+
+    return result;
 }
 
 inline std::string GenSha1(std::span<const WPShaderUnit> units) {

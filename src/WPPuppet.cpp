@@ -15,6 +15,10 @@ void WPPuppet::prepared() {
     std::vector<Affine3f> combined_tran(bones.size());
     for (uint i = 0; i < bones.size(); i++) {
         auto& b = bones[i];
+        if (!b.noParent() && b.parent >= i) {
+            LOG_INFO("puppet bone %u has invalid parent index %u during prepare, fallback to root", i, b.parent);
+            b.parent = 0xFFFFFFFFu;
+        }
         combined_tran[i] =
             (b.noParent() ? Affine3f::Identity() : combined_tran[b.parent]) * b.transform;
 
@@ -52,9 +56,8 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         auto&       affine = m_final_affines[i];
 
         affine = Affine3f::Identity();
-        assert(bone.parent < i || bone.noParent());
         const Affine3f parent =
-            bone.noParent() ? Affine3f::Identity() : m_final_affines[bone.parent];
+            (bone.noParent() || bone.parent >= i) ? Affine3f::Identity() : m_final_affines[bone.parent];
 
         Vector3f    trans { bone.transform.translation() * global_blend };
         Vector3f    scale { Vector3f::Ones() * global_blend };

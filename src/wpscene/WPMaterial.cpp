@@ -22,6 +22,9 @@ void WPMaterialPass::Update(const WPMaterialPass& p) {
     for(const auto& el:p.constantshadervalues) {
         constantshadervalues[el.first] = el.second;
     }
+    for(const auto& el:p.usershadervalues) {
+        usershadervalues[el.first] = el.second;
+    }
     for(const auto& el:p.combos) {
         combos[el.first] = el.second;
     }
@@ -39,6 +42,9 @@ void WPMaterial::MergePass(const WPMaterialPass& p) {
     }
     for(const auto& el:p.constantshadervalues) {
         constantshadervalues[el.first] = el.second;
+    }
+    for(const auto& el:p.usershadervalues) {
+        usershadervalues[el.first] = el.second;
     }
     for(const auto& el:p.combos) {
         combos[el.first] = el.second;
@@ -61,6 +67,15 @@ bool WPMaterialPass::FromJson(const nlohmann::json& json) {
             GET_JSON_VALUE(jC.key(), name);
             GET_JSON_VALUE(jC.value(), value);
             constantshadervalues[name] = value;
+        }
+    }
+    if(json.contains("usershadervalues")) {
+        for(const auto& jC:json.at("usershadervalues").items()) {
+            std::string name;
+            std::string value;
+            GET_JSON_VALUE(jC.key(), name);
+            GET_JSON_VALUE(jC.value(), value);
+            usershadervalues[name] = value;
         }
     }
     if(json.contains("combos")) {
@@ -113,6 +128,15 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
             GET_JSON_VALUE(jC.key(), name);
             GET_JSON_VALUE(jC.value(), value);
             constantshadervalues[name] = value;
+        }
+    }
+    if(jContent.contains("usershadervalues")) {
+        for(const auto& jC:jContent.at("usershadervalues").items()) {
+            std::string name;
+            std::string value;
+            GET_JSON_VALUE(jC.key(), name);
+            GET_JSON_VALUE(jC.value(), value);
+            usershadervalues[name] = value;
         }
     }
     if(jContent.contains("combos")) {

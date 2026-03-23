@@ -105,6 +105,7 @@ private:
     std::string m_assets;
     std::string m_source;
     std::string m_cache_path;
+    ShaderValueMap m_user_properties;
     bool        m_gen_graphviz { false };
 
     WPSceneParser                        m_scene_parser;
@@ -353,6 +354,13 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             std::shared_ptr<FirstFrameCallback> cb;
             msg->findObject("value", &cb);
             m_first_frame_callback = *cb;
+        } else if (property == PROPERTY_USER_PROPERTIES) {
+            std::shared_ptr<ShaderValueMap> user_properties;
+            if (msg->findObject("value", &user_properties) && user_properties) {
+                m_user_properties = *user_properties;
+            } else {
+                m_user_properties.clear();
+            }
         } else if (property == PROPERTY_SPEED) {
             float speed { 1.0f };
             if (msg->findFloat("value", &speed)) {
@@ -445,7 +453,7 @@ void MainHandler::loadScene() {
             LOG_ERROR("Not supported scene type");
             return;
         }
-        scene = m_scene_parser.Parse(scene_id, scene_src, vfs, *m_sound_manager);
+        scene = m_scene_parser.Parse(scene_id, scene_src, vfs, *m_sound_manager, &m_user_properties);
         scene->vfs.swap(pVfs);
     }
 
