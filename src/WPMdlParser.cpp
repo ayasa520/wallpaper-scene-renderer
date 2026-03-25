@@ -104,8 +104,12 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     // located after the herald value, and we'll need to account for other differences later on.
     if(curr == 0){
         alt_mdl_format = true;
-        while (curr != alt_format_vertex_size_herald_value){
+        while (curr != alt_format_vertex_size_herald_value && f.Tell() < f.Size()){
             curr = f.ReadUint32();
+        }
+        if (curr != alt_format_vertex_size_herald_value) {
+            LOG_ERROR("failed to locate alternative vertex herald 0x%08x", alt_format_vertex_size_herald_value);
+            return false;
         }
         curr = f.ReadUint32();
     }
@@ -146,8 +150,6 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     mdl.mdls = ReadMDLVesion(f);
     if (mdl.mdls == 0) {
         mdl.mdls = SeekNextMDLVersion(f, "MDLS");
-        if (mdl.mdls > 0)
-            LOG_INFO("seeked forward to MDLS version %d", mdl.mdls);
     }
     if (mdl.mdls == 0) {
         LOG_ERROR("failed to locate MDLS section");
@@ -187,9 +189,6 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
         }
 
         std::string bone_simulation_json = f.ReadStr();
-        if (i < 5) {
-            LOG_INFO("puppet bone[%u]: name='%s' parent=%u", i, name.c_str(), bone.parent);
-        }
         /*
         auto trans = bone.transform.translation();
         LOG_INFO("trans: %f %f %f", trans[0], trans[1], trans[2]);
@@ -241,9 +240,8 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
             }
         }
         constexpr std::array<std::string_view, 2> kAnimSections { "MDAT", "MDLA" };
-        if (!aligned && SeekNextMDLSection(f, kAnimSections)) {
-            LOG_INFO("seeked forward to %lld for MDAT/MDLA", (long long)f.Tell());
-        }
+        if (!aligned)
+            SeekNextMDLSection(f, kAnimSections);
     }
 
     // sometimes there can be one or more zero bytes and/or MDAT sections containing
@@ -252,6 +250,10 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     std::string mdVersion;
     
     do {
+        if (f.Tell() >= f.Size()) {
+            LOG_ERROR("failed to locate MDLA section before EOF");
+            return false;
+        }
         std::string mdPrefix = f.ReadStr();
 
         // sometimes there can be other garbage in this gap, so we need to 
@@ -290,7 +292,17 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
                 // there can be a variable number of 32-bit 0s between animations
                 anim.id = 0;
                 while(anim.id == 0){
+                    if (f.Tell() >= f.Size()) {
+                        LOG_ERROR("unexpected EOF while reading animation id");
+                        return false;
+                    }
+                    const auto before = f.Tell();
                     anim.id = f.ReadInt32();
+                    const auto after = f.Tell();
+                    if (after <= before) {
+                        LOG_ERROR("stream did not advance while reading animation id");
+                        return false;
+                    }
                 }
     
                 if (anim.id <= 0) {
@@ -309,12 +321,6 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
 
                 uint32_t b_num = f.ReadUint32();
                 anim.bframes_array.resize(b_num);
-                LOG_INFO("puppet anim id=%d name='%s' fps=%f length=%d bones=%u",
-                         anim.id,
-                         anim.name.c_str(),
-                         anim.fps,
-                         anim.length,
-                         b_num);
                 for (auto& bframes : anim.bframes_array) {
                     f.ReadInt32();
                     uint32_t byte_size = f.ReadUint32();

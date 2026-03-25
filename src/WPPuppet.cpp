@@ -16,7 +16,7 @@ void WPPuppet::prepared() {
     for (uint i = 0; i < bones.size(); i++) {
         auto& b = bones[i];
         if (!b.noParent() && b.parent >= i) {
-            LOG_INFO("puppet bone %u has invalid parent index %u during prepare, fallback to root", i, b.parent);
+            LOG_ERROR("puppet bone %u has invalid parent index %u during prepare, fallback to root", i, b.parent);
             b.parent = 0xFFFFFFFFu;
         }
         combined_tran[i] =
