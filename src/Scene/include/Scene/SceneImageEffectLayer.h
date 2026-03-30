@@ -4,6 +4,7 @@
 #include <memory>
 #include <cstdint>
 #include <string>
+#include <Eigen/Geometry>
 #include "Core/Literals.hpp"
 #include "Type.hpp"
 
@@ -47,6 +48,7 @@ public:
     SceneNode*  WorldNode() const { return m_worldNode; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
     void        SyncResolvedNodeToWorld();
+    void        SyncResolvedNodeToMatrix(const Eigen::Affine3f& world_affine);
 
     void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam);
 

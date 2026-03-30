@@ -22,6 +22,45 @@ using namespace Eigen;
 
 namespace
 {
+Vector3f ComputeParallaxOffset(SceneNode*                           node,
+                               const WPShaderValueData&             nodeData,
+                               const Scene&                         scene,
+                               const WPCameraParallax&              parallax,
+                               const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
+                               const SceneCamera*                   camera,
+                               const std::array<float, 2>&          mousePos);
+
+Matrix4d ResolveNodeModelTransform(
+    SceneNode* node, const WPShaderValueData* nodeData,
+    const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap) {
+    if (node == nullptr) return Matrix4d::Identity();
+
+    if (nodeData != nullptr && nodeData->inherit_scene_parent_transform &&
+        nodeData->scene_parent != nullptr && exists(nodeDataMap, nodeData->scene_parent)) {
+        const auto& parentData = nodeDataMap.at(nodeData->scene_parent);
+        return ResolveNodeModelTransform(nodeData->scene_parent, &parentData, nodeDataMap) *
+               node->GetLocalTrans();
+    }
+
+    node->UpdateTrans();
+    return node->ModelTrans();
+}
+
+Matrix4d ResolveParallaxedModelTransform(
+    SceneNode* node, const WPShaderValueData* nodeData, const Scene& scene,
+    const WPCameraParallax& parallax,
+    const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap, const SceneCamera* camera,
+    const std::array<float, 2>& mousePos, bool apply_parallax) {
+    Matrix4d modelTrans = ResolveNodeModelTransform(node, nodeData, nodeDataMap);
+    if (nodeData != nullptr && apply_parallax && !nodeData->skip_model_parallax) {
+        const auto parallaxOffset =
+            ComputeParallaxOffset(node, *nodeData, scene, parallax, nodeDataMap, camera, mousePos);
+        modelTrans =
+            Affine3d(Eigen::Translation3d(parallaxOffset.cast<double>())).matrix() * modelTrans;
+    }
+    return modelTrans;
+}
+
 void ApplyLocalAffine(SceneNode* node, const Affine3f& affine) {
     if (node == nullptr) return;
 
@@ -62,8 +101,7 @@ Vector3f ComputeParallaxOffset(SceneNode*                           node,
                                      mousePos);
     }
 
-    node->UpdateTrans();
-    const auto modelTrans = node->ModelTrans();
+    const auto modelTrans = ResolveNodeModelTransform(node, &nodeData, nodeDataMap);
     Vector3f   nodePos((float)modelTrans(0, 3), (float)modelTrans(1, 3), (float)modelTrans(2, 3));
     Vector2f   depth(nodeData.parallaxDepth[0], nodeData.parallaxDepth[1]);
 
@@ -88,10 +126,9 @@ void ApplyParentParallaxToAttachment(SceneNode*                           parent
                                      Affine3f&                            localTransform) {
     if (parentNode == nullptr || camera == nullptr || !parallax.enable) return;
 
-    parentNode->UpdateTrans();
     const auto parentParallax =
         ComputeParallaxOffset(parentNode, parentData, scene, parallax, nodeDataMap, camera, mousePos);
-    const auto parentModel  = parentNode->ModelTrans();
+    const auto parentModel  = ResolveNodeModelTransform(parentNode, &parentData, nodeDataMap);
     Matrix3f    parentLinear = parentModel.block<3, 3>(0, 0).cast<float>();
     Vector3f    parentParallaxLocal = parentParallax;
     if (std::abs(parentLinear.determinant()) > 1e-6f) {
@@ -223,6 +260,31 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
     if (! camera) return;
 
+    if (! pNode->Camera().empty()) {
+        auto camera_it = m_scene->cameras.find(cam_name.data());
+        if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
+            auto* effectLayer = camera_it->second->GetImgEffect().get();
+            auto* worldNode   = effectLayer->WorldNode();
+            if (worldNode != nullptr && exists(m_nodeDataMap, worldNode)) {
+                const auto& worldNodeData = m_nodeDataMap.at(worldNode);
+                if (worldNodeData.inherit_scene_parent_transform &&
+                    ! worldNodeData.attach_to_bone) {
+                    const SceneCamera* displayCamera =
+                        m_scene->activeCamera != nullptr ? m_scene->activeCamera : camera;
+                    const auto worldModel = ResolveParallaxedModelTransform(worldNode,
+                                                                            &worldNodeData,
+                                                                            *m_scene,
+                                                                            m_parallax,
+                                                                            m_nodeDataMap,
+                                                                            displayCamera,
+                                                                            m_mousePos,
+                                                                            displayCamera != nullptr);
+                    effectLayer->SyncResolvedNodeToMatrix(Affine3f(worldModel.cast<float>()));
+                }
+            }
+        }
+    }
+
     auto* material = pNode->Mesh()->Material();
     if (! material) return;
     // auto& shadervs = material->customShader.updateValueList;
@@ -269,23 +331,15 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         updateOp(G_VP, ShaderValue::fromMatrix(viewProTrans));
     }
     if (reqM || reqMVP || reqMI || reqMVPI) {
-        Matrix4d modelTrans = pNode->ModelTrans();
-        if (hasNodeData && cam_name != "effect") {
-            const auto& nodeData = m_nodeDataMap.at(pNode);
-            if (m_parallax.enable && !nodeData.skip_model_parallax) {
-                const auto parallaxOffset =
-                    ComputeParallaxOffset(pNode,
-                                          nodeData,
-                                          *m_scene,
-                                          m_parallax,
-                                          m_nodeDataMap,
-                                          camera,
-                                          m_mousePos);
-                const Vector3d parallaxOffsetD = parallaxOffset.cast<double>();
-                modelTrans =
-                    Affine3d(Eigen::Translation3d(parallaxOffsetD)).matrix() * modelTrans;
-            }
-        }
+        const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
+        Matrix4d modelTrans = ResolveParallaxedModelTransform(pNode,
+                                                              nodeDataPtr,
+                                                              *m_scene,
+                                                              m_parallax,
+                                                              m_nodeDataMap,
+                                                              camera,
+                                                              m_mousePos,
+                                                              cam_name != "effect");
 
         if (reqM) updateOp(G_M, ShaderValue::fromMatrix(modelTrans));
         if (reqAM) updateOp(G_AM, ShaderValue::fromMatrix(modelTrans));

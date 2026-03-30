@@ -500,6 +500,14 @@ void AttachNodeToScene(ParseContext&                    context,
     }
 }
 
+void ConfigureVirtualParent(ParseContext& context, int32_t parent_id, WPShaderValueData& node_data) {
+    if (parent_id == 0) return;
+    if (auto parent = FindParentNode(context, parent_id)) {
+        node_data.scene_parent                   = parent.get();
+        node_data.inherit_scene_parent_transform = true;
+    }
+}
+
 void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                     const WPShaderInfo& info) {
     // load glname from alias and load to constvalue
@@ -661,6 +669,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         if (wpeffobj.visible) count_eff++;
     }
     bool hasEffect = count_eff > 0;
+    bool use_virtual_parent = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
     // skip no effect fullscreen layer
     if (! hasEffect && wpimgobj.fullscreen) return;
 
@@ -998,7 +1007,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 auto spMesh = std::make_shared<SceneMesh>();
                 {
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-                    if (wpimgobj.parent == 0 || wpimgobj.attachment.empty()) {
+                    if (!use_virtual_parent && (wpimgobj.parent == 0 || wpimgobj.attachment.empty())) {
                         if (auto parent = FindParentNode(context, wpimgobj.parent)) {
                             svData.scene_parent = parent.get();
                         }
@@ -1022,7 +1031,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             }
         }
     }
-    AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
+    if (use_virtual_parent) {
+        if (hasEffect) {
+            ConfigureVirtualParent(context, wpimgobj.parent, worldNodeData);
+        } else {
+            ConfigureVirtualParent(context, wpimgobj.parent, svData);
+        }
+        context.scene->sceneGraph->AppendChild(spWorldNode);
+    } else {
+        AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
+    }
     context.object_nodes[wpimgobj.id] = spWorldNode;
     if (puppet) {
         context.object_puppets[wpimgobj.id] = puppet->puppet;
@@ -1228,7 +1246,12 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     if (is_child)
         child_ptr.node_parent->AppendChild(spNode);
     else {
-        AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
+        if (wppartobj.parent != 0 && wppartobj.attachment.empty()) {
+            ConfigureVirtualParent(context, wppartobj.parent, svData);
+            context.scene->sceneGraph->AppendChild(spNode);
+        } else {
+            AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
+        }
         context.object_nodes[wppartobj.id] = spNode;
     }
     context.shader_updater->SetNodeData(spNode.get(), svData);

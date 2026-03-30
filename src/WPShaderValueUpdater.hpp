@@ -54,6 +54,7 @@ struct WPShaderValueData {
 
     WPPuppetLayer puppet_layer;
     SceneNode*    scene_parent { nullptr };
+    bool          inherit_scene_parent_transform { false };
     bool          attach_to_bone { false };
     uint32_t      attach_bone { 0xFFFFFFFFu };
     Eigen::Affine3f attach_transform { Eigen::Affine3f::Identity() };
