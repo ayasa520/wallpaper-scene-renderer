@@ -18,6 +18,7 @@ namespace wallpaper
 {
 
 class Scene;
+class SceneNode;
 
 struct WPUniformInfo {
     bool has_MI { false };
@@ -52,6 +53,12 @@ struct WPShaderValueData {
     std::vector<std::pair<usize, std::string>> renderTargets;
 
     WPPuppetLayer puppet_layer;
+    SceneNode*    scene_parent { nullptr };
+    bool          attach_to_bone { false };
+    uint32_t      attach_bone { 0xFFFFFFFFu };
+    Eigen::Affine3f attach_transform { Eigen::Affine3f::Identity() };
+    Eigen::Affine3f attach_local_transform { Eigen::Affine3f::Identity() };
+    bool            skip_model_parallax { false };
 };
 
 struct WPCameraParallax {
@@ -94,6 +101,7 @@ private:
 
     std::array<float, 2> m_screen_size { 1920, 1080 };
 
+    uint64_t                  m_puppet_frame_serial { 0 };
     Map<void*, WPShaderValueData> m_nodeDataMap;
     Map<void*, WPUniformInfo>     m_nodeUniformInfoMap;
 };

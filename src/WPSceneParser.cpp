@@ -36,6 +36,7 @@
 #include <cmath>
 #include <functional>
 #include <regex>
+#include <optional>
 #include <variant>
 #include <Eigen/Dense>
 
@@ -56,6 +57,8 @@ struct ParseContext {
     std::shared_ptr<SceneNode> effect_camera_node;
     std::shared_ptr<SceneNode> global_camera_node;
     std::shared_ptr<SceneNode> global_perspective_camera_node;
+    std::unordered_map<int32_t, std::shared_ptr<SceneNode>> object_nodes;
+    std::unordered_map<int32_t, std::shared_ptr<WPPuppet>>  object_puppets;
 };
 
 using WPObjectVar = std::variant<wpscene::WPImageObject, wpscene::WPParticleObject,
@@ -440,6 +443,63 @@ void LoadAlignment(SceneNode& node, std::string_view align, Vector2f size) {
     node.SetTranslate(trans);
 }
 
+std::shared_ptr<SceneNode> FindParentNode(ParseContext& context, int32_t parent_id) {
+    auto it = context.object_nodes.find(parent_id);
+    return it == context.object_nodes.end() ? nullptr : it->second;
+}
+
+struct AttachmentBinding {
+    uint32_t        bone_index { 0xFFFFFFFFu };
+    Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
+};
+
+std::optional<AttachmentBinding> ResolveAttachmentBinding(const ParseContext& context,
+                                                          int32_t             parent_id,
+                                                          std::string_view    attachment) {
+    auto pit = context.object_puppets.find(parent_id);
+    if (pit == context.object_puppets.end() || !pit->second) return std::nullopt;
+
+    const auto& puppet = *pit->second;
+    if (const auto* named_attachment = puppet.FindAttachment(attachment)) {
+        return AttachmentBinding {
+            .bone_index = named_attachment->bone_index,
+            .transform  = named_attachment->transform,
+        };
+    }
+
+    auto bone_index = puppet.FindBoneIndex(attachment);
+    if (bone_index == 0xFFFFFFFFu) return std::nullopt;
+    return AttachmentBinding {
+        .bone_index = bone_index,
+        .transform  = Eigen::Affine3f::Identity(),
+    };
+}
+
+void AttachNodeToScene(ParseContext&                    context,
+                       const std::shared_ptr<SceneNode>& node,
+                       int32_t                           parent_id,
+                       const std::string&                object_name,
+                       WPShaderValueData*                node_data = nullptr) {
+    if (parent_id == 0) {
+        context.scene->sceneGraph->AppendChild(node);
+        return;
+    }
+
+    auto parent = FindParentNode(context, parent_id);
+    if (!parent) {
+        LOG_ERROR("parent id %d for object '%s' not found, attaching to scene root",
+                  (int)parent_id,
+                  object_name.c_str());
+        context.scene->sceneGraph->AppendChild(node);
+        return;
+    }
+
+    parent->AppendChild(node);
+    if (node_data != nullptr) {
+        node_data->scene_parent = parent.get();
+    }
+}
+
 void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                     const WPShaderInfo& info) {
     // load glname from alias and load to constvalue
@@ -626,14 +686,17 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     }
 
     // wpimgobj.origin[1] = context.ortho_h - wpimgobj.origin[1];
-    auto spImgNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
-                                                 Vector3f(wpimgobj.scale.data()),
-                                                 Vector3f(wpimgobj.angles.data()));
-    LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+    auto spWorldNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
+                                                   Vector3f(wpimgobj.scale.data()),
+                                                   Vector3f(wpimgobj.angles.data()));
+    LoadAlignment(*spWorldNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+    spWorldNode->ID() = wpimgobj.id;
+    auto spImgNode = hasEffect ? std::make_shared<SceneNode>() : spWorldNode;
     spImgNode->ID() = wpimgobj.id;
 
     SceneMaterial     material;
     WPShaderValueData svData;
+    WPShaderValueData worldNodeData;
 
     ShaderValueMap baseConstSvs = context.global_base_uniforms;
     WPShaderInfo   shaderInfo;
@@ -745,7 +808,33 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     mesh.AddMaterial(std::move(material));
     spImgNode->AddMesh(spMesh);
 
-    context.shader_updater->SetNodeData(spImgNode.get(), svData);
+    if (puppet) {
+        svData.puppet_layer = WPPuppetLayer(puppet->puppet);
+        svData.puppet_layer.prepared(wpimgobj.puppet_layers);
+    }
+
+    if (wpimgobj.parent != 0 && !wpimgobj.attachment.empty()) {
+        auto attachment_binding =
+            ResolveAttachmentBinding(context, wpimgobj.parent, wpimgobj.attachment);
+        if (attachment_binding.has_value()) {
+            svData.attach_to_bone    = true;
+            svData.attach_bone       = attachment_binding->bone_index;
+            svData.attach_transform  = attachment_binding->transform;
+            svData.attach_local_transform =
+                Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>());
+        } else {
+            LOG_ERROR("attachment '%s' not found for object '%s'",
+                      wpimgobj.attachment.c_str(),
+                      wpimgobj.name.c_str());
+        }
+    }
+
+    worldNodeData = svData;
+    worldNodeData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+    if (wpimgobj.parent != 0 && !wpimgobj.attachment.empty()) {
+        svData.skip_model_parallax = true;
+    }
+
     if (hasEffect) {
         auto& scene = *context.scene;
         // currently use addr for unique
@@ -773,15 +862,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         effect_ppong_b = WE_EFFECT_PPONG_PREFIX_B.data() + nodeAddr;
         // set image effect
         auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(
-            spImgNode.get(), wpimgobj.size[0], wpimgobj.size[1], effect_ppong_a, effect_ppong_b);
+            spWorldNode.get(), wpimgobj.size[0], wpimgobj.size[1], effect_ppong_a, effect_ppong_b);
         {
             imgEffectLayer->SetFinalBlend(imgBlendMode);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
-            imgEffectLayer->FinalNode().CopyTrans(*spImgNode);
-            if (isCompose) {
-            } else {
-                spImgNode->CopyTrans(SceneNode());
-            }
+            imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
             scene.cameras.at(nodeAddr)->AttatchImgEffect(imgEffectLayer);
         }
         // set renderTarget for ping-pong operate
@@ -913,6 +998,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 auto spMesh = std::make_shared<SceneMesh>();
                 {
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+                    if (wpimgobj.parent == 0 || wpimgobj.attachment.empty()) {
+                        if (auto parent = FindParentNode(context, wpimgobj.parent)) {
+                            svData.scene_parent = parent.get();
+                        }
+                    }
                     if (puppet && wpmat.use_puppet) {
                         svData.puppet_layer = WPPuppetLayer(puppet->puppet);
                         svData.puppet_layer.prepared(wpimgobj.puppet_layers);
@@ -932,7 +1022,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             }
         }
     }
-    context.scene->sceneGraph->AppendChild(spImgNode);
+    AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
+    context.object_nodes[wpimgobj.id] = spWorldNode;
+    if (puppet) {
+        context.object_puppets[wpimgobj.id] = puppet->puppet;
+    }
+    context.shader_updater->SetNodeData(spImgNode.get(), svData);
+    if (spImgNode.get() != spWorldNode.get()) {
+        context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
+        context.scene->sceneGraph->AppendChild(spImgNode);
+    }
 }
 
 struct ParticleChildPtr {
@@ -1093,7 +1192,22 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     mesh.AddMaterial(std::move(material));
     spNode->AddMesh(spMesh);
-    context.shader_updater->SetNodeData(spNode.get(), svData);
+
+    if (!is_child && wppartobj.parent != 0 && !wppartobj.attachment.empty()) {
+        auto attachment_binding =
+            ResolveAttachmentBinding(context, wppartobj.parent, wppartobj.attachment);
+        if (attachment_binding.has_value()) {
+            svData.attach_to_bone      = true;
+            svData.attach_bone         = attachment_binding->bone_index;
+            svData.attach_transform    = attachment_binding->transform;
+            svData.attach_local_transform =
+                Eigen::Affine3f(spNode->GetLocalTrans().cast<float>());
+        } else {
+            LOG_ERROR("attachment '%s' not found for particle object '%s'",
+                      wppartobj.attachment.c_str(),
+                      wppartobj.name.c_str());
+        }
+    }
 
     for (auto& child : particle_obj.children) {
         ParseParticleObj(context,
@@ -1113,8 +1227,11 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     if (is_child)
         child_ptr.node_parent->AppendChild(spNode);
-    else
-        context.scene->sceneGraph->AppendChild(spNode);
+    else {
+        AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
+        context.object_nodes[wppartobj.id] = spNode;
+    }
+    context.shader_updater->SetNodeData(spNode.get(), svData);
 }
 
 void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
@@ -1128,7 +1245,8 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     auto& light = *(context.scene->lights.back());
     light.setNode(node);
 
-    context.scene->sceneGraph->AppendChild(node);
+    AttachNodeToScene(context, node, light_obj.parent, light_obj.name);
+    context.object_nodes[light_obj.id] = node;
 }
 
 template<typename T>

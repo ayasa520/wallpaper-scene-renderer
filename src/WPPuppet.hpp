@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <span>
+#include <limits>
 #include <Eigen/Geometry>
 
 #include "Core/Literals.hpp"
@@ -22,6 +23,7 @@ public:
         Single
     };
     struct Bone {
+        std::string     name;
         Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
         uint32_t        parent { 0xFFFFFFFFu };
 
@@ -33,6 +35,11 @@ public:
         Eigen::Vector3f world_axis_y;
         Eigen::Vector3f world_axis_z;
         */
+    };
+    struct Attachment {
+        std::string     name;
+        uint32_t        bone_index { 0xFFFFFFFFu };
+        Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
     };
     struct BoneFrame {
         Eigen::Vector3f position;
@@ -67,13 +74,18 @@ public:
 
 public:
     std::vector<Bone>      bones;
+    std::vector<Attachment> attachments;
     std::vector<Animation> anims;
 
     std::span<const Eigen::Affine3f> genFrame(WPPuppetLayer&, double time) noexcept;
     void                             prepared();
+    const Attachment*                FindAttachment(std::string_view name) const noexcept;
+    uint32_t                         FindBoneIndex(std::string_view name) const noexcept;
+    const Eigen::Affine3f&           BoneModelTransform(uint32_t index) const noexcept;
 
 private:
     std::vector<Eigen::Affine3f> m_final_affines;
+    std::vector<Eigen::Affine3f> m_bone_model_affines;
 };
 
 class WPPuppetLayer {
@@ -97,6 +109,9 @@ public:
     void prepared(std::span<AnimationLayer>);
 
     std::span<const Eigen::Affine3f> genFrame(double time) noexcept;
+    std::span<const Eigen::Affine3f> AdvanceIfNeeded(double time, uint64_t frame_serial) noexcept;
+    std::span<const Eigen::Affine3f> SkinningMatrices() const noexcept { return m_cached_skinning; }
+    const WPPuppet*                  Puppet() const noexcept { return m_puppet.get(); }
 
     void updateInterpolation(double time) noexcept;
 
@@ -115,6 +130,8 @@ private:
 
     std::vector<Layer>        m_layers;
     std::shared_ptr<WPPuppet> m_puppet;
+    std::span<const Eigen::Affine3f> m_cached_skinning {};
+    uint64_t                        m_cached_frame_serial { std::numeric_limits<uint64_t>::max() };
 };
 
 } // namespace wallpaper

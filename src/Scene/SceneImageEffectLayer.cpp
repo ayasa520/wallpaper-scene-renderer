@@ -15,6 +15,23 @@ SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float w, float h,
       m_final_mesh(std::make_unique<SceneMesh>()),
       m_final_node(std::make_unique<SceneNode>()) {};
 
+void SceneImageEffectLayer::SyncResolvedNodeToWorld() {
+    if (m_worldNode == nullptr) return;
+
+    m_worldNode->UpdateTrans();
+    m_final_node->CopyTrans(*m_worldNode);
+
+    const auto modelTrans = m_worldNode->ModelTrans();
+    m_final_node->SetTranslate(Eigen::Vector3f((float)modelTrans(0, 3),
+                                               (float)modelTrans(1, 3),
+                                               (float)modelTrans(2, 3)));
+
+    if (m_resolved_output_node != nullptr) {
+        m_resolved_output_node->CopyTrans(*m_final_node);
+        m_resolved_output_node->UpdateTrans();
+    }
+}
+
 void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
                                           std::string_view effect_cam) {
     std::string_view ppong_a = m_pingpong_a, ppong_b = m_pingpong_b;
@@ -22,6 +39,9 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         std::swap(ppong_a, ppong_b);
     };
     auto default_node = SceneNode();
+
+    m_resolved_output_node = nullptr;
+    SyncResolvedNodeToWorld();
 
     SceneImageEffectNode* last_output { nullptr };
     for (auto& eff : m_effects) {
@@ -59,6 +79,8 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         swap_pp();
     }
     if (last_output != nullptr) {
+        m_resolved_output_node = last_output->sceneNode.get();
+        SyncResolvedNodeToWorld();
         last_output->output = SpecTex_Default;
         auto& mesh          = *(last_output->sceneNode->Mesh());
         auto& material      = *mesh.Material();

@@ -1,4 +1,5 @@
 #include "WPPuppet.hpp"
+#include <algorithm>
 #include <cmath>
 #include "Utils/Logging.h"
 
@@ -42,6 +43,7 @@ void WPPuppet::prepared() {
     }
 
     m_final_affines.resize(bones.size());
+    m_bone_model_affines.resize(bones.size());
 }
 
 std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
@@ -106,12 +108,33 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         affine.rotate(quat.slerp(global_blend, ident).cast<float>());
         affine.scale(scale);
         affine = parent * affine;
+        m_bone_model_affines[i] = affine;
     }
 
     for (uint i = 0; i < m_final_affines.size(); i++) {
         m_final_affines[i] *= bones[i].offset_trans.matrix();
     }
     return m_final_affines;
+}
+
+const WPPuppet::Attachment* WPPuppet::FindAttachment(std::string_view name) const noexcept {
+    auto it = std::find_if(attachments.begin(), attachments.end(), [name](const auto& attachment) {
+        return attachment.name == name;
+    });
+    return it == attachments.end() ? nullptr : std::addressof(*it);
+}
+
+uint32_t WPPuppet::FindBoneIndex(std::string_view name) const noexcept {
+    for (uint32_t i = 0; i < bones.size(); ++i) {
+        if (bones[i].name == name) return i;
+    }
+    return 0xFFFFFFFFu;
+}
+
+const Affine3f& WPPuppet::BoneModelTransform(uint32_t index) const noexcept {
+    static const Affine3f identity = Affine3f::Identity();
+    if (index >= m_bone_model_affines.size()) return identity;
+    return m_bone_model_affines[index];
 }
 
 static constexpr void genInterpolationInfo(WPPuppet::Animation::InterpolationInfo& info,
@@ -148,6 +171,8 @@ void WPPuppetLayer::prepared(std::span<AnimationLayer> alayers) {
     m_layers.resize(alayers.size());
     double& blend = m_global_blend;
     double& total_blend = m_total_blend;
+    m_cached_skinning     = {};
+    m_cached_frame_serial = std::numeric_limits<uint64_t>::max();
 
     total_blend = 0.0;
     for (int i = 0; i < alayers.size(); i++) {
@@ -191,7 +216,18 @@ void WPPuppetLayer::prepared(std::span<AnimationLayer> alayers) {
 }
 
 std::span<const Eigen::Affine3f> WPPuppetLayer::genFrame(double time) noexcept {
-    return m_puppet->genFrame(*this, time);
+    m_cached_skinning = m_puppet->genFrame(*this, time);
+    return m_cached_skinning;
+}
+
+std::span<const Eigen::Affine3f> WPPuppetLayer::AdvanceIfNeeded(double time,
+                                                                uint64_t frame_serial) noexcept {
+    if (!m_puppet) return {};
+    if (m_cached_frame_serial != frame_serial) {
+        m_cached_skinning     = m_puppet->genFrame(*this, time);
+        m_cached_frame_serial = frame_serial;
+    }
+    return m_cached_skinning;
 }
 
 void WPPuppetLayer::updateInterpolation(double time) noexcept {

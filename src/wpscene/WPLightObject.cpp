@@ -14,6 +14,8 @@ bool WPLightObject::FromJson(const nlohmann::json& json,  fs::VFS&) {
     GET_JSON_NAME_VALUE(json, "radius", radius);
     GET_JSON_NAME_VALUE(json, "intensity", intensity);
     GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+    GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
+    GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
     GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
     GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
     return true;

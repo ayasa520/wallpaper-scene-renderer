@@ -2,6 +2,8 @@
 #include "Eigen/src/Core/Matrix.h"
 #include "Eigen/src/Geometry/Transform.h"
 #include "Scene/Scene.h"
+#include "Scene/SceneImageEffectLayer.h"
+#include "Scene/SceneNode.h"
 #include "SpriteAnimation.hpp"
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
@@ -12,12 +14,95 @@
 #include <iostream>
 #include <chrono>
 #include <ctime>
+#include <cmath>
 #include <numeric>
 
 using namespace wallpaper;
 using namespace Eigen;
 
+namespace
+{
+void ApplyLocalAffine(SceneNode* node, const Affine3f& affine) {
+    if (node == nullptr) return;
+
+    Matrix3f linear = affine.linear();
+    Vector3f scale(linear.col(0).norm(), linear.col(1).norm(), linear.col(2).norm());
+    for (int i = 0; i < 3; ++i) {
+        if (scale[i] > 1e-6f) {
+            linear.col(i) /= scale[i];
+        } else {
+            linear.col(i).setZero();
+            linear(i, i) = 1.0f;
+            scale[i] = 1.0f;
+        }
+    }
+
+    const auto zyx = linear.eulerAngles(2, 1, 0);
+    node->SetScale(scale);
+    node->SetRotation(Vector3f(zyx[2], zyx[1], zyx[0]));
+    node->SetTranslate(affine.translation());
+}
+
+Vector3f ComputeParallaxOffset(SceneNode*                           node,
+                               const WPShaderValueData&             nodeData,
+                               const Scene&                         scene,
+                               const WPCameraParallax&              parallax,
+                               const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
+                               const SceneCamera*                   camera,
+                               const std::array<float, 2>&          mousePos) {
+    if (node == nullptr || camera == nullptr || !parallax.enable) return Vector3f::Zero();
+
+    if (nodeData.scene_parent != nullptr && exists(nodeDataMap, nodeData.scene_parent)) {
+        return ComputeParallaxOffset(nodeData.scene_parent,
+                                     nodeDataMap.at(nodeData.scene_parent),
+                                     scene,
+                                     parallax,
+                                     nodeDataMap,
+                                     camera,
+                                     mousePos);
+    }
+
+    node->UpdateTrans();
+    const auto modelTrans = node->ModelTrans();
+    Vector3f   nodePos((float)modelTrans(0, 3), (float)modelTrans(1, 3), (float)modelTrans(2, 3));
+    Vector2f   depth(nodeData.parallaxDepth[0], nodeData.parallaxDepth[1]);
+
+    Vector2f ortho { (float)scene.ortho[0], (float)scene.ortho[1] };
+    Vector2f mouseVec =
+        Scaling(1.0f, -1.0f) * (Vector2f { 0.5f, 0.5f } - Vector2f(&mousePos[0]));
+    mouseVec = mouseVec.cwiseProduct(ortho) * parallax.mouseinfluence;
+
+    Vector3f camPos = camera->GetPosition().cast<float>();
+    Vector2f paraVec =
+        (nodePos.head<2>() - camPos.head<2>() + mouseVec).cwiseProduct(depth) * parallax.amount;
+    return Vector3f(paraVec.x(), paraVec.y(), 0.0f);
+}
+
+void ApplyParentParallaxToAttachment(SceneNode*                           parentNode,
+                                     const WPShaderValueData&             parentData,
+                                     const Scene&                         scene,
+                                     const WPCameraParallax&              parallax,
+                                     const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
+                                     const SceneCamera*                   camera,
+                                     const std::array<float, 2>&          mousePos,
+                                     Affine3f&                            localTransform) {
+    if (parentNode == nullptr || camera == nullptr || !parallax.enable) return;
+
+    parentNode->UpdateTrans();
+    const auto parentParallax =
+        ComputeParallaxOffset(parentNode, parentData, scene, parallax, nodeDataMap, camera, mousePos);
+    const auto parentModel  = parentNode->ModelTrans();
+    Matrix3f    parentLinear = parentModel.block<3, 3>(0, 0).cast<float>();
+    Vector3f    parentParallaxLocal = parentParallax;
+    if (std::abs(parentLinear.determinant()) > 1e-6f) {
+        parentParallaxLocal = parentLinear.inverse() * parentParallax;
+    }
+    localTransform.translation() += parentParallaxLocal;
+}
+} // namespace
+
 void WPShaderValueUpdater::FrameBegin() {
+    m_puppet_frame_serial++;
     /*
         using namespace std::chrono;
         auto nowTime = system_clock::to_time_t(system_clock::now());
@@ -82,6 +167,49 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
 
 void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprites,
                                           const UpdateUniformOp& updateOp) {
+    if (exists(m_nodeDataMap, pNode)) {
+        auto& nodeData = m_nodeDataMap.at(pNode);
+        if (nodeData.attach_to_bone && nodeData.scene_parent != nullptr &&
+            exists(m_nodeDataMap, nodeData.scene_parent)) {
+            auto& parentData = m_nodeDataMap.at(nodeData.scene_parent);
+            if (parentData.puppet_layer.hasPuppet()) {
+                parentData.puppet_layer.AdvanceIfNeeded(m_scene->frameTime, m_puppet_frame_serial);
+                const auto* parentPuppet = parentData.puppet_layer.Puppet();
+                if (parentPuppet != nullptr) {
+                    const auto& boneTransform = parentPuppet->BoneModelTransform(nodeData.attach_bone);
+                    Affine3f    localTransform =
+                        boneTransform * nodeData.attach_transform * nodeData.attach_local_transform;
+                    ApplyParentParallaxToAttachment(nodeData.scene_parent,
+                                                    parentData,
+                                                    *m_scene,
+                                                    m_parallax,
+                                                    m_nodeDataMap,
+                                                    m_scene->activeCamera,
+                                                    m_mousePos,
+                                                    localTransform);
+
+                    SceneImageEffectLayer* effectLayer { nullptr };
+                    if (!pNode->Camera().empty()) {
+                        auto camera_it = m_scene->cameras.find(pNode->Camera());
+                        if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
+                            effectLayer = camera_it->second->GetImgEffect().get();
+                        }
+                    }
+
+                    if (effectLayer != nullptr) {
+                        if (auto* worldNode = effectLayer->WorldNode()) {
+                            ApplyLocalAffine(worldNode, localTransform);
+                            worldNode->UpdateTrans();
+                            effectLayer->SyncResolvedNodeToWorld();
+                        }
+                    } else {
+                        ApplyLocalAffine(pNode, localTransform);
+                    }
+                }
+            }
+        }
+    }
+
     if (! pNode->Mesh()) return;
 
     pNode->UpdateTrans();
@@ -122,7 +250,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             }
         }
         if (nodeData.puppet_layer.hasPuppet() && info.has_BONES) {
-            auto data = nodeData.puppet_layer.genFrame(m_scene->frameTime);
+            auto data = nodeData.puppet_layer.AdvanceIfNeeded(m_scene->frameTime, m_puppet_frame_serial);
             updateOp(G_BONES, std::span<const float> { data[0].data(), data.size() * 16 });
         }
     }
@@ -144,21 +272,18 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         Matrix4d modelTrans = pNode->ModelTrans();
         if (hasNodeData && cam_name != "effect") {
             const auto& nodeData = m_nodeDataMap.at(pNode);
-            if (m_parallax.enable) {
-                Vector3f nodePos = pNode->Translate();
-                Vector2f depth(&nodeData.parallaxDepth[0]);
-                Vector2f ortho { (float)m_scene->ortho[0], (float)m_scene->ortho[1] };
-                // flip mouse y axis
-                Vector2f mouseVec =
-                    Scaling(1.0f, -1.0f) * (Vector2f { 0.5f, 0.5f } - Vector2f(&m_mousePos[0]));
-                mouseVec        = mouseVec.cwiseProduct(ortho) * m_parallax.mouseinfluence;
-                Vector3f camPos = camera->GetPosition().cast<float>();
-                Vector2f paraVec =
-                    (nodePos.head<2>() - camPos.head<2>() + mouseVec).cwiseProduct(depth) *
-                    m_parallax.amount;
+            if (m_parallax.enable && !nodeData.skip_model_parallax) {
+                const auto parallaxOffset =
+                    ComputeParallaxOffset(pNode,
+                                          nodeData,
+                                          *m_scene,
+                                          m_parallax,
+                                          m_nodeDataMap,
+                                          camera,
+                                          m_mousePos);
+                const Vector3d parallaxOffsetD = parallaxOffset.cast<double>();
                 modelTrans =
-                    Affine3d(Translation3d(Vector3d(paraVec.x(), paraVec.y(), 0.0f))).matrix() *
-                    modelTrans;
+                    Affine3d(Eigen::Translation3d(parallaxOffsetD)).matrix() * modelTrans;
             }
         }
 
@@ -224,8 +349,11 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         for (auto& l : m_scene->lights) {
             if (i == 4) break;
             assert(l->node() != nullptr);
-            const auto& trans = l->node()->Translate();
-            std::copy(trans.begin(), trans.end(), lights.begin() + i * 4);
+            l->node()->UpdateTrans();
+            const auto modelTrans = l->node()->ModelTrans();
+            lights[i * 4 + 0]     = (float)modelTrans(0, 3);
+            lights[i * 4 + 1]     = (float)modelTrans(1, 3);
+            lights[i * 4 + 2]     = (float)modelTrans(2, 3);
             if (i < 3) {
                 const auto& color = l->premultipliedColor();
                 std::copy(color.begin(), color.end(), lights_color.begin() + i * 4);

@@ -74,6 +74,8 @@ public:
     bool                       nopadding { false };
     bool                       visible { true };
     std::string                image;
+    int32_t                    parent { 0 };
+    std::string                attachment;
     std::string                alignment { "center" };
     WPMaterial                 material;
     std::vector<WPImageEffect> effects;

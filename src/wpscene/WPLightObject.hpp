@@ -28,6 +28,7 @@ public:
     float                radius { 1000.0f };
     float                intensity { 1.0f };
     bool                 visible { true };
+    int32_t              parent { 0 };
 };
 
 } // namespace wpscene

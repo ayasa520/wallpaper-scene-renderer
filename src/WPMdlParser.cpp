@@ -170,7 +170,7 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     bones.resize(bones_num);
     for (uint i = 0; i < bones_num; i++) {
         auto&       bone = bones[i];
-        std::string name = f.ReadStr();
+        bone.name = f.ReadStr();
         f.ReadInt32(); // unk
 
         bone.parent = f.ReadUint32();
@@ -267,13 +267,13 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
                 uint32_t num_attachments = f.ReadUint16(); // number of attachments in the MDAT section
 
                 for(int i = 0; i < num_attachments; i++){
-                    f.ReadUint16(); // skip 2 bytes
-                    std::string attachment_name = f.ReadStr(); // attachment name
-                    int bytesToRead = mdat_attachment_data_byte_length;
-                    for(int j = 0; j < bytesToRead; j++){
-                        f.ReadUint8();
+                    WPPuppet::Attachment attachment;
+                    attachment.bone_index = f.ReadUint16();
+                    attachment.name       = f.ReadStr();
+                    for (auto col : attachment.transform.matrix().colwise()) {
+                        for (auto& x : col) x = f.ReadFloat();
                     }
-
+                    mdl.puppet->attachments.push_back(std::move(attachment));
                 }
             }
         }

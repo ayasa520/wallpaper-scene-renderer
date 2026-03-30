@@ -44,7 +44,9 @@ public:
     const auto& FirstTarget() const { return m_pingpong_a; }
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
     SceneNode&  FinalNode() const { return *m_final_node; }
+    SceneNode*  WorldNode() const { return m_worldNode; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
+    void        SyncResolvedNodeToWorld();
 
     void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam);
 
@@ -57,6 +59,7 @@ private:
     //    std::vector<float> m_size;
     std::unique_ptr<SceneMesh> m_final_mesh;
     std::unique_ptr<SceneNode> m_final_node;
+    SceneNode*                 m_resolved_output_node { nullptr };
     BlendMode                  m_final_blend;
 
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
