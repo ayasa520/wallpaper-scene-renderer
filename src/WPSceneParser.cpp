@@ -32,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <random>
 #include <cmath>
 #include <functional>
@@ -57,6 +58,7 @@ struct ParseContext {
     std::shared_ptr<SceneNode> effect_camera_node;
     std::shared_ptr<SceneNode> global_camera_node;
     std::shared_ptr<SceneNode> global_perspective_camera_node;
+    std::unordered_set<int32_t> dependent_parent_ids;
     std::unordered_map<int32_t, std::shared_ptr<SceneNode>> object_nodes;
     std::unordered_map<int32_t, std::shared_ptr<WPPuppet>>  object_puppets;
 };
@@ -670,6 +672,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     }
     bool hasEffect = count_eff > 0;
     bool use_virtual_parent = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
+    bool has_dependents = context.dependent_parent_ids.count(wpimgobj.id) > 0;
+    bool use_detached_effect_world_node =
+        hasEffect && (use_virtual_parent || ! wpimgobj.attachment.empty() || has_dependents);
     // skip no effect fullscreen layer
     if (! hasEffect && wpimgobj.fullscreen) return;
 
@@ -700,7 +705,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                                                    Vector3f(wpimgobj.angles.data()));
     LoadAlignment(*spWorldNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
     spWorldNode->ID() = wpimgobj.id;
-    auto spImgNode = hasEffect ? std::make_shared<SceneNode>() : spWorldNode;
+    auto spImgNode = use_detached_effect_world_node ? std::make_shared<SceneNode>() : spWorldNode;
     spImgNode->ID() = wpimgobj.id;
 
     SceneMaterial     material;
@@ -871,11 +876,19 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         effect_ppong_b = WE_EFFECT_PPONG_PREFIX_B.data() + nodeAddr;
         // set image effect
         auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(
-            spWorldNode.get(), wpimgobj.size[0], wpimgobj.size[1], effect_ppong_a, effect_ppong_b);
+            use_detached_effect_world_node ? spWorldNode.get() : nullptr,
+            wpimgobj.size[0],
+            wpimgobj.size[1],
+            effect_ppong_a,
+            effect_ppong_b);
         {
             imgEffectLayer->SetFinalBlend(imgBlendMode);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
-            imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
+            imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
+                                                                                 : *spImgNode);
+            if (! use_detached_effect_world_node && ! isCompose) {
+                spImgNode->CopyTrans(SceneNode());
+            }
             scene.cameras.at(nodeAddr)->AttatchImgEffect(imgEffectLayer);
         }
         // set renderTarget for ping-pong operate
@@ -1308,6 +1321,22 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         } else if (obj.contains("light") && ! obj.at("light").is_null()) {
             AddWPObject<wpscene::WPLightObject>(wp_objs, obj, vfs);
         }
+    }
+
+    for (const auto& obj : wp_objs) {
+        std::visit(visitor::overload {
+                       [&context](const wpscene::WPImageObject& obj) {
+                           if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
+                       },
+                       [&context](const wpscene::WPParticleObject& obj) {
+                           if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
+                       },
+                       [&context](const wpscene::WPLightObject& obj) {
+                           if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
+                       },
+                       [](const wpscene::WPSoundObject&) {},
+                   },
+                   obj);
     }
 
     if (sc.general.orthogonalprojection.auto_) {
