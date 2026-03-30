@@ -279,11 +279,61 @@ inline EShLanguage ToGLSL(ShaderType type) {
     }
 }
 
+inline std::string SanitizeBrokenPreprocessorDirectives(const std::string& src,
+                                                        ShaderType         type) {
+    std::string out;
+    out.reserve(src.size());
+
+    std::vector<std::string::size_type> if_stack;
+    std::string::size_type              pos { 0 };
+    usize                               removed_endifs { 0 };
+
+    while (pos < src.size()) {
+        auto line_end = src.find('\n', pos);
+        auto line_len =
+            line_end == std::string::npos ? src.size() - pos : line_end - pos;
+        auto line = src.substr(pos, line_len);
+
+        auto first_non_ws = line.find_first_not_of(" \t\r");
+        bool handled      = false;
+        if (first_non_ws != std::string::npos && line[first_non_ws] == '#') {
+            auto directive = line.substr(first_non_ws);
+            if (directive.rfind("#if", 0) == 0) {
+                if_stack.push_back(pos);
+            } else if (directive.rfind("#endif", 0) == 0) {
+                if (if_stack.empty()) {
+                    out.append(line.substr(0, first_non_ws));
+                    out.append("// stripped unmatched #endif");
+                    handled = true;
+                    removed_endifs++;
+                } else {
+                    if_stack.pop_back();
+                }
+            }
+        }
+
+        if (!handled) out.append(line);
+        if (line_end == std::string::npos) break;
+        out.push_back('\n');
+        pos = line_end + 1;
+    }
+
+    if (removed_endifs > 0) {
+        LOG_INFO("SanitizeBrokenPreprocessorDirectives stripped %zu unmatched #endif line(s) "
+                 "from %s shader",
+                 removed_endifs,
+                 type == ShaderType::VERTEX ? "vertex" : "fragment");
+    }
+    return out;
+}
+
 inline std::string Preprocessor(const std::string& in_src, ShaderType type, const Combos& combos,
                                 WPPreprocessorInfo& process_info) {
     std::string res;
 
-    std::string src = wallpaper::WPShaderParser::PreShaderHeader(in_src, combos, type);
+    std::string src =
+        wallpaper::WPShaderParser::PreShaderHeader(
+            SanitizeBrokenPreprocessorDirectives(in_src, type), combos, type);
 
     // workaround #require directive
     {
@@ -298,14 +348,17 @@ inline std::string Preprocessor(const std::string& in_src, ShaderType type, cons
 
     auto* data = src.c_str();
     shader.setStrings(&data, 1);
-    shader.preprocess(&vulkan::DefaultTBuiltInResource,
-                      110,
-                      EProfile::ECoreProfile,
-                      false,
-                      false,
-                      emsg,
-                      &res,
-                      includer);
+    if (! shader.preprocess(&vulkan::DefaultTBuiltInResource,
+                            110,
+                            EProfile::ECoreProfile,
+                            false,
+                            false,
+                            emsg,
+                            &res,
+                            includer)) {
+        LOG_ERROR("glslang(preprocess): %s", shader.getInfoLog());
+        return src;
+    }
 
     std::regex re_io(R"(.+\s(in|out)\s[\s\w]+\s(\w+)\s*;)", std::regex::ECMAScript);
     for (auto it = std::sregex_iterator(res.begin(), res.end(), re_io);
