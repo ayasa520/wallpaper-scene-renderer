@@ -39,6 +39,8 @@ constexpr std::array base_inst_exts {
 };
 constexpr std::array base_device_exts {
     Extension { false, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME },
+    Extension { false, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME },
+    Extension { false, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME },
     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },
@@ -179,7 +181,10 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
                                            extent.height,
                                            (info.offscreen_tiling == TexTiling::OPTIMAL
                                                 ? VK_IMAGE_TILING_OPTIMAL
-                                                : VK_IMAGE_TILING_LINEAR));
+                                                : VK_IMAGE_TILING_LINEAR),
+                                           info.export_mode,
+                                           info.export_drm_fourcc,
+                                           info.export_drm_modifiers);
         m_with_surface = false;
     }
 

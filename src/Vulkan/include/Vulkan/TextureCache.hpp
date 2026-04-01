@@ -4,6 +4,7 @@
 #include "Type.hpp"
 #include "Core/NoCopyMove.hpp"
 #include "Core/MapSet.hpp"
+#include <span>
 
 namespace wallpaper
 {
@@ -44,7 +45,9 @@ public:
     void Clear();
 
     std::optional<ExImageParameters> CreateExTex(uint32_t witdh, uint32_t height, VkFormat,
-                                                 VkImageTiling);
+                                                 VkImageTiling, ExternalFrameExportMode,
+                                                 uint32_t export_drm_fourcc = 0,
+                                                 std::span<const uint64_t> export_drm_modifiers = {});
     ImageSlotsRef                    CreateTex(Image&);
 
     std::optional<ImageParameters> Query(std::string_view key, TextureKey content_hash,

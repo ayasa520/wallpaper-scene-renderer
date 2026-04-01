@@ -42,7 +42,13 @@ ExImageParameters::ExImageParameters(ExImageParameters&& o) noexcept
       sampler(std::move(o.sampler)),
       extent(o.extent),
       mipmap_level(o.mipmap_level),
-      fd(std::exchange(o.fd, 0)) {}
+      fd(std::exchange(o.fd, -1)),
+      handle_type(o.handle_type),
+      drm_fourcc(o.drm_fourcc),
+      drm_modifier(o.drm_modifier),
+      n_planes(o.n_planes),
+      premultiplied(o.premultiplied),
+      planes(o.planes) {}
 ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept {
     mem          = std::move(o.mem);
     mem_reqs     = o.mem_reqs;
@@ -51,7 +57,13 @@ ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept 
     sampler      = std::move(o.sampler);
     extent       = o.extent;
     mipmap_level = o.mipmap_level;
-    fd           = std::exchange(o.fd, 0);
+    fd           = std::exchange(o.fd, -1);
+    handle_type  = o.handle_type;
+    drm_fourcc   = o.drm_fourcc;
+    drm_modifier = o.drm_modifier;
+    n_planes     = o.n_planes;
+    premultiplied = o.premultiplied;
+    planes       = o.planes;
     return *this;
 }
 
