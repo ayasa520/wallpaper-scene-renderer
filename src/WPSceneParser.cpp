@@ -160,7 +160,9 @@ void LoadControlPoint(ParticleSubSystem& pSys, const wpscene::Particle& wp) {
     std::span<ParticleControlpoint> pcs = pSys.Controlpoints();
     usize                           s   = std::min(pcs.size(), wp.controlpoints.size());
     for (usize i = 0; i < s; i++) {
-        pcs[i].offset = Eigen::Vector3d { array_cast<double>(wp.controlpoints[i].offset).data() };
+        pcs[i].base_offset =
+            Eigen::Vector3d { array_cast<double>(wp.controlpoints[i].offset).data() };
+        pcs[i].offset = pcs[i].base_offset;
         pcs[i].link_mouse =
             wp.controlpoints[i].flags[wpscene::ParticleControlpoint::FlagEnum::link_mouse];
         pcs[i].worldspace =
@@ -1232,6 +1234,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                 break;
             }
         });
+    particleSub->SetSceneNode(spNode.get());
 
     LoadEmitter(*particleSub, particle_obj, override.count, render_rope);
     LoadInitializer(*particleSub, particle_obj, override);

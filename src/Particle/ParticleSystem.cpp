@@ -1,6 +1,7 @@
 #include "ParticleSystem.h"
 #include "Core/Literals.hpp"
 #include "Scene/Scene.h"
+#include "Scene/SceneNode.h"
 #include "ParticleModify.h"
 #include "Scene/SceneMesh.h"
 #include "Core/Random.hpp"
@@ -28,6 +29,9 @@ std::span<const Particle> ParticleInstance::Particles() const { return m_particl
 std::vector<Particle>&    ParticleInstance::ParticlesVec() { return m_particles; };
 
 ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() { return m_bounded_data; }
+const ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() const {
+    return m_bounded_data;
+}
 
 ParticleSubSystem::ParticleSubSystem(ParticleSystem& p, std::shared_ptr<SceneMesh> sm,
                                      uint32_t maxcount, double rate, u32 maxcount_instance,
@@ -60,6 +64,30 @@ ParticleSubSystem::SpawnType ParticleSubSystem::Type() const { return m_spawn_ty
 
 u32 ParticleSubSystem::MaxInstanceCount() const { return m_maxcount_instance; };
 
+void ParticleSubSystem::SetSceneNode(SceneNode* node) { m_node = node; }
+
+void ParticleSubSystem::UpdateLinkedControlpoints() {
+    bool has_linked_controlpoint = std::any_of(m_controlpoints.begin(), m_controlpoints.end(),
+                                               [](const ParticleControlpoint& controlpoint) {
+                                                   return controlpoint.link_mouse;
+                                               });
+    if (!has_linked_controlpoint) return;
+
+    Eigen::Vector3d mouse_scene = m_sys.MouseScenePosition();
+    Eigen::Vector3d node_origin = Eigen::Vector3d::Zero();
+    if (m_node != nullptr) {
+        m_node->UpdateTrans();
+        const auto model = m_node->ModelTrans();
+        node_origin = Eigen::Vector3d { model(0, 3), model(1, 3), model(2, 3) };
+    }
+
+    for (auto& controlpoint : m_controlpoints) {
+        if (!controlpoint.link_mouse) continue;
+        controlpoint.offset = controlpoint.base_offset +
+                              (controlpoint.worldspace ? mouse_scene : (mouse_scene - node_origin));
+    }
+}
+
 void ParticleSubSystem::AddChild(std::unique_ptr<ParticleSubSystem>&& child) {
     m_children.emplace_back(std::move(child));
 }
@@ -84,6 +112,8 @@ void ParticleSubSystem::Emitt() {
     double frameTime    = m_sys.scene.frameTime;
     double particleTime = frameTime * m_rate;
     m_time += particleTime;
+
+    UpdateLinkedControlpoints();
 
     if (m_spawn_type == SpawnType::STATIC) {
         if (m_instances.empty()) m_instances.emplace_back(std::make_unique<ParticleInstance>());
@@ -137,7 +167,8 @@ void ParticleSubSystem::Emitt() {
 
         if (! inst->IsDeath()) {
             for (auto& emittOp : m_emiters) {
-                emittOp(inst->ParticlesVec(), m_initializers, m_maxcount, particleTime);
+                emittOp(inst->ParticlesVec(), m_initializers, m_controlpoints, m_maxcount,
+                        particleTime);
             }
         }
 
@@ -202,4 +233,29 @@ void ParticleSystem::Emitt() {
     for (auto& el : subsystems) {
         el->Emitt();
     }
+}
+
+void ParticleSystem::SetMousePos(float x, float y) { m_mouse_pos = { x, y }; }
+
+std::array<float, 2> ParticleSystem::MousePos() const { return m_mouse_pos; }
+
+Eigen::Vector3d ParticleSystem::MouseScenePosition() const {
+    const SceneCamera* camera = scene.activeCamera;
+    auto global_camera_it = scene.cameras.find("global");
+    if (global_camera_it != scene.cameras.end() && global_camera_it->second) {
+        camera = global_camera_it->second.get();
+    }
+
+    if (camera == nullptr) {
+        return Eigen::Vector3d { m_mouse_pos[0] * scene.ortho[0],
+                                 (1.0f - m_mouse_pos[1]) * scene.ortho[1],
+                                 0.0 };
+    }
+
+    Eigen::Vector3d camera_pos = camera->GetPosition();
+    double          left = camera_pos.x() - camera->Width() / 2.0;
+    double          top  = camera_pos.y() + camera->Height() / 2.0;
+    return Eigen::Vector3d { left + m_mouse_pos[0] * camera->Width(),
+                             top - m_mouse_pos[1] * camera->Height(),
+                             0.0 };
 }

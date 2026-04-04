@@ -9,6 +9,8 @@
 namespace wallpaper
 {
 
+class SceneNode;
+
 enum class ParticleAnimationMode
 {
     SEQUENCE,
@@ -39,6 +41,7 @@ public:
     std::vector<Particle>&    ParticlesVec();
 
     BoundedData& GetBoundedData();
+    const BoundedData& GetBoundedData() const;
 
 private:
     bool                  m_is_death { false };
@@ -78,8 +81,11 @@ public:
 
     SpawnType Type() const;
     u32       MaxInstanceCount() const;
+    void      SetSceneNode(SceneNode* node);
 
 private:
+    void UpdateLinkedControlpoints();
+
     ParticleSystem&            m_sys;
     std::shared_ptr<SceneMesh> m_mesh;
     //	std::vector<std::unique_ptr<ParticleEmitter>> m_emiters;
@@ -102,6 +108,7 @@ private:
     u32       m_maxcount_instance { 1 };
     double    m_probability { 1.0f };
     SpawnType m_spawn_type { SpawnType::STATIC };
+    SceneNode* m_node { nullptr };
 };
 
 class Scene;
@@ -111,10 +118,16 @@ public:
     ~ParticleSystem() = default;
 
     void Emitt();
+    void SetMousePos(float x, float y);
+    std::array<float, 2> MousePos() const;
+    Eigen::Vector3d MouseScenePosition() const;
 
     Scene& scene;
 
     std::vector<std::unique_ptr<ParticleSubSystem>> subsystems;
     std::unique_ptr<IParticleRawGener>              gener;
+
+private:
+    std::array<float, 2> m_mouse_pos { 0.5f, 0.5f };
 };
 } // namespace wallpaper

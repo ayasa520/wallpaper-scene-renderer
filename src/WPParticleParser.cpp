@@ -614,6 +614,7 @@ ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe
         box.maxDistance   = wpe.distancemax;
         box.directions    = wpe.directions;
         box.orgin         = wpe.origin;
+        box.controlpoint  = wpe.controlpoint;
         box.one_per_frame = wpe.flags[wpscene::Emitter::FlagEnum::one_per_frame];
         box.instantaneous = wpe.instantaneous;
         box.minSpeed      = wpe.speedmin;
@@ -627,6 +628,7 @@ ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe
         sphere.maxDistance   = wpe.distancemax[0];
         sphere.directions    = wpe.directions;
         sphere.orgin         = wpe.origin;
+        sphere.controlpoint  = wpe.controlpoint;
         sphere.sign          = wpe.sign;
         sphere.one_per_frame = wpe.flags[wpscene::Emitter::FlagEnum::one_per_frame];
         sphere.instantaneous = wpe.instantaneous;
@@ -635,6 +637,7 @@ ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe
         sphere.sort          = sort;
         return ParticleSphereEmitterArgs::MakeEmittOp(sphere);
     } else
-        return [](std::vector<Particle>&, std::vector<ParticleInitOp>&, uint32_t, float) {
+        return [](std::vector<Particle>&, std::vector<ParticleInitOp>&,
+                  std::span<const ParticleControlpoint>, uint32_t, double) {
         };
 }

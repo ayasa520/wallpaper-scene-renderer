@@ -182,6 +182,7 @@ private:
             {
                 auto pos = m_mouse_pos.load();
                 m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
+                m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
             }
             m_scene->paritileSys->Emitt();
 

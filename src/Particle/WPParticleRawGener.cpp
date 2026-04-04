@@ -97,8 +97,9 @@ inline usize GenParticleData(std::span<const std::unique_ptr<ParticleInstance>> 
 }
 
 inline size_t GenRopeParticleData(std::span<const Particle>   particles,
+                                  const Eigen::Vector3f&      instance_offset,
                                   const ParticleRawGenSpecOp& specOp, WPGOption opt,
-                                  SceneVertexArray& sv) {
+                                  SceneVertexArray& sv, size_t base_index) {
     /*
     attribute vec4 a_PositionVec4;
     attribute vec4 a_TexCoordVec4;
@@ -148,18 +149,20 @@ inline size_t GenRopeParticleData(std::span<const Particle>   particles,
         cp_vec       = pos_vec.normalized().dot(cp_vec) > 0 ? cp_vec : -1.0f * cp_vec;
         auto&    sp  = pre_p;
         auto&    ep  = p;
-        Vector3f scp = Vector3f { sp.position } + cp_vec;
-        Vector3f ecp = Vector3f { ep.position } - cp_vec;
+        Vector3f start_pos = instance_offset + sp.position;
+        Vector3f end_pos   = instance_offset + ep.position;
+        Vector3f scp       = start_pos + cp_vec;
+        Vector3f ecp       = end_pos - cp_vec;
 
         // a_PositionVec4: start pos
         AssignVertexTimes({ data + offset, totle_size },
-                          std::array { sp.position[0], sp.position[1], sp.position[2], size },
+                          std::array { start_pos[0], start_pos[1], start_pos[2], size },
                           4);
         offset += 4;
         // a_TexCoordVec4: end pos
         AssignVertexTimes(
             { data + offset, totle_size },
-            std::array { ep.position[0], ep.position[1], ep.position[2], in_ParticleTrailLength },
+            std::array { end_pos[0], end_pos[1], end_pos[2], in_ParticleTrailLength },
             4);
         offset += 4;
 
@@ -200,7 +203,8 @@ inline size_t GenRopeParticleData(std::span<const Particle>   particles,
                           std::array { p.color[0], p.color[1], p.color[2], p.alpha },
                           4);
 
-        sv.SetVertexs((i++) * 4, { data, totle_size });
+        sv.SetVertexs((base_index + i - 1) * 4, { data, totle_size });
+        i++;
     }
     return i == 0 ? 0 : i - 1;
 }
@@ -237,12 +241,19 @@ void WPParticleRawGener::GenGLData(std::span<const std::unique_ptr<ParticleInsta
 
     usize particle_num { 0 };
 
-    /*
-    if (sv.GetOption(WE_PRENDER_ROPE))
-        particle_num = GenRopeParticleData(particles, specOp, opt, sv);
-    else
-    */
-    particle_num += GenParticleData(instances, specOp, opt, sv);
+    if (sv.GetOption(WE_PRENDER_ROPE)) {
+        for (const auto& inst : instances) {
+            if (inst->IsNoLiveParticle()) continue;
+            particle_num += GenRopeParticleData(inst->Particles(),
+                                                inst->GetBoundedData().pos,
+                                                specOp,
+                                                opt,
+                                                sv,
+                                                particle_num);
+        }
+    } else {
+        particle_num += GenParticleData(instances, specOp, opt, sv);
+    }
 
     // LOG_INFO("num: %d", particle_num);
 

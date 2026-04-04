@@ -92,6 +92,7 @@ ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
     double timer { 0.0f };
     return [a, timer](std::vector<Particle>&       ps,
                       std::vector<ParticleInitOp>& inis,
+                      std::span<const ParticleControlpoint> controlpoints,
                       u32                          maxcount,
                       double                       timepass) mutable {
         timer += timepass;
@@ -105,7 +106,11 @@ ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
             ParticleModify::ChangeVelocity(p,
                                            Random::get(a.minSpeed, a.maxSpeed) * pos.normalized());
 
-            ParticleModify::Move(p, a.orgin[0], a.orgin[1], a.orgin[2]);
+            Eigen::Vector3d origin = Eigen::Vector3f { a.orgin.data() }.cast<double>();
+            if (a.controlpoint >= 0 && (usize)a.controlpoint < controlpoints.size()) {
+                origin += controlpoints[(usize)a.controlpoint].offset;
+            }
+            ParticleModify::Move(p, origin);
             return p;
         };
         u32 emit_num = GetEmitNum(timer, a.emitSpeed);
@@ -122,6 +127,7 @@ ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs
     double timer { 0.0f };
     return [a, timer](std::vector<Particle>&       ps,
                       std::vector<ParticleInitOp>& inis,
+                      std::span<const ParticleControlpoint> controlpoints,
                       u32                          maxcount,
                       double                       timepass) mutable {
         timer += timepass;
@@ -140,7 +146,11 @@ ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs
             ParticleModify::ChangeVelocity(p,
                                            Random::get(a.minSpeed, a.maxSpeed) * sp.normalized());
 
-            ParticleModify::Move(p, Eigen::Vector3f { a.orgin.data() }.cast<double>());
+            Eigen::Vector3d origin = Eigen::Vector3f { a.orgin.data() }.cast<double>();
+            if (a.controlpoint >= 0 && (usize)a.controlpoint < controlpoints.size()) {
+                origin += controlpoints[(usize)a.controlpoint].offset;
+            }
+            ParticleModify::Move(p, origin);
             return p;
         };
         u32 emit_num = GetEmitNum(timer, a.emitSpeed);
