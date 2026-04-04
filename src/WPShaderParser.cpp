@@ -402,6 +402,43 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         return std::regex_replace(decl, std::regex(R"(\bin\b)"), "out");
     };
 
+    auto EscapeRegex = [](const std::string& text) {
+        static const std::regex special(R"([-[\]{}()*+?.,\^$|#\s])");
+        return std::regex_replace(text, special, R"(\$&)");
+    };
+    auto HasMutableUse = [&](const std::string& text, const std::string& name) {
+        const auto name_re = EscapeRegex(name);
+        const auto pattern = std::string(R"(\b)") + name_re +
+                             R"(\b(?:\s*(?:\.[A-Za-z_]\w*|\[[^\]]+\]))*\s*(?:\+=|-=|\*=|/=|%=|=(?!=)|\+\+|--))";
+        return std::regex_search(text, std::regex(pattern));
+    };
+    auto MakeMutableInputShim = [](const std::string& decl, const std::string& name,
+                                   std::string& rewritten_decl, std::string& define_line,
+                                   std::string& init_line) {
+        std::smatch match;
+        if (! std::regex_match(
+                decl,
+                match,
+                std::regex(
+                    R"((\s*)in\s+([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(\s*\[[^\]]+\])?\s*;)"))) {
+            return false;
+        }
+
+        const auto indent        = match[1].str();
+        const auto type          = match[2].str();
+        const auto declared_name = match[3].str();
+        const auto suffix        = match[4].str();
+        if (declared_name != name) return false;
+
+        const auto input_name   = "_wp_input_" + name;
+        const auto mutable_name = "_wp_mutable_" + name;
+
+        rewritten_decl = indent + "in " + type + " " + input_name + suffix + ";";
+        define_line    = "#define " + name + " " + mutable_name + "\n";
+        init_line      = indent + type + " " + mutable_name + suffix + " = " + input_name + ";\n";
+        return true;
+    };
+
     std::string insert_str {};
     auto&       cur = unit.preprocess_info;
     if (pre != nullptr) {
@@ -466,6 +503,42 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         result,
         std::regex(R"(\bvec3\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;)"),
         "vec3 $1 = $2.xyz;");
+
+    // Some effect fragment shaders write back into stage inputs such as v_TexCoord. GLSL
+    // forbids that, so rewrite those inputs to immutable varyings plus mutable locals.
+    if (unit.stage == ShaderType::FRAGMENT) {
+        std::string define_lines;
+        std::string init_lines;
+        for (const auto& [name, decl] : cur.input) {
+            if (! HasMutableUse(result, name)) continue;
+
+            std::string rewritten_decl;
+            std::string define_line;
+            std::string init_line;
+            if (! MakeMutableInputShim(decl, name, rewritten_decl, define_line, init_line)) {
+                continue;
+            }
+            if (! ReplaceDeclaration(result, decl, rewritten_decl)) continue;
+
+            define_lines += define_line;
+            init_lines += init_line;
+        }
+
+        if (! define_lines.empty()) {
+            result = std::regex_replace(result,
+                                        std::regex(R"(void\s+main\s*\(\s*(?:void)?\s*\)\s*\{)"),
+                                        define_lines + "\nvoid main() {\n" + init_lines,
+                                        std::regex_constants::format_first_only);
+        }
+    }
+
+    // HLSL-style shaders often write scalar-first max/min calls such as max(0.0, vec2Expr).
+    // GLSL only accepts the scalar as the second argument for vector overloads.
+    result = std::regex_replace(
+        result,
+        std::regex(
+            R"(\b(max|min)\(\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*,\s*((?:[^(),\n]+|\([^()]*\))+)\s*\))"),
+        "$1($3, $2)");
 
     return result;
 }

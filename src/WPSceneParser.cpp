@@ -69,6 +69,12 @@ using WPObjectVar = std::variant<wpscene::WPImageObject, wpscene::WPParticleObje
 
 namespace
 {
+bool ResolveObjectVisibility(bool raw_visible, const VisibleBinding& binding,
+                             const UserPropertyMap* user_properties) {
+    if (! binding.hasUserBinding()) return raw_visible;
+    return EvaluateVisibleBinding(binding, user_properties);
+}
+
 // mapRate < 1.0
 void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
                  const std::array<float, 2> mapRate = { 1.0f, 1.0f }) {
@@ -684,7 +690,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 
     int32_t count_eff = 0;
     for (const auto& wpeffobj : wpimgobj.effects) {
-        if (EvaluateVisibleBinding(wpeffobj.visible_binding, context.user_properties)) count_eff++;
+        if (ResolveObjectVisibility(
+                wpeffobj.visible, wpeffobj.visible_binding, context.user_properties))
+            count_eff++;
     }
     bool hasEffect = count_eff > 0;
     bool use_virtual_parent = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
@@ -924,7 +932,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         int32_t i_eff = -1;
         for (const auto& wpeffobj : wpimgobj.effects) {
             i_eff++;
-            if (! EvaluateVisibleBinding(wpeffobj.visible_binding, context.user_properties)) {
+            if (! ResolveObjectVisibility(
+                    wpeffobj.visible, wpeffobj.visible_binding, context.user_properties)) {
                 i_eff--;
                 continue;
             }
@@ -1315,7 +1324,8 @@ void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj,
         LOG_ERROR("parse scene object failed, name: %s", wpobj.name.c_str());
         return;
     }
-    wpobj.visible = EvaluateVisibleBinding(wpobj.visible_binding, user_properties);
+    wpobj.visible = ResolveObjectVisibility(
+        wpobj.visible, wpobj.visible_binding, user_properties);
     if (! wpobj.visible) return;
     objs.push_back(wpobj);
 }
