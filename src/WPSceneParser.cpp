@@ -1038,6 +1038,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 auto spMesh = std::make_shared<SceneMesh>();
                 {
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+                    svData.effect_projection_node = &imgEffectLayer->FinalNode();
+                    svData.effect_projection_mesh = &imgEffectLayer->FinalMesh();
                     if (!use_virtual_parent && (wpimgobj.parent == 0 || wpimgobj.attachment.empty())) {
                         if (auto parent = FindParentNode(context, wpimgobj.parent)) {
                             svData.scene_parent = parent.get();

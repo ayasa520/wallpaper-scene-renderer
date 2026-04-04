@@ -15,6 +15,8 @@
 #include <chrono>
 #include <ctime>
 #include <cmath>
+#include <algorithm>
+#include <limits>
 #include <numeric>
 
 using namespace wallpaper;
@@ -135,6 +137,67 @@ void ApplyParentParallaxToAttachment(SceneNode*                           parent
         parentParallaxLocal = parentLinear.inverse() * parentParallax;
     }
     localTransform.translation() += parentParallaxLocal;
+}
+
+struct MeshBounds2D {
+    bool     valid { false };
+    Vector3d center { Vector3d::Zero() };
+    Vector2d halfExtent { Vector2d::Ones() };
+};
+
+MeshBounds2D ComputeMeshBounds2D(const SceneMesh* mesh) {
+    if (mesh == nullptr || mesh->VertexCount() == 0) return {};
+
+    const auto& vertexArray = mesh->GetVertexArray(0);
+    if (vertexArray.VertexCount() == 0) return {};
+
+    const auto attrOffsets = vertexArray.GetAttrOffsetMap();
+    if (!exists(attrOffsets, std::string(WE_IN_POSITION))) return {};
+
+    const auto& posAttr     = attrOffsets.at(std::string(WE_IN_POSITION));
+    const auto  components  = SceneVertexArray::TypeCount(posAttr.attr.type);
+    const auto  stride      = vertexArray.OneSize();
+    const auto  offset      = posAttr.offset / sizeof(float);
+    const auto* vertexData  = vertexArray.Data();
+    const auto  vertexCount = vertexArray.VertexCount();
+    if (vertexData == nullptr || components < 2) return {};
+
+    Vector3d minPos(std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity());
+    Vector3d maxPos(-std::numeric_limits<double>::infinity(),
+                    -std::numeric_limits<double>::infinity(),
+                    -std::numeric_limits<double>::infinity());
+
+    for (usize i = 0; i < vertexCount; ++i) {
+        const auto base = i * stride + offset;
+        const auto x    = static_cast<double>(vertexData[base + 0]);
+        const auto y    = static_cast<double>(vertexData[base + 1]);
+        const auto z    = components >= 3 ? static_cast<double>(vertexData[base + 2]) : 0.0;
+        minPos = minPos.cwiseMin(Vector3d(x, y, z));
+        maxPos = maxPos.cwiseMax(Vector3d(x, y, z));
+    }
+
+    const auto center     = (minPos + maxPos) * 0.5;
+    const auto halfExtent = Vector2d(std::max((maxPos.x() - minPos.x()) * 0.5, 1e-6),
+                                     std::max((maxPos.y() - minPos.y()) * 0.5, 1e-6));
+    return MeshBounds2D { .valid = true, .center = center, .halfExtent = halfExtent };
+}
+
+Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
+                                        const SceneMesh* projectionMesh,
+                                        const Matrix4d&  projectionModelTrans,
+                                        const Matrix4d&  viewProjectionTrans) {
+    if (projectionNode == nullptr || projectionMesh == nullptr) return Matrix4d::Identity();
+
+    const auto bounds = ComputeMeshBounds2D(projectionMesh);
+    if (!bounds.valid) return viewProjectionTrans * projectionModelTrans;
+
+    const auto localFromNormalized =
+        (Affine3d(Eigen::Translation3d(bounds.center)) *
+         Eigen::Scaling(bounds.halfExtent.x(), bounds.halfExtent.y(), 1.0))
+            .matrix();
+    return viewProjectionTrans * projectionModelTrans * localFromNormalized;
 }
 } // namespace
 
@@ -330,7 +393,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_VP) {
         updateOp(G_VP, ShaderValue::fromMatrix(viewProTrans));
     }
-    if (reqM || reqMVP || reqMI || reqMVPI) {
+    if (reqM || reqMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
         const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
         Matrix4d modelTrans = ResolveParallaxedModelTransform(pNode,
                                                               nodeDataPtr,
@@ -350,14 +413,32 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             if (reqMVPI) updateOp(G_MVPI, ShaderValue::fromMatrix(mvpTrans.inverse()));
         }
         if (reqETVP || reqETVPI) {
-            /*
-            Vector3d nodePos = pNode->Translate().cast<double>();
-            nodePos.z()      = 1.0f;
-            Matrix4d etvpTrans =
-                viewProTrans * modelTrans * Affine3d(Eigen::Scaling(nodePos)).matrix();
-            if (reqETVPI) updateOp(G_ETVP, ShaderValue::fromMatrix(etvpTrans));
-            if (reqETVPI) updateOp(G_ETVPI, ShaderValue::fromMatrix(etvpTrans.inverse()));
-            */
+            const SceneNode* projectionNode      = pNode;
+            const SceneMesh* projectionMesh      = pNode->Mesh();
+            Matrix4d         projectionModelTrans = modelTrans;
+            Matrix4d         projectionViewPro    = viewProTrans;
+
+            if (nodeDataPtr != nullptr && nodeDataPtr->effect_projection_node != nullptr &&
+                nodeDataPtr->effect_projection_mesh != nullptr && m_scene->activeCamera != nullptr) {
+                projectionNode = nodeDataPtr->effect_projection_node;
+                projectionMesh = nodeDataPtr->effect_projection_mesh;
+                const_cast<SceneNode*>(projectionNode)->UpdateTrans();
+                projectionModelTrans = projectionNode->ModelTrans();
+                projectionViewPro    = m_scene->activeCamera->GetViewProjectionMatrix();
+            }
+
+            const auto etvpTrans = ComputeEffectTextureProjection(projectionNode,
+                                                                  projectionMesh,
+                                                                  projectionModelTrans,
+                                                                  projectionViewPro);
+            if (reqETVP) updateOp(G_ETVP, ShaderValue::fromMatrix(etvpTrans));
+            if (reqETVPI) {
+                if (std::abs(etvpTrans.determinant()) > 1e-12) {
+                    updateOp(G_ETVPI, ShaderValue::fromMatrix(etvpTrans.inverse()));
+                } else {
+                    updateOp(G_ETVPI, ShaderValue::fromMatrix(Matrix4d::Identity()));
+                }
+            }
         }
     }
 

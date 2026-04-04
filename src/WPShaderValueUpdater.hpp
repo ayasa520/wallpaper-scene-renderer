@@ -19,6 +19,7 @@ namespace wallpaper
 
 class Scene;
 class SceneNode;
+class SceneMesh;
 
 struct WPUniformInfo {
     bool has_MI { false };
@@ -60,6 +61,8 @@ struct WPShaderValueData {
     Eigen::Affine3f attach_transform { Eigen::Affine3f::Identity() };
     Eigen::Affine3f attach_local_transform { Eigen::Affine3f::Identity() };
     bool            skip_model_parallax { false };
+    SceneNode*      effect_projection_node { nullptr };
+    SceneMesh*      effect_projection_mesh { nullptr };
 };
 
 struct WPCameraParallax {
