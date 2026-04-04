@@ -4,6 +4,29 @@
 
 using namespace wallpaper::wpscene;
 
+namespace
+{
+
+void ReadVisibleBinding(const nlohmann::json& json, wallpaper::VisibleBinding* binding) {
+    if (! json.is_object()) return;
+
+    GET_JSON_NAME_VALUE_NOWARN(json, "value", binding->value);
+    if (! json.contains("user") || json.at("user").is_null()) return;
+
+    const auto& user = json.at("user");
+    if (user.is_string()) {
+        GET_JSON_VALUE(user, binding->user.name);
+        return;
+    }
+
+    if (! user.is_object()) return;
+
+    GET_JSON_NAME_VALUE_NOWARN(user, "name", binding->user.name);
+    GET_JSON_NAME_VALUE_NOWARN(user, "condition", binding->user.condition);
+}
+
+} // namespace
+
 
 bool WPEffectCommand::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "command", command);
@@ -50,9 +73,11 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     std::string filePath;
     GET_JSON_NAME_VALUE(json, "file", filePath);
     GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+    if (json.contains("visible")) ReadVisibleBinding(json.at("visible"), &visible_binding);
     if(this->IsEffectBlacklisted(filePath)) {
         //hide blacklisted effects
         visible = false;
+        visible_binding = {};
     }
 	GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
     nlohmann::json jEffect;
@@ -137,6 +162,7 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs) {
 bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     GET_JSON_NAME_VALUE(json, "image", image);
     GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+    if (json.contains("visible")) ReadVisibleBinding(json.at("visible"), &visible_binding);
     GET_JSON_NAME_VALUE_NOWARN(json, "alignment", alignment);
     nlohmann::json jImage;
     if(!PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + image), jImage)) {

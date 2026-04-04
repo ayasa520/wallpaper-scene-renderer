@@ -1,5 +1,6 @@
 #pragma once
 #include "WPJson.hpp"
+#include "WPUserProperties.hpp"
 #include <nlohmann/json.hpp>
 #include "WPMaterial.h"
 #include <vector>
@@ -46,6 +47,7 @@ public:
     int32_t                      id;
     std::string                  name;
     bool                         visible { true };
+    VisibleBinding               visible_binding;
     int32_t                      version;
     std::vector<WPMaterial>      materials;
     std::vector<WPMaterialPass>  passes;
@@ -73,6 +75,7 @@ public:
     bool                       fullscreen { false };
     bool                       nopadding { false };
     bool                       visible { true };
+    VisibleBinding             visible_binding;
     std::string                image;
     int32_t                    parent { 0 };
     std::string                attachment;

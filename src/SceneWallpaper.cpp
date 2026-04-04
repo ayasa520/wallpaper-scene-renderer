@@ -7,6 +7,7 @@
 #include "Timer/FrameTimer.hpp"
 #include "Utils/FpsCounter.h"
 #include "WPSceneParser.hpp"
+#include "WPUserProperties.hpp"
 #include "Scene/Scene.h"
 #include "Particle/ParticleSystem.h"
 #include "Interface/IShaderValueUpdater.h"
@@ -105,7 +106,7 @@ private:
     std::string m_assets;
     std::string m_source;
     std::string m_cache_path;
-    ShaderValueMap m_user_properties;
+    UserPropertyMap m_user_properties;
     bool        m_gen_graphviz { false };
 
     WPSceneParser                        m_scene_parser;
@@ -355,7 +356,7 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             msg->findObject("value", &cb);
             m_first_frame_callback = *cb;
         } else if (property == PROPERTY_USER_PROPERTIES) {
-            std::shared_ptr<ShaderValueMap> user_properties;
+            std::shared_ptr<UserPropertyMap> user_properties;
             if (msg->findObject("value", &user_properties) && user_properties) {
                 m_user_properties = *user_properties;
             } else {

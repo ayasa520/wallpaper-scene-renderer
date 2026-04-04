@@ -1,5 +1,6 @@
 #pragma once
 #include "WPJson.hpp"
+#include "WPUserProperties.hpp"
 #include "WPMaterial.h"
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -158,6 +159,7 @@ public:
     std::array<float, 3>     angles { 0.0f, 0.0f, 0.0f };
     std::array<float, 2>     parallaxDepth { 0.0f, 0.0f };
     bool                     visible { true };
+    VisibleBinding           visible_binding;
     int32_t                  parent { 0 };
     std::string              attachment;
     std::string              particle;

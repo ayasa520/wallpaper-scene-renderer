@@ -8,6 +8,19 @@ bool WPMaterialPassBindItem::FromJson(const nlohmann::json& json) {
     return true;
 }
 
+bool WPUserTextureBinding::FromJson(const nlohmann::json& json) {
+    if (json.is_string()) {
+        GET_JSON_VALUE(json, name);
+        return ! name.empty();
+    }
+
+    if (! json.is_object()) return false;
+
+    GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
+    GET_JSON_NAME_VALUE_NOWARN(json, "type", type);
+    return ! name.empty();
+}
+
 
 void WPMaterialPass::Update(const WPMaterialPass& p) {
     int32_t i = -1;
@@ -17,6 +30,15 @@ void WPMaterialPass::Update(const WPMaterialPass& p) {
             textures.resize(p.textures.size());
         if(!el.empty()) {
             textures[i] = el;
+        }
+    }
+    i = -1;
+    for (const auto& el : p.usertextures) {
+        i++;
+        if (p.usertextures.size() > usertextures.size())
+            usertextures.resize(p.usertextures.size());
+        if (! el.empty()) {
+            usertextures[i] = el;
         }
     }
     for(const auto& el:p.constantshadervalues) {
@@ -40,6 +62,15 @@ void WPMaterial::MergePass(const WPMaterialPass& p) {
             textures[i] = el;
         }
     }
+    i = -1;
+    for (const auto& el : p.usertextures) {
+        i++;
+        if (p.usertextures.size() > usertextures.size())
+            usertextures.resize(p.usertextures.size());
+        if (! el.empty()) {
+            usertextures[i] = el;
+        }
+    }
     for(const auto& el:p.constantshadervalues) {
         constantshadervalues[el.first] = el.second;
     }
@@ -58,6 +89,14 @@ bool WPMaterialPass::FromJson(const nlohmann::json& json) {
             if(!jT.is_null())
                 GET_JSON_VALUE(jT, tex);
             textures.push_back(tex);
+        }
+    }
+    if (json.contains("usertextures")) {
+        for (const auto& jT : json.at("usertextures")) {
+            WPUserTextureBinding binding;
+            if (! jT.is_null())
+                binding.FromJson(jT);
+            usertextures.push_back(binding);
         }
     }
     if(json.contains("constantshadervalues")) {
@@ -119,6 +158,14 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
             if(!jT.is_null())
                 GET_JSON_VALUE(jT, tex);
             textures.push_back(tex);
+        }
+    }
+    if (jContent.contains("usertextures")) {
+        for (const auto& jT : jContent.at("usertextures")) {
+            WPUserTextureBinding binding;
+            if (! jT.is_null())
+                binding.FromJson(jT);
+            usertextures.push_back(binding);
         }
     }
     if(jContent.contains("constantshadervalues")) {

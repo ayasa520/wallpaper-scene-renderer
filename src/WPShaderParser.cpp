@@ -388,12 +388,26 @@ inline std::string Preprocessor(const std::string& in_src, ShaderType type, cons
 
 inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessorInfo* pre,
                                   const WPPreprocessorInfo* next) {
+    auto ReplaceDeclaration = [](std::string& text, const std::string& from, const std::string& to) {
+        const auto pos = text.find(from);
+        if (pos == std::string::npos) return false;
+
+        text.replace(pos, from.size(), to);
+        return true;
+    };
+    auto AsInputDecl = [](const std::string& decl) {
+        return std::regex_replace(decl, std::regex(R"(\bout\b)"), "in");
+    };
+    auto AsOutputDecl = [](const std::string& decl) {
+        return std::regex_replace(decl, std::regex(R"(\bin\b)"), "out");
+    };
+
     std::string insert_str {};
     auto&       cur = unit.preprocess_info;
     if (pre != nullptr) {
         for (auto& [k, v] : pre->output) {
             if (! exists(cur.input, k)) {
-                auto n = std::regex_replace(v, std::regex(R"(\s*out\s)"), " in ");
+                auto n = AsInputDecl(v);
                 insert_str += n + '\n';
             }
         }
@@ -401,7 +415,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     if (next != nullptr) {
         for (auto& [k, v] : next->input) {
             if (! exists(cur.output, k)) {
-                auto n = std::regex_replace(v, std::regex(R"(\s*in\s)"), " out ");
+                auto n = AsOutputDecl(v);
                 insert_str += n + '\n';
             }
         }
@@ -413,12 +427,45 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     //    std::regex_replace(cur.result, re_hold, insert_str), std::regex(R"(\s+\n)"), "\n");
     auto result = std::regex_replace(unit.src, re_hold, insert_str);
 
+    // Wallpaper Engine shaders sometimes declare the same stage interface with different types
+    // across stages. Only reconcile the consumer side with the previous stage's output.
+    // Rewriting both sides from stale preprocess metadata can flip the mismatch instead of
+    // fixing it.
+    if (pre != nullptr) {
+        for (const auto& [name, prev_decl] : pre->output) {
+            if (! exists(cur.input, name)) continue;
+
+            const auto expected_input = AsInputDecl(prev_decl);
+            if (cur.input.at(name) == expected_input) continue;
+
+            ReplaceDeclaration(result, cur.input.at(name), expected_input);
+        }
+    }
+
     // Some Wallpaper Engine effect shaders survive preprocessing with an invalid scalar
     // declaration even though the RHS is a vec2. Fix the generated GLSL before glslang sees it.
     result = std::regex_replace(
         result,
         std::regex(R"(\bfloat\s+pointer\s*=\s*g_PointerPosition\.xy\s*\*\s*u_pointerSpeed\s*;)"),
         "vec2 pointer = g_PointerPosition.xy * u_pointerSpeed;");
+
+    // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
+    result = std::regex_replace(
+        result,
+        std::regex(
+            R"(for\s*\(\s*int\s+([A-Za-z_]\w*)\s*=\s*([^;]+?)\s*;\s*\1\s*([<>]=?)\s*([^;]+?)\s*;\s*(?:\+\+\s*\1|\1\s*\+\+)\s*\))"),
+        "for (int $1 = int($2); $1 $3 int($4); $1++)");
+
+    // Wallpaper Engine shaders also rely on implicit vector narrowing in assignments like
+    // `vec2 uv = someVec4;`. GLSL does not allow that, so apply the obvious swizzle.
+    result = std::regex_replace(
+        result,
+        std::regex(R"(\bvec2\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;)"),
+        "vec2 $1 = $2.xy;");
+    result = std::regex_replace(
+        result,
+        std::regex(R"(\bvec3\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;)"),
+        "vec3 $1 = $2.xyz;");
 
     return result;
 }
@@ -523,16 +570,19 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
         unit.src = Preprocessor(unit.src, unit.stage, shader_info->combos, unit.preprocess_info);
     });
 
+    for (usize i = 0; i < units.size(); i++) {
+        auto&               unit     = units[i];
+        WPPreprocessorInfo* pre_info = i >= 1 ? &units[i - 1].preprocess_info : nullptr;
+        WPPreprocessorInfo* post_info = i + 1 < units.size() ? &units[i + 1].preprocess_info
+                                                             : nullptr;
+        unit.src = Finalprocessor(unit, pre_info, post_info);
+    }
+
     auto compile = [](std::span<WPShaderUnit> units, std::vector<ShaderCode>& codes) {
         std::vector<vulkan::ShaderCompUnit> vunits(units.size());
         for (usize i = 0; i < units.size(); i++) {
             auto&               unit     = units[i];
             auto&               vunit    = vunits[i];
-            WPPreprocessorInfo* pre_info = i >= 1 ? &units[i - 1].preprocess_info : nullptr;
-            WPPreprocessorInfo* post_info =
-                i + 1 < units.size() ? &units[i + 1].preprocess_info : nullptr;
-
-            unit.src = Finalprocessor(unit, pre_info, post_info);
 
             vunit.src   = unit.src;
             vunit.stage = ToGLSL(unit.stage);

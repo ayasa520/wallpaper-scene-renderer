@@ -1,5 +1,6 @@
 #include "WPSceneParser.hpp"
 #include "WPJson.hpp"
+#include "WPUserProperties.hpp"
 
 #include "Utils/String.h"
 #include "Utils/Logging.h"
@@ -52,7 +53,7 @@ struct ParseContext {
     i32                    ortho_w;
     i32                    ortho_h;
     fs::VFS*               vfs;
-    const ShaderValueMap*  user_properties;
+    const UserPropertyMap* user_properties;
 
     ShaderValueMap             global_base_uniforms;
     std::shared_ptr<SceneNode> effect_camera_node;
@@ -255,7 +256,8 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
 
 bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, SceneNode* pNode,
                   SceneMaterial* pMaterial, WPShaderValueData* pSvData,
-                  WPShaderInfo* pWPShaderInfo = nullptr) {
+                  const UserPropertyMap* user_properties = nullptr,
+                  WPShaderInfo*          pWPShaderInfo   = nullptr) {
     (void)pNode;
 
     auto& svData   = *pSvData;
@@ -319,6 +321,18 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     }
 
     auto textures = wpmat.textures;
+    if (wpmat.usertextures.size() > textures.size()) {
+        textures.resize(wpmat.usertextures.size());
+    }
+    for (usize i = 0; i < wpmat.usertextures.size(); i++) {
+        const auto& binding = wpmat.usertextures[i];
+        if (binding.empty() || binding.type == "system") continue;
+
+        const auto* property = LookupUserPropertyString(user_properties, binding.name);
+        if (property == nullptr || property->empty()) continue;
+
+        textures[i] = *property;
+    }
     if (pWPShaderInfo->defTexs.size() > 0) {
         for (auto& t : pWPShaderInfo->defTexs) {
             if (textures.size() > t.first) {
@@ -536,13 +550,13 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
 }
 
 void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
-                         const WPShaderInfo& info, const ShaderValueMap* user_properties) {
+                         const WPShaderInfo& info, const UserPropertyMap* user_properties) {
     if (!user_properties)
         return;
 
     for (const auto& us : wpmat.usershadervalues) {
-        const auto property_it = user_properties->find(us.second);
-        if (property_it == user_properties->end()) {
+        const auto* property = LookupUserPropertyShaderValue(user_properties, us.second);
+        if (property == nullptr) {
             LOG_INFO("UserShaderValue: property '%s' not provided for uniform '%s'",
                      us.second.c_str(), us.first.c_str());
             continue;
@@ -563,8 +577,8 @@ void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpm
         }
 
         LOG_INFO("UserShaderValue: %s -> %s (%zu)",
-                 us.second.c_str(), glname.c_str(), property_it->second.size());
-        material.customShader.constValues[glname] = property_it->second;
+                 us.second.c_str(), glname.c_str(), property->size());
+        material.customShader.constValues[glname] = *property;
     }
 }
 
@@ -668,7 +682,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 
     int32_t count_eff = 0;
     for (const auto& wpeffobj : wpimgobj.effects) {
-        if (wpeffobj.visible) count_eff++;
+        if (EvaluateVisibleBinding(wpeffobj.visible_binding, context.user_properties)) count_eff++;
     }
     bool hasEffect = count_eff > 0;
     bool use_virtual_parent = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
@@ -745,6 +759,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                            spImgNode.get(),
                            &material,
                            &svData,
+                           context.user_properties,
                            &shaderInfo)) {
             LOG_ERROR("load imageobj '%s' material faild", wpimgobj.name.c_str());
             return;
@@ -907,7 +922,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         int32_t i_eff = -1;
         for (const auto& wpeffobj : wpimgobj.effects) {
             i_eff++;
-            if (! wpeffobj.visible) {
+            if (! EvaluateVisibleBinding(wpeffobj.visible_binding, context.user_properties)) {
                 i_eff--;
                 continue;
             }
@@ -1009,6 +1024,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                                    spEffNode.get(),
                                    &material,
                                    &svData,
+                                   context.user_properties,
                                    &wpEffShaderInfo)) {
                     eff_mat_ok = false;
                     break;
@@ -1169,6 +1185,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                               spNode.get(),
                               &material,
                               &svData,
+                              context.user_properties,
                               &shaderInfo);
     } catch (const std::exception& e) {
         LOG_ERROR("load particleobj '%s' material exception: %s", wppartobj.name.c_str(), e.what());
@@ -1286,12 +1303,14 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
 }
 
 template<typename T>
-void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj, fs::VFS& vfs) {
+void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj, fs::VFS& vfs,
+                 const UserPropertyMap* user_properties) {
     T wpobj;
     if (! wpobj.FromJson(json_obj, vfs)) {
         LOG_ERROR("parse scene object failed, name: %s", wpobj.name.c_str());
         return;
     }
+    wpobj.visible = EvaluateVisibleBinding(wpobj.visible_binding, user_properties);
     if (! wpobj.visible) return;
     objs.push_back(wpobj);
 }
@@ -1299,9 +1318,12 @@ void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj,
 
 std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std::string& buf,
                                             fs::VFS& vfs, audio::SoundManager& sm,
-                                            const ShaderValueMap* user_properties) {
+                                            const UserPropertyMap* user_properties) {
     nlohmann::json json;
     if (! PARSE_JSON(buf, json)) return nullptr;
+
+    ScopedJsonUserProperties json_user_scope(user_properties);
+
     wpscene::WPScene sc;
     sc.FromJson(json);
     //	LOG_INFO(nlohmann::json(sc).dump(4));
@@ -1313,13 +1335,13 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     for (auto& obj : json.at("objects")) {
         if (obj.contains("image") && ! obj.at("image").is_null()) {
-            AddWPObject<wpscene::WPImageObject>(wp_objs, obj, vfs);
+            AddWPObject<wpscene::WPImageObject>(wp_objs, obj, vfs, user_properties);
         } else if (obj.contains("particle") && ! obj.at("particle").is_null()) {
-            AddWPObject<wpscene::WPParticleObject>(wp_objs, obj, vfs);
+            AddWPObject<wpscene::WPParticleObject>(wp_objs, obj, vfs, user_properties);
         } else if (obj.contains("sound") && ! obj.at("sound").is_null()) {
-            AddWPObject<wpscene::WPSoundObject>(wp_objs, obj, vfs);
+            AddWPObject<wpscene::WPSoundObject>(wp_objs, obj, vfs, user_properties);
         } else if (obj.contains("light") && ! obj.at("light").is_null()) {
-            AddWPObject<wpscene::WPLightObject>(wp_objs, obj, vfs);
+            AddWPObject<wpscene::WPLightObject>(wp_objs, obj, vfs, user_properties);
         }
     }
 

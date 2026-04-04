@@ -6,6 +6,29 @@
 
 using namespace wallpaper::wpscene;
 
+namespace
+{
+
+void ReadVisibleBinding(const nlohmann::json& json, wallpaper::VisibleBinding* binding) {
+    if (! json.is_object()) return;
+
+    GET_JSON_NAME_VALUE_NOWARN(json, "value", binding->value);
+    if (! json.contains("user") || json.at("user").is_null()) return;
+
+    const auto& user = json.at("user");
+    if (user.is_string()) {
+        GET_JSON_VALUE(user, binding->user.name);
+        return;
+    }
+
+    if (! user.is_object()) return;
+
+    GET_JSON_NAME_VALUE_NOWARN(user, "name", binding->user.name);
+    GET_JSON_NAME_VALUE_NOWARN(user, "condition", binding->user.condition);
+}
+
+} // namespace
+
 bool ParticleChild::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     GET_JSON_NAME_VALUE(json, "name", name);
     GET_JSON_NAME_VALUE(json, "type", type);
@@ -180,6 +203,7 @@ bool Particle::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 bool WPParticleObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     GET_JSON_NAME_VALUE(json, "particle", particle);
     GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+    if (json.contains("visible")) ReadVisibleBinding(json.at("visible"), &visible_binding);
 
     GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
     GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
