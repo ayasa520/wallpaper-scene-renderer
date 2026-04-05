@@ -15,6 +15,7 @@
 #include <regex>
 #include <stack>
 #include <charconv>
+#include <cctype>
 #include <string>
 
 static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
@@ -96,6 +97,148 @@ inline std::string LoadGlslInclude(fs::VFS& vfs, const std::string& input) {
     return output;
 }
 
+inline size_t SkipWhitespace(std::string_view source, size_t pos) {
+    while (pos < source.size() && std::isspace(static_cast<unsigned char>(source[pos]))) {
+        pos++;
+    }
+    return pos;
+}
+
+inline char PrevNonWhitespace(std::string_view source, size_t pos) {
+    while (pos > 0) {
+        pos--;
+        if (! std::isspace(static_cast<unsigned char>(source[pos]))) return source[pos];
+    }
+    return '\0';
+}
+
+inline bool LooksLikeObjectKeyAfterComma(std::string_view source, size_t pos) {
+    pos = SkipWhitespace(source, pos);
+    if (pos >= source.size() || source[pos] != '"') return false;
+
+    bool saw_char { false };
+    bool escaped { false };
+    pos++;
+    while (pos < source.size()) {
+        const char ch = source[pos];
+        if (escaped) {
+            escaped  = false;
+            saw_char = true;
+            pos++;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            pos++;
+            continue;
+        }
+        if (ch == '"') break;
+        saw_char = true;
+        pos++;
+    }
+
+    if (pos >= source.size() || ! saw_char) return false;
+    pos = SkipWhitespace(source, pos + 1);
+    return pos < source.size() && source[pos] == ':';
+}
+
+inline bool LooksLikeContainerClose(std::string_view source, size_t pos) {
+    if (pos >= source.size() || (source[pos] != '}' && source[pos] != ']')) return false;
+
+    pos = SkipWhitespace(source, pos + 1);
+    return pos >= source.size() || source[pos] == ',' || source[pos] == '}' || source[pos] == ']';
+}
+
+inline std::string TruncateMetadataSnippet(std::string_view source) {
+    constexpr size_t max_len { 120 };
+    if (source.size() <= max_len) return std::string(source);
+    return std::string(source.substr(0, max_len - 3)) + "...";
+}
+
+inline std::string RepairMissingStringQuotes(std::string_view source) {
+    std::string repaired(source);
+    bool        changed { false };
+    bool        in_string { false };
+    bool        escaped { false };
+    char        string_context { '\0' };
+
+    for (size_t i = 0; i < repaired.size(); i++) {
+        const char ch = repaired[i];
+
+        if (! in_string) {
+            if (ch == '"') {
+                in_string      = true;
+                escaped        = false;
+                string_context = PrevNonWhitespace(repaired, i);
+            }
+            continue;
+        }
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = false;
+            continue;
+        }
+
+        // Wallpaper Engine workshop shaders occasionally omit the closing quote
+        // in inline metadata comments. Only attempt a conservative repair after
+        // strict parsing fails, and only for string values that appear to run
+        // into the next object key or the end of the object.
+        if (string_context != ':') continue;
+
+        if (ch == ',' && LooksLikeObjectKeyAfterComma(repaired, i + 1)) {
+            repaired.insert(i, 1, '"');
+            changed   = true;
+            in_string = false;
+            i++;
+            continue;
+        }
+
+        if ((ch == '}' || ch == ']') && LooksLikeContainerClose(repaired, i)) {
+            repaired.insert(i, 1, '"');
+            changed   = true;
+            in_string = false;
+            i++;
+        }
+    }
+
+    if (! changed) return {};
+    return repaired;
+}
+
+inline bool TryParseShaderMetadataJson(std::string_view line, const char* kind,
+                                       nlohmann::json& result) {
+    const size_t json_start = line.find_first_of('{');
+    if (json_start == std::string::npos) return false;
+
+    const auto json_source = line.substr(json_start);
+    result                 = nlohmann::json::parse(json_source, nullptr, false);
+    if (! result.is_discarded()) return true;
+
+    const auto repaired = RepairMissingStringQuotes(json_source);
+    if (! repaired.empty()) {
+        result = nlohmann::json::parse(repaired, nullptr, false);
+        if (! result.is_discarded()) {
+            LOG_INFO("ParseWPShader: applied quote-repair to malformed %s metadata: %s",
+                     kind,
+                     TruncateMetadataSnippet(json_source).c_str());
+            return true;
+        }
+    }
+
+    LOG_INFO("ParseWPShader: skipped malformed %s metadata after quote-repair failed: %s",
+             kind,
+             TruncateMetadataSnippet(json_source).c_str());
+    return false;
+}
+
 inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                           const std::vector<WPShaderTexInfo>& texinfos) {
     auto& combos       = pWPShaderInfo->combos;
@@ -117,7 +260,7 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
         */
         if (line.find("// [COMBO]") != std::string::npos) {
             nlohmann::json combo_json;
-            if (PARSE_JSON(line.substr(line.find_first_of('{')), combo_json)) {
+            if (TryParseShaderMetadataJson(line, "combo", combo_json)) {
                 if (combo_json.contains("combo")) {
                     std::string name;
                     int32_t     value = 0;
@@ -129,7 +272,7 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
         } else if (line.find("uniform ") != std::string::npos) {
             if (line.find("// {") != std::string::npos) {
                 nlohmann::json sv_json;
-                if (PARSE_JSON(line.substr(line.find_first_of('{')), sv_json)) {
+                if (TryParseShaderMetadataJson(line, "uniform", sv_json)) {
                     std::vector<std::string> defines =
                         utils::SpliteString(line.substr(0, line.find_first_of(';')), ' ');
 
