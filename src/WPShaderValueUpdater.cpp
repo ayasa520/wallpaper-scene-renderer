@@ -211,12 +211,18 @@ void WPShaderValueUpdater::FrameBegin() {
             (((cTime->tm_hour * 60) + cTime->tm_min) * 60 + cTime->tm_sec) / (24.0f * 60.0f
        * 60.0f);
     */
+    if (!(m_parallax.delay > 0.0f) || !std::isfinite(m_parallax.delay)) {
+        m_mouseDelayedTime = 0.0f;
+        m_mousePos         = m_mousePosInput;
+        return;
+    }
+
     double new_time    = m_mouseDelayedTime + m_scene->frameTime;
     new_time           = new_time > m_parallax.delay ? m_parallax.delay : new_time;
     m_mouseDelayedTime = new_time;
     double t           = new_time / m_parallax.delay;
     m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
-                              (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
+                                      (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
 }
 
 void WPShaderValueUpdater::FrameEnd() {}

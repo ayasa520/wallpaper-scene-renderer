@@ -15,7 +15,6 @@
 
 #include <cstring>
 #include <iostream>
-
 using namespace wallpaper;
 
 enum class WPTexFlagEnum : uint32_t
@@ -43,6 +42,29 @@ char* Lz4Decompress(const char* src, int size, int decompressed_size) {
         return nullptr;
     }
     return dst;
+}
+
+bool DecodeImageContainerBytes(const char* src, int size, int& width, int& height,
+                               ImageDataPtr& data) {
+    int   channels = 0;
+    auto* decoded  = stbi_load_from_memory(
+        reinterpret_cast<const unsigned char*>(src), size, &width, &height, &channels, 4);
+    if (decoded == nullptr || width <= 0 || height <= 0) return false;
+
+    data = ImageDataPtr(reinterpret_cast<uint8_t*>(decoded), [](uint8_t* ptr) {
+        stbi_image_free(reinterpret_cast<unsigned char*>(ptr));
+    });
+    return true;
+}
+
+bool IsVideoImageContainer(const ImageHeader& header) {
+    const auto it = header.extraHeader.find("texb_is_video_mp4");
+    return it != header.extraHeader.end() && it->second.val == 1;
+}
+
+bool HasEmbeddedImagePayload(const ImageHeader& header) {
+    return header.extraHeader.at("texb").val >= 3 && header.type != ImageType::UNKNOWN &&
+           ! IsVideoImageContainer(header);
 }
 
 TextureFormat ToTexFormate(int type) {
@@ -110,7 +132,12 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
 
     header.count = file.ReadInt32();
 
-    if (header.extraHeader["texb"].val == 3) header.type = static_cast<ImageType>(file.ReadInt32());
+    if (header.extraHeader["texb"].val >= 3) {
+        header.type = static_cast<ImageType>(file.ReadInt32());
+    }
+    if (header.extraHeader["texb"].val >= 4) {
+        header.extraHeader["texb_is_video_mp4"].val = file.ReadInt32();
+    }
 }
 
 void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
@@ -184,15 +211,31 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                     return nullptr;
                 }
             }
-            // is image container
-            if (img.header.extraHeader["texb"].val == 3 && img.header.type != ImageType::UNKNOWN) {
-                int32_t w, h, n;
-                auto*   data =
-                    stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);
-                mipmap.data = ImageDataPtr((uint8_t*)data, [](uint8_t* data) {
-                    stbi_image_free((unsigned char*)data);
-                });
-                src_size    = w * h * 4;
+            // TEXB0003/TEXB0004 textures may store an image container payload instead of raw RGBA
+            // bytes.
+            if (HasEmbeddedImagePayload(img.header)) {
+                int          decoded_width  = 0;
+                int          decoded_height = 0;
+                ImageDataPtr decoded_data {};
+                const bool   decoded_from_tex = DecodeImageContainerBytes(
+                    result, src_size, decoded_width, decoded_height, decoded_data);
+
+                if (! decoded_from_tex) {
+                    delete[] result;
+                    return nullptr;
+                }
+
+                mipmap.width      = decoded_width;
+                mipmap.height     = decoded_height;
+                mipmap.data       = std::move(decoded_data);
+                src_size          = decoded_width * decoded_height * 4;
+                img.header.format = TextureFormat::RGBA8;
+
+                if (i_mipmap == 0) {
+                    img_slot.width  = decoded_width;
+                    img_slot.height = decoded_height;
+                    SetHeaderPow2(img.header, decoded_width, decoded_height);
+                }
             } else {
                 mipmap.data = ImageDataPtr(new uint8_t[(usize)src_size], [](uint8_t* data) {
                     delete[] data;
