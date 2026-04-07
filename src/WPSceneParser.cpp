@@ -107,6 +107,10 @@ using WPObjectVar = std::variant<wpscene::WPImageObject, wpscene::WPParticleObje
 
 namespace
 {
+constexpr std::string_view kSyntheticColorBlendEffectName {
+    "__hanabi_synthetic_color_blend_effect__"
+};
+
 bool ResolveObjectVisibility(bool raw_visible, const VisibleBinding& binding,
                              const UserPropertyMap* user_properties) {
     if (! binding.hasUserBinding()) return raw_visible;
@@ -722,6 +726,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         colorMat.combos["BONECOUNT"] = 1;
         colorMat.combos["BLENDMODE"] = wpimgobj.colorBlendMode;
         colorMat.blending            = "disabled";
+        colorEffect.name             = std::string(kSyntheticColorBlendEffectName);
         colorEffect.materials.push_back(colorMat);
         wpimgobj.effects.push_back(colorEffect);
     }
@@ -1057,10 +1062,20 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 if (wpmat.textures.at(0).empty()) {
                     wpmat.textures[0] = inRT;
                 }
-                auto         spEffNode  = std::make_shared<SceneNode>();
-                std::string  effmataddr = getAddr(spEffNode.get());
+                auto        spEffNode = std::make_shared<SceneNode>();
+                std::string effmataddr = getAddr(spEffNode.get());
+                const bool isSyntheticColorBlendEffect =
+                    wpeffobj.name == kSyntheticColorBlendEffectName;
+                ShaderValueMap effectBaseConstSvs = baseConstSvs;
+                if (isSyntheticColorBlendEffect) {
+                    // The passthrough blend pass should preserve the source render target's alpha,
+                    // but it must not tint that texture a second time with the object's RGB color.
+                    effectBaseConstSvs["g_Color4"] =
+                        std::array<float, 4> { 1.0f, 1.0f, 1.0f, wpimgobj.alpha };
+                    effectBaseConstSvs["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
+                }
                 WPShaderInfo wpEffShaderInfo;
-                wpEffShaderInfo.baseConstSvs = baseConstSvs;
+                wpEffShaderInfo.baseConstSvs = std::move(effectBaseConstSvs);
                 wpEffShaderInfo.baseConstSvs["g_EffectTextureProjectionMatrix"] =
                     ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
                 wpEffShaderInfo.baseConstSvs["g_EffectTextureProjectionMatrixInverse"] =
@@ -1398,8 +1413,31 @@ void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj,
     }
     wpobj.visible = ResolveObjectVisibility(
         wpobj.visible, wpobj.visible_binding, user_properties);
-    if (! wpobj.visible) return;
     objs.push_back(wpobj);
+}
+
+std::optional<int32_t> GetObjectId(const WPObjectVar& obj) {
+    return std::visit(
+        visitor::overload {
+            [](const wpscene::WPSoundObject&) -> std::optional<int32_t> {
+                return std::nullopt;
+            },
+            [](const auto& value) -> std::optional<int32_t> { return value.id; },
+        },
+        obj);
+}
+
+int32_t GetObjectParentId(const WPObjectVar& obj) {
+    return std::visit(
+        visitor::overload {
+            [](const wpscene::WPSoundObject&) { return 0; },
+            [](const auto& value) { return value.parent; },
+        },
+        obj);
+}
+
+bool IsObjectVisible(const WPObjectVar& obj) {
+    return std::visit([](const auto& value) { return value.visible; }, obj);
 }
 } // namespace
 
@@ -1433,6 +1471,30 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             AddWPObject<WPEmptyObject>(wp_objs, obj, vfs, user_properties);
         }
     }
+
+    std::unordered_set<int32_t> hidden_object_ids;
+    for (const auto& obj : wp_objs) {
+        const auto id = GetObjectId(obj);
+        if (id.has_value() && ! IsObjectVisible(obj)) hidden_object_ids.insert(*id);
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& obj : wp_objs) {
+            const auto parent_id = GetObjectParentId(obj);
+            if (parent_id == 0) continue;
+            if (! hidden_object_ids.count(parent_id)) continue;
+
+            const auto id = GetObjectId(obj);
+            if (id.has_value() && hidden_object_ids.insert(*id).second) changed = true;
+        }
+    }
+
+    std::erase_if(wp_objs, [&hidden_object_ids](const auto& obj) {
+        const auto id = GetObjectId(obj);
+        return id.has_value() && hidden_object_ids.count(*id) != 0;
+    });
 
     for (const auto& obj : wp_objs) {
         std::visit(visitor::overload {
