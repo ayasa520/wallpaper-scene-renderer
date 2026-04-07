@@ -556,8 +556,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         return std::regex_search(text, std::regex(pattern));
     };
     auto MakeMutableInputShim = [](const std::string& decl, const std::string& name,
-                                   std::string& rewritten_decl, std::string& define_line,
-                                   std::string& init_line) {
+                                   std::string& mutable_name, std::string& init_line) {
         std::smatch match;
         if (! std::regex_match(
                 decl,
@@ -573,12 +572,40 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         const auto suffix        = match[4].str();
         if (declared_name != name) return false;
 
-        const auto input_name   = "_wp_input_" + name;
-        const auto mutable_name = "_wp_mutable_" + name;
+        mutable_name = "_wp_mutable_" + name;
+        init_line    = indent + type + " " + mutable_name + suffix + " = " + name + ";\n";
+        return true;
+    };
+    auto FindMainBody = [](const std::string& text) -> std::optional<std::pair<size_t, size_t>> {
+        const auto main_pos = text.find("void main");
+        if (main_pos == std::string::npos) return std::nullopt;
 
-        rewritten_decl = indent + "in " + type + " " + input_name + suffix + ";";
-        define_line    = "#define " + name + " " + mutable_name + "\n";
-        init_line      = indent + type + " " + mutable_name + suffix + " = " + input_name + ";\n";
+        const auto brace_open = text.find('{', main_pos);
+        if (brace_open == std::string::npos) return std::nullopt;
+
+        int    depth { 1 };
+        size_t cursor { brace_open + 1 };
+        while (cursor < text.size() && depth > 0) {
+            if (text[cursor] == '{') depth++;
+            else if (text[cursor] == '}') depth--;
+            cursor++;
+        }
+        if (depth != 0 || cursor <= brace_open + 1) return std::nullopt;
+
+        return std::pair<size_t, size_t> { brace_open + 1, cursor - 1 };
+    };
+    auto ReplaceNameInMainBody = [&](std::string& text, const std::string& from,
+                                     const std::string& to) {
+        const auto main_body = FindMainBody(text);
+        if (! main_body.has_value()) return false;
+
+        auto [body_begin, body_end] = *main_body;
+        std::string body            = text.substr(body_begin, body_end - body_begin);
+        body = std::regex_replace(
+            body,
+            std::regex(std::string(R"(\b)") + EscapeRegex(from) + R"(\b)"),
+            to);
+        text.replace(body_begin, body_end - body_begin, body);
         return true;
     };
 
@@ -650,27 +677,23 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     // Some effect fragment shaders write back into stage inputs such as v_TexCoord. GLSL
     // forbids that, so rewrite those inputs to immutable varyings plus mutable locals.
     if (unit.stage == ShaderType::FRAGMENT) {
-        std::string define_lines;
         std::string init_lines;
         for (const auto& [name, decl] : cur.input) {
             if (! HasMutableUse(result, name)) continue;
 
-            std::string rewritten_decl;
-            std::string define_line;
+            std::string mutable_name;
             std::string init_line;
-            if (! MakeMutableInputShim(decl, name, rewritten_decl, define_line, init_line)) {
+            if (! MakeMutableInputShim(decl, name, mutable_name, init_line)) {
                 continue;
             }
-            if (! ReplaceDeclaration(result, decl, rewritten_decl)) continue;
-
-            define_lines += define_line;
+            if (! ReplaceNameInMainBody(result, name, mutable_name)) continue;
             init_lines += init_line;
         }
 
-        if (! define_lines.empty()) {
+        if (! init_lines.empty()) {
             result = std::regex_replace(result,
                                         std::regex(R"(void\s+main\s*\(\s*(?:void)?\s*\)\s*\{)"),
-                                        define_lines + "\nvoid main() {\n" + init_lines,
+                                        "void main() {\n" + init_lines,
                                         std::regex_constants::format_first_only);
         }
     }

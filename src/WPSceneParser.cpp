@@ -64,8 +64,46 @@ struct ParseContext {
     std::unordered_map<int32_t, std::shared_ptr<WPPuppet>>  object_puppets;
 };
 
+struct WPEmptyObject {
+    int32_t              id { 0 };
+    std::string          name;
+    std::array<float, 3> origin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3> angles { 0.0f, 0.0f, 0.0f };
+    std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
+    bool                 visible { true };
+    VisibleBinding       visible_binding;
+    int32_t              parent { 0 };
+    std::string          attachment;
+
+    bool FromJson(const nlohmann::json& json, fs::VFS&) {
+        GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
+        GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
+        GET_JSON_NAME_VALUE_NOWARN(json, "origin", origin);
+        GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
+        GET_JSON_NAME_VALUE_NOWARN(json, "angles", angles);
+        GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
+        GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+        if (json.contains("visible")) {
+            GET_JSON_NAME_VALUE_NOWARN(json.at("visible"), "value", visible_binding.value);
+            if (json.at("visible").contains("user") && ! json.at("visible").at("user").is_null()) {
+                const auto& user = json.at("visible").at("user");
+                if (user.is_string()) {
+                    GET_JSON_VALUE(user, visible_binding.user.name);
+                } else if (user.is_object()) {
+                    GET_JSON_NAME_VALUE_NOWARN(user, "name", visible_binding.user.name);
+                    GET_JSON_NAME_VALUE_NOWARN(user, "condition", visible_binding.user.condition);
+                }
+            }
+        }
+        GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
+        GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
+        return true;
+    }
+};
+
 using WPObjectVar = std::variant<wpscene::WPImageObject, wpscene::WPParticleObject,
-                                 wpscene::WPSoundObject, wpscene::WPLightObject>;
+                                 wpscene::WPSoundObject, wpscene::WPLightObject, WPEmptyObject>;
 
 namespace
 {
@@ -1316,6 +1354,40 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     context.object_nodes[light_obj.id] = node;
 }
 
+void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
+    auto node = std::make_shared<SceneNode>(Vector3f(empty_obj.origin.data()),
+                                            Vector3f(empty_obj.scale.data()),
+                                            Vector3f(empty_obj.angles.data()));
+    node->ID() = empty_obj.id;
+
+    WPShaderValueData svData;
+    svData.parallaxDepth = empty_obj.parallaxDepth;
+    if (empty_obj.parent != 0 && ! empty_obj.attachment.empty()) {
+        auto attachment_binding =
+            ResolveAttachmentBinding(context, empty_obj.parent, empty_obj.attachment);
+        if (attachment_binding.has_value()) {
+            svData.attach_to_bone      = true;
+            svData.attach_bone         = attachment_binding->bone_index;
+            svData.attach_transform    = attachment_binding->transform;
+            svData.attach_local_transform =
+                Eigen::Affine3f(node->GetLocalTrans().cast<float>());
+        } else {
+            LOG_ERROR("attachment '%s' not found for object '%s'",
+                      empty_obj.attachment.c_str(),
+                      empty_obj.name.c_str());
+        }
+    }
+
+    if (empty_obj.parent != 0 && empty_obj.attachment.empty()) {
+        ConfigureVirtualParent(context, empty_obj.parent, svData);
+        context.scene->sceneGraph->AppendChild(node);
+    } else {
+        AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name, &svData);
+    }
+    context.object_nodes[empty_obj.id] = node;
+    context.shader_updater->SetNodeData(node.get(), svData);
+}
+
 template<typename T>
 void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj, fs::VFS& vfs,
                  const UserPropertyMap* user_properties) {
@@ -1357,6 +1429,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             AddWPObject<wpscene::WPSoundObject>(wp_objs, obj, vfs, user_properties);
         } else if (obj.contains("light") && ! obj.at("light").is_null()) {
             AddWPObject<wpscene::WPLightObject>(wp_objs, obj, vfs, user_properties);
+        } else {
+            AddWPObject<WPEmptyObject>(wp_objs, obj, vfs, user_properties);
         }
     }
 
@@ -1369,6 +1443,9 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                            if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
                        },
                        [&context](const wpscene::WPLightObject& obj) {
+                           if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
+                       },
+                       [&context](const WPEmptyObject& obj) {
                            if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
                        },
                        [](const wpscene::WPSoundObject&) {},
@@ -1432,6 +1509,9 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                        },
                        [&context](wpscene::WPLightObject& obj) {
                            ParseLightObj(context, obj);
+                       },
+                       [&context](WPEmptyObject& obj) {
+                           ParseEmptyObj(context, obj);
                        },
                    },
                    obj);
