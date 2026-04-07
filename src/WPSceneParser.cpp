@@ -668,11 +668,11 @@ void ParseCamera(ParseContext& context, wpscene::WPSceneGeneral& general) {
     scene.sceneGraph->AppendChild(context.global_perspective_camera_node);
 }
 
-void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc) {
+void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc, std::string_view scene_id) {
     context.scene            = std::make_shared<Scene>();
     context.vfs              = &vfs;
     auto& scene              = *context.scene;
-    scene.imageParser        = std::make_unique<WPTexImageParser>(&vfs);
+    scene.imageParser        = std::make_unique<WPTexImageParser>(&vfs, std::string(scene_id));
     scene.paritileSys->gener = std::make_unique<WPParticleRawGener>();
     scene.shaderValueUpdater = std::make_unique<WPShaderValueUpdater>(&scene);
     GenCardMesh(scene.default_effect_mesh, { 2, 2 });
@@ -1530,7 +1530,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         sc.general.orthogonalprojection.height = h;
     }
 
-    InitContext(context, vfs, sc);
+    InitContext(context, vfs, sc, scene_id);
     ParseCamera(context, sc.general);
 
     {

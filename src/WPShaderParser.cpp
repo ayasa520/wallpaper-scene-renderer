@@ -16,12 +16,17 @@
 #include <stack>
 #include <charconv>
 #include <cctype>
+#include <sstream>
 #include <string>
 
 static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
 #define SHADER_DIR    "spvs01"
 #define SHADER_SUFFIX "spvs"
+#define SHADER_META_DIR "pre-shaders01"
+#define SHADER_META_SUFFIX "wpmeta"
+#define SHADER_SRC_DIR "prepared-shaders01"
+#define SHADER_SRC_SUFFIX "wpsrc"
 
 using namespace wallpaper;
 
@@ -721,6 +726,16 @@ inline std::string GetCachePath(std::string_view scene_id, std::string_view file
            std::string(filename) + "." SHADER_SUFFIX;
 }
 
+inline std::string GetPreShaderCachePath(std::string_view filename) {
+    return std::string("/cache/") + SHADER_META_DIR + "/" + std::string(filename) + "." +
+           SHADER_META_SUFFIX;
+}
+
+inline std::string GetPreparedShaderCachePath(std::string_view scene_id, std::string_view filename) {
+    return std::string("/cache/") + std::string(scene_id) + "/" SHADER_SRC_DIR "/" +
+           std::string(filename) + "." SHADER_SRC_SUFFIX;
+}
+
 inline bool LoadShaderFromFile(std::vector<ShaderCode>& codes, fs::IBinaryStream& file) {
     codes.clear();
     i32 ver = ReadSPVVesion(file);
@@ -756,27 +771,285 @@ inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStrea
     file.Write(nop, sizeof(nop));
 }
 
+inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, const Combos& combos) {
+    std::ostringstream out;
+    out << "prepared-shader-v2\n";
+    for (const auto& unit : units) {
+        out << static_cast<int>(unit.stage) << '\n';
+        out << utils::genSha1(unit.src) << '\n';
+    }
+    for (const auto& [name, value] : combos) {
+        out << name << '=' << value << '\n';
+    }
+    const auto data = out.str();
+    return utils::genSha1(std::span<const char>(data.data(), data.size()));
+}
+
+inline std::string GenPreShaderSha1(std::string_view expanded_src,
+                                    std::span<const WPShaderTexInfo> texinfos) {
+    std::ostringstream out;
+    out << "pre-shader-v1\n";
+    out << utils::genSha1(expanded_src) << '\n';
+    for (const auto& texinfo : texinfos) {
+        out << static_cast<int>(texinfo.enabled);
+        for (const auto component_enabled : texinfo.composEnabled) {
+            out << static_cast<int>(component_enabled);
+        }
+        out << '\n';
+    }
+
+    const auto data = out.str();
+    return utils::genSha1(std::span<const char>(data.data(), data.size()));
+}
+
+inline void WriteString(fs::IBinaryStreamW& file, std::string_view value) {
+    file.WriteUint32(static_cast<u32>(value.size()));
+    if (! value.empty()) file.Write(value.data(), value.size());
+}
+
+inline bool ReadString(fs::IBinaryStream& file, std::string& value) {
+    const auto size = file.ReadUint32();
+    value.resize(size);
+    if (size > 0) file.Read(value.data(), size);
+    return true;
+}
+
+inline bool LoadStringMap(Map<std::string, std::string>& map, fs::IBinaryStream& file) {
+    map.clear();
+
+    const auto count = file.ReadUint32();
+    for (u32 i = 0; i < count; i++) {
+        std::string key;
+        std::string value;
+        if (! ReadString(file, key)) return false;
+        if (! ReadString(file, value)) return false;
+
+        map.emplace(std::move(key), std::move(value));
+    }
+    return true;
+}
+
+inline void SaveStringMap(const Map<std::string, std::string>& map, fs::IBinaryStreamW& file) {
+    file.WriteUint32(static_cast<u32>(map.size()));
+    for (const auto& [key, value] : map) {
+        WriteString(file, key);
+        WriteString(file, value);
+    }
+}
+
+inline bool LoadShaderValue(ShaderValue& value, fs::IBinaryStream& file) {
+    const auto size = file.ReadUint32();
+    std::vector<float> values(size);
+    for (u32 i = 0; i < size; i++) {
+        values[i] = file.ReadFloat();
+    }
+    value = ShaderValue(values);
+    return true;
+}
+
+inline void SaveShaderValue(const ShaderValue& value, fs::IBinaryStreamW& file) {
+    file.WriteUint32(static_cast<u32>(value.size()));
+    for (size_t i = 0; i < value.size(); i++) {
+        const float component = value[i];
+        file.Write(&component, sizeof(component));
+    }
+}
+
+inline bool LoadShaderValueMap(ShaderValueMap& map, fs::IBinaryStream& file) {
+    map.clear();
+
+    const auto count = file.ReadUint32();
+    for (u32 i = 0; i < count; i++) {
+        std::string key;
+        ShaderValue value;
+        if (! ReadString(file, key)) return false;
+        if (! LoadShaderValue(value, file)) return false;
+        map.emplace(std::move(key), std::move(value));
+    }
+    return true;
+}
+
+inline void SaveShaderValueMap(const ShaderValueMap& map, fs::IBinaryStreamW& file) {
+    file.WriteUint32(static_cast<u32>(map.size()));
+    for (const auto& [key, value] : map) {
+        WriteString(file, key);
+        SaveShaderValue(value, file);
+    }
+}
+
+inline bool LoadDefaultTexs(WPDefaultTexs& def_texs, fs::IBinaryStream& file) {
+    def_texs.clear();
+
+    const auto count = file.ReadUint32();
+    def_texs.reserve(count);
+    for (u32 i = 0; i < count; i++) {
+        const auto slot = file.ReadInt32();
+        std::string default_tex;
+        if (! ReadString(file, default_tex)) return false;
+        def_texs.emplace_back(slot, std::move(default_tex));
+    }
+    return true;
+}
+
+inline void SaveDefaultTexs(const WPDefaultTexs& def_texs, fs::IBinaryStreamW& file) {
+    file.WriteUint32(static_cast<u32>(def_texs.size()));
+    for (const auto& [slot, default_tex] : def_texs) {
+        file.WriteInt32(slot);
+        WriteString(file, default_tex);
+    }
+}
+
+inline bool LoadPreShaderInfo(WPShaderInfo& shader_info, fs::IBinaryStream& file) {
+    const auto version = ReadVersion("WSHM", file);
+    if (version != 1) return false;
+
+    shader_info = {};
+    if (! LoadStringMap(shader_info.combos, file)) return false;
+    if (! LoadStringMap(shader_info.alias, file)) return false;
+    if (! LoadShaderValueMap(shader_info.svs, file)) return false;
+    if (! LoadDefaultTexs(shader_info.defTexs, file)) return false;
+    return true;
+}
+
+inline void SavePreShaderInfo(const WPShaderInfo& shader_info, fs::IBinaryStreamW& file) {
+    WriteVersion("WSHM", file, 1);
+    SaveStringMap(shader_info.combos, file);
+    SaveStringMap(shader_info.alias, file);
+    SaveShaderValueMap(shader_info.svs, file);
+    SaveDefaultTexs(shader_info.defTexs, file);
+}
+
+inline void MergeShaderInfo(WPShaderInfo& into, const WPShaderInfo& from) {
+    for (const auto& [key, value] : from.combos) {
+        into.combos[key] = value;
+    }
+    for (const auto& [key, value] : from.alias) {
+        into.alias[key] = value;
+    }
+    for (const auto& [key, value] : from.svs) {
+        into.svs[key] = value;
+    }
+    into.defTexs.insert(into.defTexs.end(), from.defTexs.begin(), from.defTexs.end());
+}
+
+struct ExpandedShaderSource {
+    std::string expanded_src;
+    std::string src_without_includes;
+    std::string include_src;
+};
+
+inline ExpandedShaderSource ExpandShaderSource(fs::VFS& vfs, const std::string& src) {
+    ExpandedShaderSource   result { .expanded_src = src, .src_without_includes = src, .include_src = {} };
+    std::string::size_type pos = 0;
+    while (pos = src.find("#include", pos), pos != std::string::npos) {
+        auto begin = pos;
+        pos        = src.find_first_of('\n', pos);
+        result.src_without_includes.replace(begin, pos - begin, pos - begin, ' ');
+        result.include_src.append(src.substr(begin, pos - begin) + "\n");
+    }
+
+    result.include_src = LoadGlslInclude(vfs, result.include_src);
+    result.expanded_src = result.src_without_includes;
+    result.expanded_src.insert(FindIncludeInsertPos(result.expanded_src, 0), result.include_src);
+    return result;
+}
+
+inline bool LoadPreparedShaderUnits(std::span<WPShaderUnit> units, fs::IBinaryStream& file) {
+    const auto version = ReadVersion("WSRC", file);
+    if (version != 2) return false;
+
+    const auto count = file.ReadUint32();
+    if (count != units.size()) return false;
+
+    for (usize i = 0; i < units.size(); i++) {
+        const auto stage = file.ReadInt32();
+        if (stage != static_cast<int32_t>(units[i].stage)) return false;
+
+        const auto size = file.ReadUint32();
+        std::string src(size, '\0');
+        if (size > 0) file.Read(src.data(), size);
+        units[i].src = std::move(src);
+
+        auto& info = units[i].preprocess_info;
+        info       = {};
+
+        if (! LoadStringMap(info.input, file)) return false;
+        if (! LoadStringMap(info.output, file)) return false;
+
+        const auto active_count = file.ReadUint32();
+        for (u32 j = 0; j < active_count; j++) {
+            info.active_tex_slots.insert(file.ReadUint32());
+        }
+    }
+    return true;
+}
+
+inline void SavePreparedShaderUnits(std::span<const WPShaderUnit> units, fs::IBinaryStreamW& file) {
+    WriteVersion("WSRC", file, 2);
+    file.WriteUint32(static_cast<u32>(units.size()));
+    for (const auto& unit : units) {
+        file.WriteInt32(static_cast<int32_t>(unit.stage));
+        file.WriteUint32(static_cast<u32>(unit.src.size()));
+        if (! unit.src.empty()) file.Write(unit.src.data(), unit.src.size());
+
+        SaveStringMap(unit.preprocess_info.input, file);
+        SaveStringMap(unit.preprocess_info.output, file);
+
+        file.WriteUint32(static_cast<u32>(unit.preprocess_info.active_tex_slots.size()));
+        for (const auto slot : unit.preprocess_info.active_tex_slots) {
+            file.WriteUint32(slot);
+        }
+    }
+}
+
+inline void PrepareShaderUnits(std::span<WPShaderUnit> units, WPShaderInfo* shader_info) {
+    std::for_each(units.begin(), units.end(), [shader_info](auto& unit) {
+        unit.src = Preprocessor(unit.src, unit.stage, shader_info->combos, unit.preprocess_info);
+    });
+
+    for (usize i = 0; i < units.size(); i++) {
+        auto&               unit      = units[i];
+        WPPreprocessorInfo* pre_info  = i >= 1 ? &units[i - 1].preprocess_info : nullptr;
+        WPPreprocessorInfo* post_info = i + 1 < units.size() ? &units[i + 1].preprocess_info
+                                                             : nullptr;
+        unit.src = Finalprocessor(unit, pre_info, post_info);
+    }
+}
+
 } // namespace
 
 std::string WPShaderParser::PreShaderSrc(fs::VFS& vfs, const std::string& src,
                                          WPShaderInfo*                       pWPShaderInfo,
                                          const std::vector<WPShaderTexInfo>& texinfos) {
-    std::string            newsrc(src);
-    std::string::size_type pos = 0;
-    std::string            include;
-    while (pos = src.find("#include", pos), pos != std::string::npos) {
-        auto begin = pos;
-        pos        = src.find_first_of('\n', pos);
-        newsrc.replace(begin, pos - begin, pos - begin, ' ');
-        include.append(src.substr(begin, pos - begin) + "\n");
+    auto expanded = ExpandShaderSource(vfs, src);
+
+    if (! vfs.IsMounted("cache")) {
+        ParseWPShader(expanded.include_src, pWPShaderInfo, texinfos);
+        ParseWPShader(expanded.src_without_includes, pWPShaderInfo, texinfos);
+        return expanded.expanded_src;
     }
-    include = LoadGlslInclude(vfs, include);
 
-    ParseWPShader(include, pWPShaderInfo, texinfos);
-    ParseWPShader(newsrc, pWPShaderInfo, texinfos);
+    const auto cache_key  = GenPreShaderSha1(expanded.expanded_src, texinfos);
+    const auto cache_path = GetPreShaderCachePath(cache_key);
 
-    newsrc.insert(FindIncludeInsertPos(newsrc, 0), include);
-    return newsrc;
+    WPShaderInfo cached_info;
+    if (vfs.Contains(cache_path)) {
+        auto cache_file = vfs.Open(cache_path);
+        if (! cache_file || ! LoadPreShaderInfo(cached_info, *cache_file)) {
+            LOG_ERROR("load pre-shader metadata from '%s' failed", cache_path.c_str());
+            return {};
+        }
+    } else {
+        ParseWPShader(expanded.include_src, &cached_info, texinfos);
+        ParseWPShader(expanded.src_without_includes, &cached_info, texinfos);
+
+        if (auto cache_file = vfs.OpenW(cache_path); cache_file) {
+            SavePreShaderInfo(cached_info, *cache_file);
+        }
+    }
+
+    MergeShaderInfo(*pWPShaderInfo, cached_info);
+    return expanded.expanded_src;
 }
 
 std::string WPShaderParser::PreShaderHeader(const std::string& src, const Combos& combos,
@@ -804,18 +1077,6 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
                                   std::vector<ShaderCode>& codes, fs::VFS& vfs,
                                   WPShaderInfo* shader_info, std::span<const WPShaderTexInfo> texs) {
     (void)texs;
-
-    std::for_each(units.begin(), units.end(), [shader_info](auto& unit) {
-        unit.src = Preprocessor(unit.src, unit.stage, shader_info->combos, unit.preprocess_info);
-    });
-
-    for (usize i = 0; i < units.size(); i++) {
-        auto&               unit     = units[i];
-        WPPreprocessorInfo* pre_info = i >= 1 ? &units[i - 1].preprocess_info : nullptr;
-        WPPreprocessorInfo* post_info = i + 1 < units.size() ? &units[i + 1].preprocess_info
-                                                             : nullptr;
-        unit.src = Finalprocessor(unit, pre_info, post_info);
-    }
 
     auto compile = [](std::span<WPShaderUnit> units, std::vector<ShaderCode>& codes) {
         std::vector<vulkan::ShaderCompUnit> vunits(units.size());
@@ -851,6 +1112,22 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
     bool has_cache_dir = vfs.IsMounted("cache");
 
     if (has_cache_dir) {
+        const std::string prepared_sha1            = GenPreparedShaderSha1(units, shader_info->combos);
+        const std::string prepared_cache_file_path = GetPreparedShaderCachePath(scene_id, prepared_sha1);
+
+        if (vfs.Contains(prepared_cache_file_path)) {
+            auto cache_file = vfs.Open(prepared_cache_file_path);
+            if (! cache_file || ! ::LoadPreparedShaderUnits(units, *cache_file)) {
+                LOG_ERROR("load prepared shader from '%s' failed", prepared_cache_file_path.c_str());
+                return false;
+            }
+        } else {
+            PrepareShaderUnits(units, shader_info);
+            if (auto cache_file = vfs.OpenW(prepared_cache_file_path); cache_file) {
+                ::SavePreparedShaderUnits(units, *cache_file);
+            }
+        }
+
         std::string sha1            = GenSha1(units);
         std::string cache_file_path = GetCachePath(scene_id, sha1);
 
@@ -869,6 +1146,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
         return true;
 
     } else {
+        PrepareShaderUnits(units, shader_info);
         return compile(units, codes);
     }
 }

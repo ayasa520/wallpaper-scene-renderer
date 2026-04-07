@@ -35,6 +35,7 @@ public:
     }
     const auto& GetCurFrame() const { return m_frames.at((usize)m_curFrame); }
     void        AppendFrame(const SpriteFrame& frame) { m_frames.push_back(frame); }
+    const auto& Frames() const { return m_frames; }
 
     usize numFrames() const { return m_frames.size(); }
 
