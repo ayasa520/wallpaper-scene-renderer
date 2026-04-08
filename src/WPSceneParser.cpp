@@ -601,7 +601,8 @@ void AttachNodeToScene(ParseContext&                    context,
     }
 }
 
-void ConfigureVirtualParent(ParseContext& context, int32_t parent_id, WPShaderValueData& node_data) {
+void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
+                                     WPShaderValueData& node_data) {
     if (parent_id == 0) return;
     if (auto parent = FindParentNode(context, parent_id)) {
         node_data.InheritParentTransform(parent.get());
@@ -772,10 +773,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             count_eff++;
     }
     bool hasEffect = count_eff > 0;
-    bool use_virtual_parent = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
+    // Detached effect world nodes still need to inherit the parent transform even though they
+    // cannot become real scene-graph children of that parent.
+    bool needs_inherited_parent_binding = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
     bool has_dependents = context.dependent_parent_ids.count(wpimgobj.id) > 0;
     bool use_detached_effect_world_node =
-        hasEffect && (use_virtual_parent || ! wpimgobj.attachment.empty() || has_dependents);
+        hasEffect &&
+        (needs_inherited_parent_binding || ! wpimgobj.attachment.empty() || has_dependents);
     // skip no effect fullscreen layer
     if (! hasEffect && wpimgobj.fullscreen) return;
 
@@ -1125,7 +1129,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
                     svData.effect_projection_node = &imgEffectLayer->FinalNode();
                     svData.effect_projection_mesh = &imgEffectLayer->FinalMesh();
-                    if (!use_virtual_parent && (wpimgobj.parent == 0 || wpimgobj.attachment.empty())) {
+                    if (!needs_inherited_parent_binding &&
+                        (wpimgobj.parent == 0 || wpimgobj.attachment.empty())) {
                         if (auto parent = FindParentNode(context, wpimgobj.parent)) {
                             svData.SetParallaxAnchor(parent.get());
                         }
@@ -1149,11 +1154,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             }
         }
     }
-    if (use_virtual_parent) {
+    if (needs_inherited_parent_binding) {
         if (hasEffect) {
-            ConfigureVirtualParent(context, wpimgobj.parent, worldNodeData);
+            ConfigureInheritedParentBinding(context, wpimgobj.parent, worldNodeData);
         } else {
-            ConfigureVirtualParent(context, wpimgobj.parent, svData);
+            ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
         }
         context.scene->sceneGraph->AppendChild(spWorldNode);
     } else {
@@ -1361,7 +1366,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         child_ptr.node_parent->AppendChild(spNode);
     else {
         if (wppartobj.parent != 0 && wppartobj.attachment.empty()) {
-            ConfigureVirtualParent(context, wppartobj.parent, svData);
+            ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
         } else {
             AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
@@ -1403,7 +1408,7 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
                             svData);
 
     if (empty_obj.parent != 0 && empty_obj.attachment.empty()) {
-        ConfigureVirtualParent(context, empty_obj.parent, svData);
+        ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
         context.scene->sceneGraph->AppendChild(node);
     } else {
         AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name, &svData);
