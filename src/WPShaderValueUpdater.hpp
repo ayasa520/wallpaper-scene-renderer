@@ -48,21 +48,68 @@ struct WPUniformInfo {
     std::array<Tex, 12> texs;
 };
 
+enum class WPNodeTransformBindingMode
+{
+    None,
+    InheritParent,
+    BoneAttachment,
+};
+
+struct WPNodeTransformBinding {
+    WPNodeTransformBindingMode mode { WPNodeTransformBindingMode::None };
+    SceneNode*                 parent { nullptr };
+    uint32_t                   bone_index { 0xFFFFFFFFu };
+    Eigen::Affine3f            anchor_transform { Eigen::Affine3f::Identity() };
+    Eigen::Affine3f            local_transform { Eigen::Affine3f::Identity() };
+
+    bool InheritsParentTransform() const {
+        return mode == WPNodeTransformBindingMode::InheritParent;
+    }
+
+    bool IsBoneAttachment() const {
+        return mode == WPNodeTransformBindingMode::BoneAttachment;
+    }
+};
+
 struct WPShaderValueData {
     std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
     // index + name
     std::vector<std::pair<usize, std::string>> renderTargets;
 
     WPPuppetLayer puppet_layer;
-    SceneNode*    scene_parent { nullptr };
-    bool          inherit_scene_parent_transform { false };
-    bool          attach_to_bone { false };
-    uint32_t      attach_bone { 0xFFFFFFFFu };
-    Eigen::Affine3f attach_transform { Eigen::Affine3f::Identity() };
-    Eigen::Affine3f attach_local_transform { Eigen::Affine3f::Identity() };
-    bool            skip_model_parallax { false };
-    SceneNode*      effect_projection_node { nullptr };
-    SceneMesh*      effect_projection_mesh { nullptr };
+    SceneNode*     parallax_anchor { nullptr };
+    WPNodeTransformBinding transform_binding {};
+    SceneNode*            effect_projection_node { nullptr };
+    SceneMesh*            effect_projection_mesh { nullptr };
+
+    void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
+
+    void InheritParentTransform(SceneNode* parent) {
+        parallax_anchor        = parent;
+        transform_binding.mode = WPNodeTransformBindingMode::InheritParent;
+        transform_binding.parent = parent;
+    }
+
+    void AttachToBone(SceneNode* parent, uint32_t bone_index,
+                      const Eigen::Affine3f& anchor_transform,
+                      const Eigen::Affine3f& local_transform) {
+        parallax_anchor                    = parent;
+        transform_binding.mode             = WPNodeTransformBindingMode::BoneAttachment;
+        transform_binding.parent           = parent;
+        transform_binding.bone_index       = bone_index;
+        transform_binding.anchor_transform = anchor_transform;
+        transform_binding.local_transform  = local_transform;
+    }
+
+    bool InheritsSceneParentTransform() const {
+        return transform_binding.InheritsParentTransform();
+    }
+
+    bool IsBoneAttached() const { return transform_binding.IsBoneAttachment(); }
+
+    bool AppliesModelParallax() const { return ! transform_binding.IsBoneAttachment(); }
+
+    SceneNode* TransformParent() const { return transform_binding.parent; }
 };
 
 struct WPCameraParallax {
@@ -105,7 +152,10 @@ private:
 
     std::array<float, 2> m_screen_size { 1920, 1080 };
 
-    uint64_t                  m_puppet_frame_serial { 0 };
+    uint64_t                     m_puppet_frame_serial { 0 };
+    Map<void*, Eigen::Matrix4d>  m_modelTransformCache;
+    Map<void*, Eigen::Vector3f>  m_parallaxOffsetCache;
+    Map<void*, Eigen::Affine3f>  m_attachmentTransformCache;
     Map<void*, WPShaderValueData> m_nodeDataMap;
     Map<void*, WPUniformInfo>     m_nodeUniformInfoMap;
 };

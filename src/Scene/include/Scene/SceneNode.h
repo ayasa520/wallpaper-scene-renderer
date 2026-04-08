@@ -52,6 +52,7 @@ public:
         m_translate = v;
         MarkTransDirty();
     }
+    void        SetLocalAffine(const Eigen::Affine3f& affine);
 
     void CopyTrans(const SceneNode& node) {
         m_translate = node.m_translate;

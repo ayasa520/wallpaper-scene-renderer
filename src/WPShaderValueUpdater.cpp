@@ -1,4 +1,5 @@
 #include "WPShaderValueUpdater.hpp"
+#include "WPNodeTransformResolver.hpp"
 #include "Eigen/src/Core/Matrix.h"
 #include "Eigen/src/Geometry/Transform.h"
 #include "Scene/Scene.h"
@@ -24,201 +25,6 @@ using namespace Eigen;
 
 namespace
 {
-Vector3f ComputeParallaxOffset(SceneNode*                           node,
-                               const WPShaderValueData&             nodeData,
-                               const Scene&                         scene,
-                               const WPCameraParallax&              parallax,
-                               const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
-                               const SceneCamera*                   camera,
-                               const std::array<float, 2>&          mousePos);
-
-Matrix4d ResolveNodeModelTransform(
-    SceneNode* node, const WPShaderValueData* nodeData,
-    const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap) {
-    if (node == nullptr) return Matrix4d::Identity();
-
-    if (nodeData != nullptr && nodeData->inherit_scene_parent_transform &&
-        nodeData->scene_parent != nullptr && exists(nodeDataMap, nodeData->scene_parent)) {
-        const auto& parentData = nodeDataMap.at(nodeData->scene_parent);
-        return ResolveNodeModelTransform(nodeData->scene_parent, &parentData, nodeDataMap) *
-               node->GetLocalTrans();
-    }
-
-    node->UpdateTrans();
-    return node->ModelTrans();
-}
-
-Matrix4d ResolveParallaxedModelTransform(
-    SceneNode* node, const WPShaderValueData* nodeData, const Scene& scene,
-    const WPCameraParallax& parallax,
-    const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap, const SceneCamera* camera,
-    const std::array<float, 2>& mousePos, bool apply_parallax) {
-    Matrix4d modelTrans = ResolveNodeModelTransform(node, nodeData, nodeDataMap);
-    if (nodeData != nullptr && apply_parallax && !nodeData->skip_model_parallax) {
-        const auto parallaxOffset =
-            ComputeParallaxOffset(node, *nodeData, scene, parallax, nodeDataMap, camera, mousePos);
-        modelTrans =
-            Affine3d(Eigen::Translation3d(parallaxOffset.cast<double>())).matrix() * modelTrans;
-    }
-    return modelTrans;
-}
-
-void ApplyLocalAffine(SceneNode* node, const Affine3f& affine) {
-    if (node == nullptr) return;
-
-    Matrix3f linear = affine.linear();
-    Vector3f scale(linear.col(0).norm(), linear.col(1).norm(), linear.col(2).norm());
-    for (int i = 0; i < 3; ++i) {
-        if (scale[i] > 1e-6f) {
-            linear.col(i) /= scale[i];
-        } else {
-            linear.col(i).setZero();
-            linear(i, i) = 1.0f;
-            scale[i] = 1.0f;
-        }
-    }
-
-    const auto zyx = linear.eulerAngles(2, 1, 0);
-    node->SetScale(scale);
-    node->SetRotation(Vector3f(zyx[2], zyx[1], zyx[0]));
-    node->SetTranslate(affine.translation());
-}
-
-Vector3f ComputeParallaxOffset(SceneNode*                           node,
-                               const WPShaderValueData&             nodeData,
-                               const Scene&                         scene,
-                               const WPCameraParallax&              parallax,
-                               const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
-                               const SceneCamera*                   camera,
-                               const std::array<float, 2>&          mousePos) {
-    if (node == nullptr || camera == nullptr || !parallax.enable) return Vector3f::Zero();
-
-    if (nodeData.scene_parent != nullptr && exists(nodeDataMap, nodeData.scene_parent)) {
-        const auto& parentData = nodeDataMap.at(nodeData.scene_parent);
-        if (parentData.attach_to_bone) {
-            return Vector3f::Zero();
-        }
-        return ComputeParallaxOffset(nodeData.scene_parent,
-                                     parentData,
-                                     scene,
-                                     parallax,
-                                     nodeDataMap,
-                                     camera,
-                                     mousePos);
-    }
-
-    const auto modelTrans = ResolveNodeModelTransform(node, &nodeData, nodeDataMap);
-    Vector3f   nodePos((float)modelTrans(0, 3), (float)modelTrans(1, 3), (float)modelTrans(2, 3));
-    Vector2f   depth(nodeData.parallaxDepth[0], nodeData.parallaxDepth[1]);
-
-    Vector2f ortho { (float)scene.ortho[0], (float)scene.ortho[1] };
-    Vector2f mouseVec =
-        Scaling(1.0f, -1.0f) * (Vector2f { 0.5f, 0.5f } - Vector2f(&mousePos[0]));
-    mouseVec = mouseVec.cwiseProduct(ortho) * parallax.mouseinfluence;
-
-    Vector3f camPos = camera->GetPosition().cast<float>();
-    Vector2f paraVec =
-        (nodePos.head<2>() - camPos.head<2>() + mouseVec).cwiseProduct(depth) * parallax.amount;
-    return Vector3f(paraVec.x(), paraVec.y(), 0.0f);
-}
-
-void ApplyParentParallaxToAttachment(SceneNode*                           parentNode,
-                                     const WPShaderValueData&             parentData,
-                                     const Scene&                         scene,
-                                     const WPCameraParallax&              parallax,
-                                     const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
-                                     const SceneCamera*                   camera,
-                                     const std::array<float, 2>&          mousePos,
-                                     Affine3f&                            localTransform) {
-    if (parentNode == nullptr || camera == nullptr || !parallax.enable) return;
-
-    const auto parentParallax =
-        ComputeParallaxOffset(parentNode, parentData, scene, parallax, nodeDataMap, camera, mousePos);
-    const auto parentModel  = ResolveNodeModelTransform(parentNode, &parentData, nodeDataMap);
-    Matrix3f    parentLinear = parentModel.block<3, 3>(0, 0).cast<float>();
-    Vector3f    parentParallaxLocal = parentParallax;
-    if (std::abs(parentLinear.determinant()) > 1e-6f) {
-        parentParallaxLocal = parentLinear.inverse() * parentParallax;
-    }
-    localTransform.translation() += parentParallaxLocal;
-}
-
-void ApplyResolvedParentDelta(SceneNode* targetParent, const WPShaderValueData& parentData,
-                              const wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
-                              Affine3f& localTransform) {
-    if (targetParent == nullptr) return;
-
-    targetParent->UpdateTrans();
-    const auto parentActualModel   = targetParent->ModelTrans();
-    const auto parentResolvedModel =
-        ResolveNodeModelTransform(targetParent, &parentData, nodeDataMap);
-    const auto parentActualLinear = parentActualModel.block<3, 3>(0, 0);
-    if (std::abs(parentActualLinear.determinant()) <= 1e-12) return;
-
-    const auto resolvedDelta = parentActualModel.inverse() * parentResolvedModel;
-    localTransform = Affine3f(resolvedDelta.cast<float>()) * localTransform;
-}
-
-void UpdateAttachedNodeLocalTransform(
-    SceneNode* targetNode, WPShaderValueData& nodeData, Scene& scene,
-    const WPCameraParallax& parallax,
-    wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
-    const std::array<float, 2>& mousePos, uint64_t puppet_frame_serial) {
-    if (targetNode == nullptr || ! nodeData.attach_to_bone || nodeData.scene_parent == nullptr ||
-        ! exists(nodeDataMap, nodeData.scene_parent)) {
-        return;
-    }
-
-    auto& parentData = nodeDataMap.at(nodeData.scene_parent);
-    if (parentData.attach_to_bone) {
-        UpdateAttachedNodeLocalTransform(nodeData.scene_parent,
-                                         parentData,
-                                         scene,
-                                         parallax,
-                                         nodeDataMap,
-                                         mousePos,
-                                         puppet_frame_serial);
-    }
-
-    if (! parentData.puppet_layer.hasPuppet()) return;
-
-    parentData.puppet_layer.AdvanceIfNeeded(scene.frameTime, puppet_frame_serial);
-    const auto* parentPuppet = parentData.puppet_layer.Puppet();
-    if (parentPuppet == nullptr) return;
-
-    const auto& boneTransform = parentPuppet->BoneModelTransform(nodeData.attach_bone);
-    Affine3f    localTransform =
-        boneTransform * nodeData.attach_transform * nodeData.attach_local_transform;
-    ApplyResolvedParentDelta(nodeData.scene_parent, parentData, nodeDataMap, localTransform);
-    ApplyParentParallaxToAttachment(nodeData.scene_parent,
-                                    parentData,
-                                    scene,
-                                    parallax,
-                                    nodeDataMap,
-                                    scene.activeCamera,
-                                    mousePos,
-                                    localTransform);
-    ApplyLocalAffine(targetNode, localTransform);
-}
-
-void UpdateAttachedSceneParentIfNeeded(
-    WPShaderValueData& nodeData, Scene& scene, const WPCameraParallax& parallax,
-    wallpaper::Map<void*, WPShaderValueData>& nodeDataMap,
-    const std::array<float, 2>& mousePos, uint64_t puppet_frame_serial) {
-    if (nodeData.scene_parent == nullptr || ! exists(nodeDataMap, nodeData.scene_parent)) return;
-
-    auto& parentData = nodeDataMap.at(nodeData.scene_parent);
-    if (! parentData.attach_to_bone) return;
-
-    UpdateAttachedNodeLocalTransform(nodeData.scene_parent,
-                                     parentData,
-                                     scene,
-                                     parallax,
-                                     nodeDataMap,
-                                     mousePos,
-                                     puppet_frame_serial);
-}
-
 struct MeshBounds2D {
     bool     valid { false };
     Vector3d center { Vector3d::Zero() };
@@ -283,6 +89,9 @@ Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
 
 void WPShaderValueUpdater::FrameBegin() {
     m_puppet_frame_serial++;
+    m_modelTransformCache.clear();
+    m_parallaxOffsetCache.clear();
+    m_attachmentTransformCache.clear();
     /*
         using namespace std::chrono;
         auto nowTime = system_clock::to_time_t(system_clock::now());
@@ -353,53 +162,37 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
 
 void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprites,
                                           const UpdateUniformOp& updateOp) {
+    WPNodeTransformResolver transformResolver(*m_scene,
+                                              m_parallax,
+                                              m_nodeDataMap,
+                                              m_modelTransformCache,
+                                              m_parallaxOffsetCache,
+                                              m_attachmentTransformCache,
+                                              m_scene->activeCamera,
+                                              m_mousePos,
+                                              m_puppet_frame_serial);
+
     if (exists(m_nodeDataMap, pNode)) {
         auto& nodeData = m_nodeDataMap.at(pNode);
-        UpdateAttachedSceneParentIfNeeded(nodeData,
-                                          *m_scene,
-                                          m_parallax,
-                                          m_nodeDataMap,
-                                          m_mousePos,
-                                          m_puppet_frame_serial);
-        if (nodeData.attach_to_bone && nodeData.scene_parent != nullptr &&
-            exists(m_nodeDataMap, nodeData.scene_parent)) {
-            auto& parentData = m_nodeDataMap.at(nodeData.scene_parent);
-            if (parentData.puppet_layer.hasPuppet()) {
-                parentData.puppet_layer.AdvanceIfNeeded(m_scene->frameTime, m_puppet_frame_serial);
-                const auto* parentPuppet = parentData.puppet_layer.Puppet();
-                if (parentPuppet != nullptr) {
-                    const auto& boneTransform = parentPuppet->BoneModelTransform(nodeData.attach_bone);
-                    Affine3f    localTransform =
-                        boneTransform * nodeData.attach_transform * nodeData.attach_local_transform;
-                    ApplyResolvedParentDelta(
-                        nodeData.scene_parent, parentData, m_nodeDataMap, localTransform);
-                    ApplyParentParallaxToAttachment(nodeData.scene_parent,
-                                                    parentData,
-                                                    *m_scene,
-                                                    m_parallax,
-                                                    m_nodeDataMap,
-                                                    m_scene->activeCamera,
-                                                    m_mousePos,
-                                                    localTransform);
-
-                    SceneImageEffectLayer* effectLayer { nullptr };
-                    if (!pNode->Camera().empty()) {
-                        auto camera_it = m_scene->cameras.find(pNode->Camera());
-                        if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
-                            effectLayer = camera_it->second->GetImgEffect().get();
-                        }
-                    }
-
-                    if (effectLayer != nullptr) {
-                        if (auto* worldNode = effectLayer->WorldNode()) {
-                            ApplyLocalAffine(worldNode, localTransform);
-                            worldNode->UpdateTrans();
-                            effectLayer->SyncResolvedNodeToWorld();
-                        }
-                    } else {
-                        ApplyLocalAffine(pNode, localTransform);
-                    }
+        transformResolver.UpdateAttachmentParentIfNeeded(nodeData);
+        auto localTransform = transformResolver.ResolveAttachmentLocalTransform(pNode);
+        if (localTransform.has_value()) {
+            SceneImageEffectLayer* effectLayer { nullptr };
+            if (!pNode->Camera().empty()) {
+                auto camera_it = m_scene->cameras.find(pNode->Camera());
+                if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
+                    effectLayer = camera_it->second->GetImgEffect().get();
                 }
+            }
+
+            if (effectLayer != nullptr) {
+                if (auto* worldNode = effectLayer->WorldNode()) {
+                    worldNode->SetLocalAffine(*localTransform);
+                    worldNode->UpdateTrans();
+                    effectLayer->SyncResolvedNodeToWorld();
+                }
+            } else {
+                pNode->SetLocalAffine(*localTransform);
             }
         }
     }
@@ -424,24 +217,13 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             auto* worldNode   = effectLayer->WorldNode();
             if (worldNode != nullptr && exists(m_nodeDataMap, worldNode)) {
                 auto& worldNodeData = m_nodeDataMap.at(worldNode);
-                UpdateAttachedSceneParentIfNeeded(worldNodeData,
-                                                  *m_scene,
-                                                  m_parallax,
-                                                  m_nodeDataMap,
-                                                  m_mousePos,
-                                                  m_puppet_frame_serial);
-                if (worldNodeData.inherit_scene_parent_transform &&
-                    ! worldNodeData.attach_to_bone) {
+                transformResolver.UpdateAttachmentParentIfNeeded(worldNodeData);
+                if (worldNodeData.InheritsSceneParentTransform() &&
+                    ! worldNodeData.IsBoneAttached()) {
                     const SceneCamera* displayCamera =
                         m_scene->activeCamera != nullptr ? m_scene->activeCamera : camera;
-                    const auto worldModel = ResolveParallaxedModelTransform(worldNode,
-                                                                            &worldNodeData,
-                                                                            *m_scene,
-                                                                            m_parallax,
-                                                                            m_nodeDataMap,
-                                                                            displayCamera,
-                                                                            m_mousePos,
-                                                                            displayCamera != nullptr);
+                    const auto worldModel = transformResolver.ResolveParallaxedModelTransform(
+                        worldNode, displayCamera, displayCamera != nullptr);
                     effectLayer->SyncResolvedNodeToMatrix(Affine3f(worldModel.cast<float>()));
                 }
             }
@@ -494,15 +276,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         updateOp(G_VP, ShaderValue::fromMatrix(viewProTrans));
     }
     if (reqM || reqMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
-        const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
-        Matrix4d modelTrans = ResolveParallaxedModelTransform(pNode,
-                                                              nodeDataPtr,
-                                                              *m_scene,
-                                                              m_parallax,
-                                                              m_nodeDataMap,
-                                                              camera,
-                                                              m_mousePos,
-                                                              cam_name != "effect");
+        Matrix4d modelTrans =
+            transformResolver.ResolveParallaxedModelTransform(pNode, camera, cam_name != "effect");
 
         if (reqM) updateOp(G_M, ShaderValue::fromMatrix(modelTrans));
         if (reqAM) updateOp(G_AM, ShaderValue::fromMatrix(modelTrans));
@@ -518,6 +293,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             Matrix4d         projectionModelTrans = modelTrans;
             Matrix4d         projectionViewPro    = viewProTrans;
 
+            const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
             if (nodeDataPtr != nullptr && nodeDataPtr->effect_projection_node != nullptr &&
                 nodeDataPtr->effect_projection_mesh != nullptr && m_scene->activeCamera != nullptr) {
                 projectionNode = nodeDataPtr->effect_projection_node;

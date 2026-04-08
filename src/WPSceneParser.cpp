@@ -541,6 +541,41 @@ std::optional<AttachmentBinding> ResolveAttachmentBinding(const ParseContext& co
     };
 }
 
+bool ConfigureBoneAttachment(ParseContext&          context,
+                             int32_t                parent_id,
+                             std::string_view       attachment,
+                             const Eigen::Affine3f& local_transform,
+                             std::string_view       object_kind,
+                             std::string_view       object_name,
+                             WPShaderValueData&     node_data) {
+    if (parent_id == 0 || attachment.empty()) return false;
+
+    auto parent_node = FindParentNode(context, parent_id);
+    if (! parent_node) {
+        LOG_ERROR("parent id %d for %s '%s' not found while resolving attachment '%s'",
+                  (int)parent_id,
+                  std::string(object_kind).c_str(),
+                  std::string(object_name).c_str(),
+                  std::string(attachment).c_str());
+        return false;
+    }
+
+    auto attachment_binding = ResolveAttachmentBinding(context, parent_id, attachment);
+    if (! attachment_binding.has_value()) {
+        LOG_ERROR("attachment '%s' not found for %s '%s'",
+                  std::string(attachment).c_str(),
+                  std::string(object_kind).c_str(),
+                  std::string(object_name).c_str());
+        return false;
+    }
+
+    node_data.AttachToBone(parent_node.get(),
+                           attachment_binding->bone_index,
+                           attachment_binding->transform,
+                           local_transform);
+    return true;
+}
+
 void AttachNodeToScene(ParseContext&                    context,
                        const std::shared_ptr<SceneNode>& node,
                        int32_t                           parent_id,
@@ -562,15 +597,14 @@ void AttachNodeToScene(ParseContext&                    context,
 
     parent->AppendChild(node);
     if (node_data != nullptr) {
-        node_data->scene_parent = parent.get();
+        node_data->SetParallaxAnchor(parent.get());
     }
 }
 
 void ConfigureVirtualParent(ParseContext& context, int32_t parent_id, WPShaderValueData& node_data) {
     if (parent_id == 0) return;
     if (auto parent = FindParentNode(context, parent_id)) {
-        node_data.scene_parent                   = parent.get();
-        node_data.inherit_scene_parent_transform = true;
+        node_data.InheritParentTransform(parent.get());
     }
 }
 
@@ -895,27 +929,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         svData.puppet_layer.prepared(wpimgobj.puppet_layers);
     }
 
-    if (wpimgobj.parent != 0 && !wpimgobj.attachment.empty()) {
-        auto attachment_binding =
-            ResolveAttachmentBinding(context, wpimgobj.parent, wpimgobj.attachment);
-        if (attachment_binding.has_value()) {
-            svData.attach_to_bone    = true;
-            svData.attach_bone       = attachment_binding->bone_index;
-            svData.attach_transform  = attachment_binding->transform;
-            svData.attach_local_transform =
-                Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>());
-        } else {
-            LOG_ERROR("attachment '%s' not found for object '%s'",
-                      wpimgobj.attachment.c_str(),
-                      wpimgobj.name.c_str());
-        }
-    }
+    ConfigureBoneAttachment(context,
+                            wpimgobj.parent,
+                            wpimgobj.attachment,
+                            Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>()),
+                            "object",
+                            wpimgobj.name,
+                            svData);
 
     worldNodeData = svData;
     worldNodeData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-    if (wpimgobj.parent != 0 && !wpimgobj.attachment.empty()) {
-        svData.skip_model_parallax = true;
-    }
 
     if (hasEffect) {
         auto& scene = *context.scene;
@@ -1104,7 +1127,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                     svData.effect_projection_mesh = &imgEffectLayer->FinalMesh();
                     if (!use_virtual_parent && (wpimgobj.parent == 0 || wpimgobj.attachment.empty())) {
                         if (auto parent = FindParentNode(context, wpimgobj.parent)) {
-                            svData.scene_parent = parent.get();
+                            svData.SetParallaxAnchor(parent.get());
                         }
                     }
                     if (puppet && wpmat.use_puppet) {
@@ -1308,20 +1331,14 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     mesh.AddMaterial(std::move(material));
     spNode->AddMesh(spMesh);
 
-    if (!is_child && wppartobj.parent != 0 && !wppartobj.attachment.empty()) {
-        auto attachment_binding =
-            ResolveAttachmentBinding(context, wppartobj.parent, wppartobj.attachment);
-        if (attachment_binding.has_value()) {
-            svData.attach_to_bone      = true;
-            svData.attach_bone         = attachment_binding->bone_index;
-            svData.attach_transform    = attachment_binding->transform;
-            svData.attach_local_transform =
-                Eigen::Affine3f(spNode->GetLocalTrans().cast<float>());
-        } else {
-            LOG_ERROR("attachment '%s' not found for particle object '%s'",
-                      wppartobj.attachment.c_str(),
-                      wppartobj.name.c_str());
-        }
+    if (!is_child) {
+        ConfigureBoneAttachment(context,
+                                wppartobj.parent,
+                                wppartobj.attachment,
+                                Eigen::Affine3f(spNode->GetLocalTrans().cast<float>()),
+                                "particle object",
+                                wppartobj.name,
+                                svData);
     }
 
     for (auto& child : particle_obj.children) {
@@ -1377,21 +1394,13 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
 
     WPShaderValueData svData;
     svData.parallaxDepth = empty_obj.parallaxDepth;
-    if (empty_obj.parent != 0 && ! empty_obj.attachment.empty()) {
-        auto attachment_binding =
-            ResolveAttachmentBinding(context, empty_obj.parent, empty_obj.attachment);
-        if (attachment_binding.has_value()) {
-            svData.attach_to_bone      = true;
-            svData.attach_bone         = attachment_binding->bone_index;
-            svData.attach_transform    = attachment_binding->transform;
-            svData.attach_local_transform =
-                Eigen::Affine3f(node->GetLocalTrans().cast<float>());
-        } else {
-            LOG_ERROR("attachment '%s' not found for object '%s'",
-                      empty_obj.attachment.c_str(),
-                      empty_obj.name.c_str());
-        }
-    }
+    ConfigureBoneAttachment(context,
+                            empty_obj.parent,
+                            empty_obj.attachment,
+                            Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
+                            "object",
+                            empty_obj.name,
+                            svData);
 
     if (empty_obj.parent != 0 && empty_obj.attachment.empty()) {
         ConfigureVirtualParent(context, empty_obj.parent, svData);

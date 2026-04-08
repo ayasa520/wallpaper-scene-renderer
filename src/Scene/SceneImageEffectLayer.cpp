@@ -6,28 +6,6 @@
 
 using namespace wallpaper;
 
-namespace
-{
-void ApplyAffineToNode(SceneNode& node, const Eigen::Affine3f& affine) {
-    Eigen::Matrix3f linear = affine.linear();
-    Eigen::Vector3f scale(linear.col(0).norm(), linear.col(1).norm(), linear.col(2).norm());
-    for (int i = 0; i < 3; ++i) {
-        if (scale[i] > 1e-6f) {
-            linear.col(i) /= scale[i];
-        } else {
-            linear.col(i).setZero();
-            linear(i, i) = 1.0f;
-            scale[i] = 1.0f;
-        }
-    }
-
-    const auto zyx = linear.eulerAngles(2, 1, 0);
-    node.SetScale(scale);
-    node.SetRotation(Eigen::Vector3f(zyx[2], zyx[1], zyx[0]));
-    node.SetTranslate(affine.translation());
-}
-} // namespace
-
 SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float w, float h,
                                              std::string_view pingpong_a,
                                              std::string_view pingpong_b)
@@ -55,7 +33,7 @@ void SceneImageEffectLayer::SyncResolvedNodeToWorld() {
 }
 
 void SceneImageEffectLayer::SyncResolvedNodeToMatrix(const Eigen::Affine3f& world_affine) {
-    ApplyAffineToNode(*m_final_node, world_affine);
+    m_final_node->SetLocalAffine(world_affine);
     m_final_node->UpdateTrans();
 
     if (m_resolved_output_node != nullptr) {

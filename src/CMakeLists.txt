@@ -44,6 +44,7 @@ add_library(
   WPParticleParser.cpp
   WPShaderParser.cpp
   WPSceneParser.cpp
+  WPNodeTransformResolver.cpp
   WPShaderValueUpdater.cpp
   WPTexImageParser.cpp
   WPSoundParser.cpp
