@@ -126,6 +126,7 @@ public:
     enum class CMD
     {
         CMD_INIT_VULKAN,
+        CMD_MOUSE_INPUT,
         CMD_SET_SCENE,
         CMD_SET_FILLMODE,
         CMD_SET_SPEED,
@@ -149,6 +150,7 @@ public:
             switch (cmd) {
                 CASE_CMD(DRAW);
                 CASE_CMD(STOP);
+                CASE_CMD(MOUSE_INPUT);
                 CASE_CMD(SET_FILLMODE);
                 CASE_CMD(SET_SCENE);
                 CASE_CMD(SET_SPEED);
@@ -162,9 +164,18 @@ public:
 
     bool renderInited() const { return m_render->inited(); }
 
-    void setMousePos(double x, double y) { m_mouse_pos.store(std::array { (float)x, (float)y }); }
-
 private:
+    MHANDLER_CMD(MOUSE_INPUT) {
+        float x { 0.5f };
+        float y { 0.5f };
+        if (! msg->findFloat("x", &x) || ! msg->findFloat("y", &y)) return;
+
+        m_mouse_pos.store(std::array { x, y });
+        if (! m_scene) return;
+
+        m_scene->shaderValueUpdater->MouseInput(x, y);
+        m_scene->paritileSys->SetMousePos(x, y);
+    }
     MHANDLER_CMD(STOP) {
         bool stop { false };
         if (msg->findBool("value", &stop)) {
@@ -181,7 +192,6 @@ private:
             m_scene->shaderValueUpdater->FrameBegin();
             {
                 auto pos = m_mouse_pos.load();
-                m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
                 m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
             }
             m_scene->paritileSys->Emitt();
@@ -217,6 +227,10 @@ private:
             if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
             m_render->compileRenderGraph(*m_scene, *m_rg);
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
+
+            auto pos = m_mouse_pos.load();
+            m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
+            m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
         }
     }
     MHANDLER_CMD(SET_SPEED) { msg->findFloat("value", &m_speed); }
@@ -287,7 +301,10 @@ void SceneWallpaper::pause() {
 }
 
 void SceneWallpaper::mouseInput(double x, double y) {
-    m_main_handler->renderHandler()->setMousePos(x, y);
+    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_MOUSE_INPUT);
+    msg->setFloat("x", (float)x);
+    msg->setFloat("y", (float)y);
+    msg->post();
 }
 
 #define BASIC_TYPE(NAME, TYPENAME)                                                       \

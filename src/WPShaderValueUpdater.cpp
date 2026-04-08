@@ -13,7 +13,6 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <iostream>
-#include <chrono>
 #include <ctime>
 #include <cmath>
 #include <algorithm>
@@ -25,11 +24,19 @@ using namespace Eigen;
 
 namespace
 {
+constexpr float kDefaultMouseCoord = 0.5f;
+constexpr double kParallaxSettleRatio = std::log(100.0);
+
 struct MeshBounds2D {
     bool     valid { false };
     Vector3d center { Vector3d::Zero() };
     Vector2d halfExtent { Vector2d::Ones() };
 };
+
+float SanitizeMouseCoord(double value) {
+    if (! std::isfinite(value)) return kDefaultMouseCoord;
+    return std::clamp(static_cast<float>(value), 0.0f, 1.0f);
+}
 
 MeshBounds2D ComputeMeshBounds2D(const SceneMesh* mesh) {
     if (mesh == nullptr || mesh->VertexCount() == 0) return {};
@@ -101,15 +108,13 @@ void WPShaderValueUpdater::FrameBegin() {
        * 60.0f);
     */
     if (!(m_parallax.delay > 0.0f) || !std::isfinite(m_parallax.delay)) {
-        m_mouseDelayedTime = 0.0f;
         m_mousePos         = m_mousePosInput;
         return;
     }
 
-    double new_time    = m_mouseDelayedTime + m_scene->frameTime;
-    new_time           = new_time > m_parallax.delay ? m_parallax.delay : new_time;
-    m_mouseDelayedTime = new_time;
-    double t           = new_time / m_parallax.delay;
+    const double frameTime = std::max(m_scene->frameTime, 0.0);
+    const double t =
+        1.0 - std::exp(-(frameTime * kParallaxSettleRatio) / static_cast<double>(m_parallax.delay));
     m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
                                       (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
 }
@@ -117,17 +122,8 @@ void WPShaderValueUpdater::FrameBegin() {
 void WPShaderValueUpdater::FrameEnd() {}
 
 void WPShaderValueUpdater::MouseInput(double x, double y) {
-    using namespace std::chrono;
-
-    auto   now_time = steady_clock::now();
-    double new_time = m_mouseDelayedTime -
-                      duration_cast<duration<double>>(now_time - m_last_mouse_input_time).count();
-    m_mouseDelayedTime = new_time < 0.0f ? 0.0f : new_time;
-
-    m_mousePosInput[0] = (float)x;
-    m_mousePosInput[1] = (float)y;
-
-    m_last_mouse_input_time = now_time;
+    m_mousePosInput[0] = SanitizeMouseCoord(x);
+    m_mousePosInput[1] = SanitizeMouseCoord(y);
 }
 
 void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp& existsOp) {
