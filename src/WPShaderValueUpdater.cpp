@@ -562,9 +562,10 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                      m_screen_size[0], m_screen_size[1], m_screen_size[0] / m_screen_size[1] });
 
     if (info.has_PARALLAXPOSITION) {
+        const Vector2f mouseCentered = Vector2f(&m_mousePos[0]) - Vector2f { 0.5f, 0.5f };
         Vector2f para =
             Vector2f { 0.5f, 0.5f } +
-            (Scaling(1.0f, -1.0f) * (Vector2f(&m_mousePos[0])) - Vector2f { 0.5f, 0.5f }) *
+            (Scaling(1.0f, -1.0f) * mouseCentered) *
                 m_parallax.mouseinfluence;
         updateOp(G_PARALLAXPOSITION, std::array { para[0], para[1] });
     }
