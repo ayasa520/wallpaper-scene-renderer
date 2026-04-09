@@ -3,17 +3,17 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
-#include <cctype>
 #include <cstdlib>
 #include <iomanip>
 #include <optional>
-#include <regex>
 #include <sstream>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 
 #include "Utils/Identity.hpp"
 #include "Utils/String.h"
+#include "WPScriptRuntime.hpp"
 
 namespace wallpaper
 {
@@ -22,28 +22,48 @@ namespace
 thread_local const UserPropertyMap* g_json_user_properties = nullptr;
 thread_local const nlohmann::json*  g_json_scene_root      = nullptr;
 
+template<typename T>
+struct IsStdVector : std::false_type {};
+
+template<typename T, typename Allocator>
+struct IsStdVector<std::vector<T, Allocator>> : std::true_type {};
+
 struct StaticCanvasSize {
     double x { 0.0 };
     double y { 0.0 };
     bool   valid { false };
 };
 
-enum class StaticValueKind {
-    Number,
-    Boolean,
-    VectorString,
-    NumberArray,
-};
-
-struct StaticValueState {
-    std::vector<double> values;
-    StaticValueKind     kind { StaticValueKind::Number };
-};
-
 template<typename T>
 bool TryParseNumber(std::string_view text, T& value);
 
 std::string ShaderValueToString(const ShaderValue& value);
+std::string FormatNumericVectorString(const std::vector<double>& values);
+
+std::string DescribeScriptValue(const WPScriptValue& value) {
+    switch (value.shape) {
+        case WPScriptValueShape::Boolean:
+            return value.boolean_value ? "bool(true)" : "bool(false)";
+        case WPScriptValueShape::String:
+            return std::string("string(\"") + value.string_value + "\")";
+        case WPScriptValueShape::NumberArray:
+            return std::string("array(") + FormatNumericVectorString(value.numeric_values) + ")";
+        case WPScriptValueShape::VectorString:
+            return std::string("vector(\"") + FormatNumericVectorString(value.numeric_values) + "\")";
+        case WPScriptValueShape::Number:
+        default: {
+            std::ostringstream out;
+            out << "number(" << (value.numeric_values.empty() ? 0.0 : value.numeric_values.front())
+                << ")";
+            return out.str();
+        }
+    }
+}
+
+std::string ShortenForLog(std::string_view text, size_t max_length = 160) {
+    if (text.size() <= max_length) return std::string(text);
+    return std::string(text.substr(0, max_length)) + "...";
+}
 
 std::optional<UserPropertyBinding> ResolveUserPropertyBinding(const nlohmann::json& json) {
     if (! json.is_object() || ! json.contains("user") || json.at("user").is_null()) {
@@ -169,49 +189,7 @@ bool TryParseNumberVectorString(const std::string& source, std::vector<double>& 
     return true;
 }
 
-bool TryReadStaticValueState(const nlohmann::json& node, StaticValueState& state) {
-    const auto& value_node = ResolvePropertyValueNode(node);
-
-    if (value_node.is_number()) {
-        state.kind   = StaticValueKind::Number;
-        state.values = { value_node.get<double>() };
-        return true;
-    }
-
-    if (value_node.is_boolean()) {
-        state.kind   = StaticValueKind::Boolean;
-        state.values = { value_node.get<bool>() ? 1.0 : 0.0 };
-        return true;
-    }
-
-    if (value_node.is_array()) {
-        std::vector<double> values;
-        values.reserve(value_node.size());
-        for (const auto& item : value_node) {
-            double component = 0.0;
-            if (! TryReadJsonNumber(item, component)) return false;
-            values.push_back(component);
-        }
-        if (values.empty()) return false;
-        state.kind   = StaticValueKind::NumberArray;
-        state.values = std::move(values);
-        return true;
-    }
-
-    if (value_node.is_string()) {
-        std::vector<double> values;
-        if (! TryParseNumberVectorString(value_node.get<std::string>(), values) || values.empty()) {
-            return false;
-        }
-        state.kind   = StaticValueKind::VectorString;
-        state.values = std::move(values);
-        return true;
-    }
-
-    return false;
-}
-
-std::string FormatStaticVectorString(const std::vector<double>& values) {
+std::string FormatNumericVectorString(const std::vector<double>& values) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(5);
     for (size_t i = 0; i < values.size(); i++) {
@@ -221,364 +199,148 @@ std::string FormatStaticVectorString(const std::vector<double>& values) {
     return out.str();
 }
 
-nlohmann::json SerializeStaticValueState(const StaticValueState& state) {
-    switch (state.kind) {
-        case StaticValueKind::Boolean:
-            return std::abs(state.values.front()) > 0.0001;
-        case StaticValueKind::VectorString:
-            return FormatStaticVectorString(state.values);
-        case StaticValueKind::NumberArray:
-            return nlohmann::json(state.values);
-        case StaticValueKind::Number:
-        default:
-            return state.values.front();
+std::optional<WPScriptValue> TryParseScriptValueJson(const nlohmann::json& value_node) {
+    if (value_node.is_number()) {
+        return WPScriptValue::Number(value_node.get<double>());
     }
+
+    if (value_node.is_boolean()) {
+        return WPScriptValue::Boolean(value_node.get<bool>());
+    }
+
+    if (value_node.is_array()) {
+        std::vector<double> values;
+        values.reserve(value_node.size());
+        for (const auto& item : value_node) {
+            double component = 0.0;
+            if (! TryReadJsonNumber(item, component)) return std::nullopt;
+            values.push_back(component);
+        }
+        if (values.empty()) return std::nullopt;
+        return WPScriptValue::NumberArray(std::move(values));
+    }
+
+    if (value_node.is_string()) {
+        const auto text = value_node.get<std::string>();
+
+        std::vector<double> values;
+        if (TryParseNumberVectorString(text, values) && ! values.empty()) {
+            return WPScriptValue::VectorString(std::move(values));
+        }
+
+        return WPScriptValue::String(text);
+    }
+
+    return std::nullopt;
 }
 
-std::string StripScriptComments(std::string_view source) {
-    enum class State {
-        Normal,
-        Slash,
-        LineComment,
-        BlockComment,
-        SingleQuote,
-        DoubleQuote,
-        Template,
-    };
-
-    std::string output;
-    output.reserve(source.size());
-
-    State state = State::Normal;
-    for (size_t i = 0; i < source.size(); i++) {
-        const char ch = source[i];
-
-        switch (state) {
-            case State::Normal:
-                if (ch == '/') {
-                    state = State::Slash;
-                } else {
-                    output.push_back(ch);
-                    if (ch == '\'') state = State::SingleQuote;
-                    else if (ch == '"') state = State::DoubleQuote;
-                    else if (ch == '`') state = State::Template;
-                }
-                break;
-            case State::Slash:
-                if (ch == '/') {
-                    state = State::LineComment;
-                } else if (ch == '*') {
-                    state = State::BlockComment;
-                } else {
-                    output.push_back('/');
-                    output.push_back(ch);
-                    state = State::Normal;
-                    if (ch == '\'') state = State::SingleQuote;
-                    else if (ch == '"') state = State::DoubleQuote;
-                    else if (ch == '`') state = State::Template;
-                }
-                break;
-            case State::LineComment:
-                if (ch == '\n') {
-                    output.push_back('\n');
-                    state = State::Normal;
-                }
-                break;
-            case State::BlockComment:
-                if (ch == '*' && i + 1 < source.size() && source[i + 1] == '/') {
-                    i++;
-                    state = State::Normal;
-                } else if (ch == '\n') {
-                    output.push_back('\n');
-                }
-                break;
-            case State::SingleQuote:
-                output.push_back(ch);
-                if (ch == '\\' && i + 1 < source.size()) {
-                    output.push_back(source[++i]);
-                } else if (ch == '\'') {
-                    state = State::Normal;
-                }
-                break;
-            case State::DoubleQuote:
-                output.push_back(ch);
-                if (ch == '\\' && i + 1 < source.size()) {
-                    output.push_back(source[++i]);
-                } else if (ch == '"') {
-                    state = State::Normal;
-                }
-                break;
-            case State::Template:
-                output.push_back(ch);
-                if (ch == '\\' && i + 1 < source.size()) {
-                    output.push_back(source[++i]);
-                } else if (ch == '`') {
-                    state = State::Normal;
-                }
-                break;
-        }
-    }
-
-    if (state == State::Slash) output.push_back('/');
-    return output;
+std::optional<WPScriptValue> TryReadScriptValueState(const nlohmann::json& node) {
+    return TryParseScriptValueJson(ResolvePropertyValueNode(node));
 }
 
-class StaticExpressionParser {
-public:
-    StaticExpressionParser(std::string_view expression,
-                           const std::unordered_map<std::string, double>& script_properties,
-                           const StaticCanvasSize&                        canvas_size,
-                           const StaticValueState&                        current_value)
-        : m_expression(expression),
-          m_script_properties(script_properties),
-          m_canvas_size(canvas_size),
-          m_current_value(current_value) {}
-
-    std::optional<double> Parse() {
-        auto value = ParseAddSub();
-        SkipSpace();
-        if (! value.has_value() || m_pos != m_expression.size()) return std::nullopt;
-        return value;
-    }
-
-private:
-    std::optional<double> ParseAddSub() {
-        auto lhs = ParseMulDiv();
-        while (lhs.has_value()) {
-            SkipSpace();
-            if (Consume('+')) {
-                auto rhs = ParseMulDiv();
-                if (! rhs.has_value()) return std::nullopt;
-                *lhs += *rhs;
-            } else if (Consume('-')) {
-                auto rhs = ParseMulDiv();
-                if (! rhs.has_value()) return std::nullopt;
-                *lhs -= *rhs;
-            } else {
-                break;
-            }
-        }
-        return lhs;
-    }
-
-    std::optional<double> ParseMulDiv() {
-        auto lhs = ParseUnary();
-        while (lhs.has_value()) {
-            SkipSpace();
-            if (Consume('*')) {
-                auto rhs = ParseUnary();
-                if (! rhs.has_value()) return std::nullopt;
-                *lhs *= *rhs;
-            } else if (Consume('/')) {
-                auto rhs = ParseUnary();
-                if (! rhs.has_value() || std::abs(*rhs) < 0.000001) return std::nullopt;
-                *lhs /= *rhs;
-            } else {
-                break;
-            }
-        }
-        return lhs;
-    }
-
-    std::optional<double> ParseUnary() {
-        SkipSpace();
-        if (Consume('+')) return ParseUnary();
-        if (Consume('-')) {
-            auto value = ParseUnary();
-            if (! value.has_value()) return std::nullopt;
-            return -*value;
-        }
-        return ParsePrimary();
-    }
-
-    std::optional<double> ParsePrimary() {
-        SkipSpace();
-        if (Consume('(')) {
-            auto value = ParseAddSub();
-            SkipSpace();
-            if (! value.has_value() || ! Consume(')')) return std::nullopt;
-            return value;
-        }
-
-        if (const auto number = ParseNumber(); number.has_value()) return number;
-        if (const auto identifier = ParseIdentifierPath(); identifier.has_value()) {
-            return ResolveIdentifier(*identifier);
-        }
-        return std::nullopt;
-    }
-
-    std::optional<double> ParseNumber() {
-        SkipSpace();
-        const auto remaining = std::string(m_expression.substr(m_pos));
-        if (remaining.empty()) return std::nullopt;
-
-        char*  endptr = nullptr;
-        double value = std::strtod(remaining.c_str(), &endptr);
-        if (endptr == nullptr || endptr == remaining.c_str()) return std::nullopt;
-
-        m_pos += static_cast<size_t>(endptr - remaining.c_str());
-        return value;
-    }
-
-    std::optional<std::string> ParseIdentifierPath() {
-        SkipSpace();
-        if (m_pos >= m_expression.size() || ! IsIdentifierStart(m_expression[m_pos])) {
-            return std::nullopt;
-        }
-
-        const auto start = m_pos;
-        m_pos++;
-        while (m_pos < m_expression.size() && IsIdentifierChar(m_expression[m_pos])) {
-            m_pos++;
-        }
-
-        while (m_pos < m_expression.size() && m_expression[m_pos] == '.') {
-            m_pos++;
-            if (m_pos >= m_expression.size() || ! IsIdentifierStart(m_expression[m_pos])) {
-                return std::nullopt;
-            }
-            m_pos++;
-            while (m_pos < m_expression.size() && IsIdentifierChar(m_expression[m_pos])) {
-                m_pos++;
-            }
-        }
-
-        return std::string(m_expression.substr(start, m_pos - start));
-    }
-
-    std::optional<double> ResolveIdentifier(const std::string& identifier) const {
-        if (identifier == "true") return 1.0;
-        if (identifier == "false") return 0.0;
-
-        if (identifier == "engine.canvasSize.x") return m_canvas_size.x;
-        if (identifier == "engine.canvasSize.y") return m_canvas_size.y;
-
-        if (identifier == "value") {
-            if (m_current_value.values.size() != 1) return std::nullopt;
-            return m_current_value.values[0];
-        }
-
-        if (identifier == "value.x") return ResolveValueComponent(0);
-        if (identifier == "value.y") return ResolveValueComponent(1);
-        if (identifier == "value.z") return ResolveValueComponent(2);
-        if (identifier == "value.w") return ResolveValueComponent(3);
-
-        constexpr std::string_view prefix = "scriptProperties.";
-        if (identifier.rfind(prefix.data(), 0) == 0) {
-            const auto it = m_script_properties.find(identifier.substr(prefix.size()));
-            if (it == m_script_properties.end()) return std::nullopt;
-            return it->second;
-        }
-
-        return std::nullopt;
-    }
-
-    std::optional<double> ResolveValueComponent(size_t index) const {
-        if (index >= m_current_value.values.size()) return std::nullopt;
-        return m_current_value.values[index];
-    }
-
-    void SkipSpace() {
-        while (m_pos < m_expression.size() &&
-               std::isspace(static_cast<unsigned char>(m_expression[m_pos]))) {
-            m_pos++;
-        }
-    }
-
-    bool Consume(char ch) {
-        SkipSpace();
-        if (m_pos >= m_expression.size() || m_expression[m_pos] != ch) return false;
-        m_pos++;
-        return true;
-    }
-
-    static bool IsIdentifierStart(char ch) {
-        return std::isalpha(static_cast<unsigned char>(ch)) || ch == '_';
-    }
-
-    static bool IsIdentifierChar(char ch) {
-        return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
-    }
-
-    std::string_view                          m_expression;
-    const std::unordered_map<std::string, double>& m_script_properties;
-    const StaticCanvasSize&                   m_canvas_size;
-    const StaticValueState&                   m_current_value;
-    size_t                                    m_pos { 0 };
-};
-
-bool TryResolveScriptPropertyNumber(const nlohmann::json& json, double& value) {
+std::optional<WPScriptValue> TryResolveScriptPropertyValue(const nlohmann::json& json) {
     if (const auto overridden = TryResolveUserPropertyOverrideJson(json); overridden.has_value()) {
-        return TryReadJsonNumber(*overridden, value);
+        const auto parsed = TryParseScriptValueJson(*overridden);
+        if (parsed.has_value()) {
+            LOG_INFO("SceneScript: resolved scriptproperty override from user binding -> %s",
+                     DescribeScriptValue(*parsed).c_str());
+        } else {
+            LOG_ERROR("SceneScript: failed to parse scriptproperty override json: %s",
+                      overridden->dump().c_str());
+        }
+        return parsed;
     }
 
-    return TryReadJsonNumber(ResolvePropertyValueNode(json), value);
-}
-
-bool ApplyScriptAssignment(std::string_view target, double result, StaticValueState& value) {
-    if (target.empty()) {
-        if (value.values.size() != 1) return false;
-        value.values[0] = result;
-        return true;
+    const auto parsed = TryReadScriptValueState(json);
+    if (parsed.has_value()) {
+        LOG_INFO("SceneScript: resolved scriptproperty default -> %s",
+                 DescribeScriptValue(*parsed).c_str());
+    } else {
+        LOG_ERROR("SceneScript: failed to parse scriptproperty default json: %s",
+                  json.dump().c_str());
     }
-
-    size_t index = 0;
-    if (target == "x") index = 0;
-    else if (target == "y") index = 1;
-    else if (target == "z") index = 2;
-    else if (target == "w") index = 3;
-    else return false;
-
-    if (index >= value.values.size()) return false;
-    value.values[index] = result;
-    return true;
+    return parsed;
 }
 
-std::optional<nlohmann::json> TryResolveStaticScriptValueNode(const nlohmann::json& node) {
-    if (! node.is_object() || ! node.contains("script") || ! node.contains("scriptproperties")) {
+nlohmann::json SerializeScriptValue(const WPScriptValue& value) {
+    switch (value.shape) {
+        case WPScriptValueShape::Boolean:
+            return value.boolean_value;
+        case WPScriptValueShape::String:
+            return value.string_value;
+        case WPScriptValueShape::NumberArray:
+            return nlohmann::json(value.numeric_values);
+        case WPScriptValueShape::VectorString:
+            return FormatNumericVectorString(value.numeric_values);
+        case WPScriptValueShape::Number:
+        default:
+            return value.numeric_values.empty() ? 0.0 : value.numeric_values.front();
+    }
+}
+
+WPScriptRuntime& GetScriptRuntime() {
+    thread_local WPScriptRuntime runtime;
+    return runtime;
+}
+
+std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& node) {
+    if (! node.is_object() || ! node.contains("script") || ! node.at("script").is_string()) {
         return std::nullopt;
     }
     if (ResolveUserPropertyBinding(node).has_value()) return std::nullopt;
-    if (g_json_scene_root == nullptr) return std::nullopt;
 
-    const auto canvas_size = TryReadCanvasSize(*g_json_scene_root);
-    if (! canvas_size.has_value() || ! canvas_size->valid || ! node.at("script").is_string() ||
-        ! node.at("scriptproperties").is_object()) {
+    LOG_INFO("SceneScript: evaluating script node, script=%s",
+             ShortenForLog(node.at("script").get<std::string>()).c_str());
+
+    const auto current_value = TryReadScriptValueState(node);
+    if (! current_value.has_value()) {
+        LOG_ERROR("SceneScript: failed to parse current value for script node: %s",
+                  node.dump().c_str());
+        return std::nullopt;
+    }
+    LOG_INFO("SceneScript: current value -> %s", DescribeScriptValue(*current_value).c_str());
+
+    WPScriptEvaluationContext context;
+    if (g_json_scene_root != nullptr) {
+        if (const auto canvas_size = TryReadCanvasSize(*g_json_scene_root);
+            canvas_size.has_value() && canvas_size->valid) {
+            context.canvas_size = { canvas_size->x, canvas_size->y };
+        }
+    }
+    LOG_INFO("SceneScript: canvas size -> (%.3f, %.3f)",
+             context.canvas_size[0],
+             context.canvas_size[1]);
+
+    if (node.contains("scriptproperties") && ! node.at("scriptproperties").is_null()) {
+        if (! node.at("scriptproperties").is_object()) return std::nullopt;
+        for (const auto& [name, property_node] : node.at("scriptproperties").items()) {
+            const auto property_value = TryResolveScriptPropertyValue(property_node);
+            if (! property_value.has_value()) {
+                LOG_ERROR("SceneScript: failed to resolve scriptproperty '%s'", name.c_str());
+                return std::nullopt;
+            }
+            context.script_properties.emplace(name, *property_value);
+            LOG_INFO("SceneScript: scriptproperty %s -> %s",
+                     name.c_str(),
+                     DescribeScriptValue(*property_value).c_str());
+        }
+    }
+
+    auto& runtime = GetScriptRuntime();
+    if (! runtime.isReady()) {
+        LOG_ERROR("SceneScript: QuickJS runtime is not ready");
         return std::nullopt;
     }
 
-    StaticValueState value_state;
-    if (! TryReadStaticValueState(node, value_state) || value_state.values.empty()) {
+    const auto evaluated =
+        runtime.evaluate(node.at("script").get<std::string>(), *current_value, context);
+    if (! evaluated.has_value()) {
+        LOG_ERROR("SceneScript: runtime evaluation failed, falling back to raw value");
         return std::nullopt;
     }
+    LOG_INFO("SceneScript: runtime result -> %s", DescribeScriptValue(*evaluated).c_str());
 
-    std::unordered_map<std::string, double> script_properties;
-    for (const auto& [name, property_node] : node.at("scriptproperties").items()) {
-        double property_value = 0.0;
-        if (! TryResolveScriptPropertyNumber(property_node, property_value)) return std::nullopt;
-        script_properties.emplace(name, property_value);
-    }
-
-    const auto stripped_script = StripScriptComments(node.at("script").get<std::string>());
-    const std::regex assignment_regex(R"(\bvalue(?:\.(x|y|z|w))?\s*=\s*([^;]+);)");
-
-    bool updated = false;
-    for (std::sregex_iterator it(stripped_script.begin(), stripped_script.end(), assignment_regex),
-         end;
-         it != end;
-         ++it) {
-        const auto target = (*it)[1].matched ? (*it)[1].str() : std::string {};
-        const auto expression = (*it)[2].str();
-
-        StaticExpressionParser parser(expression, script_properties, *canvas_size, value_state);
-        const auto evaluated = parser.Parse();
-        if (! evaluated.has_value()) return std::nullopt;
-        if (! ApplyScriptAssignment(target, *evaluated, value_state)) return std::nullopt;
-        updated = true;
-    }
-
-    if (! updated) return std::nullopt;
-    return SerializeStaticValueState(value_state);
+    return SerializeScriptValue(*evaluated);
 }
 
 template<>
@@ -652,6 +414,10 @@ bool TryConvertUserPropertyValue(const UserPropertyValue& property, T& value) {
 template<typename T>
 bool TryConvertUserPropertyValue(const UserPropertyValue& property, std::vector<T>& value) {
     if (const auto* shader_value = std::get_if<ShaderValue>(&property)) {
+        if (shader_value->size() == 1 && !value.empty()) {
+            std::fill(value.begin(), value.end(), (T)(*shader_value)[0]);
+            return true;
+        }
         value.resize(shader_value->size());
         for (size_t i = 0; i < shader_value->size(); i++) {
             value[i] = (T)(*shader_value)[i];
@@ -667,6 +433,10 @@ bool TryConvertUserPropertyValue(const UserPropertyValue& property, std::vector<
 template<typename T, std::size_t N>
 bool TryConvertUserPropertyValue(const UserPropertyValue& property, std::array<T, N>& value) {
     if (const auto* shader_value = std::get_if<ShaderValue>(&property)) {
+        if (shader_value->size() == 1) {
+            value.fill((T)(*shader_value)[0]);
+            return true;
+        }
         if (shader_value->size() != N) return false;
         for (size_t i = 0; i < N; i++) {
             value[i] = (T)(*shader_value)[i];
@@ -691,10 +461,19 @@ bool TryGetUserPropertyOverride(const nlohmann::json& json, T& value) {
 
     if (! binding->condition.empty() &&
         ! MatchesUserPropertyCondition(*property, binding->condition)) {
+        LOG_INFO("SceneScript: user binding '%s' present but condition '%s' did not match",
+                 binding->name.c_str(),
+                 binding->condition.c_str());
         return false;
     }
 
-    return TryConvertUserPropertyValue(*property, value);
+    const bool converted = TryConvertUserPropertyValue(*property, value);
+    if (converted) {
+        LOG_INFO("SceneScript: applied direct user binding '%s'", binding->name.c_str());
+    } else {
+        LOG_ERROR("SceneScript: failed to convert direct user binding '%s'", binding->name.c_str());
+    }
+    return converted;
 }
 } // namespace
 
@@ -714,22 +493,39 @@ inline bool _GetJsonValue(const nlohmann::json&                  json,
                           typename utils::is_std_array<T>::type& value) {
     if (TryGetUserPropertyOverride(json, value)) return true;
 
-    if (const auto scripted = TryResolveStaticScriptValueNode(json); scripted.has_value()) {
-        const auto& njson = *scripted;
-        if (njson.is_number()) {
-            value = { njson.get<typename T::value_type>() };
-            return true;
-        }
-
-        std::string strvalue = njson.get<std::string>();
-        return utils::StrToArray::Convert(strvalue, value);
+    const auto scripted = TryResolveScriptValueNode(json);
+    const auto& njson   = scripted.has_value() ? *scripted : ResolvePropertyValueNode(json);
+    if (json.is_object() && json.contains("script") && ! scripted.has_value()) {
+        LOG_INFO("SceneScript: script node fell back to raw array/string value");
     }
 
-    using Tv          = typename T::value_type;
-    const auto& njson = ResolvePropertyValueNode(json);
+    using Tv = typename T::value_type;
     if (njson.is_number()) {
         value = { njson.get<Tv>() };
         return true;
+    }
+
+    if (njson.is_array()) {
+        if constexpr (IsStdVector<T>::value) {
+            value.clear();
+            value.reserve(njson.size());
+            for (const auto& item : njson) {
+                double component = 0.0;
+                if (! TryReadJsonNumber(item, component)) return false;
+                value.push_back((Tv)component);
+            }
+            return true;
+        } else {
+            if (njson.size() != std::tuple_size_v<T>) return false;
+
+            size_t index = 0;
+            for (const auto& item : njson) {
+                double component = 0.0;
+                if (! TryReadJsonNumber(item, component)) return false;
+                value[index++] = (Tv)component;
+            }
+            return true;
+        }
     }
 
     std::string strvalue = njson.get<std::string>();
@@ -740,9 +536,12 @@ template<typename T>
 inline bool _GetJsonValue(const nlohmann::json& json, T& value) {
     if (TryGetUserPropertyOverride(json, value)) return true;
 
-    if (const auto scripted = TryResolveStaticScriptValueNode(json); scripted.has_value()) {
+    if (const auto scripted = TryResolveScriptValueNode(json); scripted.has_value()) {
         value = scripted->get<T>();
         return true;
+    }
+    if (json.is_object() && json.contains("script")) {
+        LOG_INFO("SceneScript: script node fell back to raw scalar/string value");
     }
 
     value = ResolvePropertyValueNode(json).get<T>();

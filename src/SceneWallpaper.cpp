@@ -380,6 +380,7 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             } else {
                 m_user_properties.clear();
             }
+            CALL_MHANDLER_CMD(LOAD_SCENE, msg);
         } else if (property == PROPERTY_SPEED) {
             float speed { 1.0f };
             if (msg->findFloat("value", &speed)) {

@@ -34,6 +34,7 @@ add_subdirectory(RenderGraph)
 add_library(
   ${PROJECT_NAME} STATIC
   WPJson.cpp
+  WPScriptRuntime.cpp
   WPPkgFs.cpp
   Type.cpp
   wpscene/WPImageObject.cpp
@@ -66,7 +67,7 @@ set(InteralLib
 target_link_libraries(
   ${PROJECT_NAME}
   PUBLIC wpUtils
-  PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES}
+  PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES} wpquickjs
           ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 
 target_include_directories(${PROJECT_NAME} PUBLIC . Swapchain)
