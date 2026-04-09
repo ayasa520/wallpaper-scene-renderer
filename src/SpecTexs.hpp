@@ -50,6 +50,7 @@ constexpr std::string_view WE_IN_TEXCOORDC3 { "a_TexCoordC3" };
 constexpr std::string_view WE_IN_TEXCOORDC4 { "a_TexCoordC4" };
 constexpr std::string_view WE_CB_THICK_FORMAT { "THICKFORMAT" };
 constexpr std::string_view WE_PRENDER_ROPE { "PRENDER_ROPE" };
+constexpr std::string_view WE_PRENDER_ROPE_SUBDIVISION { "PRENDER_ROPE_SUBDIVISION" };
 
 constexpr std::string_view G_M { "g_ModelMatrix" };
 constexpr std::string_view G_VP { "g_ViewProjectionMatrix" };

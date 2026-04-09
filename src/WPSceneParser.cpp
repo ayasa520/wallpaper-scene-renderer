@@ -173,7 +173,11 @@ void SetParticleMesh(SceneMesh& mesh, const wpscene::Particle& particle, uint32_
 
 void SetRopeParticleMesh(SceneMesh& mesh, const wpscene::Particle& particle, uint32_t count,
                          bool thick_format) {
-    (void)particle;
+    const float subdivision_value =
+        particle.renderers.empty() ? 1.0f : std::max(1.0f, particle.renderers.at(0).subdivision);
+    const uint32_t subdivision =
+        std::max(1u, static_cast<uint32_t>(std::lround(subdivision_value)));
+    const uint32_t quad_count = count > 1 ? (count - 1) * subdivision : count;
     std::vector<SceneVertexArray::SceneVertexAttribute> attrs {
         { WE_IN_POSITIONVEC4.data(), VertexType::FLOAT4 },
         { WE_IN_TEXCOORDVEC4.data(), VertexType::FLOAT4 },
@@ -188,10 +192,11 @@ void SetRopeParticleMesh(SceneMesh& mesh, const wpscene::Particle& particle, uin
         attrs.push_back({ WE_IN_TEXCOORDC3.data(), VertexType::FLOAT4 });
     }
     attrs.push_back({ WE_IN_COLOR.data(), VertexType::FLOAT4 });
-    mesh.AddVertexArray(SceneVertexArray(attrs, count * 4));
-    mesh.AddIndexArray(SceneIndexArray(count));
+    mesh.AddVertexArray(SceneVertexArray(attrs, quad_count * 4));
+    mesh.AddIndexArray(SceneIndexArray(quad_count));
     mesh.GetVertexArray(0).SetOption(WE_PRENDER_ROPE, true);
     mesh.GetVertexArray(0).SetOption(WE_CB_THICK_FORMAT, thick_format);
+    mesh.GetVertexArray(0).SetFloatOption(WE_PRENDER_ROPE_SUBDIVISION, subdivision_value);
 }
 
 ParticleAnimationMode ToAnimMode(const std::string& str) {
@@ -1266,6 +1271,9 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         shaderInfo.combos["THICKFORMAT"]   = "1";
         shaderInfo.combos["TRAILRENDERER"] = "1";
     }
+    if (render_rope) {
+        shaderInfo.combos["THICKFORMAT"] = "1";
+    }
 
     if (! particle_obj.flags[wpscene::Particle::FlagEnum::spritenoframeblending]) {
         shaderInfo.combos["SPRITESHEETBLEND"] = "1";
@@ -1296,7 +1304,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     bool  hasSprite          = material.hasSprite;
     (void)hasSprite;
 
-    bool thick_format = material.hasSprite || hastrail;
+    bool thick_format = render_rope || material.hasSprite || hastrail;
     {
         u32 mesh_maxcount = maxcount * (u32)child_ptr.max_instancecount;
         if (render_rope)
