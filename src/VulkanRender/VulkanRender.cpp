@@ -12,6 +12,7 @@
 #include "Vulkan/Device.hpp"
 #include "Vulkan/TextureCache.hpp"
 #include "Vulkan/Swapchain.hpp"
+#include "Vulkan/VideoTextureCache.hpp"
 #include "Vulkan/VulkanExSwapchain.hpp"
 
 #include "VulkanPass.hpp"
@@ -287,6 +288,8 @@ void VulkanRender::Impl::DestroyRenderingResource(RenderingResources& rr) {}
 void VulkanRender::Impl::drawFrame(Scene& scene) {
     if (! (m_inited && m_pass_loaded)) return;
 
+    m_device->video_tex_cache().Poll();
+
         // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);
 
 #if ENABLE_RENDERDOC_API
@@ -333,6 +336,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     });
     m_dyn_buf->recordUpload(rr.command);
+    m_device->video_tex_cache().RecordUploads(rr.command);
     for (auto* p : m_passes) {
         if (p->prepared()) {
             p->execute(*m_device, rr);
@@ -380,6 +384,7 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     });
     m_dyn_buf->recordUpload(rr.command);
+    m_device->video_tex_cache().RecordUploads(rr.command);
 
     for (auto* p : m_passes) {
         if (p->prepared()) {
@@ -492,6 +497,7 @@ void VulkanRender::Impl::clearLastRenderGraph() {
     }
     m_passes.clear();
     m_device->tex_cache().Clear();
+    m_device->video_tex_cache().Clear();
 
     m_vertex_buf->destroy();
     m_dyn_buf->destroy();

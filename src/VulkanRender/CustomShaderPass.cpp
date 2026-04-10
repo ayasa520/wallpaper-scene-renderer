@@ -4,6 +4,7 @@
 
 #include "SpecTexs.hpp"
 #include "Vulkan/Shader.hpp"
+#include "Vulkan/VideoTextureCache.hpp"
 #include "Utils/Logging.h"
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
@@ -117,7 +118,12 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         } else {
             auto image = scene.imageParser->Parse(tex_name);
             if (image) {
-                img_slots = device.tex_cache().CreateTex(*image);
+                if (scene.textures.count(tex_name) != 0 && scene.textures.at(tex_name).isVideo) {
+                    img_slots = device.video_tex_cache().Acquire(
+                        tex_name, scene.textures.at(tex_name), *image);
+                } else {
+                    img_slots = device.tex_cache().CreateTex(*image);
+                }
             } else {
                 LOG_ERROR("parse tex \"%s\" failed", tex_name.c_str());
             }

@@ -63,8 +63,12 @@ bool DecodeImageContainerBytes(const char* src, int size, int& width, int& heigh
 }
 
 bool IsVideoImageContainer(const ImageHeader& header) {
-    const auto it = header.extraHeader.find("texb_is_video_mp4");
-    return it != header.extraHeader.end() && it->second.val == 1;
+    return header.isVideoTexture;
+}
+
+bool LooksLikeMp4Payload(const char* data, size_t size) {
+    if (data == nullptr || size < 12) return false;
+    return std::memcmp(data + 4, "ftyp", 4) == 0;
 }
 
 bool HasEmbeddedImagePayload(const ImageHeader& header) {
@@ -141,7 +145,7 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
         header.type = static_cast<ImageType>(file.ReadInt32());
     }
     if (header.extraHeader["texb"].val >= 4) {
-        header.extraHeader["texb_is_video_mp4"].val = file.ReadInt32();
+        header.extraHeader["texb_reserved"].val = file.ReadInt32();
     }
 }
 
@@ -175,7 +179,7 @@ bool ReadString(fs::IBinaryStream& file, std::string& value) {
 std::string GetTextureHeaderCachePath(std::string_view cache_namespace, std::string_view name) {
     std::string key;
     key.reserve(cache_namespace.size() + name.size() + 16);
-    key.append("tex-header-v1\n");
+    key.append("tex-header-v2\n");
     key.append(cache_namespace);
     key.push_back('\n');
     key.append(name);
@@ -250,7 +254,7 @@ void SaveSpriteAnimation(const SpriteAnimation& animation, fs::IBinaryStreamW& f
 }
 
 bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinaryStream& file) {
-    if (ReadVersion("WTHD", file) != 1) return false;
+    if (ReadVersion("WTHD", file) != 2) return false;
     if (! ReadPod(file, file_size)) return false;
 
     if (! ReadPod(file, header.width)) return false;
@@ -259,6 +263,7 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
     if (! ReadPod(file, header.mapHeight)) return false;
     if (! ReadPod(file, header.mipmap_larger)) return false;
     if (! ReadPod(file, header.mipmap_pow2)) return false;
+    if (! ReadPod(file, header.isVideoTexture)) return false;
 
     int32_t type = 0;
     int32_t format = 0;
@@ -285,11 +290,15 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
 
     if (! LoadExtraHeaderMap(header.extraHeader, file)) return false;
     if (! LoadSpriteAnimation(header.spriteAnim, file)) return false;
+    if (! header.isVideoTexture) {
+        const auto it = header.extraHeader.find("texb_is_video_mp4");
+        header.isVideoTexture = it != header.extraHeader.end() && it->second.val == 1;
+    }
     return true;
 }
 
 void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IBinaryStreamW& file) {
-    WriteVersion("WTHD", file, 1);
+    WriteVersion("WTHD", file, 2);
     WritePod(file, file_size);
 
     WritePod(file, header.width);
@@ -298,6 +307,7 @@ void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IB
     WritePod(file, header.mapHeight);
     WritePod(file, header.mipmap_larger);
     WritePod(file, header.mipmap_pow2);
+    WritePod(file, header.isVideoTexture);
 
     const auto type       = static_cast<int32_t>(header.type);
     const auto format     = static_cast<int32_t>(header.format);
@@ -396,10 +406,33 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
         }
     } else {
         i32 mipmap_count = file.ReadInt32();
-        (void)mipmap_count;
-        i32 width  = file.ReadInt32();
-        i32 height = file.ReadInt32();
-        SetHeaderPow2(header, width, height);
+        for (i32 i_mipmap = 0; i_mipmap < mipmap_count; i_mipmap++) {
+            i32 width  = file.ReadInt32();
+            i32 height = file.ReadInt32();
+            if (i_mipmap == 0) SetHeaderPow2(header, width, height);
+
+            bool    LZ4_compressed    = false;
+            int32_t decompressed_size = 0;
+            if (header.extraHeader["texb"].val > 1) {
+                LZ4_compressed    = file.ReadInt32() == 1;
+                decompressed_size = file.ReadInt32();
+            }
+            (void)decompressed_size;
+
+            const i32 src_size = file.ReadInt32();
+            if (src_size <= 0) continue;
+
+            constexpr usize probe_size = 16;
+            const auto      to_read = static_cast<usize>(std::min<i32>(src_size, probe_size));
+            char            probe[probe_size] {};
+            const auto      read = file.Read(probe, to_read);
+            if (i_mipmap == 0 && !LZ4_compressed && header.type == ImageType::UNKNOWN &&
+                LooksLikeMp4Payload(probe, read)) {
+                header.isVideoTexture = true;
+                header.extraHeader["texb_is_video_mp4"].val = 1;
+            }
+            if (src_size > static_cast<i32>(read)) file.SeekCur(src_size - static_cast<i32>(read));
+        }
     }
     return header;
 }
@@ -469,6 +502,11 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                     delete[] result;
                     return nullptr;
                 }
+            }
+            if (i_image == 0 && i_mipmap == 0 && img.header.type == ImageType::UNKNOWN &&
+                LooksLikeMp4Payload(result, static_cast<size_t>(src_size))) {
+                img.header.isVideoTexture = true;
+                img.header.extraHeader["texb_is_video_mp4"].val = 1;
             }
             // TEXB0003/TEXB0004 textures may store an image container payload instead of raw RGBA
             // bytes.

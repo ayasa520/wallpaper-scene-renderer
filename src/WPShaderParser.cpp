@@ -42,8 +42,13 @@ static constexpr const char* pre_shader_code = R"(#version 150
 #define CAST4(x) (vec4(x))
 #define CAST3X3(x) (mat3(x))
 
-#define texSample2D texture
-#define texSample2DLod textureLod
+vec4 texSample2D(sampler2D tex, vec2 uv) { return texture(tex, uv); }
+vec4 texSample2D(sampler2D tex, vec3 uv) { return texture(tex, uv.xy); }
+vec4 texSample2D(sampler2D tex, vec4 uv) { return texture(tex, uv.xy); }
+
+vec4 texSample2DLod(sampler2D tex, vec2 uv, float lod) { return textureLod(tex, uv, lod); }
+vec4 texSample2DLod(sampler2D tex, vec3 uv, float lod) { return textureLod(tex, uv.xy, lod); }
+vec4 texSample2DLod(sampler2D tex, vec4 uv, float lod) { return textureLod(tex, uv.xy, lod); }
 #define mul(x, y) ((y) * (x))
 #define frac fract
 #define atan2 atan
@@ -454,6 +459,24 @@ inline bool TryParseSimpleTypedAssignment(std::string_view statement, std::strin
     return ! rhs.empty();
 }
 
+inline bool TryParseConstructorCall(std::string_view source, std::string_view& ctor,
+                                    std::string_view& args) {
+    source = TrimWhitespace(source);
+    if (source.empty() || ! IsIdentifierStart(source.front())) return false;
+
+    const auto ctor_end = SkipIdentifier(source, 0);
+    ctor                = source.substr(0, ctor_end);
+
+    auto pos = SkipWhitespace(source, ctor_end);
+    if (pos >= source.size() || source[pos] != '(') return false;
+
+    const auto close_pos = SkipBalanced(source, pos, '(', ')');
+    if (close_pos == std::string::npos || close_pos != source.size()) return false;
+
+    args = source.substr(pos + 1, close_pos - pos - 2);
+    return true;
+}
+
 inline size_t FindStatementTerminator(std::string_view text, size_t pos) {
     bool in_block_comment { false };
     bool in_string { false };
@@ -629,18 +652,42 @@ inline std::string RewriteSimpleShaderStatements(std::string_view text) {
         }
 
         std::string replacement;
-        if (parsed_type == "float" && lhs == "pointer" &&
-            RemoveAsciiWhitespace(rhs) == "g_PointerPosition.xy*u_pointerSpeed") {
-            replacement = "vec2 pointer = g_PointerPosition.xy * u_pointerSpeed;";
+        if (parsed_type == "float") {
+            const auto rhs_trim = TrimWhitespace(rhs);
+            const auto star_pos = rhs_trim.find('*');
+            if (star_pos != std::string_view::npos &&
+                rhs_trim.find('*', star_pos + 1) == std::string_view::npos) {
+                const auto left  = TrimWhitespace(rhs_trim.substr(0, star_pos));
+                const auto right = TrimWhitespace(rhs_trim.substr(star_pos + 1));
+
+                std::string_view right_ident;
+                if (TryParseStandaloneIdentifier(right, right_ident) &&
+                    (left == "g_PointerPosition" || left == "g_PointerPosition.xy")) {
+                    replacement = "vec2 " + std::string(lhs) + " = " + std::string(left) +
+                                  " * " + std::string(right_ident) + ";";
+                }
+            }
         } else if (parsed_type == "vec2") {
             std::string_view rhs_ident;
             if (TryParseStandaloneIdentifier(rhs, rhs_ident)) {
                 replacement = "vec2 " + std::string(lhs) + " = " + std::string(rhs_ident) + ".xy;";
+            } else {
+                std::string_view ctor;
+                std::string_view args;
+                if (TryParseConstructorCall(rhs, ctor, args) && (ctor == "vec3" || ctor == "vec4")) {
+                    replacement = "vec2 " + std::string(lhs) + " = vec2(" + std::string(args) + ");";
+                }
             }
         } else if (parsed_type == "vec3") {
             std::string_view rhs_ident;
             if (TryParseStandaloneIdentifier(rhs, rhs_ident)) {
                 replacement = "vec3 " + std::string(lhs) + " = " + std::string(rhs_ident) + ".xyz;";
+            } else {
+                std::string_view ctor;
+                std::string_view args;
+                if (TryParseConstructorCall(rhs, ctor, args) && ctor == "vec4") {
+                    replacement = "vec3 " + std::string(lhs) + " = vec3(" + std::string(args) + ");";
+                }
             }
         }
 
@@ -1077,6 +1124,128 @@ inline std::string RepairMissingStringQuotes(std::string_view source) {
     return repaired;
 }
 
+inline bool IsIdentChar(char ch) {
+    return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+}
+
+inline std::optional<size_t> FindMatchingParen(std::string_view source, size_t open_pos) {
+    if (open_pos >= source.size() || source[open_pos] != '(') return std::nullopt;
+
+    int depth { 1 };
+    for (size_t i = open_pos + 1; i < source.size(); i++) {
+        if (source[i] == '(') depth++;
+        else if (source[i] == ')') {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return std::nullopt;
+}
+
+inline std::string TrimCopy(std::string_view value) {
+    size_t begin = 0;
+    size_t end   = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) begin++;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) end--;
+    return std::string(value.substr(begin, end - begin));
+}
+
+inline std::vector<std::string_view> SplitTopLevelArgs(std::string_view args) {
+    std::vector<std::string_view> result;
+    size_t                        begin { 0 };
+    int                           paren_depth { 0 };
+    int                           bracket_depth { 0 };
+    int                           brace_depth { 0 };
+
+    for (size_t i = 0; i < args.size(); i++) {
+        switch (args[i]) {
+        case '(': paren_depth++; break;
+        case ')': paren_depth--; break;
+        case '[': bracket_depth++; break;
+        case ']': bracket_depth--; break;
+        case '{': brace_depth++; break;
+        case '}': brace_depth--; break;
+        case ',':
+            if (paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+                result.push_back(args.substr(begin, i - begin));
+                begin = i + 1;
+            }
+            break;
+        default: break;
+        }
+    }
+
+    result.push_back(args.substr(begin));
+    return result;
+}
+
+inline std::string TrimOverlongVectorConstructors(std::string_view source) {
+    std::string current(source);
+
+    for (;;) {
+        bool        changed { false };
+        std::string next;
+        next.reserve(current.size());
+
+        size_t pos = 0;
+        while (pos < current.size()) {
+            size_t vec2_pos = current.find("vec2(", pos);
+            size_t vec3_pos = current.find("vec3(", pos);
+
+            size_t match_pos = std::string::npos;
+            bool   is_vec2 { false };
+            if (vec2_pos == std::string::npos) {
+                match_pos = vec3_pos;
+            } else if (vec3_pos == std::string::npos || vec2_pos < vec3_pos) {
+                match_pos = vec2_pos;
+                is_vec2   = true;
+            } else {
+                match_pos = vec3_pos;
+            }
+
+            if (match_pos == std::string::npos) {
+                next.append(current.substr(pos));
+                break;
+            }
+
+            if (match_pos > 0 && IsIdentChar(current[match_pos - 1])) {
+                next.append(current.substr(pos, match_pos - pos + 1));
+                pos = match_pos + 1;
+                continue;
+            }
+
+            const size_t open_pos = match_pos + 4;
+            const auto   close_pos = FindMatchingParen(current, open_pos);
+            if (! close_pos.has_value()) {
+                next.append(current.substr(pos));
+                break;
+            }
+
+            next.append(current.substr(pos, match_pos - pos));
+
+            const auto args = SplitTopLevelArgs(
+                std::string_view(current).substr(open_pos + 1, *close_pos - open_pos - 1));
+            const size_t arg_limit = is_vec2 ? 2 : 3;
+            if (args.size() > arg_limit) {
+                next.append(is_vec2 ? "vec2(" : "vec3(");
+                for (size_t i = 0; i < arg_limit; i++) {
+                    if (i > 0) next.append(", ");
+                    next.append(TrimCopy(args[i]));
+                }
+                next.push_back(')');
+                changed = true;
+            } else {
+                next.append(current.substr(match_pos, *close_pos - match_pos + 1));
+            }
+
+            pos = *close_pos + 1;
+        }
+
+        if (! changed) return current;
+        current.swap(next);
+    }
+}
+
 inline bool TryParseShaderMetadataJson(std::string_view line, const char* kind,
                                        nlohmann::json& result) {
     const size_t json_start = line.find_first_of('{');
@@ -1400,6 +1569,113 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
 
         return std::pair<size_t, size_t> { brace_open + 1, cursor - 1 };
     };
+    auto HasLocalDeclarationInMainBody = [&](const std::string& text, const std::string& name) {
+        const auto main_body = FindMainBody(text);
+        if (! main_body.has_value()) return false;
+
+        auto [body_begin, body_end] = *main_body;
+        const auto  body = std::string_view(text).substr(body_begin, body_end - body_begin);
+        size_t      pos { 0 };
+        bool        in_block_comment { false };
+        bool        in_string { false };
+        bool        escaped { false };
+        char        quote { '\0' };
+
+        while (pos < body.size()) {
+            const char ch   = body[pos];
+            const char next = pos + 1 < body.size() ? body[pos + 1] : '\0';
+
+            if (in_block_comment) {
+                if (ch == '*' && next == '/') {
+                    in_block_comment = false;
+                    pos += 2;
+                    continue;
+                }
+                pos++;
+                continue;
+            }
+
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                    pos++;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escaped = true;
+                    pos++;
+                    continue;
+                }
+                if (ch == quote) in_string = false;
+                pos++;
+                continue;
+            }
+
+            if (ch == '/' && next == '/') {
+                const auto line_end = body.find('\n', pos);
+                pos                 = line_end == std::string_view::npos ? body.size() : line_end + 1;
+                continue;
+            }
+            if (ch == '/' && next == '*') {
+                in_block_comment = true;
+                pos += 2;
+                continue;
+            }
+            if (ch == '"' || ch == '\'') {
+                in_string = true;
+                quote     = ch;
+                pos++;
+                continue;
+            }
+            if (! IsIdentifierStart(ch)) {
+                pos++;
+                continue;
+            }
+
+            const auto first_end   = SkipIdentifier(body, pos);
+            auto       cursor      = SkipWhitespace(body, first_end);
+            auto       type_begin  = pos;
+            auto       type_end    = first_end;
+
+            if (body.substr(pos, first_end - pos) == "const") {
+                if (cursor >= body.size() || ! IsIdentifierStart(body[cursor])) {
+                    pos = first_end;
+                    continue;
+                }
+                type_begin = cursor;
+                type_end   = SkipIdentifier(body, cursor);
+                cursor     = SkipWhitespace(body, type_end);
+            }
+
+            if (type_begin == type_end || cursor >= body.size() || ! IsIdentifierStart(body[cursor])) {
+                pos = first_end;
+                continue;
+            }
+
+            const auto decl_name_end = SkipIdentifier(body, cursor);
+            const auto decl_name     = body.substr(cursor, decl_name_end - cursor);
+            if (decl_name != name) {
+                pos = decl_name_end;
+                continue;
+            }
+
+            cursor = SkipWhitespace(body, decl_name_end);
+            if (cursor < body.size() && body[cursor] == '[') {
+                cursor = SkipBalanced(body, cursor, '[', ']');
+                if (cursor == std::string::npos) return false;
+                cursor = SkipWhitespace(body, cursor);
+            }
+
+            if (cursor < body.size() &&
+                (body[cursor] == '=' || body[cursor] == ';' || body[cursor] == ',')) {
+                return true;
+            }
+
+            pos = decl_name_end;
+        }
+
+        return false;
+    };
     auto ReplaceNameInMainBody = [&](std::string& text, const std::string& from,
                                      const std::string& to) {
         const auto main_body = FindMainBody(text);
@@ -1457,6 +1733,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
 
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
     result = RewriteIntegerForLoops(result);
+    result = TrimOverlongVectorConstructors(result);
 
     // Some effect fragment shaders write back into stage inputs such as v_TexCoord. GLSL
     // forbids that, so rewrite those inputs to immutable varyings plus mutable locals.
@@ -1464,6 +1741,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         std::string init_lines;
         for (const auto& [name, decl] : cur.input) {
             if (! HasMutableUse(result, name)) continue;
+            if (HasLocalDeclarationInMainBody(result, name)) continue;
 
             std::string mutable_name;
             std::string init_line;
@@ -1549,7 +1827,7 @@ inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStrea
 
 inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, const Combos& combos) {
     std::ostringstream out;
-    out << "prepared-shader-v2\n";
+    out << "prepared-shader-v3\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';
