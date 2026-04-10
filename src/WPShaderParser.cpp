@@ -43,8 +43,13 @@ static constexpr const char* pre_shader_code = R"(#version 150
 #define CAST4(x) (vec4(x))
 #define CAST3X3(x) (mat3(x))
 
-#define texSample2D texture
-#define texSample2DLod textureLod
+vec4 texSample2D(sampler2D tex, vec2 uv) { return texture(tex, uv); }
+vec4 texSample2D(sampler2D tex, vec3 uv) { return texture(tex, uv.xy); }
+vec4 texSample2D(sampler2D tex, vec4 uv) { return texture(tex, uv.xy); }
+
+vec4 texSample2DLod(sampler2D tex, vec2 uv, float lod) { return textureLod(tex, uv, lod); }
+vec4 texSample2DLod(sampler2D tex, vec3 uv, float lod) { return textureLod(tex, uv.xy, lod); }
+vec4 texSample2DLod(sampler2D tex, vec4 uv, float lod) { return textureLod(tex, uv.xy, lod); }
 #define mul(x, y) ((y) * (x))
 #define frac fract
 #define atan2 atan
@@ -216,6 +221,128 @@ inline std::string RepairMissingStringQuotes(std::string_view source) {
 
     if (! changed) return {};
     return repaired;
+}
+
+inline bool IsIdentChar(char ch) {
+    return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+}
+
+inline std::optional<size_t> FindMatchingParen(std::string_view source, size_t open_pos) {
+    if (open_pos >= source.size() || source[open_pos] != '(') return std::nullopt;
+
+    int depth { 1 };
+    for (size_t i = open_pos + 1; i < source.size(); i++) {
+        if (source[i] == '(') depth++;
+        else if (source[i] == ')') {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return std::nullopt;
+}
+
+inline std::string TrimCopy(std::string_view value) {
+    size_t begin = 0;
+    size_t end   = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) begin++;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) end--;
+    return std::string(value.substr(begin, end - begin));
+}
+
+inline std::vector<std::string_view> SplitTopLevelArgs(std::string_view args) {
+    std::vector<std::string_view> result;
+    size_t                        begin { 0 };
+    int                           paren_depth { 0 };
+    int                           bracket_depth { 0 };
+    int                           brace_depth { 0 };
+
+    for (size_t i = 0; i < args.size(); i++) {
+        switch (args[i]) {
+        case '(': paren_depth++; break;
+        case ')': paren_depth--; break;
+        case '[': bracket_depth++; break;
+        case ']': bracket_depth--; break;
+        case '{': brace_depth++; break;
+        case '}': brace_depth--; break;
+        case ',':
+            if (paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+                result.push_back(args.substr(begin, i - begin));
+                begin = i + 1;
+            }
+            break;
+        default: break;
+        }
+    }
+
+    result.push_back(args.substr(begin));
+    return result;
+}
+
+inline std::string TrimOverlongVectorConstructors(std::string_view source) {
+    std::string current(source);
+
+    for (;;) {
+        bool        changed { false };
+        std::string next;
+        next.reserve(current.size());
+
+        size_t pos = 0;
+        while (pos < current.size()) {
+            size_t vec2_pos = current.find("vec2(", pos);
+            size_t vec3_pos = current.find("vec3(", pos);
+
+            size_t match_pos = std::string::npos;
+            bool   is_vec2 { false };
+            if (vec2_pos == std::string::npos) {
+                match_pos = vec3_pos;
+            } else if (vec3_pos == std::string::npos || vec2_pos < vec3_pos) {
+                match_pos = vec2_pos;
+                is_vec2   = true;
+            } else {
+                match_pos = vec3_pos;
+            }
+
+            if (match_pos == std::string::npos) {
+                next.append(current.substr(pos));
+                break;
+            }
+
+            if (match_pos > 0 && IsIdentChar(current[match_pos - 1])) {
+                next.append(current.substr(pos, match_pos - pos + 1));
+                pos = match_pos + 1;
+                continue;
+            }
+
+            const size_t open_pos = match_pos + 4;
+            const auto   close_pos = FindMatchingParen(current, open_pos);
+            if (! close_pos.has_value()) {
+                next.append(current.substr(pos));
+                break;
+            }
+
+            next.append(current.substr(pos, match_pos - pos));
+
+            const auto args = SplitTopLevelArgs(
+                std::string_view(current).substr(open_pos + 1, *close_pos - open_pos - 1));
+            const size_t arg_limit = is_vec2 ? 2 : 3;
+            if (args.size() > arg_limit) {
+                next.append(is_vec2 ? "vec2(" : "vec3(");
+                for (size_t i = 0; i < arg_limit; i++) {
+                    if (i > 0) next.append(", ");
+                    next.append(TrimCopy(args[i]));
+                }
+                next.push_back(')');
+                changed = true;
+            } else {
+                next.append(current.substr(match_pos, *close_pos - match_pos + 1));
+            }
+
+            pos = *close_pos + 1;
+        }
+
+        if (! changed) return current;
+        current.swap(next);
+    }
 }
 
 inline bool TryParseShaderMetadataJson(std::string_view line, const char* kind,
@@ -599,6 +726,17 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
 
         return std::pair<size_t, size_t> { brace_open + 1, cursor - 1 };
     };
+    auto HasLocalDeclarationInMainBody = [&](const std::string& text, const std::string& name) {
+        const auto main_body = FindMainBody(text);
+        if (! main_body.has_value()) return false;
+
+        auto [body_begin, body_end] = *main_body;
+        const std::string body      = text.substr(body_begin, body_end - body_begin);
+        const auto        pattern =
+            std::string(R"(\b(?:const\s+)?[A-Za-z_]\w*\s+)") + EscapeRegex(name) +
+            R"((?:\s*\[[^\]]+\])?\s*(?:=|;|,))";
+        return std::regex_search(body, std::regex(pattern));
+    };
     auto ReplaceNameInMainBody = [&](std::string& text, const std::string& from,
                                      const std::string& to) {
         const auto main_body = FindMainBody(text);
@@ -660,6 +798,15 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         result,
         std::regex(R"(\bfloat\s+pointer\s*=\s*g_PointerPosition\.xy\s*\*\s*u_pointerSpeed\s*;)"),
         "vec2 pointer = g_PointerPosition.xy * u_pointerSpeed;");
+    result = std::regex_replace(
+        result,
+        std::regex(R"(\bfloat\s+pointer\s*=\s*g_PointerPosition\s*\*\s*u_pointerSpeed\s*;)"),
+        "vec2 pointer = g_PointerPosition * u_pointerSpeed;");
+    result = std::regex_replace(
+        result,
+        std::regex(
+            R"(\bfloat\s+([A-Za-z_]\w*)\s*=\s*g_PointerPosition(\.xy)?\s*\*\s*([A-Za-z_]\w*)\s*;)"),
+        "vec2 $1 = g_PointerPosition$2 * $3;");
 
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
     result = std::regex_replace(
@@ -678,6 +825,15 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         result,
         std::regex(R"(\bvec3\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;)"),
         "vec3 $1 = $2.xyz;");
+    result = std::regex_replace(
+        result,
+        std::regex(R"(\bvec2\s+([A-Za-z_]\w*)\s*=\s*vec[34]\s*\()"),
+        "vec2 $1 = vec2(");
+    result = std::regex_replace(
+        result,
+        std::regex(R"(\bvec3\s+([A-Za-z_]\w*)\s*=\s*vec4\s*\()"),
+        "vec3 $1 = vec3(");
+    result = TrimOverlongVectorConstructors(result);
 
     // Some effect fragment shaders write back into stage inputs such as v_TexCoord. GLSL
     // forbids that, so rewrite those inputs to immutable varyings plus mutable locals.
@@ -685,6 +841,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         std::string init_lines;
         for (const auto& [name, decl] : cur.input) {
             if (! HasMutableUse(result, name)) continue;
+            if (HasLocalDeclarationInMainBody(result, name)) continue;
 
             std::string mutable_name;
             std::string init_line;
@@ -773,7 +930,7 @@ inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStrea
 
 inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, const Combos& combos) {
     std::ostringstream out;
-    out << "prepared-shader-v2\n";
+    out << "prepared-shader-v3\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';

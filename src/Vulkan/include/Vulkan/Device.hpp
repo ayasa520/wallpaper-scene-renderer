@@ -11,6 +11,7 @@ namespace vulkan
 {
 
 class PipelineParameters;
+class VideoTextureCache;
 
 class Device : NoCopy, NoMove {
 public:
@@ -37,6 +38,7 @@ public:
     bool supportExt(std::string_view) const;
 
     TextureCache& tex_cache() const { return *m_tex_cache; }
+    VideoTextureCache& video_tex_cache() const { return *m_video_tex_cache; }
 
     VkDeviceSize GetUsage() const;
 
@@ -62,6 +64,7 @@ private:
     VkExtent2D m_extent { 1, 1 };
 
     std::unique_ptr<TextureCache> m_tex_cache;
+    std::unique_ptr<VideoTextureCache> m_video_tex_cache;
 };
 
 } // namespace vulkan

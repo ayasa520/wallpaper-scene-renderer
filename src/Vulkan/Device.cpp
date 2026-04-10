@@ -2,6 +2,7 @@
 
 #include "Utils/Logging.h"
 #include "GraphicsPipeline.hpp"
+#include "VideoTextureCache.hpp"
 
 using namespace wallpaper::vulkan;
 
@@ -167,7 +168,8 @@ bool Device::Create(Instance& inst, std::span<const Extension> exts, VkExtent2D 
         allocatorInfo.instance               = *inst.inst();
         VVK_CHECK_BOOL_RE(vvk::CreateVmaAllocator(allocatorInfo, device.m_allocator));
     }
-    device.m_tex_cache = std::make_unique<TextureCache>(device);
+    device.m_tex_cache       = std::make_unique<TextureCache>(device);
+    device.m_video_tex_cache = std::make_unique<VideoTextureCache>(device);
     return true;
 }
 
@@ -179,7 +181,9 @@ VkDeviceSize Device::GetUsage() const {
 
 void Device::Destroy() { VVK_CHECK(m_device.WaitIdle()); }
 
-Device::Device(): m_tex_cache(std::make_unique<TextureCache>(*this)) {}
+Device::Device()
+    : m_tex_cache(std::make_unique<TextureCache>(*this)),
+      m_video_tex_cache(std::make_unique<VideoTextureCache>(*this)) {}
 Device::~Device() {};
 
 bool Device::supportExt(std::string_view name) const { return exists(m_extensions, name); }

@@ -39,6 +39,7 @@ struct ImageHeader {
 
     bool mipmap_larger { false };
     bool mipmap_pow2 { false };
+    bool isVideoTexture { false };
 
     ImageType     type { ImageType::UNKNOWN };
     TextureFormat format { TextureFormat::RGBA8 };
