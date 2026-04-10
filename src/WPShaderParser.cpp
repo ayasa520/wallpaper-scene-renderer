@@ -13,7 +13,6 @@
 #include "Vulkan/ShaderComp.hpp"
 
 #include <regex>
-#include <stack>
 #include <charconv>
 #include <cctype>
 #include <sstream>
@@ -158,6 +157,866 @@ inline std::string TruncateMetadataSnippet(std::string_view source) {
     constexpr size_t max_len { 120 };
     if (source.size() <= max_len) return std::string(source);
     return std::string(source.substr(0, max_len - 3)) + "...";
+}
+
+inline bool IsIdentifierStart(char ch) {
+    const auto uch = static_cast<unsigned char>(ch);
+    return std::isalpha(uch) || ch == '_';
+}
+
+inline bool IsIdentifierContinue(char ch) {
+    const auto uch = static_cast<unsigned char>(ch);
+    return std::isalnum(uch) || ch == '_';
+}
+
+inline size_t SkipIdentifier(std::string_view source, size_t pos) {
+    while (pos < source.size() && IsIdentifierContinue(source[pos])) {
+        pos++;
+    }
+    return pos;
+}
+
+inline size_t SkipBalanced(std::string_view source, size_t pos, char open_ch, char close_ch) {
+    if (pos >= source.size() || source[pos] != open_ch) return std::string::npos;
+
+    int depth { 0 };
+    while (pos < source.size()) {
+        if (source[pos] == open_ch) {
+            depth++;
+        } else if (source[pos] == close_ch) {
+            depth--;
+            if (depth == 0) return pos + 1;
+        }
+        pos++;
+    }
+    return std::string::npos;
+}
+
+inline bool IsIdentifierBoundary(std::string_view source, size_t pos) {
+    return pos >= source.size() || ! IsIdentifierContinue(source[pos]);
+}
+
+inline bool MatchIdentifierAt(std::string_view source, size_t pos, std::string_view ident) {
+    if (pos + ident.size() > source.size()) return false;
+    if (source.substr(pos, ident.size()) != ident) return false;
+    if (pos > 0 && IsIdentifierContinue(source[pos - 1])) return false;
+    return IsIdentifierBoundary(source, pos + ident.size());
+}
+
+inline bool ReplaceFirstStandaloneWord(std::string& text, std::string_view from,
+                                       std::string_view to) {
+    size_t pos { 0 };
+    while (pos < text.size()) {
+        if (! IsIdentifierStart(text[pos])) {
+            pos++;
+            continue;
+        }
+
+        const auto end   = SkipIdentifier(text, pos);
+        const auto token = std::string_view(text).substr(pos, end - pos);
+        if (token == from) {
+            text.replace(pos, from.size(), to);
+            return true;
+        }
+        pos = end;
+    }
+    return false;
+}
+
+inline std::string ReplaceStandaloneIdentifier(std::string_view text, std::string_view from,
+                                               std::string_view to) {
+    std::string result;
+    result.reserve(text.size());
+
+    size_t pos { 0 };
+    while (pos < text.size()) {
+        if (MatchIdentifierAt(text, pos, from)) {
+            result.append(to);
+            pos += from.size();
+            continue;
+        }
+
+        result.push_back(text[pos]);
+        pos++;
+    }
+    return result;
+}
+
+inline bool ReplaceAll(std::string& text, std::string_view from, std::string_view to) {
+    if (from.empty()) return false;
+
+    bool   changed { false };
+    size_t pos { 0 };
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+        changed = true;
+    }
+    return changed;
+}
+
+inline std::string_view TrimLeadingHorizontalWhitespace(std::string_view source) {
+    const auto pos = source.find_first_not_of(" \t\r");
+    if (pos == std::string_view::npos) return {};
+    return source.substr(pos);
+}
+
+inline bool StartsWithToken(std::string_view source, std::string_view token) {
+    if (source.size() < token.size()) return false;
+    if (source.substr(0, token.size()) != token) return false;
+    return source.size() == token.size() ||
+           ! IsIdentifierContinue(source[token.size()]);
+}
+
+inline void UpdateBraceDepth(std::string_view line, int& brace_depth, bool& in_block_comment) {
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+
+    for (size_t i = 0; i < line.size(); i++) {
+        const char ch = line[i];
+        const char next = i + 1 < line.size() ? line[i + 1] : '\0';
+
+        if (in_block_comment) {
+            if (ch == '*' && next == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+
+        if (ch == '/' && next == '/') break;
+        if (ch == '/' && next == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+
+        if (ch == '{') {
+            brace_depth++;
+        } else if (ch == '}' && brace_depth > 0) {
+            brace_depth--;
+        }
+    }
+}
+
+inline bool TryParseInterfaceDeclaration(std::string_view line, std::string& qualifier,
+                                         std::string& name) {
+    const auto end = line.find_last_not_of(" \t\r");
+    if (end == std::string_view::npos || line[end] != ';') return false;
+
+    size_t qualifier_pos { std::string::npos };
+    size_t qualifier_end { std::string::npos };
+    size_t pos { 0 };
+    while (pos < line.size()) {
+        if (! IsIdentifierStart(line[pos])) {
+            pos++;
+            continue;
+        }
+
+        const auto end_pos = SkipIdentifier(line, pos);
+        const auto token   = line.substr(pos, end_pos - pos);
+        if (token == "in" || token == "out") {
+            qualifier_pos = pos;
+            qualifier_end = end_pos;
+            qualifier     = std::string(token);
+            break;
+        }
+        pos = end_pos;
+    }
+    if (qualifier_pos == std::string::npos) return false;
+
+    const auto type_pos = SkipWhitespace(line, qualifier_end);
+    if (type_pos >= line.size() || ! IsIdentifierStart(line[type_pos])) return false;
+
+    const auto type_end = SkipIdentifier(line, type_pos);
+    const auto name_pos = SkipWhitespace(line, type_end);
+    if (name_pos >= line.size() || ! IsIdentifierStart(line[name_pos])) return false;
+
+    const auto name_end = SkipIdentifier(line, name_pos);
+    auto       tail_pos = SkipWhitespace(line, name_end);
+    if (tail_pos < line.size() && line[tail_pos] == '[') {
+        tail_pos = SkipBalanced(line, tail_pos, '[', ']');
+        if (tail_pos == std::string::npos) return false;
+        tail_pos = SkipWhitespace(line, tail_pos);
+    }
+
+    if (tail_pos >= line.size() || line[tail_pos] != ';') return false;
+
+    name = std::string(line.substr(name_pos, name_end - name_pos));
+    return true;
+}
+
+inline bool TryParseTextureSlot(std::string_view line, uint& slot) {
+    const auto end = line.find_last_not_of(" \t\r");
+    if (end == std::string_view::npos || line[end] != ';') return false;
+
+    bool        saw_uniform { false };
+    bool        saw_sampler2d { false };
+    std::string name;
+
+    size_t pos { 0 };
+    while (pos < line.size()) {
+        if (! IsIdentifierStart(line[pos])) {
+            pos++;
+            continue;
+        }
+
+        const auto end_pos = SkipIdentifier(line, pos);
+        const auto token   = line.substr(pos, end_pos - pos);
+        if (! saw_uniform && token == "uniform") {
+            saw_uniform = true;
+        } else if (saw_uniform && ! saw_sampler2d && token == "sampler2D") {
+            saw_sampler2d = true;
+        } else if (saw_sampler2d) {
+            name = std::string(token);
+            break;
+        }
+        pos = end_pos;
+    }
+
+    if (name.size() <= 9 || name.compare(0, 9, "g_Texture") != 0) return false;
+
+    const auto slot_text = std::string_view(name).substr(9);
+    if (slot_text.empty()) return false;
+
+    auto [ptr, ec] = std::from_chars(slot_text.data(), slot_text.data() + slot_text.size(), slot);
+    return ec == std::errc() && ptr == slot_text.data() + slot_text.size();
+}
+
+inline std::string_view TrimWhitespace(std::string_view source) {
+    const auto begin = source.find_first_not_of(" \t\r\n");
+    if (begin == std::string_view::npos) return {};
+    const auto end = source.find_last_not_of(" \t\r\n");
+    return source.substr(begin, end - begin + 1);
+}
+
+inline std::string RemoveAsciiWhitespace(std::string_view source) {
+    std::string result;
+    result.reserve(source.size());
+    for (const char ch : source) {
+        if (! std::isspace(static_cast<unsigned char>(ch))) result.push_back(ch);
+    }
+    return result;
+}
+
+inline bool TryParseStandaloneIdentifier(std::string_view source, std::string_view& ident) {
+    source = TrimWhitespace(source);
+    if (source.empty() || ! IsIdentifierStart(source.front())) return false;
+
+    const auto end = SkipIdentifier(source, 0);
+    if (end != source.size()) return false;
+
+    ident = source.substr(0, end);
+    return true;
+}
+
+inline bool TryParseSimpleTypedAssignment(std::string_view statement, std::string_view& type,
+                                          std::string_view& lhs, std::string_view& rhs) {
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || ! IsIdentifierStart(statement.front())) return false;
+
+    const auto type_end = SkipIdentifier(statement, 0);
+    type                = statement.substr(0, type_end);
+
+    auto pos = SkipWhitespace(statement, type_end);
+    if (pos >= statement.size() || ! IsIdentifierStart(statement[pos])) return false;
+
+    const auto lhs_end = SkipIdentifier(statement, pos);
+    lhs                = statement.substr(pos, lhs_end - pos);
+
+    pos = SkipWhitespace(statement, lhs_end);
+    if (pos >= statement.size() || statement[pos] != '=') return false;
+    if (pos + 1 < statement.size() && statement[pos + 1] == '=') return false;
+
+    rhs = TrimWhitespace(statement.substr(pos + 1));
+    return ! rhs.empty();
+}
+
+inline size_t FindStatementTerminator(std::string_view text, size_t pos) {
+    bool in_block_comment { false };
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+
+    while (pos < text.size()) {
+        const char ch   = text[pos];
+        const char next = pos + 1 < text.size() ? text[pos + 1] : '\0';
+
+        if (in_block_comment) {
+            if (ch == '*' && next == '/') {
+                in_block_comment = false;
+                pos += 2;
+                continue;
+            }
+            pos++;
+            continue;
+        }
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                pos++;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                pos++;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            pos++;
+            continue;
+        }
+
+        if (ch == '/' && next == '/') {
+            const auto line_end = text.find('\n', pos);
+            return line_end == std::string_view::npos ? std::string::npos : line_end;
+        }
+        if (ch == '/' && next == '*') {
+            in_block_comment = true;
+            pos += 2;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            pos++;
+            continue;
+        }
+
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == ';' && paren_depth == 0 && bracket_depth == 0) return pos;
+
+        pos++;
+    }
+
+    return std::string::npos;
+}
+
+inline std::string RewriteSimpleShaderStatements(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+
+    size_t cursor { 0 };
+    size_t pos { 0 };
+    bool   in_block_comment { false };
+    bool   in_string { false };
+    bool   escaped { false };
+    char   quote { '\0' };
+    int    paren_depth { 0 };
+    int    bracket_depth { 0 };
+
+    while (pos < text.size()) {
+        const char ch   = text[pos];
+        const char next = pos + 1 < text.size() ? text[pos + 1] : '\0';
+
+        if (in_block_comment) {
+            if (ch == '*' && next == '/') {
+                in_block_comment = false;
+                pos += 2;
+                continue;
+            }
+            pos++;
+            continue;
+        }
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                pos++;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                pos++;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            pos++;
+            continue;
+        }
+
+        if (ch == '/' && next == '/') {
+            const auto line_end = text.find('\n', pos);
+            pos                 = line_end == std::string_view::npos ? text.size() : line_end + 1;
+            continue;
+        }
+        if (ch == '/' && next == '*') {
+            in_block_comment = true;
+            pos += 2;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            pos++;
+            continue;
+        }
+
+        if (ch == '(') {
+            paren_depth++;
+            pos++;
+            continue;
+        }
+        if (ch == ')') {
+            if (paren_depth > 0) paren_depth--;
+            pos++;
+            continue;
+        }
+        if (ch == '[') {
+            bracket_depth++;
+            pos++;
+            continue;
+        }
+        if (ch == ']') {
+            if (bracket_depth > 0) bracket_depth--;
+            pos++;
+            continue;
+        }
+
+        if ((paren_depth != 0 || bracket_depth != 0 || ! IsIdentifierStart(ch))) {
+            pos++;
+            continue;
+        }
+
+        const auto ident_end = SkipIdentifier(text, pos);
+        const auto type      = text.substr(pos, ident_end - pos);
+        if (type != "float" && type != "vec2" && type != "vec3") {
+            pos = ident_end;
+            continue;
+        }
+
+        const auto stmt_end = FindStatementTerminator(text, pos);
+        if (stmt_end == std::string::npos) {
+            pos = ident_end;
+            continue;
+        }
+
+        std::string_view lhs;
+        std::string_view rhs;
+        std::string_view parsed_type;
+        const auto       statement = text.substr(pos, stmt_end - pos + 1);
+        if (! TryParseSimpleTypedAssignment(statement, parsed_type, lhs, rhs)) {
+            pos = ident_end;
+            continue;
+        }
+
+        std::string replacement;
+        if (parsed_type == "float" && lhs == "pointer" &&
+            RemoveAsciiWhitespace(rhs) == "g_PointerPosition.xy*u_pointerSpeed") {
+            replacement = "vec2 pointer = g_PointerPosition.xy * u_pointerSpeed;";
+        } else if (parsed_type == "vec2") {
+            std::string_view rhs_ident;
+            if (TryParseStandaloneIdentifier(rhs, rhs_ident)) {
+                replacement = "vec2 " + std::string(lhs) + " = " + std::string(rhs_ident) + ".xy;";
+            }
+        } else if (parsed_type == "vec3") {
+            std::string_view rhs_ident;
+            if (TryParseStandaloneIdentifier(rhs, rhs_ident)) {
+                replacement = "vec3 " + std::string(lhs) + " = " + std::string(rhs_ident) + ".xyz;";
+            }
+        }
+
+        if (replacement.empty()) {
+            pos = ident_end;
+            continue;
+        }
+
+        result.append(text.substr(cursor, pos - cursor));
+        result.append(replacement);
+        cursor = stmt_end + 1;
+        pos    = cursor;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
+inline size_t FindTopLevelChar(std::string_view text, char target, size_t start = 0) {
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+    int  brace_depth { 0 };
+
+    for (size_t pos = start; pos < text.size(); pos++) {
+        const char ch = text[pos];
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == '{') brace_depth++;
+        else if (ch == '}' && brace_depth > 0) brace_depth--;
+        else if (ch == target && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+            return pos;
+        }
+    }
+
+    return std::string::npos;
+}
+
+inline bool TryRewriteIntegerForLoopHeader(std::string_view header, std::string& replacement) {
+    if (! StartsWithToken(header, "for")) return false;
+
+    auto pos = SkipWhitespace(header, 3);
+    if (pos >= header.size() || header[pos] != '(') return false;
+
+    const auto close_pos = SkipBalanced(header, pos, '(', ')');
+    if (close_pos == std::string::npos || close_pos != header.size()) return false;
+
+    const auto inside = header.substr(pos + 1, close_pos - pos - 2);
+    const auto semi1  = FindTopLevelChar(inside, ';');
+    if (semi1 == std::string::npos) return false;
+    const auto semi2 = FindTopLevelChar(inside, ';', semi1 + 1);
+    if (semi2 == std::string::npos) return false;
+    if (FindTopLevelChar(inside, ';', semi2 + 1) != std::string::npos) return false;
+
+    const auto init = TrimWhitespace(inside.substr(0, semi1));
+    const auto cond = TrimWhitespace(inside.substr(semi1 + 1, semi2 - semi1 - 1));
+    const auto inc  = TrimWhitespace(inside.substr(semi2 + 1));
+    if (init.empty() || cond.empty() || inc.empty()) return false;
+
+    if (! StartsWithToken(init, "int")) return false;
+    pos = SkipWhitespace(init, 3);
+    if (pos >= init.size() || ! IsIdentifierStart(init[pos])) return false;
+    const auto name_end = SkipIdentifier(init, pos);
+    const auto name     = init.substr(pos, name_end - pos);
+
+    pos = SkipWhitespace(init, name_end);
+    if (pos >= init.size() || init[pos] != '=') return false;
+    const auto init_expr = TrimWhitespace(init.substr(pos + 1));
+    if (init_expr.empty()) return false;
+
+    pos = 0;
+    if (! MatchIdentifierAt(cond, 0, name)) return false;
+    pos = SkipWhitespace(cond, name.size());
+
+    std::string_view op;
+    if (pos + 1 < cond.size() && (cond.substr(pos, 2) == "<=" || cond.substr(pos, 2) == ">=")) {
+        op = cond.substr(pos, 2);
+        pos += 2;
+    } else if (pos < cond.size() && (cond[pos] == '<' || cond[pos] == '>')) {
+        op = cond.substr(pos, 1);
+        pos++;
+    } else {
+        return false;
+    }
+
+    const auto cond_expr = TrimWhitespace(cond.substr(pos));
+    if (cond_expr.empty()) return false;
+
+    const auto normalized_inc = RemoveAsciiWhitespace(inc);
+    const auto name_str       = std::string(name);
+    if (normalized_inc != "++" + name_str && normalized_inc != name_str + "++") return false;
+
+    replacement = "for (int " + name_str + " = int(" + std::string(init_expr) + "); " +
+                  name_str + " " + std::string(op) + " int(" + std::string(cond_expr) + "); " +
+                  name_str + "++)";
+    return true;
+}
+
+inline std::string RewriteIntegerForLoops(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+
+    size_t cursor { 0 };
+    size_t pos { 0 };
+    bool   in_block_comment { false };
+    bool   in_string { false };
+    bool   escaped { false };
+    char   quote { '\0' };
+
+    while (pos < text.size()) {
+        const char ch   = text[pos];
+        const char next = pos + 1 < text.size() ? text[pos + 1] : '\0';
+
+        if (in_block_comment) {
+            if (ch == '*' && next == '/') {
+                in_block_comment = false;
+                pos += 2;
+                continue;
+            }
+            pos++;
+            continue;
+        }
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                pos++;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                pos++;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            pos++;
+            continue;
+        }
+
+        if (ch == '/' && next == '/') {
+            const auto line_end = text.find('\n', pos);
+            pos                 = line_end == std::string_view::npos ? text.size() : line_end + 1;
+            continue;
+        }
+        if (ch == '/' && next == '*') {
+            in_block_comment = true;
+            pos += 2;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            pos++;
+            continue;
+        }
+
+        if (! MatchIdentifierAt(text, pos, "for")) {
+            pos++;
+            continue;
+        }
+
+        auto header_pos = SkipWhitespace(text, pos + 3);
+        if (header_pos >= text.size() || text[header_pos] != '(') {
+            pos += 3;
+            continue;
+        }
+
+        const auto header_end = SkipBalanced(text, header_pos, '(', ')');
+        if (header_end == std::string::npos) {
+            pos += 3;
+            continue;
+        }
+
+        std::string replacement;
+        const auto  header = text.substr(pos, header_end - pos);
+        if (! TryRewriteIntegerForLoopHeader(header, replacement)) {
+            pos += 3;
+            continue;
+        }
+
+        result.append(text.substr(cursor, pos - cursor));
+        result.append(replacement);
+        cursor = header_end;
+        pos    = header_end;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
+inline void CollectPreprocessorInfo(const std::string& src, WPPreprocessorInfo& process_info) {
+    process_info.input.clear();
+    process_info.output.clear();
+    process_info.active_tex_slots.clear();
+
+    size_t pos { 0 };
+    while (pos < src.size()) {
+        const auto line_end =
+            src.find('\n', pos);
+        const auto line_len =
+            line_end == std::string::npos ? src.size() - pos : line_end - pos;
+        const auto line = std::string_view(src).substr(pos, line_len);
+
+        std::string qualifier;
+        std::string name;
+        if (TryParseInterfaceDeclaration(line, qualifier, name)) {
+            if (qualifier == "in") {
+                process_info.input[name] = std::string(line);
+            } else {
+                process_info.output[name] = std::string(line);
+            }
+        }
+
+        uint slot { 0 };
+        if (TryParseTextureSlot(line, slot)) {
+            process_info.active_tex_slots.insert(slot);
+        }
+
+        if (line_end == std::string::npos) break;
+        pos = line_end + 1;
+    }
+}
+
+inline std::string CommentOutRequireDirectives(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+
+    size_t pos { 0 };
+    while (pos < src.size()) {
+        const auto line_end =
+            src.find('\n', pos);
+        const auto line_len =
+            line_end == std::string::npos ? src.size() - pos : line_end - pos;
+        const auto line = std::string_view(src).substr(pos, line_len);
+
+        const auto first_non_ws = line.find_first_not_of(" \t\r");
+        if (first_non_ws != std::string_view::npos &&
+            line.substr(first_non_ws).compare(0, 8, "#require") == 0) {
+            out.append(line.substr(0, first_non_ws));
+            out.append("//");
+            out.append(line.substr(first_non_ws));
+        } else {
+            out.append(line);
+        }
+
+        if (line_end == std::string::npos) break;
+        out.push_back('\n');
+        pos = line_end + 1;
+    }
+    return out;
+}
+
+inline bool IsMutationOperator(std::string_view text, size_t pos) {
+    if (pos >= text.size()) return false;
+
+    switch (text[pos]) {
+    case '+':
+    case '-':
+        return pos + 1 < text.size() && (text[pos + 1] == '=' || text[pos + 1] == text[pos]);
+    case '*':
+    case '/':
+    case '%': return pos + 1 < text.size() && text[pos + 1] == '=';
+    case '=': return pos + 1 >= text.size() || text[pos + 1] != '=';
+    default: return false;
+    }
+}
+
+inline bool HasMutableUse(std::string_view text, std::string_view name) {
+    size_t pos { 0 };
+    while (pos < text.size()) {
+        pos = text.find(name, pos);
+        if (pos == std::string::npos) return false;
+        if (! MatchIdentifierAt(text, pos, name)) {
+            pos++;
+            continue;
+        }
+
+        auto cursor = SkipWhitespace(text, pos + name.size());
+        while (cursor < text.size()) {
+            if (text[cursor] == '.') {
+                cursor++;
+                if (cursor >= text.size() || ! IsIdentifierStart(text[cursor])) break;
+                cursor = SkipIdentifier(text, cursor);
+                cursor = SkipWhitespace(text, cursor);
+                continue;
+            }
+            if (text[cursor] == '[') {
+                cursor = SkipBalanced(text, cursor, '[', ']');
+                if (cursor == std::string::npos) return false;
+                cursor = SkipWhitespace(text, cursor);
+                continue;
+            }
+            break;
+        }
+
+        if (IsMutationOperator(text, cursor)) return true;
+        pos += name.size();
+    }
+    return false;
+}
+
+inline bool MakeMutableInputShim(std::string_view decl, std::string_view name,
+                                 std::string& mutable_name, std::string& init_line) {
+    const auto first_non_ws = decl.find_first_not_of(" \t");
+    const auto indent =
+        first_non_ws == std::string_view::npos ? std::string_view {} : decl.substr(0, first_non_ws);
+
+    size_t in_pos { std::string::npos };
+    size_t in_end { std::string::npos };
+    size_t pos { 0 };
+    while (pos < decl.size()) {
+        if (! IsIdentifierStart(decl[pos])) {
+            pos++;
+            continue;
+        }
+
+        const auto end_pos = SkipIdentifier(decl, pos);
+        if (decl.substr(pos, end_pos - pos) == "in") {
+            in_pos = pos;
+            in_end = end_pos;
+            break;
+        }
+        pos = end_pos;
+    }
+    if (in_pos == std::string::npos) return false;
+
+    const auto type_pos = SkipWhitespace(decl, in_end);
+    if (type_pos >= decl.size() || ! IsIdentifierStart(decl[type_pos])) return false;
+
+    const auto type_end = SkipIdentifier(decl, type_pos);
+    const auto name_pos = SkipWhitespace(decl, type_end);
+    if (name_pos >= decl.size() || ! IsIdentifierStart(decl[name_pos])) return false;
+
+    const auto decl_name_end = SkipIdentifier(decl, name_pos);
+    const auto decl_name     = decl.substr(name_pos, decl_name_end - name_pos);
+    if (decl_name != name) return false;
+
+    auto        tail_pos = SkipWhitespace(decl, decl_name_end);
+    std::string suffix;
+    if (tail_pos < decl.size() && decl[tail_pos] == '[') {
+        const auto suffix_end = SkipBalanced(decl, tail_pos, '[', ']');
+        if (suffix_end == std::string::npos) return false;
+        suffix = std::string(decl.substr(tail_pos, suffix_end - tail_pos));
+        tail_pos = SkipWhitespace(decl, suffix_end);
+    }
+
+    if (tail_pos >= decl.size() || decl[tail_pos] != ';') return false;
+
+    mutable_name = "_wp_mutable_" + std::string(name);
+    init_line    = std::string(indent) + std::string(decl.substr(type_pos, type_end - type_pos)) +
+                " " + mutable_name + suffix + " = " + std::string(name) + ";\n";
+    return true;
 }
 
 inline std::string RepairMissingStringQuotes(std::string_view source) {
@@ -354,69 +1213,64 @@ inline usize FindIncludeInsertPos(const std::string& src, usize startPos) {
     not in {}
     not in #if #endif
     */
-    (void)startPos;
+    const auto mainPos = src.find("void main(", startPos);
+    if (mainPos == std::string::npos) return 0;
+    if (src.find("void main(", mainPos + 1) != std::string::npos) return 0;
 
-    auto NposToZero = [](usize p) {
-        return p == std::string::npos ? 0 : p;
-    };
-    auto search = [](const std::string& p, usize pos, const auto& re) {
-        auto        startpos = p.begin() + (isize)pos;
-        std::smatch match;
-        if (startpos < p.end() && std::regex_search(startpos, p.end(), match, re)) {
-            return pos + (usize)match.position();
-        }
-        return std::string::npos;
-    };
-    auto searchLast = [](const std::string& p, const auto& re) {
-        auto        startpos = p.begin();
-        std::smatch match;
-        while (startpos < p.end() && std::regex_search(startpos, p.end(), match, re)) {
-            startpos++;
-            startpos += match.position();
-        }
-        return startpos >= p.end() ? std::string::npos : usize(startpos - p.begin());
-    };
-    auto nextLinePos = [](const std::string& p, usize pos) {
-        return p.find_first_of('\n', pos) + 1;
-    };
+    usize candidate_pos { 0 };
+    usize pos { startPos };
+    int   brace_depth { 0 };
+    int   if_depth { 0 };
+    bool  in_block_comment { false };
+    bool  pending_struct_close { false };
 
-    usize mainPos  = src.find("void main(");
-    bool  two_main = src.find("void main(", mainPos + 2) != std::string::npos;
-    if (two_main) return 0;
+    while (pos < mainPos) {
+        const auto raw_line_end = src.find('\n', pos);
+        const auto line_end =
+            raw_line_end == std::string::npos || raw_line_end > mainPos ? mainPos : raw_line_end;
+        const auto next_pos = raw_line_end == std::string::npos || raw_line_end > mainPos
+                                ? line_end
+                                : raw_line_end + 1;
+        const auto line = std::string_view(src).substr(pos, line_end - pos);
+        const auto trimmed = TrimLeadingHorizontalWhitespace(line);
+        const auto brace_depth_before = brace_depth;
 
-    usize pos;
-    {
-        const std::regex reAfters(R"(\n(attribute|varying|uniform|struct) )");
-        usize            afterPos = searchLast(src, reAfters);
-        if (afterPos != std::string::npos) {
-            afterPos = nextLinePos(src, afterPos + 1);
+        const bool starts_if    = trimmed.rfind("#if", 0) == 0;
+        const bool starts_endif = trimmed.rfind("#endif", 0) == 0;
+        const bool top_level    = brace_depth_before == 0 && if_depth == 0;
+        const bool starts_decl =
+            top_level &&
+            (StartsWithToken(trimmed, "attribute") || StartsWithToken(trimmed, "varying") ||
+             StartsWithToken(trimmed, "uniform"));
+        const bool starts_struct = top_level && StartsWithToken(trimmed, "struct");
+
+        UpdateBraceDepth(line, brace_depth, in_block_comment);
+
+        if (starts_decl) {
+            candidate_pos = next_pos;
         }
-        pos = std::min({ NposToZero(afterPos), mainPos });
-    }
-    {
-        std::stack<usize> ifStack;
-        usize             nowPos { 0 };
-        const std::regex  reIfs(R"((#if|#endif))");
-        while (true) {
-            auto p = search(src, nowPos + 1, reIfs);
-            if (p > mainPos || p == std::string::npos) break;
-            if (src.substr(p, 3) == "#if") {
-                ifStack.push(p);
+
+        if (starts_struct) {
+            if (line.find('{') != std::string_view::npos && brace_depth > brace_depth_before) {
+                pending_struct_close = true;
             } else {
-                if (ifStack.empty()) break;
-                usize ifp = ifStack.top();
-                ifStack.pop();
-                usize endp = p;
-                if (pos > ifp && pos <= endp) {
-                    pos = nextLinePos(src, endp + 1);
-                }
+                candidate_pos = next_pos;
             }
-            nowPos = p;
+        } else if (pending_struct_close && brace_depth_before > 0 && brace_depth == 0) {
+            candidate_pos         = next_pos;
+            pending_struct_close = false;
         }
-        pos = std::min({ pos, mainPos });
+
+        if (starts_if) {
+            if_depth++;
+        } else if (starts_endif && if_depth > 0) {
+            if_depth--;
+        }
+
+        pos = next_pos;
     }
 
-    return NposToZero(pos);
+    return candidate_pos;
 }
 
 inline EShLanguage ToGLSL(ShaderType type) {
@@ -484,10 +1338,7 @@ inline std::string Preprocessor(const std::string& in_src, ShaderType type, cons
             SanitizeBrokenPreprocessorDirectives(in_src, type), combos, type);
 
     // workaround #require directive
-    {
-        std::regex re_require("(^|\r?\n)#require (.+)(\r?\n)");
-        src = std::regex_replace(src, re_require, "$1//#require $2$3");
-    }
+    src = CommentOutRequireDirectives(src);
 
     glslang::TShader::ForbidIncluder includer;
     glslang::TShader                 shader(ToGLSL(type));
@@ -508,29 +1359,7 @@ inline std::string Preprocessor(const std::string& in_src, ShaderType type, cons
         return src;
     }
 
-    std::regex re_io(R"(.+\s(in|out)\s[\s\w]+\s(\w+)\s*;)", std::regex::ECMAScript);
-    for (auto it = std::sregex_iterator(res.begin(), res.end(), re_io);
-         it != std::sregex_iterator();
-         it++) {
-        std::smatch mc = *it;
-        if (mc[1] == "in") {
-            process_info.input[mc[2]] = mc[0].str();
-        } else {
-            process_info.output[mc[2]] = mc[0].str();
-        }
-    }
-
-    std::regex re_tex(R"(uniform\s+sampler2D\s+g_Texture(\d+))", std::regex::ECMAScript);
-    for (auto it = std::sregex_iterator(res.begin(), res.end(), re_tex);
-         it != std::sregex_iterator();
-         it++) {
-        std::smatch mc  = *it;
-        auto        str = mc[1].str();
-        uint        slot;
-        auto [ptr, ec] { std::from_chars(str.c_str(), str.c_str() + str.size(), slot) };
-        if (ec != std::errc()) continue;
-        process_info.active_tex_slots.insert(slot);
-    }
+    CollectPreprocessorInfo(res, process_info);
     return res;
 }
 
@@ -544,42 +1373,14 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         return true;
     };
     auto AsInputDecl = [](const std::string& decl) {
-        return std::regex_replace(decl, std::regex(R"(\bout\b)"), "in");
+        auto result = decl;
+        ReplaceFirstStandaloneWord(result, "out", "in");
+        return result;
     };
     auto AsOutputDecl = [](const std::string& decl) {
-        return std::regex_replace(decl, std::regex(R"(\bin\b)"), "out");
-    };
-
-    auto EscapeRegex = [](const std::string& text) {
-        static const std::regex special(R"([-[\]{}()*+?.,\^$|#\s])");
-        return std::regex_replace(text, special, R"(\$&)");
-    };
-    auto HasMutableUse = [&](const std::string& text, const std::string& name) {
-        const auto name_re = EscapeRegex(name);
-        const auto pattern = std::string(R"(\b)") + name_re +
-                             R"(\b(?:\s*(?:\.[A-Za-z_]\w*|\[[^\]]+\]))*\s*(?:\+=|-=|\*=|/=|%=|=(?!=)|\+\+|--))";
-        return std::regex_search(text, std::regex(pattern));
-    };
-    auto MakeMutableInputShim = [](const std::string& decl, const std::string& name,
-                                   std::string& mutable_name, std::string& init_line) {
-        std::smatch match;
-        if (! std::regex_match(
-                decl,
-                match,
-                std::regex(
-                    R"((\s*)in\s+([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(\s*\[[^\]]+\])?\s*;)"))) {
-            return false;
-        }
-
-        const auto indent        = match[1].str();
-        const auto type          = match[2].str();
-        const auto declared_name = match[3].str();
-        const auto suffix        = match[4].str();
-        if (declared_name != name) return false;
-
-        mutable_name = "_wp_mutable_" + name;
-        init_line    = indent + type + " " + mutable_name + suffix + " = " + name + ";\n";
-        return true;
+        auto result = decl;
+        ReplaceFirstStandaloneWord(result, "in", "out");
+        return result;
     };
     auto FindMainBody = [](const std::string& text) -> std::optional<std::pair<size_t, size_t>> {
         const auto main_pos = text.find("void main");
@@ -606,10 +1407,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
 
         auto [body_begin, body_end] = *main_body;
         std::string body            = text.substr(body_begin, body_end - body_begin);
-        body = std::regex_replace(
-            body,
-            std::regex(std::string(R"(\b)") + EscapeRegex(from) + R"(\b)"),
-            to);
+        body = ReplaceStandaloneIdentifier(body, from, to);
         text.replace(body_begin, body_end - body_begin, body);
         return true;
     };
@@ -632,12 +1430,11 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
             }
         }
     }
-    std::regex re_hold(SHADER_PLACEHOLD.data());
-
     // LOG_INFO("insert: %s", insert_str.c_str());
     // return std::regex_replace(
     //    std::regex_replace(cur.result, re_hold, insert_str), std::regex(R"(\s+\n)"), "\n");
-    auto result = std::regex_replace(unit.src, re_hold, insert_str);
+    auto result = unit.src;
+    ReplaceAll(result, SHADER_PLACEHOLD, insert_str);
 
     // Wallpaper Engine shaders sometimes declare the same stage interface with different types
     // across stages. Only reconcile the consumer side with the previous stage's output.
@@ -654,30 +1451,12 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         }
     }
 
-    // Some Wallpaper Engine effect shaders survive preprocessing with an invalid scalar
-    // declaration even though the RHS is a vec2. Fix the generated GLSL before glslang sees it.
-    result = std::regex_replace(
-        result,
-        std::regex(R"(\bfloat\s+pointer\s*=\s*g_PointerPosition\.xy\s*\*\s*u_pointerSpeed\s*;)"),
-        "vec2 pointer = g_PointerPosition.xy * u_pointerSpeed;");
+    // Some Wallpaper Engine effect shaders survive preprocessing with invalid simple
+    // declarations. Normalize those with a token-aware statement rewrite.
+    result = RewriteSimpleShaderStatements(result);
 
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
-    result = std::regex_replace(
-        result,
-        std::regex(
-            R"(for\s*\(\s*int\s+([A-Za-z_]\w*)\s*=\s*([^;]+?)\s*;\s*\1\s*([<>]=?)\s*([^;]+?)\s*;\s*(?:\+\+\s*\1|\1\s*\+\+)\s*\))"),
-        "for (int $1 = int($2); $1 $3 int($4); $1++)");
-
-    // Wallpaper Engine shaders also rely on implicit vector narrowing in assignments like
-    // `vec2 uv = someVec4;`. GLSL does not allow that, so apply the obvious swizzle.
-    result = std::regex_replace(
-        result,
-        std::regex(R"(\bvec2\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;)"),
-        "vec2 $1 = $2.xy;");
-    result = std::regex_replace(
-        result,
-        std::regex(R"(\bvec3\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;)"),
-        "vec3 $1 = $2.xyz;");
+    result = RewriteIntegerForLoops(result);
 
     // Some effect fragment shaders write back into stage inputs such as v_TexCoord. GLSL
     // forbids that, so rewrite those inputs to immutable varyings plus mutable locals.
@@ -696,20 +1475,17 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
         }
 
         if (! init_lines.empty()) {
-            result = std::regex_replace(result,
-                                        std::regex(R"(void\s+main\s*\(\s*(?:void)?\s*\)\s*\{)"),
-                                        "void main() {\n" + init_lines,
-                                        std::regex_constants::format_first_only);
+            if (const auto main_body = FindMainBody(result); main_body.has_value()) {
+                result.insert(main_body->first, "\n" + init_lines);
+            }
         }
     }
 
     // HLSL-style shaders often write scalar-first max/min calls such as max(0.0, vec2Expr).
     // GLSL only accepts the scalar as the second argument for vector overloads.
-    result = std::regex_replace(
-        result,
-        std::regex(
-            R"(\b(max|min)\(\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*,\s*((?:[^(),\n]+|\([^()]*\))+)\s*\))"),
-        "$1($3, $2)");
+    static const std::regex re_scalar_first_minmax(
+        R"(\b(max|min)\(\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*,\s*((?:[^(),\n]+|\([^()]*\))+)\s*\))");
+    result = std::regex_replace(result, re_scalar_first_minmax, "$1($3, $2)");
 
     return result;
 }
