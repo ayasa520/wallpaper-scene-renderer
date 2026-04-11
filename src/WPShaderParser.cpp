@@ -1827,7 +1827,7 @@ inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStrea
 
 inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, const Combos& combos) {
     std::ostringstream out;
-    out << "prepared-shader-v3\n";
+    out << "prepared-shader-v4\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';

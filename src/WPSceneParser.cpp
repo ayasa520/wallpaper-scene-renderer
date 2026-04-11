@@ -309,6 +309,20 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
     }
 }
 
+void ApplyKnownShaderSourceFixes(std::string_view shader_name, ShaderType stage,
+                                 std::string& source) {
+    // Wallpaper Engine's stock `genericropeparticle.vert` expands the ribbon with
+    // `position += right * uvs.x * 2.0 - 1.0;`, which offsets the whole rope instead
+    // of scaling `right` symmetrically around the centerline.
+    if (shader_name == "genericropeparticle" && stage == ShaderType::VERTEX) {
+        const std::string_view broken = "position += right * uvs.x * 2.0 - 1.0;";
+        const auto             pos    = source.find(broken);
+        if (pos != std::string::npos) {
+            source.replace(pos, broken.size(), "position += right * (uvs.x * 2.0 - 1.0);");
+        }
+    }
+}
+
 bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, SceneNode* pNode,
                   SceneMaterial* pMaterial, WPShaderValueData* pSvData,
                   const UserPropertyMap* user_properties = nullptr,
@@ -342,6 +356,10 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                               .src             = fs::GetFileContent(vfs, shaderPath + ".frag"),
                               .preprocess_info = {},
                           } };
+
+    for (auto& unit : sd_units) {
+        ApplyKnownShaderSourceFixes(wpmat.shader, unit.stage, unit.src);
+    }
 
     std::vector<WPShaderTexInfo>                 texinfos;
     std::unordered_map<std::string, ImageHeader> texHeaders;
