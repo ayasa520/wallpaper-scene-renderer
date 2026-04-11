@@ -224,7 +224,12 @@ void LoadControlPoint(ParticleSubSystem& pSys, const wpscene::Particle& wp) {
 }
 void LoadInitializer(ParticleSubSystem& pSys, const wpscene::Particle& wp,
                      const wpscene::ParticleInstanceoverride& over) {
+    const bool has_color_override = over.enabled && (over.overColor || over.overColorn);
     for (const auto& ini : wp.initializers) {
+        if (has_color_override && ini.contains("name") && ini.at("name").is_string() &&
+            ini.at("name").get<std::string>() == "colorrandom") {
+            continue;
+        }
         pSys.AddInitializer(WPParticleParser::genParticleInitOp(ini));
     }
     if (over.enabled) pSys.AddInitializer(WPParticleParser::genOverrideInitOp(over));
