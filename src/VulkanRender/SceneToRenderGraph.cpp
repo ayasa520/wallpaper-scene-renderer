@@ -3,10 +3,17 @@
 #include "Scene/Scene.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "SpecTexs.hpp"
-#include "Utils/Logging.h"
 #include "Core/MapSet.hpp"
+#include "Utils/Logging.h"
 
 #include "VulkanRender/AllPasses.hpp"
+
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace wallpaper;
 namespace wallpaper::rg
@@ -19,32 +26,40 @@ void doCopy(RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc, TexNode* 
     desc.src = in->key();
     desc.dst = out->key();
 }
-void addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode* out) {
+void addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode* out,
+                 std::function<bool()> should_execute = {}) {
     rgraph.addPass<vulkan::CopyPass>(
         "copy",
         PassNode::Type::Copy,
-        [&in, &out](RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc) {
+        [in, out, should_execute = std::move(should_execute)](
+            RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc) {
             doCopy(builder, desc, in, out);
+            desc.should_execute = should_execute;
         });
 }
 
-void addCopyPass(RenderGraph& rgraph, const TexNode::Desc& in, const TexNode::Desc& out) {
+void addCopyPass(RenderGraph& rgraph, const TexNode::Desc& in, const TexNode::Desc& out,
+                 std::function<bool()> should_execute = {}) {
     rgraph.addPass<vulkan::CopyPass>(
         "copy",
         PassNode::Type::Copy,
-        [&in, &out](RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc) {
+        [in, out, should_execute = std::move(should_execute)](
+            RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc) {
             auto* in_node  = builder.createTexNode(in);
             auto* out_node = builder.createTexNode(out, true);
             doCopy(builder, desc, in_node, out_node);
+            desc.should_execute = should_execute;
         });
 }
 
-TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc = nullptr) {
+TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc = nullptr,
+                     std::function<bool()> should_execute = {}) {
     TexNode* copy { nullptr };
     rgraph.addPass<vulkan::CopyPass>(
         "copy",
         PassNode::Type::Copy,
-        [&copy, in, out_desc](RenderGraphBuilder& builder, vulkan::CopyPass::Desc& pdesc) {
+        [&copy, in, out_desc, should_execute = std::move(should_execute)](
+            RenderGraphBuilder& builder, vulkan::CopyPass::Desc& pdesc) {
             auto desc = out_desc == nullptr ? in->genDesc() : *out_desc;
             if (out_desc == nullptr) {
                 desc.key += "_" + std::to_string(in->version()) + "_copy";
@@ -52,6 +67,7 @@ TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc =
             }
             copy = builder.createTexNode(desc, true);
             doCopy(builder, pdesc, in, copy);
+            pdesc.should_execute = should_execute;
         });
     return copy;
 }
@@ -63,11 +79,6 @@ static TexNode::Desc createTexDesc(std::string path) {
                                                    : TexNode::TexType::Imported };
 }
 } // namespace wallpaper::rg
-
-static void TraverseNode(const std::function<void(SceneNode*)>& func, SceneNode* node) {
-    func(node);
-    for (auto& child : node->GetChildren()) TraverseNode(func, child.get());
-}
 
 static void CheckAndSetSprite(Scene& scene, vulkan::CustomShaderPass::Desc& desc,
                               std::span<const std::string> texs) {
@@ -82,6 +93,34 @@ static void CheckAndSetSprite(Scene& scene, vulkan::CustomShaderPass::Desc& desc
     }
 }
 
+static bool IsAudioBarShaderNode(SceneNode* node) {
+    if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr) {
+        return false;
+    }
+    const auto* shader = node->Mesh()->Material()->customShader.shader.get();
+    return shader != nullptr && shader->name.find("Simple_Audio_Bars") != std::string::npos;
+}
+
+static bool IsSyntheticCompositeNode(SceneNode* node) {
+    if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr) {
+        return false;
+    }
+    const auto* shader   = node->Mesh()->Material()->customShader.shader.get();
+    return shader != nullptr && shader->name == "genericimage3";
+}
+
+static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::string_view output) {
+    const auto owner_it = scene.nodeOwners.find(node);
+    if (owner_it == scene.nodeOwners.end()) return false;
+    if (scene.offscreenDependencyLayerIds.count(owner_it->second) == 0) return false;
+
+    // Hidden dependency layers are allowed to keep rendering only into private offscreen targets that
+    // another effect samples. They must never use that exemption for `_rt_default`, because that
+    // would make an invisible helper layer composite directly onto the wallpaper and create the large
+    // tinted rectangles seen in xray-style scenes.
+    return output != SpecTex_Default;
+}
+
 struct DelayLinkInfo {
     rg::NodeID id;
     rg::NodeID link_id;
@@ -93,59 +132,138 @@ struct ExtraInfo {
     std::vector<DelayLinkInfo> link_info {};
     rg::RenderGraph*           rgraph { nullptr };
     Scene*                     scene { nullptr };
+    std::unordered_map<int32_t, size_t> layer_order_index {};
     bool                       use_mipmap_framebuffer { false };
 };
 
-static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra) {
-    auto& rgraph = *extra.rgraph;
-    auto& scene  = *extra.scene;
+struct OrderedRenderGraphChild {
+    SceneNode* node { nullptr };
+    bool       proxy { false };
+    size_t     sequence { 0 };
+};
 
-    auto loadEffect = [node, &rgraph, &scene, &extra](SceneImageEffectLayer* effs) {
-        effs->ResolveEffect(scene.default_effect_mesh, "effect");
+static int32_t NodeLayerId(const Scene& scene, SceneNode* node) {
+    if (node == nullptr) return 0;
+    if (auto owner_it = scene.nodeOwners.find(node); owner_it != scene.nodeOwners.end()) {
+        return owner_it->second;
+    }
+    return node->ID();
+}
 
-        for (usize i = 0; i < effs->EffectCount(); i++) {
-            auto& eff     = effs->GetEffect(i);
-            auto  cmdItor = eff->commands.begin();
-            auto  cmdEnd  = eff->commands.end();
-            int   nodePos = 0;
-            for (auto& n : eff->nodes) {
-                if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
-                    rg::addCopyPass(
-                        rgraph, rg::createTexDesc(cmdItor->src), rg::createTexDesc(cmdItor->dst));
-                    cmdItor++;
-                }
-                auto& name = n.output;
-                ToGraphPass(n.sceneNode.get(), name, node->ID(), extra);
-                nodePos++;
-            }
-        }
-    };
+static size_t NodeLayerOrderIndex(SceneNode* node, const ExtraInfo& extra) {
+    if (extra.scene == nullptr || node == nullptr) return std::numeric_limits<size_t>::max();
+    const int32_t layer_id = NodeLayerId(*extra.scene, node);
+    if (auto it = extra.layer_order_index.find(layer_id); it != extra.layer_order_index.end()) {
+        return it->second;
+    }
+    return std::numeric_limits<size_t>::max();
+}
 
-    if (node->Mesh() == nullptr) return;
-    auto* mesh = node->Mesh();
-    if (mesh->Material() == nullptr) return;
-    auto* material   = mesh->Material();
-    auto* mshaderPtr = material->customShader.shader.get();
+static bool IsEffectLocalProxyDependency(SceneNode* node, const ExtraInfo& extra) {
+    if (extra.scene == nullptr || node == nullptr) return false;
+    const int32_t layer_id = NodeLayerId(*extra.scene, node);
+    return layer_id != 0 && extra.scene->offscreenDependencyLayerIds.count(layer_id) != 0;
+}
 
-    SceneImageEffectLayer* imgeff = nullptr;
-    if (! node->Camera().empty()) {
-        auto& cam = scene.cameras.at(node->Camera());
-        if (cam->HasImgEffect()) {
-            imgeff = cam->GetImgEffect().get();
-            output = imgeff->FirstTarget();
+static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode* node,
+                                                                       ExtraInfo& extra) {
+    std::vector<OrderedRenderGraphChild> children;
+    if (node == nullptr || extra.scene == nullptr) return children;
+
+    std::unordered_set<SceneNode*> seen;
+    size_t sequence = 0;
+    for (auto& child : node->GetChildren()) {
+        if (!child || !seen.insert(child.get()).second) continue;
+        children.push_back(OrderedRenderGraphChild {
+            .node = child.get(),
+            .proxy = false,
+            .sequence = sequence++,
+        });
+    }
+
+    if (auto proxy_it = extra.scene->renderOrderProxyChildren.find(node);
+        proxy_it != extra.scene->renderOrderProxyChildren.end()) {
+        for (auto* proxy_child : proxy_it->second) {
+            if (proxy_child == nullptr || !seen.insert(proxy_child).second) continue;
+            children.push_back(OrderedRenderGraphChild {
+                .node = proxy_child,
+                .proxy = true,
+                .sequence = sequence++,
+            });
         }
     }
 
-    std::string passName = material->name;
+    // The scene tree still owns lifetime and transforms, but the render graph needs Wallpaper
+    // Engine's authored layer order. Sorting only by known layer order and then by insertion
+    // sequence keeps helper nodes deterministic without forcing every runtime node to have an
+    // authored layer id.
+    std::stable_sort(children.begin(), children.end(), [&extra](const auto& lhs, const auto& rhs) {
+        const auto lhs_index = NodeLayerOrderIndex(lhs.node, extra);
+        const auto rhs_index = NodeLayerOrderIndex(rhs.node, extra);
+        if (lhs_index != rhs_index) return lhs_index < rhs_index;
+        return lhs.sequence < rhs.sequence;
+    });
+    return children;
+}
 
+static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
+                        std::function<bool()> should_execute = {}) {
+    auto& rgraph = *extra.rgraph;
+    auto& scene  = *extra.scene;
+
+    if (node->Mesh() == nullptr) {
+        return;
+    }
+    auto* mesh = node->Mesh();
+    if (mesh->Material() == nullptr) {
+        return;
+    }
+    auto* material = mesh->Material();
+
+    std::string passName = material->name;
     rgraph.addPass<vulkan::CustomShaderPass>(
         passName,
         rg::PassNode::Type::CustomShader,
-        [material, node, &output, &imgId, &rgraph, &scene, &extra](
+        [material, node, &output, &imgId, &rgraph, &scene, &extra,
+         should_execute = std::move(should_execute)](
             rg::RenderGraphBuilder& builder, vulkan::CustomShaderPass::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
+            // Passing the live scene into the prepared pass lets resource refreshes resolve current
+            // render-target dependencies directly, which is what keeps first-class text bridges and
+            // ordinary effect passes on the same stable render-graph contract.
+            pdesc.scene      = &scene;
             pdesc.node       = node;
+            pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output);
+            pdesc.should_execute      = should_execute;
             pdesc.output     = output;
+            if (IsAudioBarShaderNode(node)) {
+                LOG_INFO("SceneAudioGraphBind: pass-id=%zu source-layer=%d node-ptr=%p node-id=%d name='%s' camera='%s' output='%s' execute-when-hidden=%s gated=%s",
+                         static_cast<size_t>(pass.ID()),
+                         imgId,
+                         static_cast<void*>(node),
+                         node->ID(),
+                         node->Name().c_str(),
+                         node->Camera().c_str(),
+                         output.data(),
+                         pdesc.execute_when_hidden ? "true" : "false",
+                         pdesc.should_execute ? "true" : "false");
+            } else if (IsSyntheticCompositeNode(node)) {
+                const auto* bind_material = node->Mesh()->Material();
+                const auto texture0 = bind_material != nullptr && !bind_material->textures.empty()
+                    ? bind_material->textures[0].c_str()
+                    : "<none>";
+                LOG_INFO("SceneAudioCompositeGraphBind: pass-id=%zu source-layer=%d node-ptr=%p node-id=%d name='%s' camera='%s' output='%s' execute-when-hidden=%s gated=%s",
+                         static_cast<size_t>(pass.ID()),
+                         imgId,
+                         static_cast<void*>(node),
+                         node->ID(),
+                         node->Name().c_str(),
+                         node->Camera().c_str(),
+                         output.data(),
+                         pdesc.execute_when_hidden ? "true" : "false",
+                         pdesc.should_execute ? "true" : "false");
+                LOG_INFO("SceneAudioCompositeGraphBind: texture0='%s'", texture0);
+            }
             CheckAndSetSprite(scene, pdesc, material->textures);
             for (usize i = 0; i < material->textures.size(); i++) {
                 const auto&  url = material->textures[i];
@@ -186,23 +304,249 @@ static void ToGraphPass(SceneNode* node, std::string_view output, i32 imgId, Ext
                                                           .type = rg::TexNode::TexType::Temp },
                                       true);
             builder.write(output_node);
-            if (output == SpecTex_Default) {
-                extra.id_link_map[(usize)imgId] = output_node;
-            }
+            extra.id_link_map[(usize)imgId] = output_node;
         });
+}
 
-    // load effect
-    if (imgeff != nullptr) loadEffect(imgeff);
+static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra) {
+    auto& rgraph = *extra.rgraph;
+    auto& scene  = *extra.scene;
+
+    if (node == nullptr || node->Text() == nullptr) {
+        return;
+    }
+
+    std::string pass_name = node->Name().empty() ? std::string("text") : node->Name();
+    rgraph.addPass<vulkan::TextPass>(
+        pass_name,
+        rg::PassNode::Type::Text,
+        [node, &output, imgId, &scene, &extra](
+            rg::RenderGraphBuilder& builder, vulkan::TextPass::Desc& pdesc) {
+            const auto& pass = builder.workPassNode();
+            // Text is now emitted as its own render-graph pass. It shares the same constrained
+            // hidden-dependency rule as mesh passes: invisible helper layers may render private
+            // offscreen sources, but they must not composite text directly into `_rt_default`.
+            pdesc.scene = &scene;
+            pdesc.node = node;
+            // Keep the authored layer id on the prepared pass so runtime text rerasters can
+            // refresh the exact Clock/TextPass resources without broadening the dirty target set.
+            pdesc.layer_id = imgId;
+            pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output);
+            pdesc.output = output;
+
+            auto* output_node =
+                builder.createTexNode(rg::TexNode::Desc { .name = output.data(),
+                                                          .key = output.data(),
+                                                          .type = rg::TexNode::TexType::Temp },
+                                      true);
+            builder.write(output_node);
+            extra.id_link_map[(usize)imgId] = output_node;
+            (void)pass;
+        });
+}
+
+static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 imgId,
+                        ExtraInfo& extra, std::function<bool()> node_execute_gate = {},
+                        bool routed_node = false) {
+    auto& scene = *extra.scene;
+
+    if (node != nullptr && !routed_node) {
+        const bool proxy_node = scene.renderOrderProxyNodes.count(node) != 0;
+        const bool detached_source_node = scene.detachedEffectSourceNodes.count(node) != 0;
+        if (proxy_node || detached_source_node) {
+            // Root-owned proxy/source nodes are emitted through explicit authored-order routes.
+            // Reaching them through the physical tree means the root traversal is at the wrong
+            // sibling position, so skip this visit to avoid late duplicate composites.
+            LOG_INFO("SceneRenderGraphNodeRouteSkip: layer=%d name='%s' reason='%s'",
+                     NodeLayerId(scene, node),
+                     node->Name().c_str(),
+                     detached_source_node ? "detached-source" : "proxy");
+            return;
+        }
+    }
+
+    std::string_view         output = inherited_output;
+    SceneImageEffectLayer*   imgeff { nullptr };
+    if (node != nullptr && !node->Camera().empty()) {
+        auto camera_it = scene.cameras.find(node->Camera());
+        if (camera_it != scene.cameras.end() && camera_it->second->HasImgEffect()) {
+            imgeff = camera_it->second->GetImgEffect().get();
+            output = imgeff->FirstTarget();
+        }
+    }
+
+    if (node != nullptr && node->Mesh() != nullptr && node->Mesh()->Material() != nullptr) {
+        AddNodePass(node, output, imgId, extra, node_execute_gate);
+    }
+    // Text is now a first-class scene primitive. Whenever a node owns text we emit the dedicated
+    // text pass directly from that primitive, keeping the render graph aligned with the same
+    // authoritative text object that parser and runtime updates mutate.
+    if (node != nullptr && node->Text() != nullptr) {
+        AddTextNodePass(node, output, imgId, extra);
+    }
+
+    if (node != nullptr) {
+        if (auto detached_it = scene.detachedEffectSourceNodesByWorldNode.find(node);
+            detached_it != scene.detachedEffectSourceNodesByWorldNode.end()) {
+            for (auto* source_node : detached_it->second) {
+                if (source_node == nullptr) continue;
+                LOG_INFO("SceneRenderGraphDetachedSourceRoute: world-layer=%d source-layer=%d "
+                         "world-name='%s' source-name='%s' output='%.*s'",
+                         NodeLayerId(scene, node),
+                         NodeLayerId(scene, source_node),
+                         node->Name().c_str(),
+                         source_node->Name().c_str(),
+                         static_cast<int>(output.size()),
+                         output.data());
+                ToGraphPass(source_node,
+                            output,
+                            NodeLayerId(scene, source_node),
+                            extra,
+                            {},
+                            true);
+            }
+        }
+    }
+
+    std::vector<OrderedRenderGraphChild> deferred_proxy_children;
+    if (node != nullptr) {
+        for (const auto& child : OrderedRenderGraphChildren(node, extra)) {
+            if (child.node == nullptr) continue;
+            if (child.proxy && imgeff != nullptr &&
+                !IsEffectLocalProxyDependency(child.node, extra)) {
+                // A render-order proxy edge only restores authored sibling order. It does not make
+                // the proxied world-space node a real child of this image-effect source target, so
+                // defer ordinary proxies until the parent effect has resolved back to the inherited
+                // output space.
+                LOG_INFO("SceneRenderGraphProxyChildDefer: parent-layer=%d proxy-layer=%d "
+                         "inherited-output='%.*s' parent-effect-output='%.*s'",
+                         NodeLayerId(scene, node),
+                         NodeLayerId(scene, child.node),
+                         static_cast<int>(inherited_output.size()),
+                         inherited_output.data(),
+                         static_cast<int>(output.size()),
+                         output.data());
+                deferred_proxy_children.push_back(child);
+                continue;
+            }
+
+            if (child.proxy) {
+                if (imgeff != nullptr) {
+                    // Wallpaper Engine `dependencies` are effect-local inputs. These proxies must
+                    // stay inside the parent effect phase because the parent shader samples their
+                    // private source target while resolving the effect chain.
+                    LOG_INFO("SceneRenderGraphProxyInlineEffectRoute: parent-layer=%d "
+                             "proxy-layer=%d output='%.*s'",
+                             NodeLayerId(scene, node),
+                             NodeLayerId(scene, child.node),
+                             static_cast<int>(output.size()),
+                             output.data());
+                } else {
+                    LOG_INFO("SceneRenderGraphProxyChildRoute: parent-layer=%d proxy-layer=%d "
+                             "name='%s' output='%.*s'",
+                             NodeLayerId(scene, node),
+                             NodeLayerId(scene, child.node),
+                             child.node->Name().c_str(),
+                             static_cast<int>(output.size()),
+                             output.data());
+                }
+            }
+            ToGraphPass(child.node,
+                        output,
+                        NodeLayerId(scene, child.node),
+                        extra,
+                        {},
+                        child.proxy);
+        }
+    }
+
+    if (imgeff != nullptr) {
+        // Composite source nodes may now be transform-only containers whose children draw into the
+        // effect source target. Resolving the effect after all descendants have emitted their passes
+        // keeps those composite layers correct without requiring each child to manage effect timing.
+        imgeff->ResolveEffect(scene.default_effect_mesh, "effect");
+
+        for (usize i = 0; i < imgeff->EffectCount(); i++) {
+            auto& eff     = imgeff->GetEffect(i);
+            auto  cmdItor = eff->commands.begin();
+            auto  cmdEnd  = eff->commands.end();
+            int   nodePos = 0;
+            auto  effect_visible_gate = [eff]() {
+                return eff == nullptr || eff->LocalVisible();
+            };
+            auto effect_hidden_gate = [eff]() {
+                return eff != nullptr && !eff->LocalVisible();
+            };
+            for (auto& effect_node : eff->nodes) {
+                if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
+                    rg::addCopyPass(*extra.rgraph,
+                                    rg::createTexDesc(cmdItor->src),
+                                    rg::createTexDesc(cmdItor->dst),
+                                    effect_visible_gate);
+                    cmdItor++;
+                }
+                ToGraphPass(effect_node.sceneNode.get(), effect_node.output, imgId, extra);
+                nodePos++;
+            }
+            if (!eff->BypassSource().empty() && !eff->BypassTarget().empty() &&
+                eff->BypassSource() != eff->BypassTarget()) {
+                // Hidden effects must still advance the ping-pong chain. The shader and authored
+                // effect commands become no-ops through their local visibility, then this gated copy
+                // forwards the current input target to the effect output target so downstream
+                // effects sample the current frame, not the stale texture from the last visible
+                // frame.
+                rg::addCopyPass(*extra.rgraph,
+                                rg::createTexDesc(eff->BypassSource()),
+                                rg::createTexDesc(eff->BypassTarget()),
+                                effect_hidden_gate);
+            }
+        }
+
+        if (imgeff->HasFinalComposite()) {
+            // The final composite is deliberately a runtime fallback, not a replacement for visible
+            // authored final effects. It only draws when the final effect is hidden; otherwise the
+            // historical direct-to-output shader path remains the only screen writer for this chain.
+            auto hidden_final_fallback_gate = [imgeff]() {
+                return imgeff != nullptr && imgeff->ShouldRunFinalCompositeFallback();
+            };
+            ToGraphPass(&imgeff->FinalNode(),
+                        inherited_output,
+                        imgId,
+                        extra,
+                        hidden_final_fallback_gate);
+        }
+    }
+
+    for (const auto& child : deferred_proxy_children) {
+        if (child.node == nullptr) continue;
+        LOG_INFO("SceneRenderGraphProxyOutputRoute: parent-layer=%d proxy-layer=%d output='%.*s'",
+                 NodeLayerId(scene, node),
+                 NodeLayerId(scene, child.node),
+                 static_cast<int>(inherited_output.size()),
+                 inherited_output.data());
+        ToGraphPass(child.node,
+                    inherited_output,
+                    NodeLayerId(scene, child.node),
+                    extra,
+                    {},
+                    true);
+    }
 }
 
 std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
     std::unique_ptr<rg::RenderGraph> rgraph = std::make_unique<rg::RenderGraph>();
     ExtraInfo                        extra { .rgraph = rgraph.get(), .scene = &scene };
-    TraverseNode(
-        [&extra](SceneNode* node) {
-            ToGraphPass(node, SpecTex_Default, node->ID(), extra);
-        },
-        scene.sceneGraph.get());
+    for (size_t index = 0; index < scene.layerOrder.size(); index++) {
+        extra.layer_order_index[scene.layerOrder[index]] = index;
+    }
+    LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu proxy-parent-count=%zu proxy-node-count=%zu "
+             "detached-anchor-count=%zu detached-source-count=%zu",
+             scene.layerOrder.size(),
+             scene.renderOrderProxyChildren.size(),
+             scene.renderOrderProxyNodes.size(),
+             scene.detachedEffectSourceNodesByWorldNode.size(),
+             scene.detachedEffectSourceNodes.size());
+    ToGraphPass(scene.sceneGraph.get(), SpecTex_Default, scene.sceneGraph->ID(), extra);
 
     for (auto& info : extra.link_info) {
         if (! exists(extra.id_link_map, info.link_id)) {

@@ -13,10 +13,13 @@
 #include "Vulkan/ShaderComp.hpp"
 
 #include <regex>
+#include <array>
 #include <charconv>
 #include <cctype>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
 static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
@@ -31,6 +34,19 @@ using namespace wallpaper;
 
 namespace
 {
+struct GlslangRuntimeState {
+    std::recursive_mutex mutex;
+    std::size_t          depth { 0 };
+};
+
+GlslangRuntimeState& GetGlslangRuntimeState() {
+    static GlslangRuntimeState state;
+    return state;
+}
+
+std::size_t GetThreadLogId() {
+    return std::hash<std::thread::id> {}(std::this_thread::get_id());
+}
 
 static constexpr const char* pre_shader_code = R"(#version 150
 #define GLSL 1
@@ -543,6 +559,8 @@ inline size_t FindStatementTerminator(std::string_view text, size_t pos) {
     return std::string::npos;
 }
 
+inline std::vector<std::string_view> SplitTopLevelArgs(std::string_view args);
+
 inline std::string RewriteSimpleShaderStatements(std::string_view text) {
     std::string result;
     result.reserve(text.size());
@@ -700,6 +718,159 @@ inline std::string RewriteSimpleShaderStatements(std::string_view text) {
         result.append(replacement);
         cursor = stmt_end + 1;
         pos    = cursor;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
+inline bool IsSwizzleChar(char ch) {
+    switch (ch) {
+    case 'x':
+    case 'y':
+    case 'z':
+    case 'w':
+    case 'r':
+    case 'g':
+    case 'b':
+    case 'a': return true;
+    default: return false;
+    }
+}
+
+inline bool TryParseSwizzledLValue(std::string_view source, std::string_view& base,
+                                   std::string_view& swizzle) {
+    source = TrimWhitespace(source);
+    if (source.empty() || ! IsIdentifierStart(source.front())) return false;
+
+    const auto base_end = SkipIdentifier(source, 0);
+    if (base_end >= source.size() || source[base_end] != '.') return false;
+
+    const auto swizzle_begin = base_end + 1;
+    if (swizzle_begin >= source.size() || ! IsSwizzleChar(source[swizzle_begin])) return false;
+
+    size_t swizzle_end = swizzle_begin;
+    while (swizzle_end < source.size() && IsSwizzleChar(source[swizzle_end])) {
+        swizzle_end++;
+    }
+
+    swizzle = source.substr(swizzle_begin, swizzle_end - swizzle_begin);
+    if (swizzle.size() < 2 || swizzle.size() > 4 || swizzle_end != source.size()) return false;
+
+    base = source.substr(0, base_end);
+    return true;
+}
+
+inline std::optional<size_t> FindTopLevelAssignmentOperator(std::string_view text) {
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+    int  brace_depth { 0 };
+
+    for (size_t pos = 0; pos < text.size(); pos++) {
+        const char ch = text[pos];
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == '{') brace_depth++;
+        else if (ch == '}' && brace_depth > 0) brace_depth--;
+        else if (ch == '=' && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+            const char prev = pos > 0 ? text[pos - 1] : '\0';
+            const char next = pos + 1 < text.size() ? text[pos + 1] : '\0';
+            if (prev == '=' || prev == '!' || prev == '<' || prev == '>') continue;
+            if (next == '=') continue;
+            return pos;
+        }
+    }
+
+    return std::nullopt;
+}
+
+inline bool TryRewriteSwizzledSelfMixAssignment(std::string_view statement,
+                                                std::string&     replacement) {
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+
+    const auto assignment_pos = FindTopLevelAssignmentOperator(statement);
+    if (! assignment_pos.has_value()) return false;
+
+    std::string_view base;
+    std::string_view swizzle;
+    if (! TryParseSwizzledLValue(statement.substr(0, *assignment_pos), base, swizzle)) return false;
+
+    std::string_view function_name;
+    std::string_view call_args_source;
+    if (! TryParseConstructorCall(statement.substr(*assignment_pos + 1), function_name, call_args_source)) {
+        return false;
+    }
+    if (function_name != "mix" && function_name != "lerp") return false;
+
+    const auto args = SplitTopLevelArgs(call_args_source);
+    if (args.size() != 3) return false;
+
+    std::array<std::string, 3> rewritten_args;
+    bool                       changed { false };
+    for (size_t i = 0; i < args.size(); i++) {
+        const auto trimmed_arg = TrimWhitespace(args[i]);
+        std::string_view ident;
+        if (i < 2 && TryParseStandaloneIdentifier(trimmed_arg, ident) && ident == base) {
+            rewritten_args[i] = std::string(base) + "." + std::string(swizzle);
+            changed           = true;
+        } else {
+            rewritten_args[i] = std::string(trimmed_arg);
+        }
+    }
+
+    if (! changed) return false;
+
+    replacement = std::string(TrimWhitespace(statement.substr(0, *assignment_pos))) + " = " +
+                  std::string(function_name) + "(" + rewritten_args[0] + ", " +
+                  rewritten_args[1] + ", " + rewritten_args[2] + ");";
+    return true;
+}
+
+inline std::string RewriteSwizzledSelfMixAssignments(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+
+    size_t cursor { 0 };
+    size_t pos { 0 };
+    while (pos < text.size()) {
+        const auto stmt_end = FindStatementTerminator(text, pos);
+        if (stmt_end == std::string::npos) break;
+
+        std::string replacement;
+        if (TryRewriteSwizzledSelfMixAssignment(text.substr(pos, stmt_end - pos + 1), replacement)) {
+            result.append(text.substr(cursor, pos - cursor));
+            result.append(replacement);
+            cursor = stmt_end + 1;
+        }
+
+        pos = stmt_end + 1;
     }
 
     result.append(text.substr(cursor));
@@ -1246,6 +1417,90 @@ inline std::string TrimOverlongVectorConstructors(std::string_view source) {
     }
 }
 
+inline std::string RewriteVec2AssignmentsForVec4TexCoord(std::string_view source) {
+    if (source.find("vec4 v_TexCoord") == std::string_view::npos ||
+        source.find("vec2 ") == std::string_view::npos ||
+        source.find("v_TexCoord") == std::string_view::npos) {
+        return std::string(source);
+    }
+
+    std::string result;
+    result.reserve(source.size() + 64);
+
+    size_t pos { 0 };
+    while (pos < source.size()) {
+        const auto line_end =
+            source.find('\n', pos);
+        const auto line_len =
+            line_end == std::string::npos ? source.size() - pos : line_end - pos;
+        const auto line = source.substr(pos, line_len);
+
+        const auto first_non_ws = line.find_first_not_of(" \t\r");
+        if (first_non_ws == std::string_view::npos) {
+            result.append(line);
+        } else {
+            const auto trimmed = line.substr(first_non_ws);
+            const auto eq_pos = line.find('=');
+            const auto semicolon_pos = line.rfind(';');
+            const bool is_vec2_assignment =
+                trimmed.compare(0, 5, "vec2 ") == 0 &&
+                eq_pos != std::string_view::npos &&
+                semicolon_pos != std::string_view::npos &&
+                eq_pos < semicolon_pos;
+
+            if (! is_vec2_assignment || line.find("v_TexCoord") == std::string_view::npos) {
+                result.append(line);
+            } else {
+                std::string rewritten(line);
+                const auto rhs_begin = rewritten.find('=', 0);
+                const auto rhs_end   = rewritten.rfind(';');
+                if (rhs_begin != std::string::npos && rhs_end != std::string::npos &&
+                    rhs_begin < rhs_end) {
+                    const auto rhs_view = std::string_view(rewritten).substr(
+                        rhs_begin + 1, rhs_end - rhs_begin - 1);
+                    std::string rhs;
+                    rhs.reserve(rhs_view.size() + 16);
+
+                    size_t cursor { 0 };
+                    while (cursor < rhs_view.size()) {
+                        const auto match_pos = rhs_view.find("v_TexCoord", cursor);
+                        if (match_pos == std::string_view::npos) {
+                            rhs.append(rhs_view.substr(cursor));
+                            break;
+                        }
+
+                        rhs.append(rhs_view.substr(cursor, match_pos - cursor));
+                        const bool has_ident_prefix =
+                            match_pos > 0 && IsIdentifierContinue(rhs_view[match_pos - 1]);
+                        const size_t after_name = match_pos + std::char_traits<char>::length("v_TexCoord");
+                        const bool has_ident_suffix =
+                            after_name < rhs_view.size() && IsIdentifierContinue(rhs_view[after_name]);
+                        const bool has_component_or_index =
+                            after_name < rhs_view.size() &&
+                            (rhs_view[after_name] == '.' || rhs_view[after_name] == '[');
+
+                        if (!has_ident_prefix && !has_ident_suffix && !has_component_or_index) {
+                            rhs.append("v_TexCoord.xy");
+                        } else {
+                            rhs.append("v_TexCoord");
+                        }
+                        cursor = after_name;
+                    }
+
+                    rewritten.replace(rhs_begin + 1, rhs_end - rhs_begin - 1, rhs);
+                }
+                result.append(rewritten);
+            }
+        }
+
+        if (line_end == std::string_view::npos) break;
+        result.push_back('\n');
+        pos = line_end + 1;
+    }
+
+    return result;
+}
+
 inline bool TryParseShaderMetadataJson(std::string_view line, const char* kind,
                                        nlohmann::json& result) {
     const size_t json_start = line.find_first_of('{');
@@ -1730,10 +1985,12 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     // Some Wallpaper Engine effect shaders survive preprocessing with invalid simple
     // declarations. Normalize those with a token-aware statement rewrite.
     result = RewriteSimpleShaderStatements(result);
+    result = RewriteSwizzledSelfMixAssignments(result);
 
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
     result = RewriteIntegerForLoops(result);
     result = TrimOverlongVectorConstructors(result);
+    result = RewriteVec2AssignmentsForVec4TexCoord(result);
 
     // Some effect fragment shaders write back into stage inputs such as v_TexCoord. GLSL
     // forbids that, so rewrite those inputs to immutable varyings plus mutable locals.
@@ -2124,8 +2381,41 @@ std::string WPShaderParser::PreShaderHeader(const std::string& src, const Combos
     return header + src;
 }
 
-void WPShaderParser::InitGlslang() { glslang::InitializeProcess(); }
-void WPShaderParser::FinalGlslang() { glslang::FinalizeProcess(); }
+void WPShaderParser::InitGlslang(std::string_view reason) {
+    auto& state = GetGlslangRuntimeState();
+    state.mutex.lock();
+    if (state.depth == 0) {
+        glslang::InitializeProcess();
+    }
+    state.depth++;
+    LOG_INFO("GlslangScope: action=enter reason='%.*s' thread=%zu depth=%zu",
+             static_cast<int>(reason.size()),
+             reason.data(),
+             GetThreadLogId(),
+             state.depth);
+}
+
+void WPShaderParser::FinalGlslang(std::string_view reason) {
+    auto& state = GetGlslangRuntimeState();
+    if (state.depth == 0) {
+        LOG_ERROR("GlslangScope: action=leave reason='%.*s' thread=%zu depth-underflow=true",
+                  static_cast<int>(reason.size()),
+                  reason.data(),
+                  GetThreadLogId());
+        return;
+    }
+
+    state.depth--;
+    LOG_INFO("GlslangScope: action=leave reason='%.*s' thread=%zu depth=%zu",
+             static_cast<int>(reason.size()),
+             reason.data(),
+             GetThreadLogId(),
+             state.depth);
+    if (state.depth == 0) {
+        glslang::FinalizeProcess();
+    }
+    state.mutex.unlock();
+}
 
 bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderUnit> units,
                                   std::vector<ShaderCode>& codes, fs::VFS& vfs,

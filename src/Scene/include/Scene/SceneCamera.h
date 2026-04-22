@@ -47,6 +47,8 @@ public:
     }
     void SetAspect(double aspect) { m_aspect = aspect; }
     void SetFov(double value) { m_fov = value; }
+    void SetNearClip(double value) { m_nearClip = value; }
+    void SetFarClip(double value) { m_farClip = value; }
 
     void  AttatchImgEffect(std::shared_ptr<SceneImageEffectLayer> eff) { m_imgEffect = eff; }
     bool  HasImgEffect() const { return (bool)m_imgEffect; }

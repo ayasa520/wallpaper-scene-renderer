@@ -25,6 +25,8 @@ public:
     Eigen::Matrix4d ResolveParallaxedModelTransform(SceneNode* node,
                                                     const SceneCamera* camera,
                                                     bool apply_parallax);
+    Eigen::Matrix4d ResolveRawModelTransform(SceneNode* node);
+    Eigen::Vector3f ResolveParallaxOffset(SceneNode* node, const SceneCamera* camera);
     std::optional<Eigen::Affine3f> ResolveAttachmentLocalTransform(SceneNode* node);
     bool                           ApplyAttachment(SceneNode* node);
     void                           UpdateAttachmentParentIfNeeded(const WPShaderValueData& node_data);

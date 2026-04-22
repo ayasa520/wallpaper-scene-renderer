@@ -44,6 +44,12 @@ constexpr std::array vertex_input = {
 
 FinPass::FinPass(const Desc&) {}
 FinPass::~FinPass() {}
+
+bool FinPass::referencesRenderTarget(std::string_view render_target) const {
+    // The final present pass samples only the render-graph result target. Text bridge target
+    // resizes never need to rebind this pass unless the default result image itself was recreated.
+    return m_desc.result == render_target;
+}
 namespace
 {
 std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFormat format,
@@ -158,6 +164,7 @@ void FinPass::prepare(Scene& scene, const Device& device, RenderingResources& rr
         descriptor_info.push_descriptor = true;
         GraphicsPipeline pipeline;
         pipeline.toDefault();
+        m_desc.pipeline.debug_name = "FinPass";
         pipeline.addDescriptorSetInfo(spanone { descriptor_info })
             .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
             .addInputBindingDescription(spanone { bind_description })
@@ -179,6 +186,24 @@ void FinPass::prepare(Scene& scene, const Device& device, RenderingResources& rr
         m_desc.clear_value = VkClearValue { { sc[0], sc[1], sc[2], 1.0f } };
     }
     setPrepared();
+}
+
+void FinPass::refreshResources(Scene& scene, const Device& device, RenderingResources&) {
+    // The final composite pass keeps its fullscreen mesh and pipeline across resource-only
+    // refreshes. The only scene-owned object it samples is the render-graph result texture, so we
+    // can re-query that cache entry and keep the existing pipeline hot instead of recompiling it.
+    auto tex_name = std::string(m_desc.result);
+    if (scene.renderTargets.count(tex_name) == 0) {
+        setPrepared(false);
+        return;
+    }
+    auto& rt = scene.renderTargets.at(tex_name);
+    if (auto opt = device.tex_cache().Query(tex_name, ToTexKey(rt), !rt.allowReuse);
+        opt.has_value()) {
+        m_desc.vk_result = opt.value();
+    } else {
+        setPrepared(false);
+    }
 }
 
 void FinPass::execute(const Device& device, RenderingResources& rr) {

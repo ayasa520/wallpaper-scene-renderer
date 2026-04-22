@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <string_view>
 #include "Scene/Scene.h"
 #include "Scene/SceneShader.h"
 #include "Type.hpp"
@@ -51,8 +52,8 @@ public:
 
     static std::string PreShaderHeader(const std::string& src, const Combos& combos, ShaderType);
 
-    static void InitGlslang();
-    static void FinalGlslang();
+    static void InitGlslang(std::string_view reason = {});
+    static void FinalGlslang(std::string_view reason = {});
 
     static bool CompileToSpv(std::string_view         scene_id, std::span<WPShaderUnit>,
                              std::vector<ShaderCode>& spvs, fs::VFS&, WPShaderInfo*,

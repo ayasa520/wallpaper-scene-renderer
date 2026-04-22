@@ -5,6 +5,7 @@
 #include "Scene/Scene.h"
 #include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SceneNode.h"
+#include "Audio/SoundManager.h"
 #include "SpriteAnimation.hpp"
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
@@ -16,6 +17,7 @@
 #include <ctime>
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
 #include <limits>
 #include <numeric>
 
@@ -26,6 +28,17 @@ namespace
 {
 constexpr float kDefaultMouseCoord = 0.5f;
 constexpr double kParallaxSettleRatio = std::log(100.0);
+constexpr std::array<uint32_t, 3> kAudioSpectrumResolutions { 16, 32, 64 };
+constexpr std::array<const char*, 3> kAudioSpectrumLeftUniforms {
+    "g_AudioSpectrum16Left",
+    "g_AudioSpectrum32Left",
+    "g_AudioSpectrum64Left",
+};
+constexpr std::array<const char*, 3> kAudioSpectrumRightUniforms {
+    "g_AudioSpectrum16Right",
+    "g_AudioSpectrum32Right",
+    "g_AudioSpectrum64Right",
+};
 
 struct MeshBounds2D {
     bool     valid { false };
@@ -92,6 +105,18 @@ Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
             .matrix();
     return viewProjectionTrans * projectionModelTrans * localFromNormalized;
 }
+
+std::string_view ResolveEffectiveNodeCameraName(const SceneNode* node) {
+    // Effect-backed text still contributes intermediate bridge-source quads to the generic image
+    // path while the logical text owner carries the camera binding. Walking ancestors here lets
+    // those bridge-source quads inherit the same offscreen camera contract as the owning text
+    // primitive, so text effects stay synchronized without any text-specific fallback camera path.
+    for (auto* current = node; current != nullptr; current = current->Parent()) {
+        if (!current->Camera().empty()) return current->Camera();
+    }
+    return {};
+}
+
 } // namespace
 
 void WPShaderValueUpdater::FrameBegin() {
@@ -148,6 +173,27 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
     info.has_SCREEN           = existsOp(G_SCREEN);
     info.has_LP               = existsOp(G_LP);
+    for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {
+        info.has_audio_spectrum_left[index] = existsOp(kAudioSpectrumLeftUniforms[index]);
+        info.has_audio_spectrum_right[index] = existsOp(kAudioSpectrumRightUniforms[index]);
+    }
+
+    if (std::any_of(info.has_audio_spectrum_left.begin(),
+                    info.has_audio_spectrum_left.end(),
+                    [](bool value) { return value; }) ||
+        std::any_of(info.has_audio_spectrum_right.begin(),
+                    info.has_audio_spectrum_right.end(),
+                    [](bool value) { return value; })) {
+        LOG_INFO("SceneAudioUniformInit: layer=%d name='%s' has16=(%s,%s) has32=(%s,%s) has64=(%s,%s)",
+                 pNode->ID(),
+                 pNode->Name().c_str(),
+                 info.has_audio_spectrum_left[0] ? "true" : "false",
+                 info.has_audio_spectrum_right[0] ? "true" : "false",
+                 info.has_audio_spectrum_left[1] ? "true" : "false",
+                 info.has_audio_spectrum_right[1] ? "true" : "false",
+                 info.has_audio_spectrum_left[2] ? "true" : "false",
+                 info.has_audio_spectrum_right[2] ? "true" : "false");
+    }
 
     std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
         value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
@@ -174,8 +220,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         auto localTransform = transformResolver.ResolveAttachmentLocalTransform(pNode);
         if (localTransform.has_value()) {
             SceneImageEffectLayer* effectLayer { nullptr };
-            if (!pNode->Camera().empty()) {
-                auto camera_it = m_scene->cameras.find(pNode->Camera());
+            const auto effective_camera = ResolveEffectiveNodeCameraName(pNode);
+            if (!effective_camera.empty()) {
+                auto camera_it = m_scene->cameras.find(effective_camera.data());
                 if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
                     effectLayer = camera_it->second->GetImgEffect().get();
                 }
@@ -193,20 +240,18 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         }
     }
 
-    if (! pNode->Mesh()) return;
-
     pNode->UpdateTrans();
 
     const SceneCamera* camera;
-    std::string_view   cam_name = pNode->Camera();
-    if (! pNode->Camera().empty()) {
+    const auto         cam_name = ResolveEffectiveNodeCameraName(pNode);
+    if (! cam_name.empty()) {
         camera = m_scene->cameras.at(cam_name.data()).get();
     } else
         camera = m_scene->activeCamera;
 
     if (! camera) return;
 
-    if (! pNode->Camera().empty()) {
+    if (! cam_name.empty()) {
         auto camera_it = m_scene->cameras.find(cam_name.data());
         if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
             auto* effectLayer = camera_it->second->GetImgEffect().get();
@@ -226,8 +271,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         }
     }
 
-    auto* material = pNode->Mesh()->Material();
-    if (! material) return;
+    // Text is now allowed to be a first-class renderable without a backing SceneMesh material.
+    // The old updater returned early here, which made transform uniforms unavailable to any
+    // render path that was not disguised as a mesh/custom-shader node. Keeping material access
+    // optional lets the dedicated text pass reuse the same attachment/parallax/camera transform
+    // logic while still skipping mesh-only material uniform work when no mesh exists.
+    auto* material = pNode->Mesh() != nullptr ? pNode->Mesh()->Material() : nullptr;
     // auto& shadervs = material->customShader.updateValueList;
     // const auto& valueSet = material->customShader.valueSet;
 
@@ -244,7 +293,11 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             const auto& unifrom_tex = info.texs[el.first];
 
             if (unifrom_tex.has_resolution) {
-                std::array<i32, 4> resolution_uint({ rt.width, rt.height, rt.width, rt.height });
+                // Runtime render targets expose one canonical resolution contract through
+                // `ResolutionVector()`: physical size in `.xy`, logical content size in `.zw`.
+                // Uniform updates should always forward that authoritative scene-side contract
+                // directly instead of layering text-specific interpretation on top of it.
+                std::array<i32, 4> resolution_uint(rt.ResolutionVector());
                 updateOp(WE_GLTEX_RESOLUTION_NAMES[el.first],
                          ShaderValue(array_cast<float>(resolution_uint)));
             }
@@ -254,6 +307,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         }
         if (nodeData.puppet_layer.hasPuppet() && info.has_BONES) {
             auto data = nodeData.puppet_layer.AdvanceIfNeeded(m_scene->frameTime, m_puppet_frame_serial);
+            if (m_scene->scriptHost) {
+                m_scene->scriptHost->NotifyAnimationLayersAdvanced(pNode);
+            }
             updateOp(G_BONES, std::span<const float> { data[0].data(), data.size() * 16 });
         }
     }
@@ -343,6 +399,52 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         updateOp(G_PARALLAXPOSITION, std::array { para[0], para[1] });
     }
 
+    for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {
+        if (!info.has_audio_spectrum_left[index] && !info.has_audio_spectrum_right[index]) continue;
+
+        std::vector<float> left;
+        std::vector<float> right;
+        std::vector<float> average;
+        bool has_audio = false;
+        if (m_scene->scriptHost != nullptr) {
+            has_audio = m_scene->scriptHost->GetAudioSpectrum(kAudioSpectrumResolutions[index],
+                                                              &left,
+                                                              &right,
+                                                              &average);
+        } else if (m_scene->soundManager != nullptr) {
+            m_scene->soundManager->GetSpectrum(kAudioSpectrumResolutions[index], &left, &right, &average);
+            has_audio = !left.empty() || !right.empty() || !average.empty();
+        }
+        if (!has_audio) {
+            static std::unordered_map<int32_t, double> last_audio_missing_log_at;
+            const auto layer_id = pNode->ID();
+            const auto last_it = last_audio_missing_log_at.find(layer_id);
+            if (last_it == last_audio_missing_log_at.end() ||
+                m_scene->elapsingTime - last_it->second >= 5.0) {
+                last_audio_missing_log_at[layer_id] = m_scene->elapsingTime;
+                LOG_INFO("SceneAudioUniform: layer=%d name='%s' res=%u missing-audio-data",
+                         layer_id,
+                         pNode->Name().c_str(),
+                         kAudioSpectrumResolutions[index]);
+            }
+            continue;
+        }
+
+        if (info.has_audio_spectrum_left[index]) {
+            updateOp(kAudioSpectrumLeftUniforms[index],
+                     std::span<const float> { left.data(), left.size() });
+        }
+        if (info.has_audio_spectrum_right[index]) {
+            updateOp(kAudioSpectrumRightUniforms[index],
+                     std::span<const float> { right.data(), right.size() });
+        }
+
+    }
+
+    if (m_scene->scriptHost) {
+        m_scene->scriptHost->ApplyTextureAnimations(pNode, sprites, m_scene->frameTime);
+    }
+
     for (auto& [i, sp] : sprites) {
         const auto& f      = sp.GetAnimateFrame(m_scene->frameTime);
         auto        grot   = WE_GLTEX_ROTATION_NAMES[i];
@@ -376,6 +478,16 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
 void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
     m_nodeDataMap[nodeAddr] = data;
+}
+
+const WPShaderValueData* WPShaderValueUpdater::GetNodeData(const void* node_addr) const {
+    auto it = m_nodeDataMap.find(const_cast<void*>(node_addr));
+    return it == m_nodeDataMap.end() ? nullptr : std::addressof(it->second);
+}
+
+WPShaderValueData* WPShaderValueUpdater::GetNodeData(const void* node_addr) {
+    auto it = m_nodeDataMap.find(const_cast<void*>(node_addr));
+    return it == m_nodeDataMap.end() ? nullptr : std::addressof(it->second);
 }
 
 void WPShaderValueUpdater::SetTexelSize(float x, float y) { m_texelSize = { x, y }; }

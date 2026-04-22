@@ -6,6 +6,7 @@
 
 #include <string>
 #include <string_view>
+#include <limits>
 
 using namespace wallpaper;
 
@@ -58,6 +59,10 @@ public:
         return frameReads;
     };
     void PassDesc(const Desc& d) override { m_desc = d; }
+    void Reset() override {
+        m_curActive.reset();
+        m_curIndex = m_soundPaths.empty() ? 0 : static_cast<uint32_t>(m_soundPaths.size() - 1);
+    }
     void Switch() {
         std::string path = m_soundPaths[LoopIndex()];
         // LOG_INFO("Switch to audio file: %s", path.c_str());
@@ -73,20 +78,19 @@ private:
     fs::VFS& vfs;
     Config   m_config;
     Desc     m_desc;
-    uint32_t m_curIndex { 0 };
+    uint32_t m_curIndex { std::numeric_limits<uint32_t>::max() };
 
     const std::vector<std::string> m_soundPaths;
     std::unique_ptr<SoundStream>   m_curActive;
 };
 
-void WPSoundParser::Parse(const wpscene::WPSoundObject& obj, fs::VFS& vfs,
-                          audio::SoundManager& sm) {
+audio::SoundHandle WPSoundParser::Parse(const wpscene::WPSoundObject& obj, fs::VFS& vfs,
+                                        audio::SoundManager& sm) {
     WPSoundStream::Config config { .maxtime = obj.maxtime,
                                    .mintime = obj.mintime,
-                                   .volume  = obj.volume > 1.0f ? 1.0f : obj.volume,
+                                   .volume  = 1.0f,
                                    .mode    = ToPlaybackMode(obj.playbackmode) };
 
     auto ss = std::make_unique<WPSoundStream>(obj.sound, vfs, config);
-    // auto ss_raw = ss.get();
-    sm.MountStream(std::move(ss));
+    return sm.MountStream(std::move(ss), obj.volume, obj.visible);
 }

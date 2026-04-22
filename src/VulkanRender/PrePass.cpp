@@ -4,8 +4,14 @@
 
 using namespace wallpaper::vulkan;
 
-PrePass::PrePass(const Desc&) {}
+PrePass::PrePass(const Desc& desc): m_desc(desc) {}
 PrePass::~PrePass() {}
+
+bool PrePass::referencesRenderTarget(std::string_view render_target) const {
+    // The pre-pass only clears the graph result target. It should stay out of text bridge refreshes
+    // unless the default framebuffer-sized target itself was the resource that changed.
+    return m_desc.result == render_target;
+}
 
 namespace
 {
@@ -36,6 +42,30 @@ void PrePass::prepare(Scene& scene, const Device& device, RenderingResources&) {
         m_desc.clear_value = VkClearValue { sc[0], sc[1], sc[2], 1.0f };
     }
     setPrepared();
+}
+
+void PrePass::refreshResources(Scene& scene, const Device& device, RenderingResources&) {
+    // Resource-only rebuilds clear the texture cache without discarding the pre-pass object. The
+    // clear pass therefore has to re-query the recreated render-target image here; otherwise the
+    // next frame would keep clearing a stale Vulkan image handle and the renderer can fall into a
+    // black frame or crash once text-driven effect resources are rebuilt in place.
+    auto tex_name = std::string(m_desc.result);
+    if (scene.renderTargets.count(tex_name) == 0) {
+        setPrepared(false);
+        return;
+    }
+
+    auto& rt = scene.renderTargets.at(tex_name);
+    if (auto opt = device.tex_cache().Query(tex_name, ToTexKey(rt), !rt.allowReuse);
+        opt.has_value()) {
+        m_desc.vk_result = opt.value();
+    } else {
+        setPrepared(false);
+        return;
+    }
+
+    auto& sc = scene.clearColor;
+    m_desc.clear_value = VkClearValue { sc[0], sc[1], sc[2], 1.0f };
 }
 
 void PrePass::execute(const Device&, RenderingResources& rr) {

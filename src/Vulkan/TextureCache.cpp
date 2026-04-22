@@ -161,6 +161,18 @@ VkResult TransImgLayout(const vvk::Queue& queue, vvk::CommandBuffer& cmd,
     return result;
 }
 
+std::size_t ImageAllocationBytes(const VmaImageParameters& image) {
+    return image.handle ? static_cast<std::size_t>(image.handle.AllocationSize()) : 0u;
+}
+
+std::size_t ImageSlotsAllocationBytes(const ImageSlots& slots) {
+    std::size_t total = 0;
+    for (const auto& image : slots.slots) {
+        total += ImageAllocationBytes(image);
+    }
+    return total;
+}
+
 std::optional<vvk::DeviceMemory> AllocateMemory(const vvk::Device& device, vvk::PhysicalDevice gpu,
                                                 VkMemoryRequirements  reqs,
                                                 VkMemoryPropertyFlags property,
@@ -378,7 +390,8 @@ CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat form
 
 inline VkResult CopyImageData(std::span<const BufferParameters> in_bufs,
                               std::span<const VkExtent3D> in_exts, const vvk::Queue& queue,
-                              vvk::CommandBuffer& cmd, const ImageParameters& image) {
+                              vvk::CommandBuffer& cmd, const ImageParameters& image,
+                              VkImageLayout old_layout) {
     VkResult result;
     do {
         result = cmd.Begin(VkCommandBufferBeginInfo {
@@ -401,7 +414,7 @@ inline VkResult CopyImageData(std::span<const BufferParameters> in_bufs,
                 .pNext            = nullptr,
                 .srcAccessMask    = VK_ACCESS_MEMORY_WRITE_BIT,
                 .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+                .oldLayout        = old_layout,
                 .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 .image            = image.handle,
                 .subresourceRange = subresourceRange,
@@ -453,6 +466,64 @@ inline VkResult CopyImageData(std::span<const BufferParameters> in_bufs,
         result = queue.Submit(sub_info);
     } while (false);
     return result;
+}
+
+bool CanReuseTextureSlots(const ImageSlots& existing, const Image& image) {
+    if (existing.slots.size() != image.slots.size()) return false;
+
+    for (usize i = 0; i < image.slots.size(); i++) {
+        const auto& cached_slot = existing.slots[i];
+        const auto& next_slot = image.slots[i];
+        if (cached_slot.extent.width != static_cast<uint32_t>(next_slot.width) ||
+            cached_slot.extent.height != static_cast<uint32_t>(next_slot.height) ||
+            cached_slot.mipmap_level != next_slot.mipmaps.size()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool UploadImageDataToSlots(const Device& device, vvk::CommandBuffer& cmd, const Image& image,
+                            ImageSlots& slots, VkImageLayout old_layout) {
+    for (usize i = 0; i < image.slots.size(); i++) {
+        const auto& image_slot = image.slots[i];
+        auto&       gpu_slot   = slots.slots[i];
+
+        std::vector<VmaBufferParameters> stage_bufs;
+        std::vector<VkExtent3D>          extents;
+        stage_bufs.reserve(image_slot.mipmaps.size());
+        extents.reserve(image_slot.mipmaps.size());
+
+        for (const auto& mipmap : image_slot.mipmaps) {
+            VmaBufferParameters buf;
+            (void)CreateStagingBuffer(device.vma_allocator(), static_cast<u32>(mipmap.size), buf);
+            void* mapped = nullptr;
+            VVK_CHECK(buf.handle.MapMemory(&mapped));
+            memcpy(mapped, mipmap.data.get(), static_cast<u32>(mipmap.size));
+            buf.handle.UnMapMemory();
+            stage_bufs.emplace_back(std::move(buf));
+            extents.push_back(VkExtent3D {
+                static_cast<u32>(mipmap.width),
+                static_cast<u32>(mipmap.height),
+                1,
+            });
+        }
+
+        const auto result = CopyImageData(
+            transform<VmaBufferParameters>(stage_bufs, [](BufferParameters e) { return e; }),
+            extents,
+            device.graphics_queue().handle,
+            cmd,
+            ImageParameters(gpu_slot),
+            old_layout);
+        if (result != VK_SUCCESS) {
+            return false;
+        }
+        device.handle().WaitIdle();
+    }
+
+    return true;
 }
 } // namespace
 
@@ -528,7 +599,23 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
 
 ImageSlotsRef TextureCache::CreateTex(Image& image) {
     if (exists(m_tex_map, image.key)) {
-        return m_tex_map.at(image.key);
+        auto& cached = m_tex_map.at(image.key);
+        const auto cached_revision =
+            exists(m_tex_revision_map, image.key) ? m_tex_revision_map.at(image.key) : 0;
+        if (cached_revision == image.revision) {
+            return cached;
+        }
+
+        if (! m_tex_cmd) allocateCmd();
+        if (CanReuseTextureSlots(cached, image) &&
+            UploadImageDataToSlots(
+                m_device, m_tex_cmd, image, cached, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
+            m_tex_revision_map[image.key] = image.revision;
+            return cached;
+        }
+
+        m_tex_map.erase(image.key);
+        m_tex_revision_map.erase(image.key);
     }
 
     ImageSlots img_slots;
@@ -602,11 +689,13 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
                       extents,
                       m_device.graphics_queue().handle,
                       m_tex_cmd,
-                      image_paras);
+                      image_paras,
+                      VK_IMAGE_LAYOUT_UNDEFINED);
 
         m_device.handle().WaitIdle();
     }
     m_tex_map[image.key] = std::move(img_slots);
+    m_tex_revision_map[image.key] = image.revision;
     return m_tex_map[image.key];
 }
 
@@ -654,42 +743,82 @@ TextureCache::~TextureCache() {};
 
 void TextureCache::Clear() {
     m_tex_map.clear();
+    m_tex_revision_map.clear();
     m_query_texs.clear();
     m_query_map.clear();
 }
 
 std::optional<ImageParameters> TextureCache::Query(std::string_view key, TextureKey content_hash,
                                                    bool persist) {
-    if (exists(m_query_map, key)) {
-        auto& query = *(m_query_map.find(key)->second);
+    const std::string key_string(key);
+    const TexHash     tex_hash = TextureKey::HashValue(content_hash);
 
-        query.share_ready = false;
-        query.persist     = persist;
+    if (exists(m_query_map, key_string)) {
+        auto* query = m_query_map.find(key_string)->second;
 
-        return query.image;
+        if (query->content_hash != tex_hash) {
+            // Resource-only render graph refreshes must behave like particle updates: keep the
+            // graph and unrelated GPU resources alive, then resize only the specific offscreen
+            // image whose render-target contract changed. The old cache returned stale images for
+            // an existing key until the entire cache was cleared, which made minute-level text
+            // bridge updates recreate every scene texture and caused visible hitches.
+            LOG_INFO("TextureCache: resize cached render target key='%s' previousHash=%zu nextHash=%zu "
+                     "previousSize=[%u, %u] nextSize=[%d, %d]",
+                     key_string.c_str(),
+                     query->content_hash,
+                     tex_hash,
+                     query->image.extent.width,
+                     query->image.extent.height,
+                     content_hash.width,
+                     content_hash.height);
+
+            if (query->query_keys.size() > 1) {
+                // A reusable image can be shared by multiple logical render-target keys. When only
+                // one key changes size, detach that key into a fresh cache entry so the remaining
+                // users keep sampling their still-valid image instead of being silently resized.
+                query->query_keys.erase(key_string);
+                m_query_map.erase(key_string);
+            } else {
+                if (auto opt = CreateTex(content_hash); opt.has_value()) {
+                    query->image        = std::move(opt.value());
+                    query->content_hash = tex_hash;
+                    query->share_ready  = false;
+                    query->persist      = persist;
+                    query->query_keys.clear();
+                    query->query_keys.insert(key_string);
+                    m_query_map[key_string] = query;
+                    return query->image;
+                }
+                return std::nullopt;
+            }
+        } else {
+            query->share_ready = false;
+            query->persist     = persist;
+
+            return query->image;
+        }
     };
 
-    TexHash tex_hash = TextureKey::HashValue(content_hash);
     for (auto& query : m_query_texs) {
         if (! (query->share_ready)) continue;
         if (query->content_hash != tex_hash) continue;
 
         query->share_ready = false;
         query->persist     = persist;
-        query->query_keys.insert(std::string(key));
+        query->query_keys.insert(key_string);
 
-        m_query_map[std::string(key)] = &(*query);
+        m_query_map[key_string] = &(*query);
 
         return query->image;
     }
 
     m_query_texs.emplace_back(std::make_unique<QueryTex>());
     auto& query                   = *m_query_texs.back();
-    m_query_map[std::string(key)] = &query;
+    m_query_map[key_string] = &query;
 
     query.index        = (idx)m_query_texs.size() - 1;
     query.content_hash = tex_hash;
-    query.query_keys.insert(std::string(key));
+    query.query_keys.insert(key_string);
     query.persist = persist;
     if (auto opt = CreateTex(content_hash); opt.has_value()) {
         query.image = std::move(opt.value());
@@ -699,12 +828,49 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
 }
 
 void TextureCache::MarkShareReady(std::string_view key) {
-    if (exists(m_query_map, key)) {
-        auto& query = m_query_map.find(key)->second;
-        if (query->persist) return;
-        query->share_ready = true;
-        m_query_map.erase(key.data());
+    const std::string key_string(key);
+    const auto query_it = m_query_map.find(key_string);
+    if (query_it == m_query_map.end()) return;
+
+    // Copy the cached QueryTex pointer before erasing the lookup entry. Holding a reference to the
+    // map value across `erase()` leaves a dangling reference, and minute-rollover text bridge
+    // refreshes hit that path when the final effect pass releases the resized clock source.
+    auto* query = query_it->second;
+    if (query == nullptr) {
+        m_query_map.erase(query_it);
+        return;
     }
+    if (query->persist) return;
+
+    // A texture entry is reusable only after every logical key that still references it has reached
+    // its last read. This makes per-key resize safe for shared render targets while preserving the
+    // old transient-reuse behavior for unshared effect outputs.
+    query->query_keys.erase(key_string);
+    m_query_map.erase(query_it);
+    query->share_ready = query->query_keys.empty();
+}
+
+std::size_t TextureCache::GetTrackedBytes() const {
+    std::size_t total = 0;
+    for (const auto& [_, slots] : m_tex_map) {
+        total += ImageSlotsAllocationBytes(slots);
+    }
+    for (const auto& query : m_query_texs) {
+        if (! query) continue;
+        total += ImageAllocationBytes(query->image);
+    }
+    return total;
+}
+
+std::size_t TextureCache::GetTrackedImageCount() const {
+    std::size_t total = 0;
+    for (const auto& [_, slots] : m_tex_map) {
+        total += slots.slots.size();
+    }
+    for (const auto& query : m_query_texs) {
+        if (query && query->image.handle) total++;
+    }
+    return total;
 }
 
 void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParameters& image) const {

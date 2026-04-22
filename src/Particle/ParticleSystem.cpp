@@ -9,8 +9,24 @@
 #include "Utils/Logging.h"
 
 #include <algorithm>
+#include <cmath>
 
 using namespace wallpaper;
+
+namespace
+{
+struct ParticleSystemStats {
+    size_t subsystem_count { 0 };
+    size_t instance_count { 0 };
+    size_t particle_count { 0 };
+};
+
+constexpr float kRuntimeSizeEpsilon = 0.000001f;
+
+float SafeRuntimeSizeReference(float size) {
+    return std::abs(size) > kRuntimeSizeEpsilon ? size : 1.0f;
+}
+} // namespace
 
 void ParticleInstance::Refresh() {
     SetDeath(false);
@@ -66,6 +82,110 @@ u32 ParticleSubSystem::MaxInstanceCount() const { return m_maxcount_instance; };
 
 void ParticleSubSystem::SetSceneNode(SceneNode* node) { m_node = node; }
 
+void ParticleSubSystem::ApplyRuntimeColorOverrideToParticle(Particle& particle) const {
+    if (!m_runtime_color_override.has_value()) return;
+
+    const auto& color = *m_runtime_color_override;
+    const Eigen::Vector3f particle_color { color[0], color[1], color[2] };
+    particle.init.color = particle_color;
+    particle.color      = particle_color;
+}
+
+void ParticleSubSystem::ApplyRuntimeColorOverrideToInstances() {
+    for (auto& instance : m_instances) {
+        if (!instance) continue;
+        for (auto& particle : instance->ParticlesVec()) {
+            ApplyRuntimeColorOverrideToParticle(particle);
+        }
+    }
+}
+
+void ParticleSubSystem::SetRuntimeColorOverride(const std::array<float, 3>& color) {
+    m_runtime_color_override = color;
+    // Live user-property color edits must affect particles that have already been emitted. Future
+    // particles will receive the same value through Emitt(), but the currently visible trail would
+    // otherwise keep the cold-parse color until it naturally expires.
+    ApplyRuntimeColorOverrideToInstances();
+    if (m_mesh) m_mesh->SetDirty();
+
+    for (auto& child : m_children) {
+        if (child) child->SetRuntimeColorOverride(color);
+    }
+}
+
+std::optional<std::array<float, 3>> ParticleSubSystem::RuntimeColorOverride() const {
+    return m_runtime_color_override;
+}
+
+void ParticleSubSystem::ApplyRuntimeSizeDeltaToParticle(Particle& particle,
+                                                        float     size_delta) const {
+    particle.init.size *= size_delta;
+    particle.size *= size_delta;
+}
+
+void ParticleSubSystem::ApplyRuntimeSizeDeltaToInstances(float size_delta) {
+    for (auto& instance : m_instances) {
+        if (!instance) continue;
+        for (auto& particle : instance->ParticlesVec()) {
+            ApplyRuntimeSizeDeltaToParticle(particle, size_delta);
+        }
+    }
+}
+
+void ParticleSubSystem::ApplyRuntimeSizeOverrideToNewParticle(Particle& particle) const {
+    if (!m_runtime_size_override.has_value()) return;
+    if (std::abs(m_runtime_size_ratio - 1.0f) <= kRuntimeSizeEpsilon) return;
+
+    // Newly emitted particles have just received the parse-time instanceoverride.size multiplier
+    // from the initializer list. Apply the current live ratio exactly once before the particle is
+    // marked old so future Reset() calls preserve the corrected initializer size.
+    ApplyRuntimeSizeDeltaToParticle(particle, m_runtime_size_ratio);
+}
+
+void ParticleSubSystem::SetRuntimeSizeReference(float size) {
+    m_runtime_size_reference = SafeRuntimeSizeReference(size);
+    m_runtime_size_override  = size;
+    m_runtime_size_ratio     = 1.0f;
+
+    for (auto& child : m_children) {
+        if (child) child->SetRuntimeSizeReference(size);
+    }
+}
+
+void ParticleSubSystem::SetRuntimeSizeOverride(float size) {
+    if (!m_runtime_size_reference.has_value()) {
+        // Dynamic or legacy parse paths should seed the reference during ParseParticleObj(), but
+        // falling back to the first runtime value keeps the subsystem stable if an older caller
+        // wires size edits before the parser had a chance to record the cold multiplier.
+        m_runtime_size_reference = SafeRuntimeSizeReference(size);
+    }
+
+    const float reference = SafeRuntimeSizeReference(*m_runtime_size_reference);
+    const float next_ratio = size / reference;
+    const float current_ratio =
+        std::abs(m_runtime_size_ratio) > kRuntimeSizeEpsilon ? m_runtime_size_ratio : 1.0f;
+    const float size_delta = next_ratio / current_ratio;
+
+    m_runtime_size_override = size;
+    m_runtime_size_ratio    = next_ratio;
+
+    if (std::isfinite(size_delta) && std::abs(size_delta - 1.0f) > kRuntimeSizeEpsilon) {
+        // Existing particles already contain the previous live multiplier in init.size. Scaling by
+        // the ratio delta changes them to the new multiplier without rebuilding the emitter or
+        // compounding the size on every frame.
+        ApplyRuntimeSizeDeltaToInstances(size_delta);
+        if (m_mesh) m_mesh->SetDirty();
+    }
+
+    for (auto& child : m_children) {
+        if (child) child->SetRuntimeSizeOverride(size);
+    }
+}
+
+std::optional<float> ParticleSubSystem::RuntimeSizeOverride() const {
+    return m_runtime_size_override;
+}
+
 void ParticleSubSystem::UpdateLinkedControlpoints() {
     bool has_linked_controlpoint = std::any_of(m_controlpoints.begin(), m_controlpoints.end(),
                                                [](const ParticleControlpoint& controlpoint) {
@@ -90,6 +210,24 @@ void ParticleSubSystem::UpdateLinkedControlpoints() {
 
 void ParticleSubSystem::AddChild(std::unique_ptr<ParticleSubSystem>&& child) {
     m_children.emplace_back(std::move(child));
+}
+
+void ParticleSubSystem::CollectStats(size_t* subsystem_count,
+                                     size_t* instance_count,
+                                     size_t* particle_count) const {
+    if (subsystem_count != nullptr) (*subsystem_count)++;
+
+    if (instance_count != nullptr || particle_count != nullptr) {
+        for (const auto& instance : m_instances) {
+            if (!instance) continue;
+            if (instance_count != nullptr) (*instance_count)++;
+            if (particle_count != nullptr) (*particle_count) += instance->Particles().size();
+        }
+    }
+
+    for (const auto& child : m_children) {
+        if (child) child->CollectStats(subsystem_count, instance_count, particle_count);
+    }
 }
 
 ParticleInstance* ParticleSubSystem::QueryNewInstance() {
@@ -194,6 +332,7 @@ void ParticleSubSystem::Emitt() {
                         child->Type() == SpawnType::EVENT_SPAWN)
                         spawn_inst(*inst, *child, i);
                 }
+                ApplyRuntimeSizeOverrideToNewParticle(p);
             }
 
             ParticleModify::MarkOld(p);
@@ -202,6 +341,10 @@ void ParticleSubSystem::Emitt() {
             }
             ParticleModify::Reset(p);
             ParticleModify::ChangeLifetime(p, -particleTime);
+            // Reset() restores particle color from its initializer snapshot every frame. Re-apply
+            // the live instanceoverride color here so user-property color edits survive that reset
+            // and run before later particle operators mutate the rendered state.
+            ApplyRuntimeColorOverrideToParticle(p);
 
             if (! ParticleModify::LifetimeOk(p)) {
                 // new dead
@@ -259,3 +402,4 @@ Eigen::Vector3d ParticleSystem::MouseScenePosition() const {
                              top - m_mouse_pos[1] * camera->Height(),
                              0.0 };
 }
+ParticleSystem::~ParticleSystem() = default;

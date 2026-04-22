@@ -54,6 +54,8 @@ public:
                                          bool persist = false);
 
     void MarkShareReady(std::string_view key);
+    std::size_t GetTrackedBytes() const;
+    std::size_t GetTrackedImageCount() const;
 
     void RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParameters& image) const;
 
@@ -65,6 +67,7 @@ private:
 
     const Device&                m_device;
     Map<std::string, ImageSlots> m_tex_map;
+    Map<std::string, uint64_t>   m_tex_revision_map;
 
     struct QueryTex {
         idx                index { 0 };

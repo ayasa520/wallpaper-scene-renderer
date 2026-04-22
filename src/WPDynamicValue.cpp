@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <sstream>
 #include <type_traits>
 
@@ -21,6 +22,95 @@ std::string ShaderValueToString(const ShaderValue& value) {
         out << value[i];
     }
     return out.str();
+}
+
+// These helpers intentionally keep every debug payload self-describing so text-layer
+// logs can print dynamic property values without needing the caller to know the
+// concrete storage type that travelled through bindings, scripts, or animations.
+std::string EscapeDebugString(std::string_view text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (const char ch : text) {
+        switch (ch) {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            case '\'':
+                escaped += "\\'";
+                break;
+            default:
+                escaped.push_back(ch);
+                break;
+        }
+    }
+    return escaped;
+}
+
+template<typename T, size_t N>
+void AppendArrayToStream(std::ostringstream& out, const std::array<T, N>& value) {
+    out << '[';
+    for (size_t i = 0; i < N; i++) {
+        if (i != 0) out << ", ";
+        if constexpr (std::is_floating_point_v<T>) {
+            out << std::fixed << std::setprecision(6) << value[i];
+        } else {
+            out << value[i];
+        }
+    }
+    out << ']';
+}
+
+template<typename T>
+void AppendVectorToStream(std::ostringstream& out, const std::vector<T>& value) {
+    out << '[';
+    for (size_t i = 0; i < value.size(); i++) {
+        if (i != 0) out << ", ";
+        if constexpr (std::is_floating_point_v<T>) {
+            out << std::fixed << std::setprecision(6) << value[i];
+        } else {
+            out << value[i];
+        }
+    }
+    out << ']';
+}
+
+const char* DynamicValueTypeName(WPDynamicValue::Type type) {
+    switch (type) {
+        case WPDynamicValue::Type::Null:
+            return "null";
+        case WPDynamicValue::Type::Boolean:
+            return "bool";
+        case WPDynamicValue::Type::Int32:
+            return "int32";
+        case WPDynamicValue::Type::UInt32:
+            return "uint32";
+        case WPDynamicValue::Type::Float:
+            return "float";
+        case WPDynamicValue::Type::Double:
+            return "double";
+        case WPDynamicValue::Type::String:
+            return "string";
+        case WPDynamicValue::Type::FloatVector:
+            return "floatVector";
+        case WPDynamicValue::Type::Int3:
+            return "int3";
+        case WPDynamicValue::Type::Float2:
+            return "float2";
+        case WPDynamicValue::Type::Float3:
+            return "float3";
+        case WPDynamicValue::Type::Float4:
+            return "float4";
+    }
+    return "unknown";
 }
 
 template<typename T>
@@ -133,14 +223,24 @@ std::optional<WPDynamicValue> ConvertPropertyVector(const ShaderValue&          
         case WPDynamicValue::Type::Null:
             return WPDynamicValue(value.size() == 0 ? 0.0f : value[0]);
         case WPDynamicValue::Type::Float2: {
+            if (value.size() == 1) {
+                return WPDynamicValue(std::array<float, 2> { value[0], value[0] });
+            }
             if (value.size() < 2) return std::nullopt;
             return WPDynamicValue(std::array<float, 2> { value[0], value[1] });
         }
         case WPDynamicValue::Type::Float3: {
+            if (value.size() == 1) {
+                return WPDynamicValue(std::array<float, 3> { value[0], value[0], value[0] });
+            }
             if (value.size() < 3) return std::nullopt;
             return WPDynamicValue(std::array<float, 3> { value[0], value[1], value[2] });
         }
         case WPDynamicValue::Type::Float4: {
+            if (value.size() == 1) {
+                return WPDynamicValue(
+                    std::array<float, 4> { value[0], value[0], value[0], value[0] });
+            }
             if (value.size() < 4) return std::nullopt;
             return WPDynamicValue(std::array<float, 4> { value[0], value[1], value[2], value[3] });
         }
@@ -160,6 +260,12 @@ std::optional<WPDynamicValue> ConvertPropertyVector(const ShaderValue&          
             return WPDynamicValue(std::move(out));
         }
         case WPDynamicValue::Type::Int3: {
+            if (value.size() == 1) {
+                return WPDynamicValue(
+                    std::array<int32_t, 3> { static_cast<int32_t>(value[0]),
+                                             static_cast<int32_t>(value[0]),
+                                             static_cast<int32_t>(value[0]) });
+            }
             if (value.size() < 3) return std::nullopt;
             return WPDynamicValue(
                 std::array<int32_t, 3> { static_cast<int32_t>(value[0]),
@@ -179,6 +285,65 @@ WPDynamicValue::Type WPDynamicValue::type() const noexcept {
 
 bool WPDynamicValue::isNull() const noexcept {
     return std::holds_alternative<std::monostate>(m_storage);
+}
+
+bool WPDynamicValue::equals(const WPDynamicValue& other) const noexcept {
+    return m_storage == other.m_storage;
+}
+
+std::string WPDynamicValue::describe() const {
+    std::ostringstream out;
+    out << "type=" << DynamicValueTypeName(type()) << ", value=";
+
+    if (const auto* value = std::get_if<bool>(&m_storage)) {
+        out << (*value ? "true" : "false");
+        return out.str();
+    }
+    if (const auto* value = std::get_if<int32_t>(&m_storage)) {
+        out << *value;
+        return out.str();
+    }
+    if (const auto* value = std::get_if<uint32_t>(&m_storage)) {
+        out << *value;
+        return out.str();
+    }
+    if (const auto* value = std::get_if<float>(&m_storage)) {
+        out << std::fixed << std::setprecision(6) << *value;
+        return out.str();
+    }
+    if (const auto* value = std::get_if<double>(&m_storage)) {
+        out << std::fixed << std::setprecision(6) << *value;
+        return out.str();
+    }
+    if (const auto* value = std::get_if<std::string>(&m_storage)) {
+        out << "'" << EscapeDebugString(*value) << "'"
+            << " (length=" << value->size() << ")";
+        return out.str();
+    }
+    if (const auto* value = std::get_if<std::vector<float>>(&m_storage)) {
+        AppendVectorToStream(out, *value);
+        out << " (length=" << value->size() << ")";
+        return out.str();
+    }
+    if (const auto* value = std::get_if<std::array<int32_t, 3>>(&m_storage)) {
+        AppendArrayToStream(out, *value);
+        return out.str();
+    }
+    if (const auto* value = std::get_if<std::array<float, 2>>(&m_storage)) {
+        AppendArrayToStream(out, *value);
+        return out.str();
+    }
+    if (const auto* value = std::get_if<std::array<float, 3>>(&m_storage)) {
+        AppendArrayToStream(out, *value);
+        return out.str();
+    }
+    if (const auto* value = std::get_if<std::array<float, 4>>(&m_storage)) {
+        AppendArrayToStream(out, *value);
+        return out.str();
+    }
+
+    out << "null";
+    return out.str();
 }
 
 std::optional<WPScriptValue> WPDynamicValue::toScriptValue() const {
@@ -369,12 +534,25 @@ std::optional<WPDynamicValue> WPDynamicValue::FromScriptValue(const WPScriptValu
         case Type::String:
             return WPDynamicValue(value.string_value);
         case Type::Float2:
+            if (value.numeric_values.size() == 1) {
+                return WPDynamicValue(std::array<float, 2> {
+                    static_cast<float>(value.numeric_values.front()),
+                    static_cast<float>(value.numeric_values.front()),
+                });
+            }
             if (value.numeric_values.size() < 2) return std::nullopt;
             return WPDynamicValue(std::array<float, 2> {
                 static_cast<float>(value.numeric_values[0]),
                 static_cast<float>(value.numeric_values[1]),
             });
         case Type::Float3:
+            if (value.numeric_values.size() == 1) {
+                return WPDynamicValue(std::array<float, 3> {
+                    static_cast<float>(value.numeric_values.front()),
+                    static_cast<float>(value.numeric_values.front()),
+                    static_cast<float>(value.numeric_values.front()),
+                });
+            }
             if (value.numeric_values.size() < 3) return std::nullopt;
             return WPDynamicValue(std::array<float, 3> {
                 static_cast<float>(value.numeric_values[0]),
@@ -382,6 +560,14 @@ std::optional<WPDynamicValue> WPDynamicValue::FromScriptValue(const WPScriptValu
                 static_cast<float>(value.numeric_values[2]),
             });
         case Type::Float4:
+            if (value.numeric_values.size() == 1) {
+                return WPDynamicValue(std::array<float, 4> {
+                    static_cast<float>(value.numeric_values.front()),
+                    static_cast<float>(value.numeric_values.front()),
+                    static_cast<float>(value.numeric_values.front()),
+                    static_cast<float>(value.numeric_values.front()),
+                });
+            }
             if (value.numeric_values.size() < 4) return std::nullopt;
             return WPDynamicValue(std::array<float, 4> {
                 static_cast<float>(value.numeric_values[0]),
@@ -397,6 +583,13 @@ std::optional<WPDynamicValue> WPDynamicValue::FromScriptValue(const WPScriptValu
             return WPDynamicValue(std::move(values));
         }
         case Type::Int3:
+            if (value.numeric_values.size() == 1) {
+                return WPDynamicValue(std::array<int32_t, 3> {
+                    static_cast<int32_t>(value.numeric_values.front()),
+                    static_cast<int32_t>(value.numeric_values.front()),
+                    static_cast<int32_t>(value.numeric_values.front()),
+                });
+            }
             if (value.numeric_values.size() < 3) return std::nullopt;
             return WPDynamicValue(std::array<int32_t, 3> {
                 static_cast<int32_t>(value.numeric_values[0]),

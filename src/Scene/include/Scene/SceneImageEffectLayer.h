@@ -32,6 +32,37 @@ struct SceneImageEffect {
     };
     std::vector<Command>            commands;
     std::list<SceneImageEffectNode> nodes;
+
+    // Effect visibility is a first-class runtime contract. Wallpaper Engine allows an effect to
+    // start hidden and later become visible through a script, user property, or animation. The
+    // effect therefore needs its own local visibility state instead of borrowing the owner layer's
+    // visibility or being pruned while parsing.
+    void SetIdentity(int32_t owner_layer_id, int32_t effect_id, uint32_t effect_index,
+                     std::string effect_name);
+    void SetLocalVisible(bool visible);
+    bool LocalVisible() const { return m_local_visible; }
+
+    int32_t            OwnerLayerId() const { return m_owner_layer_id; }
+    int32_t            EffectId() const { return m_effect_id; }
+    uint32_t           EffectIndex() const { return m_effect_index; }
+    const std::string& EffectName() const { return m_effect_name; }
+
+    // ResolveEffect() rewrites authored ping-pong aliases to concrete render targets. These two
+    // names describe the stable bypass copy used while the effect is hidden: copy the input
+    // ping-pong target to the output ping-pong target so downstream effects never sample a stale
+    // frame left by the last visible execution.
+    void SetBypassTargets(std::string src, std::string dst);
+    const std::string& BypassSource() const { return m_bypass_src; }
+    const std::string& BypassTarget() const { return m_bypass_dst; }
+
+private:
+    int32_t     m_owner_layer_id { 0 };
+    int32_t     m_effect_id { 0 };
+    uint32_t    m_effect_index { 0 };
+    std::string m_effect_name;
+    bool        m_local_visible { true };
+    std::string m_bypass_src;
+    std::string m_bypass_dst;
 };
 
 class SceneImageEffectLayer {
@@ -45,8 +76,12 @@ public:
     const auto& FirstTarget() const { return m_pingpong_a; }
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
     SceneNode&  FinalNode() const { return *m_final_node; }
+    bool        HasFinalComposite() const;
+    bool        ShouldRunFinalCompositeFallback() const;
+    void        SetFinalCompositeSource(std::string source);
     SceneNode*  WorldNode() const { return m_worldNode; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
+    void        SyncResolvedOutputMesh();
     void        SyncResolvedNodeToWorld();
     void        SyncResolvedNodeToMatrix(const Eigen::Affine3f& world_affine);
 
@@ -62,6 +97,10 @@ private:
     std::unique_ptr<SceneMesh> m_final_mesh;
     std::unique_ptr<SceneNode> m_final_node;
     SceneNode*                 m_resolved_output_node { nullptr };
+    // The synthetic final composite is a narrow fallback, not the normal output path. Keep the
+    // authored final effect as the resolved screen writer while it is visible, and only enable the
+    // passthrough composite when that exact final effect becomes runtime-hidden.
+    SceneImageEffect* m_final_output_effect { nullptr };
     BlendMode                  m_final_blend;
 
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;

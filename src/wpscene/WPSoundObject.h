@@ -17,6 +17,7 @@ namespace wpscene
 {
 
 struct WPSoundObject {
+    int32_t                  id { 0 };
     std::string              playbackmode { "loop" };
     float                    maxtime { 10.0f };
     float                    mintime { 0.0f };
@@ -27,6 +28,7 @@ struct WPSoundObject {
     std::vector<std::string> sound;
 
     bool FromJson(const nlohmann::json& json, fs::VFS&) {
+        GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
         GET_JSON_NAME_VALUE(json, "volume", volume);
         GET_JSON_NAME_VALUE(json, "playbackmode", playbackmode);
         GET_JSON_NAME_VALUE_NOWARN(json, "mintime", mintime);

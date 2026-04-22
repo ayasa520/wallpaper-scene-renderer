@@ -147,8 +147,10 @@ WPDynamicValue WPUserSetting::evaluate(const UserPropertyMap*           user_pro
 
     if (property.has_value()) {
         if (const auto* user_value = LookupUserProperty(user_properties, property->name)) {
+            const auto* user_entry = FindUserPropertyEntry(user_properties, property->name);
             if (property->condition.empty() ||
-                MatchesUserPropertyCondition(*user_value, property->condition)) {
+                (user_entry != nullptr &&
+                 MatchesUserPropertyCondition(*user_entry, property->condition))) {
                 if (const auto override_value =
                         WPDynamicValue::FromUserPropertyValue(*user_value, value.type());
                     override_value.has_value()) {
@@ -172,7 +174,7 @@ bool ParseUserSetting(const nlohmann::json& json, WPUserSetting& setting, WPDyna
         parsed_value = WPDynamicValue::FromJsonLiteral(*value_node, hint);
     } else {
         WPDynamicValue legacy_value;
-        if (ParseLegacyValue(json, hint, legacy_value)) {
+        if (ParseLegacyValue(*value_node, hint, legacy_value)) {
             parsed_value = legacy_value;
         } else {
             parsed_value = WPDynamicValue::FromJsonLiteral(*value_node, hint);

@@ -313,6 +313,7 @@ struct VideoTextureCache::Entry {
     bool     plane_dirty { false };
     bool     warned_size_mismatch { false };
     bool     pipeline_failed { false };
+    bool     paused { false };
     size_t   read_offset { 0 };
     UploadMode upload_mode { UploadMode::RGBA };
     vvk::Framebuffer convert_framebuffer;
@@ -431,6 +432,7 @@ bool VideoTextureCache::ensureNv12Pipeline() {
 
     GraphicsPipeline pipeline;
     pipeline.toDefault();
+    m_nv12_pipeline.debug_name = "VideoTextureCache::NV12";
     pipeline.setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .addDescriptorSetInfo(spanone { descriptor_info });
     for (auto& spv : spvs) pipeline.addStage(std::move(spv));
@@ -523,15 +525,40 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
         stopPipeline(entry);
         return false;
     }
+    entry.paused = false;
     return true;
 }
 
 bool VideoTextureCache::restartPipeline(Entry& entry) {
+    const bool was_paused = entry.paused;
     if (!startPipeline(entry)) {
         LOG_ERROR("video texture '%s': failed to rebuild pipeline for loop", entry.key.c_str());
         entry.pipeline_failed = true;
         return false;
     }
+    if (was_paused) setPaused(entry, true);
+    return true;
+}
+
+bool VideoTextureCache::setPaused(Entry& entry, bool paused) {
+    if (entry.paused == paused) return true;
+    if (entry.pipeline == nullptr) {
+        entry.paused = paused;
+        return true;
+    }
+
+    // getVideoTexture().pause() is often called every scene tick by authored Wallpaper Engine
+    // scripts. Make the cache transition the GStreamer pipeline only when the desired state
+    // changes so hidden videos stop decoding without turning repeated script calls into stalls.
+    const auto target_state = paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+    if (gst_element_set_state(entry.pipeline, target_state) == GST_STATE_CHANGE_FAILURE) {
+        LOG_ERROR("video texture '%s': failed to %s playback",
+                  entry.key.c_str(),
+                  paused ? "pause" : "resume");
+        entry.pipeline_failed = true;
+        return false;
+    }
+    entry.paused = paused;
     return true;
 }
 
@@ -667,8 +694,9 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
 }
 
 ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTexture& texture,
-                                         const Image& image) {
-    if (const auto* entry = find(key)) {
+                                         const Image& image, bool paused) {
+    if (auto* entry = find(key)) {
+        setPaused(*entry, paused);
         ImageSlotsRef ref;
         ref.slots.push_back(ImageParameters(entry->image));
         return ref;
@@ -831,11 +859,21 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
     if (!startPipeline(*entry)) {
         return {};
     }
+    if (paused) setPaused(*entry, true);
 
     m_entries.emplace_back(std::move(entry));
     ImageSlotsRef ref;
     ref.slots.push_back(ImageParameters(m_entries.back()->image));
     return ref;
+}
+
+void VideoTextureCache::ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key) {
+    for (auto& entry_ptr : m_entries) {
+        if (entry_ptr == nullptr) continue;
+        auto state_it = paused_by_key.find(entry_ptr->key);
+        if (state_it == paused_by_key.end()) continue;
+        setPaused(*entry_ptr, state_it->second);
+    }
 }
 
 void VideoTextureCache::Poll() {
@@ -871,6 +909,8 @@ void VideoTextureCache::Poll() {
         if (should_restart && !entry.pipeline_failed) {
             if (!restartPipeline(entry)) continue;
         }
+
+        if (entry.paused) continue;
 
         GstSample* latest_sample = nullptr;
         while (entry.appsink_elem != nullptr) {
@@ -1128,4 +1168,30 @@ void VideoTextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
 
 void VideoTextureCache::Clear() {
     m_entries.clear();
+}
+
+std::size_t VideoTextureCache::GetTrackedBytes() const {
+    std::size_t total = 0;
+    for (const auto& entry : m_entries) {
+        if (! entry) continue;
+        if (entry->image.handle) total += static_cast<std::size_t>(entry->image.handle.AllocationSize());
+        if (entry->plane_y_image.handle) {
+            total += static_cast<std::size_t>(entry->plane_y_image.handle.AllocationSize());
+        }
+        if (entry->plane_uv_image.handle) {
+            total += static_cast<std::size_t>(entry->plane_uv_image.handle.AllocationSize());
+        }
+        if (entry->staging.handle) total += static_cast<std::size_t>(entry->staging.handle.AllocationSize());
+        if (entry->plane_y_staging.handle) {
+            total += static_cast<std::size_t>(entry->plane_y_staging.handle.AllocationSize());
+        }
+        if (entry->plane_uv_staging.handle) {
+            total += static_cast<std::size_t>(entry->plane_uv_staging.handle.AllocationSize());
+        }
+    }
+    return total;
+}
+
+std::size_t VideoTextureCache::GetTrackedEntryCount() const {
+    return m_entries.size();
 }

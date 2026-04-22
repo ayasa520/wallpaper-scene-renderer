@@ -7,6 +7,7 @@ CustomShaderPass.cpp
 FinPass.cpp
 PrePass.cpp
 SceneToRenderGraph.cpp
+TextPass.cpp
 VulkanRender.cpp
 )
 

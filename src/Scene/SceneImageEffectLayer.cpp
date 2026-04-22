@@ -3,8 +3,59 @@
 
 #include "SpecTexs.hpp"
 #include "Core/StringHelper.hpp"
+#include "Utils/Logging.h"
 
 using namespace wallpaper;
+
+namespace
+{
+bool IsAudioBarNode(const SceneNode* node) {
+    auto* mutable_node = const_cast<SceneNode*>(node);
+    if (mutable_node == nullptr || mutable_node->Mesh() == nullptr ||
+        mutable_node->Mesh()->Material() == nullptr) {
+        return false;
+    }
+    const auto* shader = mutable_node->Mesh()->Material()->customShader.shader.get();
+    return shader != nullptr && shader->name.find("Simple_Audio_Bars") != std::string::npos;
+}
+
+bool HasAudioBarEffect(const SceneImageEffectLayer& layer) {
+    auto& mutable_layer = const_cast<SceneImageEffectLayer&>(layer);
+    for (std::size_t effect_index = 0; effect_index < mutable_layer.EffectCount(); effect_index++) {
+        auto& effect = mutable_layer.GetEffect(effect_index);
+        for (const auto& node : effect->nodes) {
+            if (IsAudioBarNode(node.sceneNode.get())) return true;
+        }
+    }
+    return false;
+}
+
+void LogNodeTransform(const char* prefix, const SceneNode* node) {
+    if (node == nullptr) {
+        LOG_INFO("%s node=<null>", prefix);
+        return;
+    }
+    const auto& t = node->Translate();
+    const auto& s = node->Scale();
+    const auto& r = node->Rotation();
+    LOG_INFO("%s layer=%d name='%s' visible=%s translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) "
+             "rotation=(%.3f,%.3f,%.3f)",
+             prefix,
+             const_cast<SceneNode*>(node)->ID(),
+             node->Name().c_str(),
+             node->Visible() ? "true" : "false",
+             t.x(),
+             t.y(),
+             t.z(),
+             s.x(),
+             s.y(),
+             s.z(),
+             r.x(),
+             r.y(),
+             r.z());
+    LOG_INFO("%s ptr=%p", prefix, static_cast<const void*>(node));
+}
+} // namespace
 
 SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float w, float h,
                                              std::string_view pingpong_a,
@@ -15,6 +66,83 @@ SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float w, float h,
       m_final_mesh(std::make_unique<SceneMesh>()),
       m_final_node(std::make_unique<SceneNode>()) {};
 
+void SceneImageEffect::SetIdentity(int32_t owner_layer_id, int32_t effect_id,
+                                   uint32_t effect_index, std::string effect_name) {
+    m_owner_layer_id = owner_layer_id;
+    m_effect_id      = effect_id;
+    m_effect_index   = effect_index;
+    m_effect_name    = std::move(effect_name);
+}
+
+void SceneImageEffect::SetLocalVisible(bool visible) {
+    m_local_visible = visible;
+    for (auto& node : nodes) {
+        if (node.sceneNode != nullptr) {
+            // Effect-local visibility is intentionally separate from layer visibility. The layer
+            // tree still owns parent/child propagation through SceneNode::SetLayerVisible(), while
+            // this flag lets scripts and animations disable only this effect without rebuilding
+            // the render graph or hiding the owner layer.
+            node.sceneNode->SetLocalVisible(visible);
+        }
+    }
+}
+
+void SceneImageEffect::SetBypassTargets(std::string src, std::string dst) {
+    m_bypass_src = std::move(src);
+    m_bypass_dst = std::move(dst);
+}
+
+bool SceneImageEffectLayer::HasFinalComposite() const {
+    return m_final_node != nullptr && m_final_node->HasMaterial();
+}
+
+bool SceneImageEffectLayer::ShouldRunFinalCompositeFallback() const {
+    // Visible final effects must keep the historical direct-to-screen shader path because authored
+    // effects such as xray/composite shaders may rely on writing the default target themselves. The
+    // synthetic composite is therefore only allowed to run when the final authored effect is hidden
+    // and its shader pass is intentionally skipped.
+    return HasFinalComposite() && m_final_output_effect != nullptr &&
+        !m_final_output_effect->LocalVisible();
+}
+
+void SceneImageEffectLayer::SetFinalCompositeSource(std::string source) {
+    if (!HasFinalComposite()) return;
+
+    auto* material = m_final_node->Mesh()->Material();
+    if (material == nullptr) return;
+
+    // The final composite is deliberately separate from every authored effect shader. ResolveEffect()
+    // keeps its source pointed at the fully resolved ping-pong chain, then restores the visible final
+    // authored effect to the historical direct output path. When that final effect is hidden, this
+    // neutral passthrough can draw the bypassed ping-pong texture without rebuilding the graph.
+    if (material->textures.empty()) material->textures.resize(1);
+    material->textures[0] = std::move(source);
+}
+
+void SceneImageEffectLayer::SyncResolvedOutputMesh() {
+    if (m_resolved_output_node == nullptr || m_resolved_output_node->Mesh() == nullptr) return;
+
+    // Resource-only render-graph refreshes keep the already-resolved effect nodes alive and only
+    // recreate their GPU resources. Runtime text updates therefore cannot rely on ResolveEffect()
+    // running again to copy `m_final_mesh` into the currently active output node. Synchronizing
+    // the resolved node mesh here keeps effect-backed text quads visually in lockstep with the
+    // latest runtime map-rate/size changes even when the pass topology is intentionally reused.
+    m_resolved_output_node->Mesh()->ChangeMeshDataFrom(*m_final_mesh);
+    // `ChangeMeshDataFrom()` shares the CPU-side mesh payload but does not flip the render-pass
+    // dirty flag. Resource-only refreshes look at the live pass mesh, not at `m_final_mesh`, so
+    // the resolved output node must be marked dirty explicitly or Vulkan keeps drawing the stale
+    // vertex buffer even though the debug logs already show the updated quad geometry.
+    m_resolved_output_node->Mesh()->SetDirty();
+    if (HasFinalComposite() && m_final_node->Mesh() != nullptr) {
+        // The hidden-final fallback pass has its own node so the visible final shader can continue
+        // using the old direct output path. Keep that fallback mesh synchronized as well; otherwise
+        // a runtime text/image resize could fix the visible path while leaving the emergency
+        // passthrough card with stale geometry.
+        m_final_node->Mesh()->ChangeMeshDataFrom(*m_final_mesh);
+        m_final_node->Mesh()->SetDirty();
+    }
+}
+
 void SceneImageEffectLayer::SyncResolvedNodeToWorld() {
     if (m_worldNode == nullptr) return;
 
@@ -22,9 +150,8 @@ void SceneImageEffectLayer::SyncResolvedNodeToWorld() {
     m_final_node->CopyTrans(*m_worldNode);
 
     const auto modelTrans = m_worldNode->ModelTrans();
-    m_final_node->SetTranslate(Eigen::Vector3f((float)modelTrans(0, 3),
-                                               (float)modelTrans(1, 3),
-                                               (float)modelTrans(2, 3)));
+    m_final_node->SetTranslate(
+        Eigen::Vector3f((float)modelTrans(0, 3), (float)modelTrans(1, 3), (float)modelTrans(2, 3)));
 
     if (m_resolved_output_node != nullptr) {
         m_resolved_output_node->CopyTrans(*m_final_node);
@@ -51,10 +178,17 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
     auto default_node = SceneNode();
 
     m_resolved_output_node = nullptr;
+    m_final_output_effect  = nullptr;
     SyncResolvedNodeToWorld();
 
-    SceneImageEffectNode* last_output { nullptr };
+    SceneImageEffectNode* fallback_last_output { nullptr };
     for (auto& eff : m_effects) {
+        // Each effect consumes the current input ping-pong target and normally writes the next
+        // output ping-pong target. Capturing that pair after alias resolution gives the renderer a
+        // topology-stable hidden path: when this effect is locally hidden, a conditional copy moves
+        // input to output so later effects observe the correct current frame instead of the last
+        // frame produced while the effect was visible.
+        eff->SetBypassTargets(std::string(ppong_a), std::string(ppong_b));
         for (auto& cmd : eff->commands) {
             if (sstart_with(cmd.src, WE_EFFECT_PPONG_PREFIX_A)) cmd.src = ppong_a;
 
@@ -63,8 +197,9 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         for (auto it = eff->nodes.begin(); it != eff->nodes.end(); it++) {
             if (sstart_with(it->output, WE_EFFECT_PPONG_PREFIX_B) ||
                 it->output == SpecTex_Default) {
-                it->output  = ppong_b;
-                last_output = &(*it);
+                it->output           = ppong_b;
+                fallback_last_output = &(*it);
+                m_final_output_effect = eff.get();
             }
 
             assert(it->sceneNode->HasMaterial());
@@ -88,16 +223,44 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         }
         swap_pp();
     }
-    if (last_output != nullptr) {
-        m_resolved_output_node = last_output->sceneNode.get();
+    if (HasFinalComposite()) {
+        // Prepare a neutral fallback output but do not make it the normal resolved writer. Visible
+        // final effects keep Wallpaper Engine's authored behavior by drawing directly to the
+        // inherited output target. When that final effect is hidden, the renderer gates this node on
+        // and samples the bypassed ping-pong target so the layer still contributes its unmodified
+        // input instead of going blank.
+        SetFinalCompositeSource(std::string(ppong_a));
         SyncResolvedNodeToWorld();
-        last_output->output = SpecTex_Default;
-        auto& mesh          = *(last_output->sceneNode->Mesh());
+        auto& mesh          = *m_final_node->Mesh();
         auto& material      = *mesh.Material();
         {
             material.blenmode = m_final_blend;
-            last_output->sceneNode->SetCamera(std::string());
-            last_output->sceneNode->CopyTrans(*m_final_node);
+            m_final_node->SetCamera(std::string());
+            mesh.ChangeMeshDataFrom(*m_final_mesh);
+            if (HasAudioBarEffect(*this)) {
+                LOG_INFO("SceneAudioEffectResolve: final-blend=%d output='%s'",
+                         static_cast<int>(m_final_blend),
+                         SpecTex_Default.data());
+                LogNodeTransform("SceneAudioEffectResolve: world", m_worldNode);
+                LogNodeTransform("SceneAudioEffectResolve: final", m_final_node.get());
+                LogNodeTransform("SceneAudioEffectResolve: resolved", m_final_node.get());
+            }
+        }
+    }
+
+    if (fallback_last_output != nullptr) {
+        // Keep the historical visible path: the final authored shader writes the screen/default
+        // output directly, preserving shaders whose visual result depends on being the final
+        // compositor. The synthetic final composite remains dormant unless this effect is hidden.
+        m_resolved_output_node = fallback_last_output->sceneNode.get();
+        SyncResolvedNodeToWorld();
+        fallback_last_output->output = SpecTex_Default;
+        auto& mesh                   = *(fallback_last_output->sceneNode->Mesh());
+        auto& material               = *mesh.Material();
+        {
+            material.blenmode = m_final_blend;
+            fallback_last_output->sceneNode->SetCamera(std::string());
+            fallback_last_output->sceneNode->CopyTrans(*m_final_node);
             mesh.ChangeMeshDataFrom(*m_final_mesh);
         }
     }

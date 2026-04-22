@@ -4,6 +4,9 @@
 #include "Core/Literals.hpp"
 #include "Utils/Logging.h"
 
+#include <algorithm>
+#include <unordered_map>
+
 using namespace wallpaper;
 using namespace wallpaper::audio;
 
@@ -21,19 +24,58 @@ miniaudio::DeviceDesc ToSSDesc(const SoundStream::Desc& d) {
 
 class Channel_Impl : public miniaudio::Channel {
 public:
-    Channel_Impl(std::unique_ptr<SoundStream>&& ss): m_ss(std::move(ss)) {}
+    Channel_Impl(std::unique_ptr<SoundStream>&& ss, float volume, bool autoplay)
+        : m_ss(std::move(ss)), m_playing(autoplay), m_volume(std::clamp(volume, 0.0f, 1.0f)) {}
     virtual ~Channel_Impl() = default;
 
     ma_uint64 NextPcmData(void* pData, ma_uint32 frameCount) override {
-        return m_ss->NextPcmData(pData, frameCount);
+        if (!m_playing || m_ended) return 0;
+        const ma_uint64 frames_read = m_ss->NextPcmData(pData, frameCount);
+        if (frames_read == 0) MarkEnded();
+        return frames_read;
     }
     void PassDeviceDesc(const miniaudio::DeviceDesc& desc) override {
         m_ss->PassDesc(ToSSDesc(desc));
+    }
+    bool IsPlaying() const override { return m_playing && !m_ended; }
+    bool IsEnded() const override { return m_ended; }
+    bool ShouldRemove() const override { return m_detached; }
+    float Volume() const override { return m_volume; }
+
+    void Play() {
+        if (m_ended) {
+            m_ss->Reset();
+            m_ended = false;
+        }
+        m_playing = true;
+    }
+
+    void Pause() { m_playing = false; }
+
+    void Stop() {
+        m_ss->Reset();
+        m_playing = false;
+        m_ended = false;
+    }
+
+    void MarkEnded() {
+        m_playing = false;
+        m_ended = true;
+    }
+
+    void SetVolume(float volume) { m_volume = std::clamp(volume, 0.0f, 1.0f); }
+    void Detach() {
+        m_playing  = false;
+        m_detached = true;
     }
 
 private:
     miniaudio::DeviceDesc        m_desc;
     std::unique_ptr<SoundStream> m_ss;
+    bool                         m_playing { true };
+    bool                         m_ended { false };
+    bool                         m_detached { false };
+    float                        m_volume { 1.0f };
 };
 
 struct BStreamWrapper {
@@ -65,6 +107,7 @@ public:
         return m_ss->NextPcmData(pData, frameCount);
     }
     void PassDesc(const Desc&) override {}
+    void Reset() override { m_ss->Reset(); }
 
 private:
     std::unique_ptr<T> m_ss;
@@ -84,15 +127,20 @@ class SoundManager::impl : NoCopy, NoMove {
 public:
     impl(): device() {};
     ~impl() = default;
-    miniaudio::Device device {};
+    miniaudio::Device                                      device {};
+    SoundHandle                                            next_handle { 1 };
+    std::unordered_map<SoundHandle, std::shared_ptr<Channel_Impl>> channels;
 };
 
 SoundManager::SoundManager(): pImpl(std::make_unique<impl>()) {}
 SoundManager::~SoundManager() {}
 
-void SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss) {
-    // if(!IsInited()) return;
-    pImpl->device.MountChannel(std::make_unique<Channel_Impl>(std::move(ss)));
+SoundHandle SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss, float volume, bool autoplay) {
+    const SoundHandle handle = pImpl->next_handle++;
+    auto channel = std::make_shared<Channel_Impl>(std::move(ss), volume, autoplay);
+    pImpl->channels.emplace(handle, channel);
+    pImpl->device.MountChannel(std::move(channel));
+    return handle;
 }
 
 void SoundManager::Test(std::shared_ptr<fs::IBinaryStream> stream) {
@@ -110,7 +158,60 @@ bool SoundManager::IsInited() const { return pImpl->device.IsInited(); }
 void SoundManager::Play() { pImpl->device.Start(); }
 void SoundManager::Pause() { pImpl->device.Stop(); }
 
-void  SoundManager::UnMountAll() { pImpl->device.UnmountAll(); }
+bool SoundManager::UnmountStream(SoundHandle handle) {
+    auto it = pImpl->channels.find(handle);
+    if (it == pImpl->channels.end() || !it->second) return false;
+    it->second->Detach();
+    pImpl->channels.erase(it);
+    return true;
+}
+
+bool SoundManager::Play(SoundHandle handle) {
+    auto it = pImpl->channels.find(handle);
+    if (it == pImpl->channels.end() || !it->second) return false;
+    it->second->Play();
+    return true;
+}
+
+bool SoundManager::Pause(SoundHandle handle) {
+    auto it = pImpl->channels.find(handle);
+    if (it == pImpl->channels.end() || !it->second) return false;
+    it->second->Pause();
+    return true;
+}
+
+bool SoundManager::Stop(SoundHandle handle) {
+    auto it = pImpl->channels.find(handle);
+    if (it == pImpl->channels.end() || !it->second) return false;
+    it->second->Stop();
+    return true;
+}
+
+bool SoundManager::IsPlaying(SoundHandle handle) const {
+    auto it = pImpl->channels.find(handle);
+    return it != pImpl->channels.end() && it->second && it->second->IsPlaying();
+}
+
+float SoundManager::StreamVolume(SoundHandle handle) const {
+    auto it = pImpl->channels.find(handle);
+    return it != pImpl->channels.end() && it->second ? it->second->Volume() : 0.0f;
+}
+
+bool SoundManager::SetStreamVolume(SoundHandle handle, float volume) {
+    auto it = pImpl->channels.find(handle);
+    if (it == pImpl->channels.end() || !it->second) return false;
+    it->second->SetVolume(volume);
+    return true;
+}
+
+void SoundManager::UnMountAll() {
+    for (auto& [handle, channel] : pImpl->channels) {
+        (void)handle;
+        if (channel) channel->Detach();
+    }
+    pImpl->channels.clear();
+    pImpl->device.UnmountAll();
+}
 float SoundManager::Volume() const { return pImpl->device.Volume(); }
 
 bool SoundManager::Muted() const { return pImpl->device.Muted(); }
@@ -123,3 +224,9 @@ void SoundManager::SetMuted(bool v) {
     }
 }
 void SoundManager::SetVolume(float v) { pImpl->device.SetVolume(v); }
+void SoundManager::GetSpectrum(uint32_t resolution,
+                               std::vector<float>* left,
+                               std::vector<float>* right,
+                               std::vector<float>* average) const {
+    pImpl->device.GetSpectrum(resolution, left, right, average);
+}

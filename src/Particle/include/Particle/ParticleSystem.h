@@ -5,6 +5,7 @@
 #include "Core/MapSet.hpp"
 
 #include <memory>
+#include <optional>
 
 namespace wallpaper
 {
@@ -82,9 +83,22 @@ public:
     SpawnType Type() const;
     u32       MaxInstanceCount() const;
     void      SetSceneNode(SceneNode* node);
+    void      SetRuntimeColorOverride(const std::array<float, 3>& color);
+    std::optional<std::array<float, 3>> RuntimeColorOverride() const;
+    void      SetRuntimeSizeReference(float size);
+    void      SetRuntimeSizeOverride(float size);
+    std::optional<float> RuntimeSizeOverride() const;
+    void      CollectStats(size_t* subsystem_count,
+                           size_t* instance_count,
+                           size_t* particle_count) const;
 
 private:
     void UpdateLinkedControlpoints();
+    void ApplyRuntimeColorOverrideToParticle(Particle& particle) const;
+    void ApplyRuntimeColorOverrideToInstances();
+    void ApplyRuntimeSizeDeltaToParticle(Particle& particle, float size_delta) const;
+    void ApplyRuntimeSizeDeltaToInstances(float size_delta);
+    void ApplyRuntimeSizeOverrideToNewParticle(Particle& particle) const;
 
     ParticleSystem&            m_sys;
     std::shared_ptr<SceneMesh> m_mesh;
@@ -109,13 +123,25 @@ private:
     double    m_probability { 1.0f };
     SpawnType m_spawn_type { SpawnType::STATIC };
     SceneNode* m_node { nullptr };
+    // Wallpaper particle `instanceoverride.colorn` is an initializer-time color during cold parse,
+    // while user-property edits arrive after the initializer list has already produced live
+    // particles. Store the normalized runtime color separately so both future spawns and already
+    // alive particles can be synchronized without rebuilding the whole particle subsystem.
+    std::optional<std::array<float, 3>> m_runtime_color_override;
+    // Wallpaper particle `instanceoverride.size` is a multiplier baked into each particle's
+    // initializer state. Remember the parse-time multiplier as a reference so live edits can scale
+    // existing particles by the precise ratio instead of treating the property as an absolute pixel
+    // size or compounding the multiplier every frame.
+    std::optional<float> m_runtime_size_reference;
+    std::optional<float> m_runtime_size_override;
+    float                m_runtime_size_ratio { 1.0f };
 };
 
 class Scene;
 class ParticleSystem : NoCopy, NoMove {
 public:
     ParticleSystem(Scene& scene): scene(scene) {};
-    ~ParticleSystem() = default;
+    ~ParticleSystem();
 
     void Emitt();
     void SetMousePos(float x, float y);

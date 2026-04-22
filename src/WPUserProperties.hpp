@@ -35,6 +35,7 @@ using UserPropertyValue = std::variant<ShaderValue, std::string>;
 struct UserProperty {
     UserPropertyValue value;
     std::string       condition;
+    bool              is_boolean { false };
 };
 
 using UserPropertyMap = std::unordered_map<std::string, UserProperty>;
@@ -67,27 +68,35 @@ inline bool IsUserPropertyTruthy(const UserPropertyValue& value) {
     return ! lowered.empty() && lowered != "0" && lowered != "false";
 }
 
-inline bool MatchesUserPropertyCondition(const UserPropertyValue& value,
-                                         std::string_view         condition) {
+inline bool MatchesUserPropertyCondition(const UserProperty& property,
+                                         std::string_view   condition) {
     const auto trimmed = TrimString(condition);
-    if (trimmed.empty()) return IsUserPropertyTruthy(value);
+    if (trimmed.empty()) return IsUserPropertyTruthy(property.value);
 
     char* endptr = nullptr;
     const auto expected = std::strtof(trimmed.c_str(), &endptr);
     if (endptr != nullptr && *endptr == '\0') {
-        if (const auto* shader_value = std::get_if<ShaderValue>(&value)) {
+        // Wallpaper Engine checkboxes behave like a 2-state selector where
+        // condition "0" means enabled and condition "1" means disabled.
+        if (property.is_boolean) {
+            if (std::abs(expected) < 0.0001f) return IsUserPropertyTruthy(property.value);
+            if (std::abs(expected - 1.0f) < 0.0001f) return ! IsUserPropertyTruthy(property.value);
+            return false;
+        }
+
+        if (const auto* shader_value = std::get_if<ShaderValue>(&property.value)) {
             return shader_value->size() > 0 && std::abs((*shader_value)[0] - expected) < 0.0001f;
         }
 
-        const auto* string_value = std::get_if<std::string>(&value);
+        const auto* string_value = std::get_if<std::string>(&property.value);
         return string_value != nullptr && TrimString(*string_value) == trimmed;
     }
 
     if (const auto lowered = LowerString(trimmed); lowered == "true" || lowered == "false") {
-        return IsUserPropertyTruthy(value) == (lowered == "true");
+        return IsUserPropertyTruthy(property.value) == (lowered == "true");
     }
 
-    if (const auto* string_value = std::get_if<std::string>(&value)) {
+    if (const auto* string_value = std::get_if<std::string>(&property.value)) {
         return TrimString(*string_value) == trimmed;
     }
 
@@ -442,8 +451,8 @@ inline bool EvaluateVisibleBinding(const VisibleBinding& binding,
                                    const UserPropertyMap* properties) {
     if (! binding.hasUserBinding()) return binding.value;
 
-    const auto* property = LookupUserProperty(properties, binding.user.name);
-    if (! property) return binding.value;
+    const auto* property = FindUserPropertyEntry(properties, binding.user.name);
+    if (! property || !IsUserPropertyEnabled(binding.user.name, properties, nullptr)) return binding.value;
 
     return MatchesUserPropertyCondition(*property, binding.user.condition);
 }

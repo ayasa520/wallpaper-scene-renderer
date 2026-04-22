@@ -6,6 +6,7 @@
 #include "Utils/AutoDeletor.hpp"
 #include "vvk/vulkan_wrapper.hpp"
 #include <cstdint>
+#include <string>
 
 using namespace wallpaper::vulkan;
 
@@ -34,6 +35,15 @@ inline std::optional<vvk::ShaderModule> CreateShaderModule(const vvk::Device& de
     vvk::ShaderModule sm;
     VVK_CHECK_ACT(return std::nullopt, device.CreateShaderModule(ci, sm));
     return sm;
+}
+
+const char* ShaderStageName(VkShaderStageFlagBits stage) {
+    switch (stage) {
+    case VK_SHADER_STAGE_VERTEX_BIT: return "vertex";
+    case VK_SHADER_STAGE_FRAGMENT_BIT: return "fragment";
+    case VK_SHADER_STAGE_GEOMETRY_BIT: return "geometry";
+    default: return "unknown";
+    }
 }
 
 } // namespace
@@ -154,13 +164,58 @@ GraphicsPipeline& GraphicsPipeline::setTopology(VkPrimitiveTopology topology) {
 
 bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
                               PipelineParameters& pipeline) {
+    const char* debug_name = pipeline.debug_name.empty() ? "(unnamed)" : pipeline.debug_name.c_str();
+    LOG_INFO("GraphicsPipeline: create begin name=%s existingDescriptorLayouts=%zu existingLayout=%s existingPipeline=%s stageCount=%zu descriptorSetInfos=%zu",
+             debug_name,
+             pipeline.descriptor_layouts.size(),
+             pipeline.layout ? "true" : "false",
+             pipeline.handle ? "true" : "false",
+             m_stage_spv_map.size(),
+             m_descriptor_set_infos.size());
+    if (pipeline.handle || pipeline.layout || pipeline.pass || !pipeline.descriptor_layouts.empty()) {
+        LOG_INFO("GraphicsPipeline: reset stale pipeline state name=%s descriptorLayouts=%zu layout=%s pipeline=%s pass=%s",
+                 debug_name,
+                 pipeline.descriptor_layouts.size(),
+                 pipeline.layout ? "true" : "false",
+                 pipeline.handle ? "true" : "false",
+                 pipeline.pass ? "true" : "false");
+        pipeline.handle.reset();
+        pipeline.layout.reset();
+        pipeline.pass.reset();
+        pipeline.descriptor_layouts.clear();
+    }
+    for (const auto& [stage, spv] : m_stage_spv_map) {
+        if (!spv) continue;
+        LOG_INFO("GraphicsPipeline: stage name=%s stage=%s entry=%s spirvWords=%zu",
+                 debug_name,
+                 ShaderStageName(stage),
+                 spv->entry_point.c_str(),
+                 spv->spirv.size());
+    }
     VkPipelineDynamicStateCreateInfo dynamic_info {
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext             = nullptr,
         .dynamicStateCount = (uint32_t)m_dynamic_states.size(),
         .pDynamicStates    = m_dynamic_states.data()
     };
-    for (auto& info : m_descriptor_set_infos) {
+    for (size_t info_index = 0; info_index < m_descriptor_set_infos.size(); ++info_index) {
+        auto& info = m_descriptor_set_infos[info_index];
+        LOG_INFO("GraphicsPipeline: descriptor-set-info name=%s index=%zu push=%s bindingCount=%zu",
+                 debug_name,
+                 info_index,
+                 info.push_descriptor ? "true" : "false",
+                 info.bindings.size());
+        for (size_t binding_index = 0; binding_index < info.bindings.size(); ++binding_index) {
+            const auto& binding = info.bindings[binding_index];
+            LOG_INFO("GraphicsPipeline: descriptor-binding name=%s set=%zu bindingIndex=%zu binding=%u type=%u count=%u stageFlags=0x%x",
+                     debug_name,
+                     info_index,
+                     binding_index,
+                     binding.binding,
+                     binding.descriptorType,
+                     binding.descriptorCount,
+                     binding.stageFlags);
+        }
         VkDescriptorSetLayoutCreateInfo create_info {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .pNext = nullptr
         };
@@ -173,10 +228,25 @@ bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
         vvk::DescriptorSetLayout layout;
         VVK_CHECK(device.handle().CreateDescriptorSetLayout(create_info, layout));
         pipeline.descriptor_layouts.emplace_back(std::move(layout));
+        LOG_INFO("GraphicsPipeline: descriptor-layout-created name=%s set=%zu handle=%p totalLayouts=%zu",
+                 debug_name,
+                 info_index,
+                 reinterpret_cast<void*>(*pipeline.descriptor_layouts.back()),
+                 pipeline.descriptor_layouts.size());
     }
     {
         std::vector<VkDescriptorSetLayout> layouts =
             vvk::ToVector<vvk::DescriptorSetLayout>(pipeline.descriptor_layouts);
+        LOG_INFO("GraphicsPipeline: create pipeline layout name=%s layoutCount=%zu renderPass=%p",
+                 debug_name,
+                 layouts.size(),
+                 reinterpret_cast<void*>(*pass));
+        for (size_t layout_index = 0; layout_index < layouts.size(); ++layout_index) {
+            LOG_INFO("GraphicsPipeline: pipeline-layout-entry name=%s index=%zu handle=%p",
+                     debug_name,
+                     layout_index,
+                     reinterpret_cast<void*>(layouts[layout_index]));
+        }
 
         VkPipelineLayoutCreateInfo ci {
             .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -185,6 +255,9 @@ bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
             .pSetLayouts    = layouts.data(),
         };
         VVK_CHECK(device.handle().CreatePipelineLayout(ci, pipeline.layout));
+        LOG_INFO("GraphicsPipeline: create pipeline layout success name=%s layout=%p",
+                 debug_name,
+                 reinterpret_cast<void*>(*pipeline.layout));
     }
 
     std::vector<VkPipelineShaderStageCreateInfo> shaderStages;
@@ -238,6 +311,9 @@ bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
         .renderPass          = *pass,
     };
     VVK_CHECK_BOOL_RE(device.handle().CreateGraphicsPipeline(create, pipeline.handle));
+    LOG_INFO("GraphicsPipeline: create graphics pipeline success name=%s pipeline=%p",
+             debug_name,
+             reinterpret_cast<void*>(*pipeline.handle));
     pipeline.pass = std::move(pass);
     return true;
 }

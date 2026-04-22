@@ -2,6 +2,7 @@
 #include "Instance.hpp"
 #include "Core/MapSet.hpp"
 #include "Spv.hpp"
+#include <string>
 
 namespace wallpaper
 {
@@ -13,6 +14,7 @@ struct PipelineParameters {
     vvk::PipelineLayout layout;
     vvk::RenderPass     pass;
 
+    std::string debug_name;
     std::vector<vvk::DescriptorSetLayout> descriptor_layouts;
 };
 

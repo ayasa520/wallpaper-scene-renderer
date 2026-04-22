@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <array>
 #include <cstdlib>
 #include <iomanip>
 #include <optional>
@@ -37,8 +38,47 @@ struct StaticCanvasSize {
 template<typename T>
 bool TryParseNumber(std::string_view text, T& value);
 
+std::string ShortenForLog(std::string_view text, size_t max_length);
 std::string ShaderValueToString(const ShaderValue& value);
 std::string FormatNumericVectorString(const std::vector<double>& values);
+
+std::string DescribeUserPropertyValue(const UserPropertyValue& value) {
+    if (const auto* shader_value = std::get_if<ShaderValue>(&value)) {
+        return std::string("shader(") + ShaderValueToString(*shader_value) + ")";
+    }
+    return std::string("string(\"") + ShortenForLog(std::get<std::string>(value), 160) + "\")";
+}
+
+template<typename T>
+std::string DescribeConvertedOverrideValue(const T& value) {
+    std::ostringstream out;
+    out << value;
+    return out.str();
+}
+
+template<typename T>
+std::string DescribeConvertedOverrideValue(const std::vector<T>& value) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t index = 0; index < value.size(); index++) {
+        if (index != 0) out << ", ";
+        out << value[index];
+    }
+    out << "]";
+    return out.str();
+}
+
+template<typename T, size_t N>
+std::string DescribeConvertedOverrideValue(const std::array<T, N>& value) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t index = 0; index < N; index++) {
+        if (index != 0) out << ", ";
+        out << value[index];
+    }
+    out << "]";
+    return out.str();
+}
 
 std::string DescribeScriptValue(const WPScriptValue& value) {
     switch (value.shape) {
@@ -117,10 +157,11 @@ std::optional<nlohmann::json> TryResolveUserPropertyOverrideJson(const nlohmann:
     if (! binding.has_value()) return std::nullopt;
 
     const auto* property = LookupUserProperty(g_json_user_properties, binding->name);
-    if (property == nullptr) return std::nullopt;
+    const auto* property_entry = FindUserPropertyEntry(g_json_user_properties, binding->name);
+    if (property == nullptr || property_entry == nullptr) return std::nullopt;
 
     if (! binding->condition.empty() &&
-        ! MatchesUserPropertyCondition(*property, binding->condition)) {
+        ! MatchesUserPropertyCondition(*property_entry, binding->condition)) {
         return std::nullopt;
     }
 
@@ -241,10 +282,7 @@ std::optional<WPScriptValue> TryReadScriptValueState(const nlohmann::json& node)
 std::optional<WPScriptValue> TryResolveScriptPropertyValue(const nlohmann::json& json) {
     if (const auto overridden = TryResolveUserPropertyOverrideJson(json); overridden.has_value()) {
         const auto parsed = TryParseScriptValueJson(*overridden);
-        if (parsed.has_value()) {
-            LOG_INFO("SceneScript: resolved scriptproperty override from user binding -> %s",
-                     DescribeScriptValue(*parsed).c_str());
-        } else {
+        if (!parsed.has_value()) {
             LOG_ERROR("SceneScript: failed to parse scriptproperty override json: %s",
                       overridden->dump().c_str());
         }
@@ -252,10 +290,7 @@ std::optional<WPScriptValue> TryResolveScriptPropertyValue(const nlohmann::json&
     }
 
     const auto parsed = TryReadScriptValueState(json);
-    if (parsed.has_value()) {
-        LOG_INFO("SceneScript: resolved scriptproperty default -> %s",
-                 DescribeScriptValue(*parsed).c_str());
-    } else {
+    if (!parsed.has_value()) {
         LOG_ERROR("SceneScript: failed to parse scriptproperty default json: %s",
                   json.dump().c_str());
     }
@@ -289,16 +324,12 @@ std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& no
     }
     if (ResolveUserPropertyBinding(node).has_value()) return std::nullopt;
 
-    LOG_INFO("SceneScript: evaluating script node, script=%s",
-             ShortenForLog(node.at("script").get<std::string>()).c_str());
-
     const auto current_value = TryReadScriptValueState(node);
     if (! current_value.has_value()) {
         LOG_ERROR("SceneScript: failed to parse current value for script node: %s",
                   node.dump().c_str());
         return std::nullopt;
     }
-    LOG_INFO("SceneScript: current value -> %s", DescribeScriptValue(*current_value).c_str());
 
     WPScriptEvaluationContext context;
     if (g_json_scene_root != nullptr) {
@@ -307,9 +338,6 @@ std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& no
             context.canvas_size = { canvas_size->x, canvas_size->y };
         }
     }
-    LOG_INFO("SceneScript: canvas size -> (%.3f, %.3f)",
-             context.canvas_size[0],
-             context.canvas_size[1]);
 
     if (node.contains("scriptproperties") && ! node.at("scriptproperties").is_null()) {
         if (! node.at("scriptproperties").is_object()) return std::nullopt;
@@ -320,9 +348,6 @@ std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& no
                 return std::nullopt;
             }
             context.script_properties.emplace(name, *property_value);
-            LOG_INFO("SceneScript: scriptproperty %s -> %s",
-                     name.c_str(),
-                     DescribeScriptValue(*property_value).c_str());
         }
     }
 
@@ -335,10 +360,13 @@ std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& no
     const auto evaluated =
         runtime.evaluate(node.at("script").get<std::string>(), *current_value, context);
     if (! evaluated.has_value()) {
-        LOG_ERROR("SceneScript: runtime evaluation failed, falling back to raw value");
+        // Parser-time script execution is only a best-effort value probe. The persistent
+        // QuickJS host will run the real Wallpaper Engine callbacks after the scene is loaded,
+        // so falling back to the authored raw value is expected recovery rather than a fatal
+        // scene loading error.
+        LOG_INFO("SceneScript: runtime evaluation failed, falling back to raw value");
         return std::nullopt;
     }
-    LOG_INFO("SceneScript: runtime result -> %s", DescribeScriptValue(*evaluated).c_str());
 
     return SerializeScriptValue(*evaluated);
 }
@@ -457,21 +485,20 @@ bool TryGetUserPropertyOverride(const nlohmann::json& json, T& value) {
     if (! binding.has_value()) return false;
 
     const auto* property = LookupUserProperty(g_json_user_properties, binding->name);
-    if (property == nullptr) return false;
+    const auto* property_entry = FindUserPropertyEntry(g_json_user_properties, binding->name);
+    if (property == nullptr || property_entry == nullptr) return false;
 
     if (! binding->condition.empty() &&
-        ! MatchesUserPropertyCondition(*property, binding->condition)) {
-        LOG_INFO("SceneScript: user binding '%s' present but condition '%s' did not match",
-                 binding->name.c_str(),
-                 binding->condition.c_str());
+        ! MatchesUserPropertyCondition(*property_entry, binding->condition)) {
         return false;
     }
 
     const bool converted = TryConvertUserPropertyValue(*property, value);
-    if (converted) {
-        LOG_INFO("SceneScript: applied direct user binding '%s'", binding->name.c_str());
-    } else {
-        LOG_ERROR("SceneScript: failed to convert direct user binding '%s'", binding->name.c_str());
+    if (!converted) {
+        LOG_ERROR("SceneScript: failed to convert direct user binding '%s' raw=%s condition='%s'",
+                  binding->name.c_str(),
+                  DescribeUserPropertyValue(property_entry->value).c_str(),
+                  binding->condition.c_str());
     }
     return converted;
 }
@@ -495,9 +522,6 @@ inline bool _GetJsonValue(const nlohmann::json&                  json,
 
     const auto scripted = TryResolveScriptValueNode(json);
     const auto& njson   = scripted.has_value() ? *scripted : ResolvePropertyValueNode(json);
-    if (json.is_object() && json.contains("script") && ! scripted.has_value()) {
-        LOG_INFO("SceneScript: script node fell back to raw array/string value");
-    }
 
     using Tv = typename T::value_type;
     if (njson.is_number()) {
@@ -539,9 +563,6 @@ inline bool _GetJsonValue(const nlohmann::json& json, T& value) {
     if (const auto scripted = TryResolveScriptValueNode(json); scripted.has_value()) {
         value = scripted->get<T>();
         return true;
-    }
-    if (json.is_object() && json.contains("script")) {
-        LOG_INFO("SceneScript: script node fell back to raw scalar/string value");
     }
 
     value = ResolvePropertyValueNode(json).get<T>();
@@ -642,6 +663,7 @@ template<std::size_t N>
 using farray = std::array<float, N>;
 T_IMPL_GET_JSON(farray<2>);
 T_IMPL_GET_JSON(farray<3>);
+T_IMPL_GET_JSON(farray<4>);
 
 ScopedJsonUserProperties::ScopedJsonUserProperties(const UserPropertyMap* properties,
                                                    const nlohmann::json*  root)

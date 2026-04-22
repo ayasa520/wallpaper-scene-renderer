@@ -61,3 +61,13 @@ void SceneNode::MarkTransDirty() {
         }
     }
 }
+
+void SceneNode::MarkTransSubtreeDirty() {
+    // Parent changes are not normal local transform edits. A child branch can contain clean cached
+    // matrices even when the branch root is already dirty, so this path deliberately walks every
+    // descendant and overwrites the dirty flag unconditionally.
+    m_dirty = true;
+    for (auto& child : m_children) {
+        if (child) child->MarkTransSubtreeDirty();
+    }
+}

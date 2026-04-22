@@ -30,6 +30,7 @@ struct RenderInitInfo {
 
     uint16_t width { 1920 };
     uint16_t height { 1080 };
+    double   render_scale { 1.0 };
     ReDrawCB redraw_callback;
 };
 

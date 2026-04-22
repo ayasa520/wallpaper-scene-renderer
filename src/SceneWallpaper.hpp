@@ -20,7 +20,13 @@ constexpr std::string_view PROPERTY_VOLUME               = "volume";
 constexpr std::string_view PROPERTY_MUTED                = "muted";
 constexpr std::string_view PROPERTY_CACHE_PATH           = "cache_path";
 constexpr std::string_view PROPERTY_FIRST_FRAME_CALLBACK = "first_frame_callback";
+// Load-time user properties update the MainHandler state that the next scene
+// parse consumes, but they deliberately do not send live script updates to the
+// scene that is currently still on screen during a reused-backend project switch.
+constexpr std::string_view PROPERTY_LOAD_USER_PROPERTIES = "load_user_properties";
 constexpr std::string_view PROPERTY_USER_PROPERTIES      = "user_properties";
+constexpr std::string_view PROPERTY_MEDIA_STATE          = "media_state";
+constexpr std::string_view PROPERTY_AUDIO_SAMPLES        = "audio_samples";
 
 #include "Core/NoCopyMove.hpp"
 class MainHandler;
@@ -38,6 +44,7 @@ public:
     void play();
     void pause();
     void mouseInput(double x, double y);
+    void mouseLeftButton(bool down);
 
     void setPropertyBool(std::string_view, bool);
     void setPropertyInt32(std::string_view, int32_t);

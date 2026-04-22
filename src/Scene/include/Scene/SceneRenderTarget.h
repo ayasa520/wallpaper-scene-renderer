@@ -1,6 +1,7 @@
 #pragma once
 #include "SceneTexture.h"
 #include "Core/Literals.hpp"
+#include <array>
 
 namespace wallpaper
 {
@@ -15,6 +16,8 @@ struct SceneRenderTarget {
 
     i32           width;
     i32           height;
+    i32           mapWidth { 0 };
+    i32           mapHeight { 0 };
     bool          allowReuse { false };
     bool          withDepth { false };
     bool          has_mipmap { false };
@@ -24,5 +27,22 @@ struct SceneRenderTarget {
                            TextureFilter::LINEAR,
                            TextureFilter::LINEAR };
     Bind          bind {};
+
+    [[nodiscard]] i32 ContentWidth() const {
+        // Render targets can expose a logical content rectangle that is smaller than their
+        // allocated Vulkan image. This remains a generic render-target capability for authored
+        // effect chains that intentionally decouple sampled content size from backing allocation.
+        return mapWidth > 0 ? mapWidth : width;
+    }
+
+    [[nodiscard]] i32 ContentHeight() const {
+        // Keep the fallback symmetric with ContentWidth() so targets that never set
+        // mapWidth/mapHeight continue to behave exactly as before.
+        return mapHeight > 0 ? mapHeight : height;
+    }
+
+    [[nodiscard]] std::array<i32, 4> ResolutionVector() const {
+        return { width, height, ContentWidth(), ContentHeight() };
+    }
 };
 } // namespace wallpaper

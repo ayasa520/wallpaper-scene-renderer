@@ -66,6 +66,7 @@ struct Image : NoCopy, NoMove {
     ImageHeader       header;
     std::vector<Slot> slots;
     std::string       key;
+    uint64_t          revision { 0 };
 };
 
 } // namespace wallpaper

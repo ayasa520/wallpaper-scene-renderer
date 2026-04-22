@@ -315,11 +315,18 @@ VkResult Device::Create(Device& device, VkPhysicalDevice physical_device,
         .pEnabledFeatures        = nullptr,
     };
     VkDevice vkdevice;
+    LOG_INFO("VulkanDevice: vkCreateDevice physicalDevice=%p queueCreateInfos=%zu enabledExts=%zu",
+             static_cast<void*>(physical_device),
+             queues_ci.size(),
+             enabled_extensions.size());
     VkResult res = dld.vkCreateDevice(physical_device, &ci, nullptr, &vkdevice);
     if (res == VK_SUCCESS) {
         Load(vkdevice, dld);
         device = Device(vkdevice, dld);
     }
+    LOG_INFO("VulkanDevice: vkCreateDevice result=%d device=%p",
+             static_cast<int>(res),
+             res == VK_SUCCESS ? static_cast<void*>(vkdevice) : nullptr);
     return res;
 }
 
@@ -344,8 +351,15 @@ VkResult Device::AllocateMemory(const VkMemoryAllocateInfo& ai, DeviceMemory& me
 
 VkResult Device::CreateCommandPool(const VkCommandPoolCreateInfo& ci, CommandPool& pool) const {
     VkCommandPool vkpool;
+    LOG_INFO("VulkanDevice: vkCreateCommandPool device=%p queueFamilyIndex=%u flags=0x%x",
+             static_cast<void*>(handle),
+             ci.queueFamilyIndex,
+             ci.flags);
     VkResult      res = dld->vkCreateCommandPool(handle, &ci, nullptr, &vkpool);
     if (res == VK_SUCCESS) pool = CommandPool(vkpool, handle, *dld);
+    LOG_INFO("VulkanDevice: vkCreateCommandPool result=%d pool=%p",
+             static_cast<int>(res),
+             res == VK_SUCCESS ? static_cast<void*>(vkpool) : nullptr);
     return res;
 }
 

@@ -39,6 +39,17 @@ Matrix4d WPNodeTransformResolver::ResolveParallaxedModelTransform(SceneNode* nod
     return model_trans;
 }
 
+Matrix4d WPNodeTransformResolver::ResolveRawModelTransform(SceneNode* node) {
+    const auto* node_data = FindNodeData(node);
+    return ResolveModelTransform(node, node_data);
+}
+
+Vector3f WPNodeTransformResolver::ResolveParallaxOffset(SceneNode* node, const SceneCamera* camera) {
+    const auto* node_data = FindNodeData(node);
+    if (node_data == nullptr) return Vector3f::Zero();
+    return ComputeParallaxOffset(node, *node_data, camera);
+}
+
 std::optional<Affine3f> WPNodeTransformResolver::ResolveAttachmentLocalTransform(SceneNode* node) {
     const auto* node_data = FindNodeData(node);
     if (node_data == nullptr) return std::nullopt;

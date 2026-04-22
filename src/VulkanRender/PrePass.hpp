@@ -29,8 +29,10 @@ public:
     // void setClearValue(vk::ClearValue);
 
     void prepare(Scene&, const Device&, RenderingResources&) override;
+    void refreshResources(Scene&, const Device&, RenderingResources&) override;
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
+    bool referencesRenderTarget(std::string_view) const override;
 
 private:
     Desc m_desc;

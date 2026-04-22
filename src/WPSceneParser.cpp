@@ -12,9 +12,14 @@
 
 #include "WPShaderParser.hpp"
 #include "WPTexImageParser.hpp"
+#include "WPSyntheticImageParser.hpp"
 #include "WPParticleParser.hpp"
 #include "WPSoundParser.hpp"
 #include "WPMdlParser.hpp"
+#include "WPPropertyAnimation.hpp"
+#include "WPSceneScriptMedia.hpp"
+#include "WPTextLayer.hpp"
+#include "WPUserSetting.hpp"
 
 #include "Particle/WPParticleRawGener.h"
 #include "Particle/ParticleSystem.h"
@@ -39,13 +44,226 @@
 #include <functional>
 #include <regex>
 #include <optional>
+#include <type_traits>
 #include <variant>
+#include <limits>
 #include <Eigen/Dense>
 
 using namespace wallpaper;
 using namespace Eigen;
 
 std::string getAddr(void* p) { return std::to_string(reinterpret_cast<intptr_t>(p)); }
+
+template <typename Map>
+std::string DescribeStringMap(const Map& values) {
+    std::ostringstream oss;
+    oss << "{";
+    size_t count = 0;
+    for (const auto& [name, value] : values) {
+        if (count != 0) oss << ", ";
+        oss << name << "=" << value;
+        count++;
+        if (count >= 12 && values.size() > count) {
+            oss << ", ...";
+            break;
+        }
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string DescribeStringVec(const std::vector<std::string>& values) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); i++) {
+        if (i != 0) oss << ", ";
+        oss << i << "='" << values[i] << "'";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string DescribeShaderValueMapSummary(const ShaderValueMap& values) {
+    std::ostringstream oss;
+    oss << "{";
+    size_t count = 0;
+    for (const auto& [name, value] : values) {
+        if (count != 0) oss << ", ";
+        oss << name << "=[";
+        for (size_t i = 0; i < value.size(); i++) {
+            if (i != 0) oss << ", ";
+            oss << value[i];
+            if (i >= 3 && value.size() > 4) {
+                oss << ", ...";
+                break;
+            }
+        }
+        oss << "]";
+        count++;
+        if (count >= 12 && values.size() > count) {
+            oss << ", ...";
+            break;
+        }
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string DescribeShaderValueMapFull(const ShaderValueMap& values) {
+    std::ostringstream oss;
+    oss << "{";
+    size_t count = 0;
+    for (const auto& [name, value] : values) {
+        if (count != 0) oss << ", ";
+        oss << name << "=[";
+        for (size_t i = 0; i < value.size(); i++) {
+            if (i != 0) oss << ", ";
+            oss << value[i];
+        }
+        oss << "]";
+        count++;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string DescribeUserPropertyForLog(const UserPropertyMap* properties, std::string_view name) {
+    // Visibility regressions are easiest to understand at parse time, before
+    // scripts or live property updates can hide the original state.  This helper
+    // prints the exact tracked value that ResolveObjectVisibility receives.
+    if (properties == nullptr) return "map-null";
+
+    const auto iter = properties->find(std::string(name));
+    if (iter == properties->end()) return "missing";
+
+    if (const auto* string_value = std::get_if<std::string>(&iter->second.value))
+        return std::string("string:") + *string_value;
+
+    const auto* shader_value = std::get_if<ShaderValue>(&iter->second.value);
+    if (shader_value == nullptr) return "unknown";
+
+    std::ostringstream oss;
+    oss << "shader:[";
+    for (size_t index = 0; index < shader_value->size(); index++) {
+        if (index != 0) oss << ",";
+        oss << (*shader_value)[index];
+        if (index >= 3 && shader_value->size() > 4) {
+            oss << ",...";
+            break;
+        }
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void ExtractReferencedLayerNamesFromScript(std::string_view script,
+                                           std::unordered_set<std::string>& out_names) {
+    static const std::regex kLayerRefPattern(
+        R"((?:getLayer|getLayerIndex)\(\s*['"]([^'"]+)['"]\s*\))");
+    static const std::regex kStringLiteralPattern(R"(['"]([^'"]+)['"])");
+
+    const std::string script_text(script);
+    for (std::sregex_iterator it(script_text.begin(), script_text.end(), kLayerRefPattern), end;
+         it != end;
+         ++it) {
+        if ((*it).size() >= 2) out_names.insert((*it)[1].str());
+    }
+
+    // Some scene scripts keep layer names in string arrays first and only call
+    // getLayer(name) later via map/forEach helpers, so plain getLayer(...)
+    // matching alone misses those runtime-controlled hidden layers.
+    for (std::sregex_iterator it(script_text.begin(), script_text.end(), kStringLiteralPattern), end;
+         it != end;
+         ++it) {
+        if ((*it).size() >= 2) out_names.insert((*it)[1].str());
+    }
+}
+
+void CollectScriptReferencedLayerNames(const nlohmann::json& value,
+                                       std::unordered_set<std::string>& out_names) {
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (it.key() == "script" && it->is_string()) {
+                ExtractReferencedLayerNamesFromScript(it->get_ref<const std::string&>(), out_names);
+                continue;
+            }
+            CollectScriptReferencedLayerNames(*it, out_names);
+        }
+        return;
+    }
+
+    if (value.is_array()) {
+        for (const auto& item : value) {
+            CollectScriptReferencedLayerNames(item, out_names);
+        }
+    }
+}
+
+// Text-layer bindings and deferred materialization span authored JSON, runtime state, and script
+// registration data. Keeping these small predicates centralized avoids duplicating the text-layer
+// identification rules across parser entry points that need to make the same decisions.
+bool IsTextLayerObjectJson(const nlohmann::json& object_json) {
+    return object_json.contains("text") && !object_json.at("text").is_null();
+}
+
+const char* DynamicValueTypeName(WPDynamicValue::Type hint) {
+    switch (hint) {
+        case WPDynamicValue::Type::Null:
+            return "null";
+        case WPDynamicValue::Type::Boolean:
+            return "bool";
+        case WPDynamicValue::Type::Int32:
+            return "int32";
+        case WPDynamicValue::Type::UInt32:
+            return "uint32";
+        case WPDynamicValue::Type::Float:
+            return "float";
+        case WPDynamicValue::Type::Double:
+            return "double";
+        case WPDynamicValue::Type::String:
+            return "string";
+        case WPDynamicValue::Type::FloatVector:
+            return "floatVector";
+        case WPDynamicValue::Type::Int3:
+            return "int3";
+        case WPDynamicValue::Type::Float2:
+            return "float2";
+        case WPDynamicValue::Type::Float3:
+            return "float3";
+        case WPDynamicValue::Type::Float4:
+            return "float4";
+    }
+    return "unknown";
+}
+
+void LogTextLayerRegistration(const char*                    event_name,
+                              int32_t                        object_id,
+                              const std::string&             object_name,
+                              std::string_view               property_name,
+                              WPDynamicValue::Type           hint,
+                              const WPUserSetting&           setting,
+                              const std::optional<WPDynamicValue>& base_value) {
+}
+
+enum class LazyMaterializeKind
+{
+    None,
+    Particle,
+    Text,
+};
+
+struct VisibilityContract {
+    bool authored_visible { true };
+    bool initial_visible { true };
+    bool has_user_binding { false };
+    bool has_script { false };
+    bool has_animation { false };
+    bool referenced_by_script { false };
+    bool dependency_source { false };
+    bool requires_runtime_contract { false };
+    bool can_prune_at_parse_time { false };
+    LazyMaterializeKind lazy_materialize_kind { LazyMaterializeKind::None };
+};
 
 struct ParseContext {
     std::shared_ptr<Scene> scene;
@@ -60,8 +278,9 @@ struct ParseContext {
     std::shared_ptr<SceneNode> global_camera_node;
     std::shared_ptr<SceneNode> global_perspective_camera_node;
     std::unordered_set<int32_t> dependent_parent_ids;
+    std::unordered_map<int32_t, VisibilityContract> layer_visibility_contracts;
     std::unordered_map<int32_t, std::shared_ptr<SceneNode>> object_nodes;
-    std::unordered_map<int32_t, std::shared_ptr<WPPuppet>>  object_puppets;
+    std::unordered_map<int32_t, const WPPuppet*>            object_puppets;
 };
 
 struct WPEmptyObject {
@@ -102,8 +321,91 @@ struct WPEmptyObject {
     }
 };
 
-using WPObjectVar = std::variant<wpscene::WPImageObject, wpscene::WPParticleObject,
-                                 wpscene::WPSoundObject, wpscene::WPLightObject, WPEmptyObject>;
+struct WPShapeObject {
+    int32_t              id { 0 };
+    std::string          name;
+    std::string          shape;
+    std::array<float, 3> origin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3> angles { 0.0f, 0.0f, 0.0f };
+    std::array<float, 2> size { 0.0f, 0.0f };
+    std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
+    std::array<float, 3> color { 1.0f, 1.0f, 1.0f };
+    float                alpha { 1.0f };
+    float                brightness { 1.0f };
+    bool                 visible { true };
+    bool                 has_size { false };
+    VisibleBinding       visible_binding;
+    int32_t              parent { 0 };
+    std::string          attachment;
+    std::vector<wpscene::WPImageEffect> effects;
+
+    bool FromJson(const nlohmann::json& json, fs::VFS& vfs) {
+        GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
+        GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
+        GET_JSON_NAME_VALUE_NOWARN(json, "shape", shape);
+        GET_JSON_NAME_VALUE_NOWARN(json, "origin", origin);
+        GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
+        GET_JSON_NAME_VALUE_NOWARN(json, "angles", angles);
+        if (json.contains("size") && !json.at("size").is_null()) {
+            GET_JSON_NAME_VALUE_NOWARN(json, "size", size);
+            has_size = size[0] > 0.0f && size[1] > 0.0f;
+        }
+        GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
+        GET_JSON_NAME_VALUE_NOWARN(json, "color", color);
+        GET_JSON_NAME_VALUE_NOWARN(json, "alpha", alpha);
+        GET_JSON_NAME_VALUE_NOWARN(json, "brightness", brightness);
+
+        if (json.contains("visible") && !json.at("visible").is_null()) {
+            const auto& visible_json = json.at("visible");
+            if (visible_json.is_boolean()) {
+                GET_JSON_VALUE_NOWARN(visible_json, visible);
+                visible_binding.value = visible;
+            } else if (visible_json.is_object()) {
+                // Shape layers can be driven by the same user/script visibility contracts as image
+                // layers. Preserve the authored fallback and binding instead of treating the whole
+                // object as a boolean, otherwise direct-draw effects would materialize with the
+                // wrong initial visibility and runtime toggles would have no stable target.
+                GET_JSON_NAME_VALUE_NOWARN(visible_json, "value", visible_binding.value);
+                visible = visible_binding.value;
+                if (visible_json.contains("user") && ! visible_json.at("user").is_null()) {
+                    const auto& user = visible_json.at("user");
+                    if (user.is_string()) {
+                        GET_JSON_VALUE(user, visible_binding.user.name);
+                    } else if (user.is_object()) {
+                        GET_JSON_NAME_VALUE_NOWARN(user, "name", visible_binding.user.name);
+                        GET_JSON_NAME_VALUE_NOWARN(user, "condition", visible_binding.user.condition);
+                    }
+                }
+            }
+        }
+
+        GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
+        GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
+
+        if (json.contains("effects") && json.at("effects").is_array()) {
+            for (const auto& effect_json : json.at("effects")) {
+                wpscene::WPImageEffect effect;
+                if (effect.FromJson(effect_json, vfs)) {
+                    effects.push_back(std::move(effect));
+                } else {
+                    LOG_ERROR("ShapeObject: effect parse failed, layer=%d name='%s'",
+                              id,
+                              name.c_str());
+                }
+            }
+        }
+        return true;
+    }
+};
+
+using WPObjectVar = std::variant<wpscene::WPImageObject,
+                                 wpscene::WPParticleObject,
+                                 wpscene::WPSoundObject,
+                                 wpscene::WPLightObject,
+                                 wpscene::WPTextObject,
+                                 WPShapeObject,
+                                 WPEmptyObject>;
 
 namespace
 {
@@ -111,10 +413,205 @@ constexpr std::string_view kSyntheticColorBlendEffectName {
     "__hanabi_synthetic_color_blend_effect__"
 };
 
+constexpr std::string_view kSyntheticDirectDrawShapeTextureName {
+    "__hanabi_shape_directdraw_transparent_source"
+};
+
+void EnsureSystemTextureRegistered(Scene& scene, std::string_view texture_key) {
+    auto* synthetic_parser = AsSyntheticImageParser(scene.imageParser.get());
+    if (synthetic_parser == nullptr) return;
+
+    const std::string key(texture_key);
+    if (scene.textures.count(key) != 0) return;
+
+    synthetic_parser->RegisterImage(key, CreateSceneScriptSolidImage(texture_key, { 0, 0, 0, 0 }));
+    scene.textures[key] = SceneTexture {
+        .url = key,
+        .sample = TextureSample {
+            .wrapS = TextureWrap::CLAMP_TO_EDGE,
+            .wrapT = TextureWrap::CLAMP_TO_EDGE,
+            .magFilter = TextureFilter::LINEAR,
+            .minFilter = TextureFilter::LINEAR,
+        },
+        .isVideo = false,
+        .isSprite = false,
+        .width = 1,
+        .height = 1,
+        .mapWidth = 1,
+        .mapHeight = 1,
+    };
+    scene.dirtyImportedTextureKeys.insert(key);
+}
+
 bool ResolveObjectVisibility(bool raw_visible, const VisibleBinding& binding,
                              const UserPropertyMap* user_properties) {
     if (! binding.hasUserBinding()) return raw_visible;
     return EvaluateVisibleBinding(binding, user_properties);
+}
+
+bool JsonPropertyHasRuntimeMember(const nlohmann::json* property_json, const char* member_name) {
+    return property_json != nullptr && property_json->is_object() &&
+           property_json->contains(member_name) && !property_json->at(member_name).is_null();
+}
+
+const nlohmann::json* FindVisibleProperty(const nlohmann::json& json) {
+    if (!json.is_object() || !json.contains("visible")) return nullptr;
+    return &json.at("visible");
+}
+
+bool ReadAuthoredVisibleValue(const nlohmann::json& json, bool default_visible = true) {
+    const auto* visible_json = FindVisibleProperty(json);
+    if (visible_json == nullptr) return default_visible;
+    if (visible_json->is_boolean()) return visible_json->get<bool>();
+    if (visible_json->is_object() && visible_json->contains("value") &&
+        visible_json->at("value").is_boolean()) {
+        return visible_json->at("value").get<bool>();
+    }
+    return default_visible;
+}
+
+VisibleBinding ReadVisibleBindingFromJson(const nlohmann::json* visible_json,
+                                          bool authored_visible) {
+    VisibleBinding binding;
+    binding.value = authored_visible;
+    if (visible_json == nullptr || !visible_json->is_object()) return binding;
+
+    GET_JSON_NAME_VALUE_NOWARN(*visible_json, "value", binding.value);
+    if (!visible_json->contains("user") || visible_json->at("user").is_null()) return binding;
+
+    const auto& user = visible_json->at("user");
+    if (user.is_string()) {
+        GET_JSON_VALUE(user, binding.user.name);
+    } else if (user.is_object()) {
+        GET_JSON_NAME_VALUE_NOWARN(user, "name", binding.user.name);
+        GET_JSON_NAME_VALUE_NOWARN(user, "condition", binding.user.condition);
+    }
+    return binding;
+}
+
+VisibilityContract BuildVisibilityContract(bool authored_visible,
+                                           const VisibleBinding& binding,
+                                           const nlohmann::json* visible_json,
+                                           const UserPropertyMap* user_properties,
+                                           bool dependency_source = false,
+                                           bool referenced_by_script = false,
+                                           LazyMaterializeKind lazy_kind =
+                                               LazyMaterializeKind::None) {
+    VisibilityContract contract;
+    contract.authored_visible = authored_visible;
+    contract.initial_visible =
+        ResolveObjectVisibility(authored_visible, binding, user_properties);
+    contract.has_user_binding =
+        binding.hasUserBinding() || JsonPropertyHasRuntimeMember(visible_json, "user");
+    contract.has_script = JsonPropertyHasRuntimeMember(visible_json, "script");
+    contract.has_animation = JsonPropertyHasRuntimeMember(visible_json, "animation");
+    contract.referenced_by_script = referenced_by_script;
+    contract.dependency_source = dependency_source;
+    contract.lazy_materialize_kind = lazy_kind;
+    contract.requires_runtime_contract = contract.has_user_binding || contract.has_script ||
+                                         contract.has_animation || referenced_by_script ||
+                                         dependency_source;
+    // Parse-time pruning is reserved for purely static invisible authored content. Anything that
+    // can be driven by scripts, user properties, animations, dependencies, or name references keeps
+    // a runtime contract even if it begins hidden.
+    contract.can_prune_at_parse_time =
+        !contract.initial_visible && !contract.requires_runtime_contract;
+    return contract;
+}
+
+VisibilityContract BuildObjectVisibilityContractFromJson(
+    const nlohmann::json& obj,
+    const UserPropertyMap* user_properties,
+    bool dependency_source,
+    bool referenced_by_script,
+    LazyMaterializeKind lazy_kind = LazyMaterializeKind::None) {
+    const auto* visible_json = FindVisibleProperty(obj);
+    const bool authored_visible = ReadAuthoredVisibleValue(obj);
+    const auto binding = ReadVisibleBindingFromJson(visible_json, authored_visible);
+    return BuildVisibilityContract(authored_visible,
+                                   binding,
+                                   visible_json,
+                                   user_properties,
+                                   dependency_source,
+                                   referenced_by_script,
+                                   lazy_kind);
+}
+
+VisibilityContract BuildEffectVisibilityContract(const wpscene::WPImageEffect& effect,
+                                                 const UserPropertyMap* user_properties) {
+    const nlohmann::json* visible_json =
+        effect.visible_json.is_null() ? nullptr : &effect.visible_json;
+    return BuildVisibilityContract(effect.visible,
+                                   effect.visible_binding,
+                                   visible_json,
+                                   user_properties);
+}
+
+const VisibilityContract* FindLayerVisibilityContract(const ParseContext& context,
+                                                      int32_t layer_id) {
+    const auto it = context.layer_visibility_contracts.find(layer_id);
+    return it == context.layer_visibility_contracts.end() ? nullptr : &it->second;
+}
+
+class ScopedGlslangSession {
+public:
+    explicit ScopedGlslangSession(std::string_view reason) : m_reason(reason) {
+        WPShaderParser::InitGlslang(m_reason);
+    }
+
+    ~ScopedGlslangSession() { WPShaderParser::FinalGlslang(m_reason); }
+
+private:
+    std::string m_reason;
+};
+
+void PopulateGlobalBaseUniforms(ParseContext& context, const Scene& scene) {
+    auto& gb              = context.global_base_uniforms;
+    gb["g_ViewUp"]        = std::array { 0.0f, 1.0f, 0.0f };
+    gb["g_ViewRight"]     = std::array { 1.0f, 0.0f, 0.0f };
+    gb["g_ViewForward"]   = std::array { 0.0f, 0.0f, -1.0f };
+    gb["g_EyePosition"]   = std::array { 0.0f, 0.0f, 0.0f };
+    gb["g_TexelSize"]     = std::array { 1.0f / 1920.0f, 1.0f / 1080.0f };
+    gb["g_TexelSizeHalf"] = std::array { 1.0f / 1920.0f / 2.0f, 1.0f / 1080.0f / 2.0f };
+    gb["g_LightAmbientColor"] = scene.ambientColor;
+    gb["g_LightSkylightColor"] = scene.skylightColor;
+    gb["g_NormalModelMatrix"] = ShaderValue::fromMatrix(Matrix4f::Identity());
+
+    if (context.ortho_w > 0 && context.ortho_h > 0) {
+        gb["g_TexelSize"] = std::array {
+            1.0f / static_cast<float>(context.ortho_w),
+            1.0f / static_cast<float>(context.ortho_h)
+        };
+        gb["g_TexelSizeHalf"] = std::array {
+            1.0f / static_cast<float>(context.ortho_w) / 2.0f,
+            1.0f / static_cast<float>(context.ortho_h) / 2.0f
+        };
+    }
+}
+
+void CollectSceneNodeRefs(const std::shared_ptr<SceneNode>&                            node,
+                          std::unordered_map<SceneNode*, std::shared_ptr<SceneNode>>& refs) {
+    if (!node) return;
+    refs[node.get()] = node;
+    for (const auto& child : node->GetChildren()) {
+        CollectSceneNodeRefs(child, refs);
+    }
+}
+
+int32_t AllocateDynamicLayerId(const Scene& scene) {
+    int32_t max_id = 0;
+    for (const auto layer_id : scene.layerOrder) {
+        max_id = std::max(max_id, layer_id);
+    }
+    for (const auto& [layer_id, _] : scene.layerNodes) {
+        (void)_;
+        max_id = std::max(max_id, layer_id);
+    }
+    for (const auto& [layer_id, _] : scene.objectRuntimeNodes) {
+        (void)_;
+        max_id = std::max(max_id, layer_id);
+    }
+    return max_id + 1;
 }
 
 // mapRate < 1.0
@@ -404,7 +901,17 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     }
     for (usize i = 0; i < wpmat.usertextures.size(); i++) {
         const auto& binding = wpmat.usertextures[i];
-        if (binding.empty() || binding.type == "system") continue;
+        if (binding.empty()) continue;
+        if (binding.type == "system") {
+            if (binding.name == "$mediaThumbnail") {
+                textures[i] = std::string(WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE);
+                EnsureSystemTextureRegistered(*pScene, WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE);
+            } else if (binding.name == "$mediaPreviousThumbnail") {
+                textures[i] = std::string(WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
+                EnsureSystemTextureRegistered(*pScene, WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
+            }
+            continue;
+        }
 
         const auto* property = LookupUserPropertyString(user_properties, binding.name);
         if (property == nullptr || property->empty()) continue;
@@ -442,7 +949,11 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
             } else {
                 svData.renderTargets.push_back({ i, name });
                 const auto& rt = pScene->renderTargets.at(name);
-                resolution     = { rt.width, rt.height, rt.width, rt.height };
+                // Runtime render targets may keep a larger physical allocation than the logical
+                // content they currently store. Forwarding the authored content extent through
+                // `.zw` preserves Wallpaper Engine's original "sample area" contract for effects
+                // that distinguish between allocated size and meaningful image size.
+                resolution     = rt.ResolutionVector();
             }
         } else {
             const ImageHeader& texh = texHeaders.count(name) == 0
@@ -524,6 +1035,77 @@ const auto& f1     = texh.spriteAnim.GetCurFrame();
     return true;
 }
 
+bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer& effect_layer,
+                                   std::string_view initial_source, int32_t owner_layer_id,
+                                   std::string_view owner_name) {
+    auto& vfs = *context.vfs;
+
+    wpscene::WPMaterial composite_source;
+    nlohmann::json      composite_json;
+    if (!PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
+                    composite_json) ||
+        !composite_source.FromJson(composite_json)) {
+        LOG_ERROR("SceneEffectFinalComposite: layer=%d name='%.*s' failed to load passthrough material",
+                  owner_layer_id,
+                  static_cast<int>(owner_name.size()),
+                  owner_name.data());
+        return false;
+    }
+
+    if (composite_source.textures.empty()) composite_source.textures.resize(1);
+    composite_source.textures[0] = std::string(initial_source);
+
+    WPShaderInfo composite_shader_info;
+    composite_shader_info.baseConstSvs = context.global_base_uniforms;
+    // The source object/effect chain has already baked authored color, alpha, brightness, and
+    // effect output into the ping-pong texture. The final composite must therefore be a neutral
+    // sampler: it applies the layer's final mesh and blend state, but it must not tint or fade the
+    // resolved texture a second time.
+    composite_shader_info.baseConstSvs["g_Color4"] = std::array<float, 4> {
+        1.0f,
+        1.0f,
+        1.0f,
+        1.0f
+    };
+    composite_shader_info.baseConstSvs["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
+    composite_shader_info.baseConstSvs["g_Alpha"] = 1.0f;
+    composite_shader_info.baseConstSvs["g_UserAlpha"] = 1.0f;
+    composite_shader_info.baseConstSvs["g_Brightness"] = 1.0f;
+
+    SceneMaterial     composite_material;
+    WPShaderValueData composite_data;
+    if (!LoadMaterial(vfs,
+                      composite_source,
+                      context.scene.get(),
+                      &effect_layer.FinalNode(),
+                      &composite_material,
+                      &composite_data,
+                      context.user_properties,
+                      &composite_shader_info)) {
+        LOG_ERROR("SceneEffectFinalComposite: layer=%d name='%.*s' material compile failed",
+                  owner_layer_id,
+                  static_cast<int>(owner_name.size()),
+                  owner_name.data());
+        return false;
+    }
+
+    auto composite_mesh = std::make_shared<SceneMesh>();
+    composite_mesh->AddMaterial(std::move(composite_material));
+
+    auto& final_node = effect_layer.FinalNode();
+    final_node.SetName(owner_name.empty()
+                           ? std::string("__hanabi_effect_final_composite")
+                           : std::string(owner_name) + "::__hanabi_effect_final_composite");
+    final_node.ID() = owner_layer_id;
+    final_node.SetCamera(std::string());
+    final_node.AddMesh(composite_mesh);
+
+    context.shader_updater->SetNodeData(&final_node, composite_data);
+    context.scene->nodeOwners[&final_node] = owner_layer_id;
+    effect_layer.SetFinalCompositeSource(std::string(initial_source));
+    return true;
+}
+
 void LoadAlignment(SceneNode& node, std::string_view align, Vector2f size) {
     Vector3f trans = node.Translate();
     size *= 0.5f;
@@ -547,6 +1129,95 @@ std::shared_ptr<SceneNode> FindParentNode(ParseContext& context, int32_t parent_
     return it == context.object_nodes.end() ? nullptr : it->second;
 }
 
+void RegisterRenderOrderProxyChild(ParseContext&                    context,
+                                   int32_t                          parent_id,
+                                   const std::shared_ptr<SceneNode>& child,
+                                   int32_t                          child_layer_id) {
+    if (context.scene == nullptr || parent_id == 0 || child == nullptr) return;
+
+    auto parent = FindParentNode(context, parent_id);
+    if (!parent) return;
+
+    // This edge is intentionally order-only. The child may remain root-owned for inherited
+    // transform, attachment, or effect-camera correctness, while render-graph traversal later emits
+    // it at the authored parent's visual sibling position.
+    auto& routed_children = context.scene->renderOrderProxyChildren[parent.get()];
+    if (std::find(routed_children.begin(), routed_children.end(), child.get()) ==
+        routed_children.end()) {
+        routed_children.push_back(child.get());
+    }
+    context.scene->renderOrderProxyNodes.insert(child.get());
+    LOG_INFO("SceneRenderOrderProxyRegister: parent-layer=%d proxy-layer=%d parent-name='%s' "
+             "proxy-name='%s'",
+             parent_id,
+             child_layer_id,
+             parent->Name().c_str(),
+             child->Name().c_str());
+}
+
+void RegisterDetachedRenderOrderSource(ParseContext&                    context,
+                                       const std::shared_ptr<SceneNode>& world_node,
+                                       const std::shared_ptr<SceneNode>& source_node,
+                                       int32_t                          layer_id) {
+    if (context.scene == nullptr || world_node == nullptr || source_node == nullptr ||
+        world_node.get() == source_node.get()) {
+        return;
+    }
+
+    // Effect-backed layers split into a visible world transform node and a root-owned source node.
+    // Recording the pair here lets render-graph construction draw the source exactly where the
+    // world node appears in authored layer order without duplicating it during root traversal.
+    auto& sources = context.scene->detachedEffectSourceNodesByWorldNode[world_node.get()];
+    if (std::find(sources.begin(), sources.end(), source_node.get()) == sources.end()) {
+        sources.push_back(source_node.get());
+    }
+    context.scene->detachedEffectSourceNodes.insert(source_node.get());
+    LOG_INFO("SceneRenderOrderDetachedSourceRegister: layer=%d world-name='%s' source-name='%s'",
+             layer_id,
+             world_node->Name().c_str(),
+             source_node->Name().c_str());
+}
+
+void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
+    if (node == nullptr) return;
+
+    // Deferred materialization replaces placeholder nodes with real particle/text nodes. Any
+    // order-routing references to the placeholder must be removed first so the new node becomes the
+    // only authored-order participant for that layer.
+    const auto erase_node_from_vector = [node](std::vector<SceneNode*>& nodes) {
+        nodes.erase(std::remove(nodes.begin(), nodes.end(), node), nodes.end());
+    };
+
+    scene.renderOrderProxyNodes.erase(node);
+    scene.detachedEffectSourceNodes.erase(node);
+    for (auto it = scene.renderOrderProxyChildren.begin();
+         it != scene.renderOrderProxyChildren.end();) {
+        if (it->first == node) {
+            it = scene.renderOrderProxyChildren.erase(it);
+            continue;
+        }
+        erase_node_from_vector(it->second);
+        if (it->second.empty()) {
+            it = scene.renderOrderProxyChildren.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = scene.detachedEffectSourceNodesByWorldNode.begin();
+         it != scene.detachedEffectSourceNodesByWorldNode.end();) {
+        if (it->first == node) {
+            it = scene.detachedEffectSourceNodesByWorldNode.erase(it);
+            continue;
+        }
+        erase_node_from_vector(it->second);
+        if (it->second.empty()) {
+            it = scene.detachedEffectSourceNodesByWorldNode.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 struct AttachmentBinding {
     uint32_t        bone_index { 0xFFFFFFFFu };
     Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
@@ -556,7 +1227,7 @@ std::optional<AttachmentBinding> ResolveAttachmentBinding(const ParseContext& co
                                                           int32_t             parent_id,
                                                           std::string_view    attachment) {
     auto pit = context.object_puppets.find(parent_id);
-    if (pit == context.object_puppets.end() || !pit->second) return std::nullopt;
+    if (pit == context.object_puppets.end() || pit->second == nullptr) return std::nullopt;
 
     const auto& puppet = *pit->second;
     if (const auto* named_attachment = puppet.FindAttachment(attachment)) {
@@ -640,6 +1311,102 @@ void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
     if (auto parent = FindParentNode(context, parent_id)) {
         node_data.InheritParentTransform(parent.get());
     }
+}
+
+void RegisterLayerSceneState(ParseContext&    context,
+                             int32_t          layer_id,
+                             int32_t          parent_id,
+                             std::string_view attachment,
+                             bool             visible) {
+    if (context.scene == nullptr || layer_id == 0) return;
+    context.scene->SetLayerParentBinding(layer_id, parent_id, std::string(attachment));
+    context.scene->SetLayerLocalVisibility(layer_id, visible);
+}
+
+void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObject& wppartobj) {
+    auto node = std::make_shared<SceneNode>(Vector3f(wppartobj.origin.data()),
+                                            Vector3f(wppartobj.scale.data()),
+                                            Vector3f(wppartobj.angles.data()),
+                                            wppartobj.name);
+    node->ID() = wppartobj.id;
+
+    WPShaderValueData node_data;
+    node_data.parallaxDepth = { wppartobj.parallaxDepth[0], wppartobj.parallaxDepth[1] };
+
+    ConfigureBoneAttachment(context,
+                            wppartobj.parent,
+                            wppartobj.attachment,
+                            Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
+                            "particle object",
+                            wppartobj.name,
+                            node_data);
+
+    if (wppartobj.parent != 0 && wppartobj.attachment.empty()) {
+        ConfigureInheritedParentBinding(context, wppartobj.parent, node_data);
+        context.scene->sceneGraph->AppendChild(node);
+        RegisterRenderOrderProxyChild(context, wppartobj.parent, node, wppartobj.id);
+    } else {
+        AttachNodeToScene(context, node, wppartobj.parent, wppartobj.name, &node_data);
+    }
+
+    context.object_nodes[wppartobj.id] = node;
+    context.scene->objectRuntimeNodes[wppartobj.id].push_back(node.get());
+    context.scene->nodeOwners[node.get()] = wppartobj.id;
+    context.shader_updater->SetNodeData(node.get(), node_data);
+    RegisterLayerSceneState(
+        context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
+    context.scene->ApplyLayerVisibility(wppartobj.id);
+    context.scene->deferredRuntimeParticleLayerIds.insert(wppartobj.id);
+}
+
+void RegisterLogicalTextLayer(ParseContext& context, wpscene::WPTextObject& text_obj) {
+    auto node = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
+                                            Vector3f(text_obj.scale.data()),
+                                            Vector3f(text_obj.angles.data()),
+                                            text_obj.name);
+    node->ID() = text_obj.id;
+
+    WPShaderValueData node_data;
+    node_data.parallaxDepth = { text_obj.parallaxDepth[0], text_obj.parallaxDepth[1] };
+
+    ConfigureBoneAttachment(context,
+                            text_obj.parent,
+                            text_obj.attachment,
+                            Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
+                            "text object",
+                            text_obj.name,
+                            node_data);
+
+    if (text_obj.parent != 0 && text_obj.attachment.empty()) {
+        ConfigureInheritedParentBinding(context, text_obj.parent, node_data);
+        context.scene->sceneGraph->AppendChild(node);
+        RegisterRenderOrderProxyChild(context, text_obj.parent, node, text_obj.id);
+    } else {
+        AttachNodeToScene(context, node, text_obj.parent, text_obj.name, &node_data);
+    }
+
+    context.object_nodes[text_obj.id] = node;
+    context.scene->objectRuntimeNodes[text_obj.id].push_back(node.get());
+    context.scene->nodeOwners[node.get()] = text_obj.id;
+    context.shader_updater->SetNodeData(node.get(), node_data);
+    context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
+        .object = text_obj,
+        .primitive = nullptr,
+        .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
+    };
+    RegisterLayerSceneState(
+        context, text_obj.id, text_obj.parent, text_obj.attachment, text_obj.visible);
+    context.scene->ApplyLayerVisibility(text_obj.id);
+    context.scene->deferredRuntimeTextLayerIds.insert(text_obj.id);
+}
+
+bool DetachNodeFromTree(const std::shared_ptr<SceneNode>& parent, SceneNode* target) {
+    if (!parent || target == nullptr) return false;
+    if (parent->RemoveChild(target)) return true;
+    for (auto& child : parent->GetChildren()) {
+        if (DetachNodeFromTree(child, target)) return true;
+    }
+    return false;
 }
 
 void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
@@ -740,31 +1507,26 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc, std:
     context.scene            = std::make_shared<Scene>();
     context.vfs              = &vfs;
     auto& scene              = *context.scene;
-    scene.imageParser        = std::make_unique<WPTexImageParser>(&vfs, std::string(scene_id));
+    scene.imageParser = std::make_unique<WPSyntheticImageParser>(
+        std::make_unique<WPTexImageParser>(&vfs, std::string(scene_id)));
     scene.paritileSys->gener = std::make_unique<WPParticleRawGener>();
     scene.shaderValueUpdater = std::make_unique<WPShaderValueUpdater>(&scene);
     GenCardMesh(scene.default_effect_mesh, { 2, 2 });
     context.shader_updater = static_cast<WPShaderValueUpdater*>(scene.shaderValueUpdater.get());
 
     scene.clearColor = sc.general.clearcolor;
+    scene.ambientColor = sc.general.ambientcolor;
+    scene.skylightColor = sc.general.skylightcolor;
+    scene.cameraParallax = sc.general.cameraparallax;
+    scene.cameraParallaxAmount = sc.general.cameraparallaxamount;
+    scene.cameraParallaxDelay = sc.general.cameraparallaxdelay;
+    scene.cameraParallaxMouseInfluence = sc.general.cameraparallaxmouseinfluence;
     scene.ortho[0]   = sc.general.orthogonalprojection.width;
     scene.ortho[1]   = sc.general.orthogonalprojection.height;
     context.ortho_w  = scene.ortho[0];
     context.ortho_h  = scene.ortho[1];
 
-    {
-        auto& gb              = context.global_base_uniforms;
-        gb["g_ViewUp"]        = std::array { 0.0f, 1.0f, 0.0f };
-        gb["g_ViewRight"]     = std::array { 1.0f, 0.0f, 0.0f };
-        gb["g_ViewForward"]   = std::array { 0.0f, 0.0f, -1.0f };
-        gb["g_EyePosition"]   = std::array { 0.0f, 0.0f, 0.0f };
-        gb["g_TexelSize"]     = std::array { 1.0f / 1920.0f, 1.0f / 1080.0f };
-        gb["g_TexelSizeHalf"] = std::array { 1.0f / 1920.0f / 2.0f, 1.0f / 1080.0f / 2.0f };
-
-        gb["g_LightAmbientColor"] = sc.general.ambientcolor;
-        gb["g_LightSkylightColor"] = sc.general.skylightcolor;
-        gb["g_NormalModelMatrix"] = ShaderValue::fromMatrix(Matrix4f::Identity());
-    }
+    PopulateGlobalBaseUniforms(context, scene);
 
     {
         WPCameraParallax cam_para;
@@ -776,11 +1538,67 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc, std:
     }
 }
 
-void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
+void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
+                   bool force_runtime_materialization = false) {
     auto& wpimgobj = img_obj;
-    if (! wpimgobj.visible) return;
+    if (!wpimgobj.visible && !force_runtime_materialization) return;
 
     auto& vfs = *context.vfs;
+
+    const auto register_logical_only_layer = [&]() {
+        auto node = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
+                                                Vector3f(wpimgobj.scale.data()),
+                                                Vector3f(wpimgobj.angles.data()),
+                                                wpimgobj.name);
+        LoadAlignment(*node, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+        node->ID() = wpimgobj.id;
+
+        WPShaderValueData node_data;
+        node_data.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+        ConfigureBoneAttachment(context,
+                                wpimgobj.parent,
+                                wpimgobj.attachment,
+                                Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
+                                "image layer",
+                                wpimgobj.name,
+                                node_data);
+
+        if (wpimgobj.parent != 0 && wpimgobj.attachment.empty()) {
+            ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
+            context.scene->sceneGraph->AppendChild(node);
+            RegisterRenderOrderProxyChild(context, wpimgobj.parent, node, wpimgobj.id);
+        } else {
+            AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
+        }
+
+        context.object_nodes[wpimgobj.id] = node;
+        context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
+            .size = wpimgobj.size,
+            .alignment = wpimgobj.alignment,
+        };
+        context.scene->objectRuntimeNodes[wpimgobj.id].push_back(node.get());
+        context.scene->nodeOwners[node.get()] = wpimgobj.id;
+        context.shader_updater->SetNodeData(node.get(), node_data);
+        RegisterLayerSceneState(
+            context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
+        // Logical-only image layers are deliberately still registered as scene/runtime layers.
+        // The log records the image path and project-layer flag so a run log can prove that a
+        // framebuffer helper stayed logical instead of being materialized into a drawable pass.
+        LOG_INFO("SceneObjectMaterialize: mode=image-logical-only id=%d name='%s' image='%s' "
+                 "fullscreen=%s autosize=%s projectlayer=%s effects=%zu dependency-source=%s",
+                 wpimgobj.id,
+                 wpimgobj.name.c_str(),
+                 wpimgobj.image.c_str(),
+                 wpimgobj.fullscreen ? "true" : "false",
+                 wpimgobj.autosize ? "true" : "false",
+                 wpimgobj.projectlayer ? "true" : "false",
+                 wpimgobj.effects.size(),
+                 context.scene != nullptr &&
+                         context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0
+                     ? "true"
+                     : "false");
+        context.scene->ApplyLayerVisibility(wpimgobj.id);
+    };
 
     // coloBlendMode load passthrough manaully
     if (wpimgobj.colorBlendMode != 0) {
@@ -801,28 +1619,45 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 
     int32_t count_eff = 0;
     for (const auto& wpeffobj : wpimgobj.effects) {
-        if (ResolveObjectVisibility(
-                wpeffobj.visible, wpeffobj.visible_binding, context.user_properties))
-            count_eff++;
+        const auto effect_visibility =
+            BuildEffectVisibilityContract(wpeffobj, context.user_properties);
+        if (!effect_visibility.can_prune_at_parse_time) count_eff++;
     }
     bool hasEffect = count_eff > 0;
+    bool isCompose = (wpimgobj.image == "models/util/composelayer.json");
+    const bool isProjectLayer =
+        wpimgobj.projectlayer || wpimgobj.image == "models/util/projectlayer.json";
+    const bool is_offscreen_dependency_source =
+        context.scene != nullptr &&
+        context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0;
     // Detached effect world nodes still need to inherit the parent transform even though they
-    // cannot become real scene-graph children of that parent.
+    // cannot become real scene-graph children of that parent. SceneScript/property-animation
+    // also needs a dedicated logical/world node for image layers with effects, otherwise runtime
+    // transform updates move the offscreen source quad out of its effect camera and the final
+    // output turns blank.
     bool needs_inherited_parent_binding = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
-    bool has_dependents = context.dependent_parent_ids.count(wpimgobj.id) > 0;
     bool use_detached_effect_world_node =
         hasEffect &&
-        (needs_inherited_parent_binding || ! wpimgobj.attachment.empty() || has_dependents);
+        ! isCompose;
+    const std::array<float, 2> effect_source_size =
+        wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
+            ? wpimgobj.effectSourceSize
+            : wpimgobj.size;
     // skip no effect fullscreen layer
-    if (! hasEffect && wpimgobj.fullscreen) return;
+    if (! hasEffect && wpimgobj.fullscreen) {
+        register_logical_only_layer();
+        return;
+    }
 
     bool hasPuppet = ! wpimgobj.puppet.empty();
     (void)hasPuppet;
-
-    bool isCompose = (wpimgobj.image == "models/util/composelayer.json");
-    // skip no effect compose layer
-    // it's not the correct behaviour, but do it for now
-    if (! hasEffect && isCompose) return;
+    // No-effect compose/project layers are logical framebuffer helpers. Drawing them as regular
+    // image meshes can sample `_rt_default` and write it back through the scene camera, which
+    // applies a second projection to the already-composited frame on non-authored output aspects.
+    if (! hasEffect && (isCompose || isProjectLayer) && !is_offscreen_dependency_source) {
+        register_logical_only_layer();
+        return;
+    }
 
     std::unique_ptr<WPMdl> puppet;
     if (! wpimgobj.puppet.empty()) {
@@ -840,10 +1675,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     // wpimgobj.origin[1] = context.ortho_h - wpimgobj.origin[1];
     auto spWorldNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
                                                    Vector3f(wpimgobj.scale.data()),
-                                                   Vector3f(wpimgobj.angles.data()));
+                                                   Vector3f(wpimgobj.angles.data()),
+                                                   wpimgobj.name);
     LoadAlignment(*spWorldNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
     spWorldNode->ID() = wpimgobj.id;
     auto spImgNode = use_detached_effect_world_node ? std::make_shared<SceneNode>() : spWorldNode;
+    spImgNode->SetName(wpimgobj.name);
     spImgNode->ID() = wpimgobj.id;
 
     SceneMaterial     material;
@@ -929,8 +1766,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 
         if (puppet) {
             if (hasEffect) {
-                GenCardMesh(
-                    mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
+                // Keep the offscreen draw extents in scene/display units so effect
+                // composition matches the original visual size. Only the backing
+                // render targets may use a reduced source resolution.
+                GenCardMesh(mesh,
+                            { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] },
+                            mapRate);
                 WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
 
                 wpscene::WPImageEffect puppet_effect;
@@ -947,7 +1788,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             }
         }
         if (! puppet) {
-            GenCardMesh(mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
+            const auto source_mesh_size = wpimgobj.size;
+            GenCardMesh(mesh,
+                        { (uint16_t)source_mesh_size[0], (uint16_t)source_mesh_size[1] },
+                        mapRate);
             GenCardMesh(effct_final_mesh,
                         { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
         }
@@ -992,12 +1836,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             if (scene.linkedCameras.count("global") == 0) scene.linkedCameras["global"] = {};
             scene.linkedCameras.at("global").push_back(nodeAddr);
         } else {
-            // applly scale to crop
+            // Keep the effect camera extents in display units. The render target
+            // resolution below may still be reduced independently.
             i32 w                   = (i32)wpimgobj.size[0];
             i32 h                   = (i32)wpimgobj.size[1];
             scene.cameras[nodeAddr] = std::make_shared<SceneCamera>(w, h, -1.0f, 1.0f);
             scene.cameras.at(nodeAddr)->AttatchNode(context.effect_camera_node);
         }
+        scene.objectRuntimeCameraNames[wpimgobj.id].push_back(nodeAddr);
         spImgNode->SetCamera(nodeAddr);
         std::string effect_ppong_a, effect_ppong_b;
         effect_ppong_a = WE_EFFECT_PPONG_PREFIX_A.data() + nodeAddr;
@@ -1022,25 +1868,47 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         // set renderTarget for ping-pong operate
         {
             scene.renderTargets[effect_ppong_a] = {
-                .width      = (uint16_t)wpimgobj.size[0],
-                .height     = (uint16_t)wpimgobj.size[1],
+                .width      = (uint16_t)effect_source_size[0],
+                .height     = (uint16_t)effect_source_size[1],
+                .mapWidth   = (uint16_t)effect_source_size[0],
+                .mapHeight  = (uint16_t)effect_source_size[1],
                 .allowReuse = true,
             };
             if (wpimgobj.fullscreen) {
                 scene.renderTargets[effect_ppong_a].bind = { .enable = true, .screen = true };
             }
             scene.renderTargets[effect_ppong_b] = scene.renderTargets.at(effect_ppong_a);
+            scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_a);
+            scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_b);
         }
-
+        ConfigureEffectFinalComposite(context,
+                                      *imgEffectLayer,
+                                      effect_ppong_a,
+                                      wpimgobj.id,
+                                      wpimgobj.name);
         int32_t i_eff = -1;
         for (const auto& wpeffobj : wpimgobj.effects) {
             i_eff++;
-            if (! ResolveObjectVisibility(
-                    wpeffobj.visible, wpeffobj.visible_binding, context.user_properties)) {
+            const auto effect_visibility =
+                BuildEffectVisibilityContract(wpeffobj, context.user_properties);
+            if (effect_visibility.can_prune_at_parse_time) {
                 i_eff--;
                 continue;
             }
             std::shared_ptr<SceneImageEffect> imgEffect = std::make_shared<SceneImageEffect>();
+            imgEffect->SetIdentity(wpimgobj.id,
+                                   wpeffobj.id,
+                                   static_cast<uint32_t>(i_eff),
+                                   wpeffobj.name);
+            if (effect_visibility.requires_runtime_contract) {
+                LOG_INFO("SceneVisibilityEffectMaterialize: layer=%d effect-id=%d effect-index=%d name='%s' initial-visible=%s authored-visible=%s",
+                         wpimgobj.id,
+                         wpeffobj.id,
+                         i_eff,
+                         wpeffobj.name.c_str(),
+                         effect_visibility.initial_visible ? "true" : "false",
+                         effect_visibility.authored_visible ? "true" : "false");
+            }
 
             // this will be replace when resolve, use here to get rt info
             const std::string inRT { effect_ppong_a };
@@ -1055,7 +1923,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                     const auto& wpfbo  = wpeffobj.fbos.at(i);
                     std::string rtname = wpfbo.name + "_" + effaddr;
                     if (wpimgobj.fullscreen) {
-                        scene.renderTargets[rtname]      = { 2, 2, true };
+                        scene.renderTargets[rtname]      = {
+                            .width = 2,
+                            .height = 2,
+                            .mapWidth = 2,
+                            .mapHeight = 2,
+                            .allowReuse = true,
+                        };
                         scene.renderTargets[rtname].bind = {
                             .enable = true,
                             .screen = true,
@@ -1064,11 +1938,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                     } else {
                         // i+2 for not override object's rt
                         scene.renderTargets[rtname] = {
-                            .width      = (uint16_t)(wpimgobj.size[0] / (float)wpfbo.scale),
-                            .height     = (uint16_t)(wpimgobj.size[1] / (float)wpfbo.scale),
+                            .width      = (uint16_t)(effect_source_size[0] / (float)wpfbo.scale),
+                            .height     = (uint16_t)(effect_source_size[1] / (float)wpfbo.scale),
+                            .mapWidth   = (uint16_t)(effect_source_size[0] / (float)wpfbo.scale),
+                            .mapHeight  = (uint16_t)(effect_source_size[1] / (float)wpfbo.scale),
                             .allowReuse = true
                         };
                     }
+                    scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(rtname);
                     fboMap[wpfbo.name] = rtname;
                 }
             }
@@ -1150,6 +2027,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                                    &svData,
                                    context.user_properties,
                                    &wpEffShaderInfo)) {
+                    LOG_ERROR("SceneEffectLoad: layer=%d effect='%s' material-index=%zu load failed",
+                              wpimgobj.id,
+                              wpeffobj.name.c_str(),
+                              i_mat);
                     eff_mat_ok = false;
                     break;
                 }
@@ -1177,12 +2058,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 spEffNode->AddMesh(spMesh);
 
                 context.shader_updater->SetNodeData(spEffNode.get(), svData);
+                context.scene->nodeOwners[spEffNode.get()] = wpimgobj.id;
                 imgEffect->nodes.push_back({ matOutRT, spEffNode });
             }
 
-            if (eff_mat_ok)
+            if (eff_mat_ok) {
+                imgEffect->SetLocalVisible(effect_visibility.initial_visible);
                 imgEffectLayer->AddEffect(imgEffect);
-            else {
+            } else {
                 LOG_ERROR("effect \'%s\' failed to load", wpeffobj.name.c_str());
             }
         }
@@ -1194,18 +2077,317 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
         }
         context.scene->sceneGraph->AppendChild(spWorldNode);
+        RegisterRenderOrderProxyChild(context, wpimgobj.parent, spWorldNode, wpimgobj.id);
     } else {
         AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
     }
     context.object_nodes[wpimgobj.id] = spWorldNode;
+    context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
+        .size = wpimgobj.size,
+        .alignment = wpimgobj.alignment,
+    };
+    context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spWorldNode.get());
+    context.scene->nodeOwners[spWorldNode.get()] = wpimgobj.id;
     if (puppet) {
-        context.object_puppets[wpimgobj.id] = puppet->puppet;
+        context.object_puppets[wpimgobj.id] = puppet->puppet.get();
     }
     context.shader_updater->SetNodeData(spImgNode.get(), svData);
     if (spImgNode.get() != spWorldNode.get()) {
         context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
         context.scene->sceneGraph->AppendChild(spImgNode);
+        RegisterDetachedRenderOrderSource(context, spWorldNode, spImgNode, wpimgobj.id);
+        context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spImgNode.get());
+        context.scene->nodeOwners[spImgNode.get()] = wpimgobj.id;
     }
+    RegisterLayerSceneState(
+        context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
+    context.scene->ApplyLayerVisibility(wpimgobj.id);
+}
+
+void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
+    const auto* visibility_contract = FindLayerVisibilityContract(context, text_obj.id);
+    const bool has_runtime_visibility_contract =
+        visibility_contract != nullptr && visibility_contract->requires_runtime_contract;
+    if (!text_obj.visible && has_runtime_visibility_contract) {
+        // Hidden dynamic text stays as a lightweight logical layer until first visible. This keeps
+        // startup cheap while preserving the same runtime target that scripts and user bindings
+        // will materialize later through MaterializeDeferredTextLayer().
+        RegisterLogicalTextLayer(context, text_obj);
+        return;
+    }
+    if (!text_obj.visible) {
+        return;
+    }
+
+    std::shared_ptr<SceneTextPrimitive> primitive;
+    std::string error;
+    if (!BuildSceneTextPrimitive(*context.vfs,
+                                 text_obj,
+                                 0,
+                                 context.scene->textRenderScale,
+                                 &primitive,
+                                 &error)) {
+        LOG_ERROR("build text primitive '%s' failed: %s", text_obj.name.c_str(), error.c_str());
+        return;
+    }
+
+    int32_t text_effect_count = 0;
+    for (const auto& wp_effect : text_obj.effects) {
+        const auto effect_visibility =
+            BuildEffectVisibilityContract(wp_effect, context.user_properties);
+        if (!effect_visibility.can_prune_at_parse_time) text_effect_count++;
+    }
+    const bool has_effect = text_effect_count > 0;
+    auto spWorldNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
+                                                   Vector3f(text_obj.scale.data()),
+                                                   Vector3f(text_obj.angles.data()),
+                                                   text_obj.name);
+    spWorldNode->ID() = text_obj.id;
+    auto spTextNode = has_effect ? std::make_shared<SceneNode>() : spWorldNode;
+    spTextNode->SetName(text_obj.name);
+    spTextNode->ID() = text_obj.id;
+    spTextNode->AddText(primitive);
+
+    WPShaderValueData worldNodeData;
+    worldNodeData.parallaxDepth = { text_obj.parallaxDepth[0], text_obj.parallaxDepth[1] };
+    ConfigureBoneAttachment(context,
+                            text_obj.parent,
+                            text_obj.attachment,
+                            Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>()),
+                            "text object",
+                            text_obj.name,
+                            worldNodeData);
+
+    if (has_effect) {
+        auto& scene = *context.scene;
+        const std::string camera_name = getAddr(spTextNode.get());
+        primitive->bridge.enabled = true;
+        primitive->bridge.camera_name = camera_name;
+        primitive->bridge.pingpong_a = WE_EFFECT_PPONG_PREFIX_A.data() + camera_name;
+        primitive->bridge.pingpong_b = WE_EFFECT_PPONG_PREFIX_B.data() + camera_name;
+        primitive->bridge.source_size = primitive->VisibleSourceSize();
+        primitive->bridge.render_targets.push_back(
+            TextBridgeRenderTarget { .name = primitive->bridge.pingpong_a, .scale = 1 });
+        primitive->bridge.render_targets.push_back(
+            TextBridgeRenderTarget { .name = primitive->bridge.pingpong_b, .scale = 1 });
+
+        const auto display_size = primitive->VisibleDisplaySize();
+        SceneMesh effect_final_mesh {};
+        GenCardMesh(effect_final_mesh,
+                    { static_cast<uint16_t>(std::max(1.0f, display_size[0])),
+                      static_cast<uint16_t>(std::max(1.0f, display_size[1])) });
+
+        scene.cameras[camera_name] = std::make_shared<SceneCamera>(
+            std::max(1, static_cast<int32_t>(std::lround(display_size[0]))),
+            std::max(1, static_cast<int32_t>(std::lround(display_size[1]))),
+            -1.0f,
+            1.0f);
+        scene.cameras.at(camera_name)->AttatchNode(context.effect_camera_node);
+        // Effect-backed text draws the canonical glyph primitive into an isolated source target
+        // before authored image effects sample it. Keep that source node on an explicit identity
+        // shader-data contract instead of relying on the visible world node's parallax/attachment
+        // data: the world node is only the final composited output transform, while this node must
+        // fill the bridge camera exactly in local text space.
+        WPShaderValueData text_source_node_data;
+        context.shader_updater->SetNodeData(spTextNode.get(), text_source_node_data);
+        scene.objectRuntimeCameraNames[text_obj.id].push_back(camera_name);
+        spTextNode->SetCamera(camera_name);
+
+        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(
+            spWorldNode.get(),
+            display_size[0],
+            display_size[1],
+            primitive->bridge.pingpong_a,
+            primitive->bridge.pingpong_b);
+        imgEffectLayer->SetFinalBlend(BlendMode::Translucent);
+        imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
+        imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
+        scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
+
+        scene.renderTargets[primitive->bridge.pingpong_a] = SceneRenderTarget {
+            .width = std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[0]))),
+            .height = std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[1]))),
+            .mapWidth = std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[0]))),
+            .mapHeight = std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[1]))),
+            .allowReuse = true,
+        };
+        scene.renderTargets[primitive->bridge.pingpong_b] = scene.renderTargets.at(primitive->bridge.pingpong_a);
+        scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_a);
+        scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_b);
+        ConfigureEffectFinalComposite(context,
+                                      *imgEffectLayer,
+                                      primitive->bridge.pingpong_a,
+                                      text_obj.id,
+                                      text_obj.name);
+
+        const std::string in_rt = primitive->bridge.pingpong_a;
+        const std::string effect_addr = getAddr(imgEffectLayer.get());
+        int32_t effect_index = -1;
+        for (const auto& wp_effect : text_obj.effects) {
+            effect_index++;
+            const auto effect_visibility =
+                BuildEffectVisibilityContract(wp_effect, context.user_properties);
+            if (effect_visibility.can_prune_at_parse_time) {
+                effect_index--;
+                continue;
+            }
+            std::shared_ptr<SceneImageEffect> img_effect = std::make_shared<SceneImageEffect>();
+            img_effect->SetIdentity(text_obj.id,
+                                    wp_effect.id,
+                                    static_cast<uint32_t>(effect_index),
+                                    wp_effect.name);
+            if (effect_visibility.requires_runtime_contract) {
+                LOG_INFO("SceneVisibilityEffectMaterialize: layer=%d effect-id=%d effect-index=%d name='%s' initial-visible=%s authored-visible=%s",
+                         text_obj.id,
+                         wp_effect.id,
+                         effect_index,
+                         wp_effect.name.c_str(),
+                         effect_visibility.initial_visible ? "true" : "false",
+                         effect_visibility.authored_visible ? "true" : "false");
+            }
+            std::unordered_map<std::string, std::string> fbo_map;
+            fbo_map["previous"] = in_rt;
+
+            for (const auto& wp_fbo : wp_effect.fbos) {
+                const std::string rt_name = wp_fbo.name + "_" + effect_addr;
+                // The first-class text bridge uses exact logical sizes for every effect target.
+                // Converting the authored FBO scale through an explicit floating-point divisor
+                // avoids the accidental int/uint max() mixing that would otherwise keep this new
+                // path from compiling cleanly.
+                const double fbo_scale = static_cast<double>(std::max<uint32_t>(1u, wp_fbo.scale));
+                const int32_t scaled_width = std::max(
+                    1,
+                    static_cast<int32_t>(
+                        std::lround(primitive->VisibleSourceSize()[0] / fbo_scale)));
+                const int32_t scaled_height = std::max(
+                    1,
+                    static_cast<int32_t>(
+                        std::lround(primitive->VisibleSourceSize()[1] / fbo_scale)));
+                scene.renderTargets[rt_name] = SceneRenderTarget {
+                    .width = scaled_width,
+                    .height = scaled_height,
+                    .mapWidth = scaled_width,
+                    .mapHeight = scaled_height,
+                    .allowReuse = true,
+                };
+                scene.objectRuntimeRenderTargets[text_obj.id].push_back(rt_name);
+                primitive->bridge.render_targets.push_back(
+                    TextBridgeRenderTarget { .name = rt_name, .scale = std::max<uint32_t>(1u, wp_fbo.scale) });
+                fbo_map[wp_fbo.name] = rt_name;
+            }
+
+            for (const auto& command : wp_effect.commands) {
+                if (command.command != "copy") continue;
+                if (fbo_map.count(command.target) == 0 || fbo_map.count(command.source) == 0) continue;
+                img_effect->commands.push_back({ .cmd = SceneImageEffect::CmdType::Copy,
+                                                 .dst = fbo_map.at(command.target),
+                                                 .src = fbo_map.at(command.source),
+                                                 .afterpos = command.afterpos });
+            }
+
+            bool effect_materials_ok = true;
+            for (usize material_index = 0; material_index < wp_effect.materials.size(); material_index++) {
+                wpscene::WPMaterial material_source = wp_effect.materials.at(material_index);
+                std::string material_output { WE_EFFECT_PPONG_PREFIX_B };
+                if (wp_effect.passes.size() > material_index) {
+                    const auto& wp_pass = wp_effect.passes.at(material_index);
+                    material_source.MergePass(wp_pass);
+                    for (const auto& bind : wp_pass.bind) {
+                        if (fbo_map.count(bind.name) == 0) continue;
+                        if (material_source.textures.size() <= static_cast<usize>(bind.index)) {
+                            material_source.textures.resize(static_cast<usize>(bind.index) + 1);
+                        }
+                        material_source.textures[static_cast<usize>(bind.index)] = fbo_map.at(bind.name);
+                    }
+                    if (!wp_pass.target.empty() && fbo_map.count(wp_pass.target) != 0) {
+                        material_output = fbo_map.at(wp_pass.target);
+                    }
+                }
+                if (material_source.textures.empty()) material_source.textures.resize(1);
+                if (material_source.textures[0].empty()) material_source.textures[0] = in_rt;
+
+                auto spEffectNode = std::make_shared<SceneNode>();
+                WPShaderInfo effect_shader_info;
+                effect_shader_info.baseConstSvs = context.global_base_uniforms;
+                effect_shader_info.baseConstSvs["g_EffectTextureProjectionMatrix"] =
+                    ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
+                effect_shader_info.baseConstSvs["g_EffectTextureProjectionMatrixInverse"] =
+                    ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
+
+                SceneMaterial effect_material;
+                WPShaderValueData effect_node_data;
+                if (!LoadMaterial(*context.vfs,
+                                  material_source,
+                                  context.scene.get(),
+                                  spEffectNode.get(),
+                                  &effect_material,
+                                  &effect_node_data,
+                                  context.user_properties,
+                                  &effect_shader_info)) {
+                    effect_materials_ok = false;
+                    break;
+                }
+                LoadConstvalue(effect_material, material_source, effect_shader_info);
+                LoadUserShaderValue(effect_material, material_source, effect_shader_info, context.user_properties);
+
+                // Text effect passes can receive a new bridge quad whenever the shaped text bounds
+                // change, for example on a minute rollover from "12:47" to "12:48". Treating these
+                // effect meshes as dynamic from graph construction keeps the already-compiled
+                // CustomShaderPass hot and lets the renderer upload the changed quad through the
+                // same dynamic-buffer path used by particle-like geometry, instead of destroying
+                // and rebuilding the shader pass for every text size change.
+                auto spMesh = std::make_shared<SceneMesh>(true);
+                effect_node_data.parallaxDepth = { text_obj.parallaxDepth[0], text_obj.parallaxDepth[1] };
+                effect_node_data.effect_projection_node = &imgEffectLayer->FinalNode();
+                effect_node_data.effect_projection_mesh = &imgEffectLayer->FinalMesh();
+                spMesh->AddMaterial(std::move(effect_material));
+                spEffectNode->AddMesh(spMesh);
+                context.shader_updater->SetNodeData(spEffectNode.get(), effect_node_data);
+                context.scene->nodeOwners[spEffectNode.get()] = text_obj.id;
+                img_effect->nodes.push_back({ material_output, spEffectNode });
+            }
+
+            if (effect_materials_ok) {
+                img_effect->SetLocalVisible(effect_visibility.initial_visible);
+                imgEffectLayer->AddEffect(img_effect);
+            }
+        }
+    }
+
+    if (text_obj.parent != 0 && text_obj.attachment.empty()) {
+        ConfigureInheritedParentBinding(context, text_obj.parent, worldNodeData);
+        context.scene->sceneGraph->AppendChild(spWorldNode);
+        RegisterRenderOrderProxyChild(context, text_obj.parent, spWorldNode, text_obj.id);
+    } else {
+        AttachNodeToScene(context, spWorldNode, text_obj.parent, text_obj.name, &worldNodeData);
+    }
+
+    context.object_nodes[text_obj.id] = spWorldNode;
+    context.scene->objectRuntimeNodes[text_obj.id].push_back(spWorldNode.get());
+    context.scene->nodeOwners[spWorldNode.get()] = text_obj.id;
+    context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
+
+    if (spTextNode.get() != spWorldNode.get()) {
+        context.scene->sceneGraph->AppendChild(spTextNode);
+        RegisterDetachedRenderOrderSource(context, spWorldNode, spTextNode, text_obj.id);
+        context.scene->objectRuntimeNodes[text_obj.id].push_back(spTextNode.get());
+        context.scene->nodeOwners[spTextNode.get()] = text_obj.id;
+    }
+
+    context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
+        .object = text_obj,
+        .primitive = primitive,
+        .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
+    };
+
+    const auto resolved =
+        ResolveTextLayerNodeTranslation(context.scene->textLayers[text_obj.id], text_obj.origin);
+    spWorldNode->SetTranslate(Eigen::Vector3f { resolved[0], resolved[1], resolved[2] });
+
+    RegisterLayerSceneState(
+        context, text_obj.id, text_obj.parent, text_obj.attachment, text_obj.visible);
+    context.scene->ApplyLayerVisibility(text_obj.id);
+    context.scene->deferredRuntimeTextLayerIds.erase(text_obj.id);
 }
 
 struct ParticleChildPtr {
@@ -1213,7 +2395,15 @@ struct ParticleChildPtr {
     SceneNode*              node_parent { nullptr };
     ParticleSubSystem*      particle_parent { nullptr };
 
+    // This is the mesh-capacity estimate for the subsystem currently being parsed, not the
+    // authored child `maxcount` blindly multiplied through the whole child chain. Runtime child
+    // subsystem instances are globally capped by each child relationship, so recursive products
+    // overestimate dynamic particle meshes by orders of magnitude.
     i32 max_instancecount { 1 };
+    // Event-follow children can only follow live parent particles. Carrying the parent's live slot
+    // count lets mesh capacity match that runtime constraint instead of reserving the authored
+    // default follow count when the parent can only ever expose fewer live particles.
+    u32 parent_live_particle_slots { 1 };
 };
 
 void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartobj,
@@ -1236,20 +2426,31 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     ChildData                  child_data;
 
     bool is_child = child_ptr.child != nullptr;
+    const auto* visibility_contract = FindLayerVisibilityContract(context, wppartobj.id);
+    const bool has_runtime_visibility_contract =
+        visibility_contract != nullptr && visibility_contract->requires_runtime_contract;
+    if (!is_child && !wppartobj.visible && has_runtime_visibility_contract) {
+        // Hidden dynamic particles keep only their logical registration at parse time. The heavy
+        // particle system allocation is deferred until runtime visibility turns true, matching the
+        // text lazy path while still keeping static hidden particles prunable.
+        RegisterLogicalParticleLayer(context, wppartobj);
+        return;
+    }
+
     if (is_child) {
         p_particle_obj = &(child_ptr.child->obj);
         spNode         = std::make_shared<SceneNode>(Vector3f(child_ptr.child->origin.data()),
-                                             Vector3f(child_ptr.child->scale.data()),
-                                             Vector3f(child_ptr.child->angles.data()));
+                                                     Vector3f(child_ptr.child->scale.data()),
+                                                     Vector3f(child_ptr.child->angles.data()),
+                                                     child_ptr.child->name);
         child_data     = ChildData(*child_ptr.child);
-
-        child_ptr.max_instancecount *= child_data.maxcount;
 
     } else {
         p_particle_obj = &wppartobj.particleObj;
         spNode         = std::make_shared<SceneNode>(Vector3f(wppartobj.origin.data()),
-                                             Vector3f(wppartobj.scale.data()),
-                                             Vector3f(wppartobj.angles.data()));
+                                                     Vector3f(wppartobj.scale.data()),
+                                                     Vector3f(wppartobj.angles.data()),
+                                                     wppartobj.name);
     }
 
     wpscene::ParticleInstanceoverride override = wppartobj.instanceoverride;
@@ -1289,8 +2490,42 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         1000.0f,
     };
 
+    const auto spawn_type = ParseSpawnType(child_data.type);
+    const u32 authored_child_maxcount =
+        static_cast<u32>(std::max<i32>(1, child_data.maxcount));
+    u32 mesh_instancecount = static_cast<u32>(std::max<i32>(1, child_ptr.max_instancecount));
+    if (is_child) {
+        switch (spawn_type) {
+        case ParticleSubSystem::SpawnType::STATIC:
+            // Runtime static children create one persistent child instance. Their authored
+            // `maxcount` controls child subsystem policy, but it does not mean "duplicate this
+            // mesh capacity N times" during scene parsing.
+            mesh_instancecount = 1;
+            break;
+        case ParticleSubSystem::SpawnType::EVENT_FOLLOW:
+            // Follow instances are bounded by live parent particles as well as by authored child
+            // maxcount. This keeps one live parent particle from reserving the default 20 follow
+            // instances that Wallpaper Engine cannot actually use at the same time.
+            mesh_instancecount = std::max<u32>(
+                1, std::min<u32>(authored_child_maxcount, child_ptr.parent_live_particle_slots));
+            break;
+        case ParticleSubSystem::SpawnType::EVENT_SPAWN:
+        case ParticleSubSystem::SpawnType::EVENT_DEATH:
+            // Spawn/death children can outlive the triggering parent particle, so keep their local
+            // authored cap. The cap is local to this child subsystem, not multiplied by ancestor
+            // static child counts.
+            mesh_instancecount = authored_child_maxcount;
+            break;
+        }
+    }
+
     u32 maxcount = particle_obj.maxcount;
     maxcount     = std::min(maxcount, 20000u);
+    const uint64_t live_particle_slots64 =
+        static_cast<uint64_t>(std::max<u32>(1, maxcount)) *
+        static_cast<uint64_t>(std::max<u32>(1, mesh_instancecount));
+    const u32 live_particle_slots = static_cast<u32>(
+        std::min<uint64_t>(live_particle_slots64, std::numeric_limits<u32>::max()));
 
     if (hastrail) {
         double in_SegmentUVTimeOffset           = 0.0;
@@ -1339,7 +2574,10 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     bool thick_format = render_rope || material.hasSprite || hastrail;
     {
-        u32 mesh_maxcount = maxcount * (u32)child_ptr.max_instancecount;
+        const uint64_t mesh_maxcount64 =
+            static_cast<uint64_t>(maxcount) * static_cast<uint64_t>(mesh_instancecount);
+        u32 mesh_maxcount = static_cast<u32>(
+            std::min<uint64_t>(mesh_maxcount64, std::numeric_limits<u32>::max()));
         if (render_rope)
             SetRopeParticleMesh(mesh, particle_obj, mesh_maxcount, thick_format);
         else
@@ -1353,7 +2591,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         override.rate,
         child_data.maxcount,
         child_data.probability,
-        ParseSpawnType(child_data.type),
+        spawn_type,
         [=](const Particle& p, const ParticleRawGenSpec& spec) {
             auto& lifetime = *(spec.lifetime);
             if (lifetime <= 0.0f) {
@@ -1366,8 +2604,13 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                 lifetime = (1.0f - (p.lifetime / p.init.lifetime)) * sequencemultiplier;
                 break;
             }
-        });
+    });
+    auto* particle_subsystem = particleSub.get();
     particleSub->SetSceneNode(spNode.get());
+    // instanceoverride.size is baked into initializer output during cold parse. Keep that parsed
+    // multiplier as the runtime reference so later user-property size edits can rescale live
+    // particles by ratio instead of mistaking the multiplier for an absolute particle size.
+    particleSub->SetRuntimeSizeReference(override.size);
 
     LoadEmitter(*particleSub, particle_obj, override.count, render_rope);
     LoadInitializer(*particleSub, particle_obj, override);
@@ -1394,14 +2637,17 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                              .child             = &child,
                              .node_parent       = spNode.get(),
                              .particle_parent   = particleSub.get(),
-                             .max_instancecount = child_ptr.max_instancecount,
+                             .max_instancecount = static_cast<i32>(mesh_instancecount),
+                             .parent_live_particle_slots = live_particle_slots,
                          });
     }
 
     if (is_child)
         child_ptr.particle_parent->AddChild(std::move(particleSub));
-    else
+    else {
         context.scene->paritileSys->subsystems.emplace_back(std::move(particleSub));
+        context.scene->objectRuntimeParticleSubsystems[wppartobj.id].push_back(particle_subsystem);
+    }
 
     if (is_child)
         child_ptr.node_parent->AppendChild(spNode);
@@ -1409,10 +2655,16 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         if (wppartobj.parent != 0 && wppartobj.attachment.empty()) {
             ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
+            RegisterRenderOrderProxyChild(context, wppartobj.parent, spNode, wppartobj.id);
         } else {
             AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
         }
         context.object_nodes[wppartobj.id] = spNode;
+        context.scene->objectRuntimeNodes[wppartobj.id].push_back(spNode.get());
+        context.scene->nodeOwners[spNode.get()] = wppartobj.id;
+        RegisterLayerSceneState(
+            context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
+        context.scene->ApplyLayerVisibility(wppartobj.id);
     }
     context.shader_updater->SetNodeData(spNode.get(), svData);
 }
@@ -1420,22 +2672,29 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     auto node = std::make_shared<SceneNode>(Vector3f(light_obj.origin.data()),
                                             Vector3f(light_obj.scale.data()),
-                                            Vector3f(light_obj.angles.data()));
+                                            Vector3f(light_obj.angles.data()),
+                                            light_obj.name);
 
     context.scene->lights.emplace_back(std::make_unique<SceneLight>(
         Vector3f(light_obj.color.data()), light_obj.radius, light_obj.intensity));
 
     auto& light = *(context.scene->lights.back());
+    context.scene->objectRuntimeLights[light_obj.id].push_back(&light);
     light.setNode(node);
 
     AttachNodeToScene(context, node, light_obj.parent, light_obj.name);
     context.object_nodes[light_obj.id] = node;
+    context.scene->objectRuntimeNodes[light_obj.id].push_back(node.get());
+    context.scene->nodeOwners[node.get()] = light_obj.id;
+    RegisterLayerSceneState(context, light_obj.id, light_obj.parent, {}, light_obj.visible);
+    context.scene->ApplyLayerVisibility(light_obj.id);
 }
 
 void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     auto node = std::make_shared<SceneNode>(Vector3f(empty_obj.origin.data()),
                                             Vector3f(empty_obj.scale.data()),
-                                            Vector3f(empty_obj.angles.data()));
+                                            Vector3f(empty_obj.angles.data()),
+                                            empty_obj.name);
     node->ID() = empty_obj.id;
 
     WPShaderValueData svData;
@@ -1451,11 +2710,120 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     if (empty_obj.parent != 0 && empty_obj.attachment.empty()) {
         ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
         context.scene->sceneGraph->AppendChild(node);
+        RegisterRenderOrderProxyChild(context, empty_obj.parent, node, empty_obj.id);
     } else {
         AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name, &svData);
     }
     context.object_nodes[empty_obj.id] = node;
+    context.scene->objectRuntimeNodes[empty_obj.id].push_back(node.get());
+    context.scene->nodeOwners[node.get()] = empty_obj.id;
     context.shader_updater->SetNodeData(node.get(), svData);
+    RegisterLayerSceneState(
+        context, empty_obj.id, empty_obj.parent, empty_obj.attachment, empty_obj.visible);
+    context.scene->ApplyLayerVisibility(empty_obj.id);
+}
+
+void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
+                   bool force_runtime_materialization = false) {
+    if (!shape_obj.visible && !force_runtime_materialization) return;
+
+    if (shape_obj.shape != "quad" || shape_obj.effects.empty()) {
+        // Unsupported or effect-less shape layers still need to behave like transform containers.
+        // Registering a normal empty object preserves parent bindings, scripts, and child ordering
+        // while making the missing drawable path explicit in the log instead of silently dropping
+        // the authored layer.
+        LOG_INFO("SceneShapeObjectFallback: id=%d name='%s' shape='%s' effects=%zu",
+                 shape_obj.id,
+                 shape_obj.name.c_str(),
+                 shape_obj.shape.c_str(),
+                 shape_obj.effects.size());
+
+        WPEmptyObject empty_obj;
+        empty_obj.id             = shape_obj.id;
+        empty_obj.name           = shape_obj.name;
+        empty_obj.origin         = shape_obj.origin;
+        empty_obj.scale          = shape_obj.scale;
+        empty_obj.angles         = shape_obj.angles;
+        empty_obj.parallaxDepth  = shape_obj.parallaxDepth;
+        empty_obj.visible        = shape_obj.visible;
+        empty_obj.visible_binding = shape_obj.visible_binding;
+        empty_obj.parent         = shape_obj.parent;
+        empty_obj.attachment     = shape_obj.attachment;
+        ParseEmptyObj(context, empty_obj);
+        return;
+    }
+
+    auto& vfs = *context.vfs;
+
+    wpscene::WPMaterial transparent_source_material;
+    nlohmann::json      transparent_source_json;
+    if (!PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
+                    transparent_source_json) ||
+        !transparent_source_material.FromJson(transparent_source_json)) {
+        LOG_ERROR("SceneShapeDirectDraw: layer=%d name='%s' failed to load transparent source material",
+                  shape_obj.id,
+                  shape_obj.name.c_str());
+        return;
+    }
+
+    EnsureSystemTextureRegistered(*context.scene, kSyntheticDirectDrawShapeTextureName);
+    if (transparent_source_material.textures.empty()) {
+        transparent_source_material.textures.resize(1);
+    }
+    transparent_source_material.textures[0] = std::string(kSyntheticDirectDrawShapeTextureName);
+    // Direct-draw shape effects author their visible pixels inside the effect shader and leave
+    // untouched areas with alpha zero. The synthetic source material's blend mode is captured as
+    // the final screen blend for the visible authored effect, so force alpha blending here; using
+    // the passthrough material's normal overwrite mode would draw transparent black texels over the
+    // wallpaper and make the light shaft layer look like an opaque full-screen mask.
+    transparent_source_material.blending = "translucent";
+
+    const std::array<float, 2> resolved_size = shape_obj.has_size
+        ? shape_obj.size
+        : std::array<float, 2> {
+              static_cast<float>(std::max(1, context.ortho_w)),
+              static_cast<float>(std::max(1, context.ortho_h)),
+          };
+
+    // Wallpaper Engine serializes direct-draw light-shaft layers as `shape: "quad"` with no image
+    // asset. The effect shader owns the visible pixels (`DIRECTDRAW=1`), so we synthesize a fully
+    // transparent image source only to reuse the established image-effect camera, ping-pong render
+    // targets, visibility contracts, and final composite path.
+    wpscene::WPImageObject image_obj;
+    image_obj.id               = shape_obj.id;
+    image_obj.name             = shape_obj.name;
+    image_obj.origin           = shape_obj.origin;
+    image_obj.scale            = shape_obj.scale;
+    image_obj.angles           = shape_obj.angles;
+    image_obj.size             = resolved_size;
+    image_obj.parallaxDepth    = shape_obj.parallaxDepth;
+    image_obj.color            = shape_obj.color;
+    image_obj.alpha            = shape_obj.alpha;
+    image_obj.brightness       = shape_obj.brightness;
+    image_obj.visible          = shape_obj.visible;
+    image_obj.visible_binding  = shape_obj.visible_binding;
+    image_obj.image            = "__hanabi_shape_quad_directdraw";
+    image_obj.parent           = shape_obj.parent;
+    image_obj.attachment       = shape_obj.attachment;
+    image_obj.effectSourceSize = resolved_size;
+    image_obj.material         = std::move(transparent_source_material);
+    image_obj.effects          = std::move(shape_obj.effects);
+    image_obj.nopadding        = true;
+
+    LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
+             "size=[%.3f, %.3f] authored-size=%s transparent-texture='%.*s' final-blend='%s'",
+             image_obj.id,
+             image_obj.name.c_str(),
+             shape_obj.shape.c_str(),
+             image_obj.effects.size(),
+             image_obj.size[0],
+             image_obj.size[1],
+             shape_obj.has_size ? "true" : "false",
+             static_cast<int>(kSyntheticDirectDrawShapeTextureName.size()),
+             kSyntheticDirectDrawShapeTextureName.data(),
+             transparent_source_material.blending.c_str());
+
+    ParseImageObj(context, image_obj, force_runtime_materialization);
 }
 
 template<typename T>
@@ -1466,20 +2834,74 @@ void AddWPObject(std::vector<WPObjectVar>& objs, const nlohmann::json& json_obj,
         LOG_ERROR("parse scene object failed, name: %s", wpobj.name.c_str());
         return;
     }
-    wpobj.visible = ResolveObjectVisibility(
-        wpobj.visible, wpobj.visible_binding, user_properties);
+
+    const auto* visible_json = FindVisibleProperty(json_obj);
+    const auto visible_contract = BuildVisibilityContract(
+        wpobj.visible, wpobj.visible_binding, visible_json, user_properties);
+    const bool has_visible_runtime_binding =
+        visible_contract.has_script || visible_contract.has_user_binding ||
+        visible_contract.has_animation;
+    wpobj.visible = visible_contract.initial_visible;
+    if (has_visible_runtime_binding &&
+        !std::is_same_v<T, wpscene::WPImageObject> &&
+        !std::is_same_v<T, wpscene::WPParticleObject> &&
+        !std::is_same_v<T, wpscene::WPTextObject> &&
+        !std::is_same_v<T, WPShapeObject>) {
+        // Legacy non-lazy layer types still need a concrete runtime node to receive visibility
+        // writes. Image and shape-direct-draw layers now use explicit
+        // materialize-but-apply-initial-visibility handling, and particle/text layers keep their
+        // existing lightweight lazy nodes until first shown.
+        wpobj.visible = true;
+    }
+    if constexpr (std::is_same_v<T, wpscene::WPImageObject>) {
+        // This image parse log intentionally mirrors the runtime geometry fields that decide
+        // whether utility layers become drawable. It makes project-layer regressions visible in
+        // run logs before the render graph has a chance to create a framebuffer feedback pass.
+        LOG_INFO("SceneObjectParsed: source=scene-load kind=image id=%d name='%s' "
+                 "origin=[%.3f, %.3f, %.3f] size=[%.3f, %.3f] fullscreen=%s autosize=%s "
+                 "projectlayer=%s image='%s' effects=%zu",
+                 wpobj.id,
+                 wpobj.name.c_str(),
+                 wpobj.origin[0],
+                 wpobj.origin[1],
+                 wpobj.origin[2],
+                 wpobj.size[0],
+                 wpobj.size[1],
+                 wpobj.fullscreen ? "true" : "false",
+                 wpobj.autosize ? "true" : "false",
+                 wpobj.projectlayer ? "true" : "false",
+                 wpobj.image.c_str(),
+                 wpobj.effects.size());
+    } else if constexpr (std::is_same_v<T, WPShapeObject>) {
+        // Shape/direct-draw layers do not carry an image model, so this parser log is the only
+        // early proof that the layer was classified as drawable effect content rather than as a
+        // transform-only empty object.
+        LOG_INFO("SceneObjectParsed: source=scene-load kind=shape id=%d name='%s' "
+                 "origin=[%.3f, %.3f, %.3f] size=[%.3f, %.3f] has-size=%s shape='%s' effects=%zu",
+                 wpobj.id,
+                 wpobj.name.c_str(),
+                 wpobj.origin[0],
+                 wpobj.origin[1],
+                 wpobj.origin[2],
+                 wpobj.size[0],
+                 wpobj.size[1],
+                 wpobj.has_size ? "true" : "false",
+                 wpobj.shape.c_str(),
+                 wpobj.effects.size());
+    }
     objs.push_back(wpobj);
 }
 
 std::optional<int32_t> GetObjectId(const WPObjectVar& obj) {
     return std::visit(
         visitor::overload {
-            [](const wpscene::WPSoundObject&) -> std::optional<int32_t> {
-                return std::nullopt;
-            },
             [](const auto& value) -> std::optional<int32_t> { return value.id; },
         },
         obj);
+}
+
+std::string GetObjectName(const WPObjectVar& obj) {
+    return std::visit([](const auto& value) { return value.name; }, obj);
 }
 
 int32_t GetObjectParentId(const WPObjectVar& obj) {
@@ -1494,11 +2916,1310 @@ int32_t GetObjectParentId(const WPObjectVar& obj) {
 bool IsObjectVisible(const WPObjectVar& obj) {
     return std::visit([](const auto& value) { return value.visible; }, obj);
 }
+
+std::optional<WPDynamicValue> ParsePropertyBaseValue(const nlohmann::json& property_json,
+                                                     WPDynamicValue::Type  hint) {
+    if (!property_json.is_object() || !property_json.contains("value")) return std::nullopt;
+    return WPDynamicValue::FromJsonLiteral(property_json.at("value"), hint);
+}
+
+void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann::json& object_json,
+                                          std::string_view property_name, WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !object_json.contains(property_name)) {
+        return;
+    }
+
+    const auto& property_json = object_json.at(property_name);
+    if (!property_json.is_object() || !property_json.contains("animation")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    // Property animation registrations still target SceneNode-backed values. Sound streams are
+    // mounted outside the scene graph, so their live volume user binding is handled by
+    // RegisterScenePropertyBinding instead of entering the property animation table.
+    if (context.object_nodes.count(object_id) == 0) return;
+
+    WPPropertyAnimationDefinition animation_definition;
+    if (!ParsePropertyAnimationDefinition(property_json, hint, animation_definition)) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint)) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    context.scene->propertyAnimationRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id     = object_id,
+        .object_name   = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node          = context.object_nodes.at(object_id).get(),
+        .target_kind   = WPSceneScriptTargetKind::Layer,
+        .target_index  = 0,
+        .value_type    = hint,
+        .base_value    = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
+        .animation     = std::make_shared<WPPropertyAnimationDefinition>(std::move(animation_definition)),
+        .setting       = std::move(setting),
+    });
+    if (IsTextLayerObjectJson(object_json)) {
+        const auto& registration = context.scene->propertyAnimationRegistrations.back();
+        LogTextLayerRegistration("register-property-animation",
+                                 registration.object_id,
+                                 registration.object_name,
+                                 registration.property_name,
+                                 registration.value_type,
+                                 registration.setting,
+                                 registration.base_value);
+    }
+}
+
+void RegisterSceneScriptBinding(ParseContext& context, const nlohmann::json& object_json,
+                                std::string_view property_name, WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !object_json.contains(property_name)) {
+        return;
+    }
+
+    const auto& property_json = object_json.at(property_name);
+    if (!property_json.is_object() || !property_json.contains("script")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasScript()) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    // Script bindings still dispatch through a SceneNode-backed target. Sound volume live edits
+    // are plain user-property bindings and are registered in RegisterScenePropertyBinding below.
+    if (context.object_nodes.count(object_id) == 0) return;
+
+    context.scene->scriptRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id     = object_id,
+        .object_name   = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node          = context.object_nodes.at(object_id).get(),
+        .target_kind   = WPSceneScriptTargetKind::Layer,
+        .target_index  = 0,
+        .value_type    = hint,
+        .base_value    = setting.value,
+        .setting       = std::move(setting),
+    });
+    if (IsTextLayerObjectJson(object_json)) {
+        const auto& registration = context.scene->scriptRegistrations.back();
+        LogTextLayerRegistration("register-script-binding",
+                                 registration.object_id,
+                                 registration.object_name,
+                                 registration.property_name,
+                                 registration.value_type,
+                                 registration.setting,
+                                 registration.base_value);
+    }
+}
+
+void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& object_json,
+                                  std::string_view property_name, WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !object_json.contains(property_name)) {
+        return;
+    }
+
+    const auto& property_json = object_json.at(property_name);
+    if (!property_json.is_object()) return;
+    if (property_json.contains("script") || property_json.contains("animation")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    // Sound objects are mounted as SoundManager streams and intentionally have no SceneNode in
+    // context.object_nodes. Treat volume as a first-class runtime binding anyway so live user
+    // property edits follow the same value path as the parse-time WPSoundParser::MountStream call.
+    const bool sound_volume_binding =
+        property_name == "volume" && context.scene != nullptr &&
+        context.scene->objectRuntimeSoundHandles.count(object_id) != 0;
+    const auto object_node_it = context.object_nodes.find(object_id);
+    if (object_node_it == context.object_nodes.end() && !sound_volume_binding) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasUserBinding()) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id = object_id,
+        .object_name = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node = sound_volume_binding ? nullptr : object_node_it->second.get(),
+        .target_kind = sound_volume_binding ? WPSceneScriptTargetKind::Sound
+                                            : WPSceneScriptTargetKind::Layer,
+        .target_index = 0,
+        .value_type = hint,
+        .base_value = setting.value,
+        .setting = std::move(setting),
+    });
+    if (sound_volume_binding) {
+        LOG_INFO("SceneSoundRegister: layer=%d property='%.*s' kind=user target=sound",
+                 object_id,
+                 static_cast<int>(property_name.size()),
+                 property_name.data());
+    }
+    if (IsTextLayerObjectJson(object_json)) {
+        const auto& registration = context.scene->bindingRegistrations.back();
+        LogTextLayerRegistration("register-user-binding",
+                                 registration.object_id,
+                                 registration.object_name,
+                                 registration.property_name,
+                                 registration.value_type,
+                                 registration.setting,
+                                 registration.base_value);
+    }
+}
+
+void RegisterSceneParticleOverridePropertyBinding(ParseContext& context,
+                                                  const nlohmann::json& object_json,
+                                                  std::string_view property_name,
+                                                  WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !object_json.contains("particle") || object_json.at("particle").is_null() ||
+        !object_json.contains("instanceoverride") ||
+        !object_json.at("instanceoverride").is_object()) {
+        return;
+    }
+
+    const auto& override_json = object_json.at("instanceoverride");
+    if (!override_json.contains(property_name)) return;
+
+    const auto& property_json = override_json.at(property_name);
+    if (!property_json.is_object()) return;
+    if (property_json.contains("script") || property_json.contains("animation")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    const auto object_node_it = context.object_nodes.find(object_id);
+    if (object_node_it == context.object_nodes.end()) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasUserBinding()) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    // Particle authoring stores trail/sprite overrides under `instanceoverride`, not beside
+    // ordinary layer material or image-size properties. Registering the nested value as a layer
+    // target lets the runtime dispatch reuse the existing user-property pipeline while
+    // ApplyLayerPropertyValue() routes `colorn` and scalar `size` to ParticleSubSystem.
+    context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id     = object_id,
+        .object_name   = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node          = object_node_it->second.get(),
+        .target_kind   = WPSceneScriptTargetKind::Layer,
+        .target_index  = 0,
+        .value_type    = hint,
+        .base_value    = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
+        .setting       = std::move(setting),
+    });
+
+    const auto& registration = context.scene->bindingRegistrations.back();
+    LOG_INFO("SceneParticleOverrideRegister: layer=%d property='instanceoverride.%.*s' "
+             "kind=user target=particle user='%s'",
+             object_id,
+             static_cast<int>(property_name.size()),
+             property_name.data(),
+             registration.setting.property.has_value()
+                 ? registration.setting.property->name.c_str()
+                 : "");
+}
+
+void LogUnsupportedEffectMaterialScripts(const nlohmann::json& object_json,
+                                         const nlohmann::json& effect_json,
+                                         int32_t object_id,
+                                         int32_t effect_id,
+                                         uint32_t effect_index,
+                                         std::string_view effect_name) {
+    if (!effect_json.is_object() || !effect_json.contains("passes") ||
+        !effect_json.at("passes").is_array()) {
+        return;
+    }
+
+    for (std::size_t pass_index = 0; pass_index < effect_json.at("passes").size(); pass_index++) {
+        const auto& pass_json = effect_json.at("passes").at(pass_index);
+        if (!pass_json.is_object() || !pass_json.contains("constantshadervalues") ||
+            !pass_json.at("constantshadervalues").is_object()) {
+            continue;
+        }
+
+        for (const auto& value_entry : pass_json.at("constantshadervalues").items()) {
+            const auto& value_json = value_entry.value();
+            if (!value_json.is_object() || !value_json.contains("script") ||
+                value_json.at("script").is_null()) {
+                continue;
+            }
+            std::string object_name;
+            GET_JSON_NAME_VALUE_NOWARN(object_json, "name", object_name);
+            LOG_INFO("SceneVisibilityEffectMaterialScriptUnsupported: layer=%d layer-name='%s' effect-id=%d effect-index=%u effect-name='%.*s' pass-index=%zu constant='%s'",
+                     object_id,
+                     object_name.c_str(),
+                     effect_id,
+                     effect_index,
+                     static_cast<int>(effect_name.size()),
+                     effect_name.data(),
+                     pass_index,
+                     value_entry.key().c_str());
+        }
+    }
+}
+
+void RegisterEffectVisibilityBinding(ParseContext& context,
+                                     const nlohmann::json& object_json,
+                                     const nlohmann::json& effect_json,
+                                     uint32_t authored_effect_index) {
+    if (!object_json.is_object() || !effect_json.is_object() ||
+        !effect_json.contains("visible") || !effect_json.at("visible").is_object()) {
+        return;
+    }
+
+    int32_t object_id { 0 };
+    GET_JSON_NAME_VALUE_NOWARN(object_json, "id", object_id);
+    if (object_id == 0 || context.object_nodes.count(object_id) == 0 || context.scene == nullptr) {
+        return;
+    }
+
+    int32_t effect_id { 0 };
+    std::string authored_effect_name;
+    GET_JSON_NAME_VALUE_NOWARN(effect_json, "id", effect_id);
+    GET_JSON_NAME_VALUE_NOWARN(effect_json, "name", authored_effect_name);
+
+    SceneImageEffect* effect =
+        effect_id != 0
+            ? context.scene->FindImageEffectById(object_id, effect_id)
+            : context.scene->FindImageEffect(object_id, authored_effect_index);
+    if (effect == nullptr) return;
+
+    const auto& visible_json = effect_json.at("visible");
+    const std::string effect_name =
+        !authored_effect_name.empty() ? authored_effect_name : effect->EffectName();
+    WPUserSetting setting;
+    if (!ParseUserSetting(visible_json, setting, WPDynamicValue::Type::Boolean)) return;
+
+    WPSceneScriptRegistration registration {
+        .object_id     = object_id,
+        .object_name   = effect_name,
+        .property_name = "visible",
+        .node          = context.object_nodes.at(object_id).get(),
+        .target_kind   = WPSceneScriptTargetKind::Effect,
+        .target_index  = effect->EffectIndex(),
+        .target_id     = effect_id,
+        .value_type    = WPDynamicValue::Type::Boolean,
+        .base_value    = ParsePropertyBaseValue(visible_json, WPDynamicValue::Type::Boolean)
+                          .value_or(setting.value),
+        .setting       = std::move(setting),
+    };
+
+    const char* registration_kind = nullptr;
+    if (visible_json.contains("animation") && !visible_json.at("animation").is_null()) {
+        WPPropertyAnimationDefinition animation_definition;
+        if (!ParsePropertyAnimationDefinition(
+                visible_json, WPDynamicValue::Type::Boolean, animation_definition)) {
+            return;
+        }
+        registration.animation =
+            std::make_shared<WPPropertyAnimationDefinition>(std::move(animation_definition));
+        context.scene->propertyAnimationRegistrations.push_back(std::move(registration));
+        registration_kind = "animation";
+    } else if (registration.setting.hasScript()) {
+        context.scene->scriptRegistrations.push_back(std::move(registration));
+        registration_kind = "script";
+    } else if (registration.setting.hasUserBinding()) {
+        context.scene->bindingRegistrations.push_back(std::move(registration));
+        registration_kind = "user";
+    }
+
+    if (registration_kind != nullptr) {
+        LOG_INFO("SceneVisibilityEffectRegister: layer=%d effect-id=%d effect-index=%u name='%s' kind=%s initial-visible=%s",
+                 object_id,
+                 effect_id,
+                 effect->EffectIndex(),
+                 effect_name.c_str(),
+                 registration_kind,
+                 effect->LocalVisible() ? "true" : "false");
+    }
+}
+
+void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::json& object_json) {
+    if (!object_json.is_object() || !object_json.contains("effects") ||
+        !object_json.at("effects").is_array()) {
+        return;
+    }
+
+    int32_t object_id { 0 };
+    GET_JSON_NAME_VALUE_NOWARN(object_json, "id", object_id);
+    uint32_t effect_index = 0;
+    for (const auto& effect_json : object_json.at("effects")) {
+        int32_t effect_id { 0 };
+        std::string effect_name;
+        GET_JSON_NAME_VALUE_NOWARN(effect_json, "id", effect_id);
+        GET_JSON_NAME_VALUE_NOWARN(effect_json, "name", effect_name);
+        SceneImageEffect* effect =
+            context.scene != nullptr && effect_id != 0
+                ? context.scene->FindImageEffectById(object_id, effect_id)
+                : nullptr;
+        if (effect != nullptr && effect_name.empty()) effect_name = effect->EffectName();
+        LogUnsupportedEffectMaterialScripts(object_json,
+                                            effect_json,
+                                            object_id,
+                                            effect_id,
+                                            effect != nullptr ? effect->EffectIndex() : effect_index,
+                                            effect_name);
+        RegisterEffectVisibilityBinding(context, object_json, effect_json, effect_index);
+        effect_index++;
+    }
+}
+
+void RegisterAnimationLayerSceneScriptBinding(ParseContext& context,
+                                              const nlohmann::json& object_json,
+                                              const nlohmann::json& layer_json,
+                                              uint32_t             layer_index,
+                                              std::string_view     property_name,
+                                              WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !layer_json.is_object() || !layer_json.contains(property_name)) {
+        return;
+    }
+
+    const auto& property_json = layer_json.at(property_name);
+    if (!property_json.is_object() || !property_json.contains("script")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    if (context.object_nodes.count(object_id) == 0) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasScript()) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    context.scene->scriptRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id     = object_id,
+        .object_name   = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node          = context.object_nodes.at(object_id).get(),
+        .target_kind   = WPSceneScriptTargetKind::AnimationLayer,
+        .target_index  = layer_index,
+        .value_type    = hint,
+        .base_value    = setting.value,
+        .setting       = std::move(setting),
+    });
+}
+
+void RegisterAnimationLayerPropertyBinding(ParseContext& context,
+                                          const nlohmann::json& object_json,
+                                          const nlohmann::json& layer_json,
+                                          uint32_t layer_index,
+                                          std::string_view property_name,
+                                          WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !layer_json.is_object() || !layer_json.contains(property_name)) {
+        return;
+    }
+
+    const auto& property_json = layer_json.at(property_name);
+    if (!property_json.is_object()) return;
+    // A script on an animation-layer property can initialize timing or shared state while the same
+    // property still declares a user binding for live visibility/blend control. Only authored
+    // property animations own the value path exclusively; scripts and direct user bindings must
+    // coexist so runtime project-property edits are applied after script initialization.
+    if (property_json.contains("animation")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    if (context.object_nodes.count(object_id) == 0) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasUserBinding()) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id = object_id,
+        .object_name = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node = context.object_nodes.at(object_id).get(),
+        .target_kind = WPSceneScriptTargetKind::AnimationLayer,
+        .target_index = layer_index,
+        .value_type = hint,
+        .base_value = setting.value,
+        .setting = std::move(setting),
+    });
+
+    LOG_INFO("SceneAnimationLayerRegister: layer=%d animation-index=%u property='%.*s' kind=user target=animationLayer script-present=%s",
+             object_id,
+             layer_index,
+             static_cast<int>(property_name.size()),
+             property_name.data(),
+             property_json.contains("script") ? "true" : "false");
+}
+
+void RegisterSceneGeneralPropertyBinding(ParseContext& context,
+                                         const nlohmann::json& general_json,
+                                         std::string_view property_name,
+                                         WPDynamicValue::Type hint) {
+    if (context.scene == nullptr || !general_json.is_object() || !general_json.contains(property_name)) {
+        return;
+    }
+
+    const auto& property_json = general_json.at(property_name);
+    if (!property_json.is_object()) return;
+    // General properties do not have SceneNode owners. Keep authored animations out of the direct
+    // binding table, but allow user-bound values to drive global runtime state such as camera
+    // parallax through the same dispatch path as layer and effect properties.
+    if (property_json.contains("animation")) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasUserBinding()) return;
+
+    context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id     = 0,
+        .object_name   = "scene.general",
+        .property_name = std::string(property_name),
+        .node          = nullptr,
+        .target_kind   = WPSceneScriptTargetKind::Scene,
+        .target_index  = 0,
+        .value_type    = hint,
+        .base_value    = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
+        .setting       = std::move(setting),
+    });
+
+    LOG_INFO("SceneGeneralRegister: property='%.*s' kind=user target=scene.general",
+             static_cast<int>(property_name.size()),
+             property_name.data());
+}
+
+void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
+    if (json.contains("general") && json.at("general").is_object()) {
+        const auto& general_json = json.at("general");
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "clearcolor", WPDynamicValue::Type::Float3);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "ambientcolor", WPDynamicValue::Type::Float3);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "skylightcolor", WPDynamicValue::Type::Float3);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "cameraparallax", WPDynamicValue::Type::Boolean);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "cameraparallaxamount", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "cameraparallaxdelay", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "cameraparallaxmouseinfluence", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(context, general_json, "fov", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(context, general_json, "nearz", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(context, general_json, "farz", WPDynamicValue::Type::Float);
+    }
+
+    if (!json.contains("objects") || !json.at("objects").is_array()) return;
+
+    for (const auto& object_json : json.at("objects")) {
+        RegisterScenePropertyBinding(
+            context, object_json, "visible", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyBinding(
+            context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
+        if ((object_json.contains("image") && !object_json.at("image").is_null()) ||
+            (object_json.contains("text") && !object_json.at("text").is_null())) {
+            RegisterScenePropertyBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
+        }
+        RegisterScenePropertyBinding(context, object_json, "text", WPDynamicValue::Type::String);
+        RegisterScenePropertyBinding(context, object_json, "font", WPDynamicValue::Type::String);
+        RegisterScenePropertyBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
+        // Particle trail controls such as mouse-tail `colorn` and scalar `size` are nested below
+        // instanceoverride, so the generic top-level scans above never see them. Register the
+        // normalized color, byte-color, and size override names here so user-property edits can
+        // reach live particles.
+        RegisterSceneParticleOverridePropertyBinding(
+            context, object_json, "colorn", WPDynamicValue::Type::Float3);
+        RegisterSceneParticleOverridePropertyBinding(
+            context, object_json, "color", WPDynamicValue::Type::Float3);
+        RegisterSceneParticleOverridePropertyBinding(
+            context, object_json, "size", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
+        // Sound-layer volume is authored beside visual layer properties, but its runtime target is
+        // the mounted audio stream instead of a SceneNode material.
+        RegisterScenePropertyBinding(context, object_json, "volume", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(
+            context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyBinding(
+            context, object_json, "backgroundbrightness", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(
+            context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+        RegisterScenePropertyBinding(
+            context, object_json, "horizontalalign", WPDynamicValue::Type::String);
+        RegisterScenePropertyBinding(
+            context, object_json, "verticalalign", WPDynamicValue::Type::String);
+        RegisterScenePropertyBinding(context, object_json, "anchor", WPDynamicValue::Type::String);
+        RegisterScenePropertyBinding(
+            context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
+        RegisterScenePropertyBinding(
+            context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "visible", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyAnimationBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyAnimationBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyAnimationBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
+        if ((object_json.contains("image") && !object_json.at("image").is_null()) ||
+            (object_json.contains("text") && !object_json.at("text").is_null())) {
+            RegisterScenePropertyAnimationBinding(
+                context, object_json, "size", WPDynamicValue::Type::Float2);
+        }
+        RegisterScenePropertyAnimationBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyAnimationBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "brightness", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "backgroundbrightness", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyAnimationBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyAnimationBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
+        RegisterScenePropertyAnimationBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+
+        RegisterSceneScriptBinding(
+            context, object_json, "visible", WPDynamicValue::Type::Boolean);
+        RegisterSceneScriptBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
+        RegisterSceneScriptBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
+        RegisterSceneScriptBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
+        RegisterSceneScriptBinding(
+            context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
+        if ((object_json.contains("image") && !object_json.at("image").is_null()) ||
+            (object_json.contains("text") && !object_json.at("text").is_null())) {
+            RegisterSceneScriptBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
+        }
+        RegisterSceneScriptBinding(context, object_json, "text", WPDynamicValue::Type::String);
+        RegisterSceneScriptBinding(context, object_json, "font", WPDynamicValue::Type::String);
+        RegisterSceneScriptBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
+        RegisterSceneScriptBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(
+            context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
+        RegisterSceneScriptBinding(
+            context, object_json, "backgroundbrightness", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(
+            context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
+        RegisterSceneScriptBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+        RegisterSceneScriptBinding(
+            context, object_json, "horizontalalign", WPDynamicValue::Type::String);
+        RegisterSceneScriptBinding(
+            context, object_json, "verticalalign", WPDynamicValue::Type::String);
+        RegisterSceneScriptBinding(context, object_json, "anchor", WPDynamicValue::Type::String);
+        RegisterSceneScriptBinding(
+            context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
+        RegisterSceneScriptBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
+        RegisterSceneScriptBinding(
+            context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
+        RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+
+        RegisterEffectVisibilityBindings(context, object_json);
+
+        if (!object_json.contains("animationlayers") || !object_json.at("animationlayers").is_array()) {
+            continue;
+        }
+
+        uint32_t layer_index = 0;
+        for (const auto& animation_layer_json : object_json.at("animationlayers")) {
+            RegisterAnimationLayerPropertyBinding(
+                context,
+                object_json,
+                animation_layer_json,
+                layer_index,
+                "visible",
+                WPDynamicValue::Type::Boolean);
+            RegisterAnimationLayerPropertyBinding(
+                context,
+                object_json,
+                animation_layer_json,
+                layer_index,
+                "rate",
+                WPDynamicValue::Type::Float);
+            RegisterAnimationLayerPropertyBinding(
+                context,
+                object_json,
+                animation_layer_json,
+                layer_index,
+                "blend",
+                WPDynamicValue::Type::Float);
+            RegisterAnimationLayerSceneScriptBinding(
+                context,
+                object_json,
+                animation_layer_json,
+                layer_index,
+                "visible",
+                WPDynamicValue::Type::Boolean);
+            RegisterAnimationLayerSceneScriptBinding(
+                context,
+                object_json,
+                animation_layer_json,
+                layer_index,
+                "rate",
+                WPDynamicValue::Type::Float);
+            RegisterAnimationLayerSceneScriptBinding(
+                context,
+                object_json,
+                animation_layer_json,
+                layer_index,
+                "blend",
+                WPDynamicValue::Type::Float);
+            layer_index++;
+        }
+    }
+}
+
+void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& object_json) {
+    RegisterScenePropertyBinding(
+        context, object_json, "visible", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyBinding(
+        context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
+    if ((object_json.contains("image") && !object_json.at("image").is_null()) ||
+        (object_json.contains("text") && !object_json.at("text").is_null())) {
+        RegisterScenePropertyBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
+    }
+    RegisterScenePropertyBinding(context, object_json, "text", WPDynamicValue::Type::String);
+    RegisterScenePropertyBinding(context, object_json, "font", WPDynamicValue::Type::String);
+    RegisterScenePropertyBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
+    // Dynamic layer materialization uses this per-object registration path, so particle
+    // instanceoverride color and size bindings must be added here as well as during the initial
+    // full-scene scan above.
+    RegisterSceneParticleOverridePropertyBinding(
+        context, object_json, "colorn", WPDynamicValue::Type::Float3);
+    RegisterSceneParticleOverridePropertyBinding(
+        context, object_json, "color", WPDynamicValue::Type::Float3);
+    RegisterSceneParticleOverridePropertyBinding(
+        context, object_json, "size", WPDynamicValue::Type::Float);
+    RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
+    RegisterScenePropertyBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
+    // Dynamic materialization reuses the same registration helper, so keep sound volume in this
+    // per-object path as well as the initial full-scene scan.
+    RegisterScenePropertyBinding(context, object_json, "volume", WPDynamicValue::Type::Float);
+    RegisterScenePropertyBinding(
+        context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyBinding(
+        context, object_json, "backgroundbrightness", WPDynamicValue::Type::Float);
+    RegisterScenePropertyBinding(
+        context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
+    RegisterScenePropertyBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+    RegisterScenePropertyBinding(
+        context, object_json, "horizontalalign", WPDynamicValue::Type::String);
+    RegisterScenePropertyBinding(
+        context, object_json, "verticalalign", WPDynamicValue::Type::String);
+    RegisterScenePropertyBinding(context, object_json, "anchor", WPDynamicValue::Type::String);
+    RegisterScenePropertyBinding(
+        context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
+    RegisterScenePropertyBinding(
+        context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "visible", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyAnimationBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyAnimationBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyAnimationBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
+    if ((object_json.contains("image") && !object_json.at("image").is_null()) ||
+        (object_json.contains("text") && !object_json.at("text").is_null())) {
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "size", WPDynamicValue::Type::Float2);
+    }
+    RegisterScenePropertyAnimationBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyAnimationBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "brightness", WPDynamicValue::Type::Float);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "backgroundbrightness", WPDynamicValue::Type::Float);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyAnimationBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
+    RegisterScenePropertyAnimationBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyAnimationBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyAnimationBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+
+    RegisterSceneScriptBinding(
+        context, object_json, "visible", WPDynamicValue::Type::Boolean);
+    RegisterSceneScriptBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
+    RegisterSceneScriptBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
+    RegisterSceneScriptBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
+    RegisterSceneScriptBinding(
+        context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
+    if ((object_json.contains("image") && !object_json.at("image").is_null()) ||
+        (object_json.contains("text") && !object_json.at("text").is_null())) {
+        RegisterSceneScriptBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
+    }
+    RegisterSceneScriptBinding(context, object_json, "text", WPDynamicValue::Type::String);
+    RegisterSceneScriptBinding(context, object_json, "font", WPDynamicValue::Type::String);
+    RegisterSceneScriptBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
+    RegisterSceneScriptBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
+    RegisterSceneScriptBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
+    RegisterSceneScriptBinding(
+        context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
+    RegisterSceneScriptBinding(
+        context, object_json, "backgroundbrightness", WPDynamicValue::Type::Float);
+    RegisterSceneScriptBinding(
+        context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
+    RegisterSceneScriptBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
+    RegisterSceneScriptBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+    RegisterSceneScriptBinding(
+        context, object_json, "horizontalalign", WPDynamicValue::Type::String);
+    RegisterSceneScriptBinding(
+        context, object_json, "verticalalign", WPDynamicValue::Type::String);
+    RegisterSceneScriptBinding(context, object_json, "anchor", WPDynamicValue::Type::String);
+    RegisterSceneScriptBinding(
+        context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
+    RegisterSceneScriptBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
+    RegisterSceneScriptBinding(
+        context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
+    RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+
+    RegisterEffectVisibilityBindings(context, object_json);
+
+    if (!object_json.contains("animationlayers") || !object_json.at("animationlayers").is_array()) {
+        return;
+    }
+
+    uint32_t layer_index = 0;
+    for (const auto& animation_layer_json : object_json.at("animationlayers")) {
+        RegisterAnimationLayerPropertyBinding(
+            context,
+            object_json,
+            animation_layer_json,
+            layer_index,
+            "visible",
+            WPDynamicValue::Type::Boolean);
+        RegisterAnimationLayerPropertyBinding(
+            context,
+            object_json,
+            animation_layer_json,
+            layer_index,
+            "rate",
+            WPDynamicValue::Type::Float);
+        RegisterAnimationLayerPropertyBinding(
+            context,
+            object_json,
+            animation_layer_json,
+            layer_index,
+            "blend",
+            WPDynamicValue::Type::Float);
+        RegisterAnimationLayerSceneScriptBinding(
+            context,
+            object_json,
+            animation_layer_json,
+            layer_index,
+            "visible",
+            WPDynamicValue::Type::Boolean);
+        RegisterAnimationLayerSceneScriptBinding(
+            context,
+            object_json,
+            animation_layer_json,
+            layer_index,
+            "rate",
+            WPDynamicValue::Type::Float);
+        RegisterAnimationLayerSceneScriptBinding(
+            context,
+            object_json,
+            animation_layer_json,
+            layer_index,
+            "blend",
+            WPDynamicValue::Type::Float);
+        layer_index++;
+    }
+}
+
+bool InitDynamicParseContext(ParseContext& context, Scene& scene, const UserPropertyMap* user_properties) {
+    if (scene.shaderValueUpdater == nullptr || scene.vfs == nullptr) return false;
+
+    auto* shader_updater = dynamic_cast<WPShaderValueUpdater*>(scene.shaderValueUpdater.get());
+    if (shader_updater == nullptr) return false;
+
+    context.scene = std::shared_ptr<Scene>(&scene, [](Scene*) {});
+    context.shader_updater = shader_updater;
+    context.vfs = scene.vfs.get();
+    context.user_properties = user_properties;
+    context.ortho_w = scene.ortho[0];
+    context.ortho_h = scene.ortho[1];
+    PopulateGlobalBaseUniforms(context, scene);
+
+    auto effect_it = scene.cameras.find("effect");
+    auto global_it = scene.cameras.find("global");
+    auto perspective_it = scene.cameras.find("global_perspective");
+    if (effect_it != scene.cameras.end()) context.effect_camera_node = effect_it->second->GetAttachedNode();
+    if (global_it != scene.cameras.end()) context.global_camera_node = global_it->second->GetAttachedNode();
+    if (perspective_it != scene.cameras.end()) {
+        context.global_perspective_camera_node = perspective_it->second->GetAttachedNode();
+    }
+
+    std::unordered_map<SceneNode*, std::shared_ptr<SceneNode>> shared_nodes;
+    CollectSceneNodeRefs(scene.sceneGraph, shared_nodes);
+    for (const auto& [layer_id, node] : scene.layerNodes) {
+        auto node_it = shared_nodes.find(node);
+        if (node_it != shared_nodes.end()) {
+            context.object_nodes[layer_id] = node_it->second;
+        }
+
+        if (const auto* node_data = shader_updater->GetNodeData(node);
+            node_data != nullptr && node_data->puppet_layer.Puppet() != nullptr) {
+            context.object_puppets[layer_id] = node_data->puppet_layer.Puppet();
+        }
+    }
+    return true;
+}
+
+bool ParseDynamicSceneObject(ParseContext&             context,
+                             const nlohmann::json&    object_json,
+                             const UserPropertyMap*   user_properties,
+                             int32_t*                 out_layer_id) {
+    const auto register_visibility_contract = [&](int32_t layer_id, LazyMaterializeKind lazy_kind) {
+        if (layer_id == 0) return;
+        // Dynamically-created layers go through the same runtime visibility policy as scene-load
+        // layers. Without this, hidden text/particle objects created from scripts would fall back
+        // to scattered type checks instead of the unified contract used by the main parser.
+        context.layer_visibility_contracts[layer_id] = BuildObjectVisibilityContractFromJson(
+            object_json, user_properties, false, false, lazy_kind);
+    };
+    const auto resolve_visibility = [&](auto& object) {
+        object.visible = ResolveObjectVisibility(object.visible, object.visible_binding, user_properties);
+    };
+
+    if (object_json.contains("image") && !object_json.at("image").is_null()) {
+        wpscene::WPImageObject object;
+        if (!object.FromJson(object_json, *context.vfs)) return false;
+        register_visibility_contract(object.id, LazyMaterializeKind::None);
+        resolve_visibility(object);
+
+        const bool requested_visible = object.visible;
+        ParseImageObj(context, object, true);
+        context.scene->SetLayerLocalVisibility(object.id, requested_visible);
+        context.scene->ApplyLayerVisibility(object.id);
+        if (out_layer_id) *out_layer_id = object.id;
+        return context.object_nodes.count(object.id) != 0;
+    }
+
+    if (object_json.contains("particle") && !object_json.at("particle").is_null()) {
+        wpscene::WPParticleObject object;
+        if (!object.FromJson(object_json, *context.vfs)) return false;
+        register_visibility_contract(object.id, LazyMaterializeKind::Particle);
+        resolve_visibility(object);
+        ParseParticleObj(context, object);
+        context.scene->SetLayerLocalVisibility(object.id, object.visible);
+        context.scene->ApplyLayerVisibility(object.id);
+        if (out_layer_id) *out_layer_id = object.id;
+        return context.object_nodes.count(object.id) != 0;
+    }
+
+    if (object_json.contains("light") && !object_json.at("light").is_null()) {
+        wpscene::WPLightObject object;
+        if (!object.FromJson(object_json, *context.vfs)) return false;
+        register_visibility_contract(object.id, LazyMaterializeKind::None);
+        resolve_visibility(object);
+        ParseLightObj(context, object);
+        context.scene->SetLayerLocalVisibility(object.id, object.visible);
+        context.scene->ApplyLayerVisibility(object.id);
+        if (out_layer_id) *out_layer_id = object.id;
+        return context.object_nodes.count(object.id) != 0;
+    }
+
+    if (object_json.contains("sound") && !object_json.at("sound").is_null()) {
+        wpscene::WPSoundObject object;
+        if (!object.FromJson(object_json, *context.vfs)) return false;
+        resolve_visibility(object);
+        if (context.scene->soundManager == nullptr) return false;
+        const auto sound_handle = WPSoundParser::Parse(object, *context.vfs, *context.scene->soundManager);
+        if (sound_handle == 0) return false;
+        context.scene->objectRuntimeSoundHandles[object.id] = sound_handle;
+        if (out_layer_id) *out_layer_id = object.id;
+        return true;
+    }
+
+    if (object_json.contains("text") && !object_json.at("text").is_null()) {
+        wpscene::WPTextObject object;
+        if (!object.FromJson(object_json, *context.vfs)) return false;
+        register_visibility_contract(object.id, LazyMaterializeKind::Text);
+        resolve_visibility(object);
+        ParseTextObj(context, object);
+        context.scene->SetLayerLocalVisibility(object.id, object.visible);
+        context.scene->ApplyLayerVisibility(object.id);
+        if (out_layer_id) *out_layer_id = object.id;
+        return context.object_nodes.count(object.id) != 0;
+    }
+
+    if (object_json.contains("model") && !object_json.at("model").is_null()) {
+        LOG_ERROR("dynamic model layers are not supported yet");
+        return false;
+    }
+
+    WPEmptyObject object;
+    if (!object.FromJson(object_json, *context.vfs)) return false;
+    register_visibility_contract(object.id, LazyMaterializeKind::None);
+    resolve_visibility(object);
+    ParseEmptyObj(context, object);
+    context.scene->SetLayerLocalVisibility(object.id, object.visible);
+    context.scene->ApplyLayerVisibility(object.id);
+    if (out_layer_id) *out_layer_id = object.id;
+    return context.object_nodes.count(object.id) != 0;
+}
 } // namespace
 
-std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std::string& buf,
-                                            fs::VFS& vfs, audio::SoundManager& sm,
-                                            const UserPropertyMap* user_properties) {
+bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
+                                                 const UserPropertyMap* user_properties) {
+    if (scene.deferredRuntimeParticleLayerIds.count(layer_id) == 0) return false;
+
+    const auto config_it = scene.initialLayerConfigJson.find(layer_id);
+    if (config_it == scene.initialLayerConfigJson.end()) return false;
+
+    nlohmann::json object_json;
+    if (!PARSE_JSON(config_it->second, object_json)) return false;
+
+    ParseContext context {};
+    if (!InitDynamicParseContext(context, scene, user_properties)) return false;
+    ScopedGlslangSession glslang_scope("deferred-particle-parse");
+
+    std::shared_ptr<SceneNode> placeholder_node;
+    if (auto node_it = context.object_nodes.find(layer_id); node_it != context.object_nodes.end()) {
+        placeholder_node = node_it->second;
+    }
+
+    wpscene::WPParticleObject object;
+    if (!object.FromJson(object_json, *context.vfs)) return false;
+
+    object.id = layer_id;
+    object.visible = true;
+    const auto binding = scene.GetLayerParentBinding(layer_id);
+    object.parent = binding.parent_id;
+    object.attachment = binding.attachment;
+    if (placeholder_node != nullptr) {
+        object.name = placeholder_node->Name();
+        const auto& translate = placeholder_node->Translate();
+        const auto& scale = placeholder_node->Scale();
+        const auto& rotation = placeholder_node->Rotation();
+        object.origin = { translate.x(), translate.y(), translate.z() };
+        object.scale = { scale.x(), scale.y(), scale.z() };
+        object.angles = { rotation.x(), rotation.y(), rotation.z() };
+    }
+
+    if (placeholder_node != nullptr && scene.sceneGraph != nullptr) {
+        RemoveRenderOrderNodeReferences(scene, placeholder_node.get());
+        (void)DetachNodeFromTree(scene.sceneGraph, placeholder_node.get());
+        scene.nodeOwners.erase(placeholder_node.get());
+    }
+    scene.objectRuntimeNodes.erase(layer_id);
+    scene.layerNodes[layer_id] = nullptr;
+
+    ParseParticleObj(context, object);
+    auto node_it = context.object_nodes.find(layer_id);
+    if (node_it == context.object_nodes.end() || !node_it->second) return false;
+
+    scene.layerNodes[layer_id] = node_it->second.get();
+    for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
+        if (it->second == layer_id) {
+            it = scene.layerNameToId.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!node_it->second->Name().empty()) {
+        scene.layerNameToId[node_it->second->Name()] = layer_id;
+    }
+    scene.deferredRuntimeParticleLayerIds.erase(layer_id);
+    return true;
+}
+
+bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
+                                             const UserPropertyMap* user_properties) {
+    if (scene.deferredRuntimeTextLayerIds.count(layer_id) == 0) return false;
+
+    ParseContext context {};
+    if (!InitDynamicParseContext(context, scene, user_properties)) return false;
+    ScopedGlslangSession glslang_scope("deferred-text-parse");
+
+    std::shared_ptr<SceneNode> placeholder_node;
+    if (auto node_it = context.object_nodes.find(layer_id); node_it != context.object_nodes.end()) {
+        placeholder_node = node_it->second;
+    }
+
+    wpscene::WPTextObject object;
+    if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
+        object = state_it->second.object;
+    } else {
+        const auto config_it = scene.initialLayerConfigJson.find(layer_id);
+        if (config_it == scene.initialLayerConfigJson.end()) return false;
+
+        nlohmann::json object_json;
+        if (!PARSE_JSON(config_it->second, object_json)) return false;
+        if (!object.FromJson(object_json, *context.vfs)) return false;
+    }
+
+    object.id = layer_id;
+    object.visible = true;
+    const auto binding = scene.GetLayerParentBinding(layer_id);
+    object.parent = binding.parent_id;
+    object.attachment = binding.attachment;
+    if (placeholder_node != nullptr) {
+        object.name = placeholder_node->Name();
+        const auto& translate = placeholder_node->Translate();
+        const auto& scale = placeholder_node->Scale();
+        const auto& rotation = placeholder_node->Rotation();
+        object.origin = { translate.x(), translate.y(), translate.z() };
+        object.scale = { scale.x(), scale.y(), scale.z() };
+        object.angles = { rotation.x(), rotation.y(), rotation.z() };
+    }
+
+    if (placeholder_node != nullptr && scene.sceneGraph != nullptr) {
+        RemoveRenderOrderNodeReferences(scene, placeholder_node.get());
+        (void)DetachNodeFromTree(scene.sceneGraph, placeholder_node.get());
+        scene.nodeOwners.erase(placeholder_node.get());
+    }
+    scene.objectRuntimeNodes.erase(layer_id);
+    scene.layerNodes[layer_id] = nullptr;
+
+    ParseTextObj(context, object);
+    auto node_it = context.object_nodes.find(layer_id);
+    if (node_it == context.object_nodes.end() || !node_it->second) return false;
+
+    scene.layerNodes[layer_id] = node_it->second.get();
+    for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
+        if (it->second == layer_id) {
+            it = scene.layerNameToId.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!node_it->second->Name().empty()) {
+        scene.layerNameToId[node_it->second->Name()] = layer_id;
+    }
+    scene.deferredRuntimeTextLayerIds.erase(layer_id);
+    if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
+    } else {
+    }
+    return true;
+}
+
+bool wallpaper::CreateDynamicSceneLayer(Scene&                                  scene,
+                                        const nlohmann::json&                   object_json,
+                                        const UserPropertyMap*                  user_properties,
+                                        std::vector<WPSceneScriptRegistration>* out_binding_registrations,
+                                        std::vector<WPSceneScriptRegistration>* out_script_registrations,
+                                        std::vector<WPSceneScriptRegistration>* out_property_animation_registrations,
+                                        std::string*                            out_initial_config_json,
+                                        int32_t*                                out_layer_id) {
+    if (!object_json.is_object()) return false;
+
+    ParseContext context {};
+    if (!InitDynamicParseContext(context, scene, user_properties)) return false;
+    ScopedGlslangSession glslang_scope("dynamic-layer-parse");
+
+    nlohmann::json normalized_object_json = object_json;
+    int32_t layer_id = 0;
+    GET_JSON_NAME_VALUE_NOWARN(normalized_object_json, "id", layer_id);
+    if (layer_id <= 0 || scene.layerNodes.count(layer_id) != 0 ||
+        scene.objectRuntimeNodes.count(layer_id) != 0) {
+        layer_id = AllocateDynamicLayerId(scene);
+        normalized_object_json["id"] = layer_id;
+    }
+
+    if (!ParseDynamicSceneObject(context, normalized_object_json, user_properties, &layer_id)) {
+        return false;
+    }
+
+    auto      node_it = context.object_nodes.find(layer_id);
+    SceneNode* layer_node =
+        node_it != context.object_nodes.end() && node_it->second ? node_it->second.get() : nullptr;
+    const bool has_sound_runtime = scene.objectRuntimeSoundHandles.count(layer_id) != 0;
+    if (layer_node == nullptr && !has_sound_runtime) return false;
+
+    const auto binding_start = scene.bindingRegistrations.size();
+    const auto property_animation_start = scene.propertyAnimationRegistrations.size();
+    const auto script_start = scene.scriptRegistrations.size();
+    RegisterSceneScriptsForObject(context, normalized_object_json);
+
+    scene.layerOrder.push_back(layer_id);
+    scene.layerNodes[layer_id] = layer_node;
+    scene.initialLayerConfigJson[layer_id] = normalized_object_json.dump();
+    std::string layer_name =
+        layer_node != nullptr ? layer_node->Name() : normalized_object_json.value("name", std::string {});
+    if (!layer_name.empty()) {
+        scene.layerNameToId[layer_name] = layer_id;
+    }
+
+    if (out_binding_registrations != nullptr) {
+        out_binding_registrations->assign(scene.bindingRegistrations.begin() + binding_start,
+                                          scene.bindingRegistrations.end());
+    }
+    if (out_property_animation_registrations != nullptr) {
+        out_property_animation_registrations->assign(
+            scene.propertyAnimationRegistrations.begin() + property_animation_start,
+            scene.propertyAnimationRegistrations.end());
+    }
+    if (out_script_registrations != nullptr) {
+        out_script_registrations->assign(
+            scene.scriptRegistrations.begin() + script_start,
+            scene.scriptRegistrations.end());
+    }
+    if (out_initial_config_json != nullptr) {
+        *out_initial_config_json = scene.initialLayerConfigJson.at(layer_id);
+    }
+    if (out_layer_id != nullptr) {
+        *out_layer_id = layer_id;
+    }
+    return true;
+}
+
+std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view   scene_id,
+                                            const std::string& buf,
+                                            fs::VFS&           vfs,
+                                            audio::SoundManager& sm,
+                                            const UserPropertyMap* user_properties,
+                                            double               text_render_scale) {
     nlohmann::json json;
     if (! PARSE_JSON(buf, json)) return nullptr;
 
@@ -1512,8 +4233,84 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     context.user_properties = user_properties;
 
     std::vector<WPObjectVar> wp_objs;
+    std::unordered_map<int32_t, VisibilityContract> layer_visibility_contracts;
+    std::unordered_map<int32_t, std::string> initial_layer_config_json_by_id;
+    std::unordered_set<int32_t> dependency_source_ids;
+    std::unordered_set<std::string> script_referenced_layer_names;
+
+    CollectScriptReferencedLayerNames(json, script_referenced_layer_names);
 
     for (auto& obj : json.at("objects")) {
+        if (obj.contains("dependencies") && obj.at("dependencies").is_array()) {
+            for (const auto& dependency : obj.at("dependencies")) {
+                int32_t dependency_id = 0;
+                GET_JSON_VALUE_NOWARN(dependency, dependency_id);
+                if (dependency_id != 0) dependency_source_ids.insert(dependency_id);
+            }
+        }
+    }
+
+    for (auto& obj : json.at("objects")) {
+        int32_t object_id = 0;
+        std::string object_name;
+        GET_JSON_NAME_VALUE_NOWARN(obj, "id", object_id);
+        GET_JSON_NAME_VALUE_NOWARN(obj, "name", object_name);
+
+        const bool is_image_layer = obj.contains("image") && !obj.at("image").is_null();
+        const bool script_referenced_hidden_image =
+            is_image_layer && object_id != 0 && !object_name.empty() &&
+            !ReadAuthoredVisibleValue(obj) &&
+            script_referenced_layer_names.count(object_name) != 0;
+
+        LazyMaterializeKind lazy_kind = LazyMaterializeKind::None;
+        if (obj.contains("particle") && !obj.at("particle").is_null()) {
+            lazy_kind = LazyMaterializeKind::Particle;
+        } else if (obj.contains("text") && !obj.at("text").is_null()) {
+            lazy_kind = LazyMaterializeKind::Text;
+        }
+
+        if (object_id != 0) {
+            // Deferred runtime materialization must keep the exact authored JSON for this layer id.
+            // The parser prunes static hidden layers before building Scene::layerOrder, so using the
+            // surviving vector index later can point a hidden dynamic particle/text layer at a
+            // different original object and make false->true user-property toggles realize the
+            // wrong runtime layer.
+            initial_layer_config_json_by_id[object_id] = obj.dump();
+
+            auto visibility_contract = BuildObjectVisibilityContractFromJson(
+                obj,
+                user_properties,
+                dependency_source_ids.count(object_id) != 0,
+                script_referenced_hidden_image,
+                lazy_kind);
+            layer_visibility_contracts[object_id] = visibility_contract;
+
+            if (object_name == "Stars" || object_id == 1183 || object_id == 413) {
+                const auto* visible_json = FindVisibleProperty(obj);
+                const auto binding =
+                    ReadVisibleBindingFromJson(visible_json, ReadAuthoredVisibleValue(obj));
+                // The 3308867900 star-river layers are user-property controlled
+                // particle layers.  Logging their parse-time contract separates
+                // "the scene was parsed with defaults" from "runtime changed it
+                // later", which is the key distinction for switch-only flicker.
+                LOG_INFO("SceneVisibilityProbe: id=%d name='%s' particle=%s user='%s' "
+                         "condition='%s' property=%s authored=%s binding-value=%s "
+                         "initial=%s runtime-contract=%s lazy=%s",
+                         object_id,
+                         object_name.c_str(),
+                         obj.contains("particle") && !obj.at("particle").is_null() ? "true" : "false",
+                         binding.user.name.c_str(),
+                         binding.user.condition.c_str(),
+                         DescribeUserPropertyForLog(user_properties, binding.user.name).c_str(),
+                         visibility_contract.authored_visible ? "true" : "false",
+                         binding.value ? "true" : "false",
+                         visibility_contract.initial_visible ? "true" : "false",
+                         visibility_contract.requires_runtime_contract ? "true" : "false",
+                         lazy_kind == LazyMaterializeKind::Particle ? "particle" :
+                             (lazy_kind == LazyMaterializeKind::Text ? "text" : "none"));
+            }
+        }
+
         if (obj.contains("image") && ! obj.at("image").is_null()) {
             AddWPObject<wpscene::WPImageObject>(wp_objs, obj, vfs, user_properties);
         } else if (obj.contains("particle") && ! obj.at("particle").is_null()) {
@@ -1522,6 +4319,13 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             AddWPObject<wpscene::WPSoundObject>(wp_objs, obj, vfs, user_properties);
         } else if (obj.contains("light") && ! obj.at("light").is_null()) {
             AddWPObject<wpscene::WPLightObject>(wp_objs, obj, vfs, user_properties);
+        } else if (obj.contains("text") && ! obj.at("text").is_null()) {
+            AddWPObject<wpscene::WPTextObject>(wp_objs, obj, vfs, user_properties);
+        } else if (obj.contains("shape") && ! obj.at("shape").is_null()) {
+            // Wallpaper Engine uses shape objects for direct-draw effects such as Light Shafts.
+            // They have no `image` field, so they must be classified before the generic empty
+            // object fallback or their effect chain never reaches the render graph.
+            AddWPObject<WPShapeObject>(wp_objs, obj, vfs, user_properties);
         } else {
             AddWPObject<WPEmptyObject>(wp_objs, obj, vfs, user_properties);
         }
@@ -1530,6 +4334,16 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     std::unordered_set<int32_t> hidden_object_ids;
     for (const auto& obj : wp_objs) {
         const auto id = GetObjectId(obj);
+        if (id.has_value()) {
+            const auto contract_it = layer_visibility_contracts.find(*id);
+            if (contract_it != layer_visibility_contracts.end()) {
+                if (contract_it->second.requires_runtime_contract) continue;
+                if (contract_it->second.can_prune_at_parse_time) {
+                    hidden_object_ids.insert(*id);
+                    continue;
+                }
+            }
+        }
         if (id.has_value() && ! IsObjectVisible(obj)) hidden_object_ids.insert(*id);
     }
 
@@ -1542,12 +4356,26 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             if (! hidden_object_ids.count(parent_id)) continue;
 
             const auto id = GetObjectId(obj);
+            if (id.has_value()) {
+                const auto contract_it = layer_visibility_contracts.find(*id);
+                if (contract_it != layer_visibility_contracts.end() &&
+                    contract_it->second.requires_runtime_contract) {
+                    continue;
+                }
+            }
             if (id.has_value() && hidden_object_ids.insert(*id).second) changed = true;
         }
     }
 
-    std::erase_if(wp_objs, [&hidden_object_ids](const auto& obj) {
+    std::erase_if(wp_objs, [&hidden_object_ids, &layer_visibility_contracts](const auto& obj) {
         const auto id = GetObjectId(obj);
+        if (id.has_value()) {
+            const auto contract_it = layer_visibility_contracts.find(*id);
+            if (contract_it != layer_visibility_contracts.end() &&
+                contract_it->second.requires_runtime_contract) {
+                return false;
+            }
+        }
         return id.has_value() && hidden_object_ids.count(*id) != 0;
     });
 
@@ -1562,6 +4390,15 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                        [&context](const wpscene::WPLightObject& obj) {
                            if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
                        },
+                       [&context](const wpscene::WPTextObject& obj) {
+                           if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
+                       },
+                       [&context](const WPShapeObject& obj) {
+                           // Shape effect layers participate in the same inherited-parent ordering
+                           // as images; otherwise a parented direct-draw light shaft would resolve
+                           // outside the transform that authored its final screen position.
+                           if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
+                       },
                        [&context](const WPEmptyObject& obj) {
                            if (obj.parent != 0) context.dependent_parent_ids.insert(obj.parent);
                        },
@@ -1574,11 +4411,21 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         i32 w = 0, h = 0;
         for (auto& obj : wp_objs) {
             auto* img = std::get_if<wpscene::WPImageObject>(&obj);
-            if (img == nullptr) continue;
-            i32 size = (i32)(img->size.at(0) * img->size.at(1));
+            auto* shape = std::get_if<WPShapeObject>(&obj);
+            const std::array<float, 2>* candidate_size = nullptr;
+            if (img != nullptr) {
+                candidate_size = &img->size;
+            } else if (shape != nullptr && shape->has_size) {
+                // Authored shape sizes can define the projection when no larger image layer exists;
+                // implicit full-screen shape sizes are resolved later from the final projection and
+                // must not feed this auto-projection bootstrap loop.
+                candidate_size = &shape->size;
+            }
+            if (candidate_size == nullptr) continue;
+            i32 size = (i32)(candidate_size->at(0) * candidate_size->at(1));
             if (size > w * h) {
-                w = (i32)img->size.at(0);
-                h = (i32)img->size.at(1);
+                w = (i32)candidate_size->at(0);
+                h = (i32)candidate_size->at(1);
             }
         }
         sc.general.orthogonalprojection.width  = w;
@@ -1586,23 +4433,41 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
 
     InitContext(context, vfs, sc, scene_id);
+    context.layer_visibility_contracts = std::move(layer_visibility_contracts);
+    context.scene->soundManager = &sm;
+    // Parse text layers at the final renderer scale whenever the caller already knows it.
+    // This removes the guaranteed scene-load rerender that used to happen later on the
+    // render thread just to rebuild the same text at a different device scale.
+    context.scene->textRenderScale = std::max(1.0, text_render_scale);
+    context.scene->offscreenDependencyLayerIds = dependency_source_ids;
+    if (user_properties) {
+        context.scene->userProperties = *user_properties;
+    } else {
+        context.scene->userProperties.clear();
+    }
     ParseCamera(context, sc.general);
 
     {
         context.scene->renderTargets[SpecTex_Default.data()] = {
             .width  = context.ortho_w,
             .height = context.ortho_h,
+            .mapWidth = context.ortho_w,
+            .mapHeight = context.ortho_h,
             .bind   = { .enable = true, .screen = true },
         };
         context.scene->renderTargets[WE_MIP_MAPPED_FRAME_BUFFER.data()] = {
             .width      = context.ortho_w,
             .height     = context.ortho_h,
+            .mapWidth   = context.ortho_w,
+            .mapHeight  = context.ortho_h,
             .has_mipmap = true,
             .bind       = { .enable = true, .name = SpecTex_Default.data() }
         };
         context.scene->renderTargets["_rt_shadowAtlas"] = {
             .width      = context.ortho_w,
             .height     = context.ortho_h,
+            .mapWidth   = context.ortho_w,
+            .mapHeight  = context.ortho_h,
             .allowReuse = true,
             .withDepth  = true,
             .bind       = { .enable = true, .screen = true },
@@ -1611,21 +4476,48 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     context.scene->scene_id = scene_id;
 
-    WPShaderParser::InitGlslang();
+    WPShaderParser::InitGlslang("scene-parse");
 
     for (WPObjectVar& obj : wp_objs) {
         std::visit(visitor::overload {
-                       [&context](wpscene::WPImageObject& obj) {                           
-                            ParseImageObj(context, obj);
+                       [&context](wpscene::WPImageObject& obj) {
+                            const auto* visibility_contract =
+                                FindLayerVisibilityContract(context, obj.id);
+                            const bool force_runtime_materialization =
+                                visibility_contract != nullptr &&
+                                visibility_contract->requires_runtime_contract;
+
+                            // Image layers now keep the authored initial visibility intact while
+                            // still materializing runtime-controlled hidden nodes. RegisterLayerSceneState()
+                            // applies that initial local visibility after the node exists, so scripts
+                            // can later flip visibility without the parser pretending the layer was
+                            // authored visible.
+                            ParseImageObj(context, obj, force_runtime_materialization);
                        },
                        [&context](wpscene::WPParticleObject& obj) {
                            ParseParticleObj(context, obj);
                        },
                        [&context, &sm](wpscene::WPSoundObject& obj) {
-                           WPSoundParser::Parse(obj, *context.vfs, sm);
+                           context.scene->objectRuntimeSoundHandles[obj.id] =
+                               WPSoundParser::Parse(obj, *context.vfs, sm);
                        },
                        [&context](wpscene::WPLightObject& obj) {
                            ParseLightObj(context, obj);
+                       },
+                       [&context](wpscene::WPTextObject& obj) {
+                           ParseTextObj(context, obj);
+                       },
+                       [&context](WPShapeObject& obj) {
+                           const auto* visibility_contract =
+                               FindLayerVisibilityContract(context, obj.id);
+                           const bool force_runtime_materialization =
+                               visibility_contract != nullptr &&
+                               visibility_contract->requires_runtime_contract;
+
+                           // Shape direct-draw effects mirror image-layer visibility behavior:
+                           // materialize runtime-controlled hidden layers, then let the shared
+                           // layer visibility state apply the authored initial value.
+                           ParseShapeObj(context, obj, force_runtime_materialization);
                        },
                        [&context](WPEmptyObject& obj) {
                            ParseEmptyObj(context, obj);
@@ -1634,7 +4526,36 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                    obj);
     }
 
-    WPShaderParser::FinalGlslang();
+    RegisterSceneScripts(context, json);
+
+    context.scene->layerOrder.clear();
+    context.scene->layerNodes.clear();
+    context.scene->initialLayerConfigJson.clear();
+    context.scene->layerNameToId.clear();
+    for (const auto& obj : wp_objs) {
+        const auto object_id = GetObjectId(obj);
+        if (!object_id.has_value()) continue;
+
+        auto node_it = context.object_nodes.find(*object_id);
+        context.scene->layerOrder.push_back(*object_id);
+        context.scene->layerNodes[*object_id] =
+            node_it != context.object_nodes.end() && node_it->second ? node_it->second.get() : nullptr;
+        if (auto config_it = initial_layer_config_json_by_id.find(*object_id);
+            config_it != initial_layer_config_json_by_id.end()) {
+            context.scene->initialLayerConfigJson[*object_id] = config_it->second;
+        }
+
+        const auto node_name =
+            node_it != context.object_nodes.end() && node_it->second ? node_it->second->Name()
+                                                                     : GetObjectName(obj);
+        if (!node_name.empty()) {
+            context.scene->layerNameToId[node_name] = *object_id;
+        }
+    }
+
+    context.scene->ApplyAllLayerVisibility();
+
+    WPShaderParser::FinalGlslang("scene-parse");
     return context.scene;
 }
 

@@ -1,13 +1,16 @@
 #pragma once
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
 #include "WPJson.hpp"
 #include "WPUserProperties.hpp"
-#include <nlohmann/json.hpp>
 #include "WPMaterial.h"
-#include <vector>
 #include "WPPuppet.hpp"
-#include <unordered_set>
-#include <string>
-#include <filesystem>
+#include "wpscene/WPEffect.h"
 
 namespace wallpaper
 {
@@ -18,42 +21,6 @@ class VFS;
 
 namespace wpscene
 {
-
-class WPEffectCommand {
-public:
-    bool        FromJson(const nlohmann::json&);
-    std::string command;
-    std::string target;
-    std::string source;
-
-    i32 afterpos { 0 }; // 0 for begin, start from 1
-};
-
-class WPEffectFbo {
-public:
-    bool        FromJson(const nlohmann::json&);
-    std::string name;
-    std::string format;
-    uint32_t    scale { 1 };
-};
-
-class WPImageEffect {
-private:
-    static const std::unordered_set<std::string> BLACKLISTED_WORKSHOP_EFFECTS;
-    bool IsEffectBlacklisted(const std::string& filePath);
-public:
-    bool                         FromJson(const nlohmann::json&, fs::VFS& vfs);
-    bool                         FromFileJson(const nlohmann::json&, fs::VFS& vfs);
-    int32_t                      id;
-    std::string                  name;
-    bool                         visible { true };
-    VisibleBinding               visible_binding;
-    int32_t                      version;
-    std::vector<WPMaterial>      materials;
-    std::vector<WPMaterialPass>  passes;
-    std::vector<WPEffectCommand> commands;
-    std::vector<WPEffectFbo>     fbos;
-};
 
 class WPImageObject {
 public:
@@ -73,6 +40,11 @@ public:
     float                      alpha { 1.0f };
     float                      brightness { 1.0f };
     bool                       fullscreen { false };
+    bool                       autosize { false };
+    // Wallpaper Engine's `models/util/projectlayer.json` stores this marker in the model asset,
+    // not on the scene object itself. Keeping it on the parsed image object lets the scene parser
+    // distinguish logical framebuffer helper layers from normal drawable image layers.
+    bool                       projectlayer { false };
     bool                       nopadding { false };
     bool                       visible { true };
     VisibleBinding             visible_binding;
@@ -80,6 +52,7 @@ public:
     int32_t                    parent { 0 };
     std::string                attachment;
     std::string                alignment { "center" };
+    std::array<float, 2>       effectSourceSize { 0.0f, 0.0f };
     WPMaterial                 material;
     std::vector<WPImageEffect> effects;
     Config                     config;
@@ -88,8 +61,9 @@ public:
     std::vector<WPPuppetLayer::AnimationLayer> puppet_layers;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale);
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageEffect, name, visible, passes, fbos, materials);
+// Image objects now depend on the neutral WPEffect model instead of owning those declarations.
+// Text objects include the same effect header directly, which removes the previous text->image
+// header dependency while preserving the authored effect JSON shape.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageObject, name, origin, angles, scale, size, visible,
                                    material, effects);
 

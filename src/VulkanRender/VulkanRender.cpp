@@ -1,11 +1,14 @@
 #include "VulkanRender.hpp"
+#include <typeinfo>
 
 #include "Utils/Logging.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "Scene/Scene.h"
+#include "Interface/IImageParser.h"
 #include "Interface/IShaderValueUpdater.h"
 
 #include "Utils/Algorism.h"
+#include "WPShaderParser.hpp"
 
 #include <glslang/Public/ShaderLang.h>
 
@@ -23,8 +26,8 @@
 #include "Core/ArrayHelper.hpp"
 
 #include <cassert>
-#include <vector>
 #include <cstdint>
+#include <vector>
 
 #if ENABLE_RENDERDOC_API
 #    include "RenderDoc.h"
@@ -62,7 +65,9 @@ struct VulkanRender::Impl {
     void DestroyRenderingResource(RenderingResources&);
 
     void clearLastRenderGraph();
-    void compileRenderGraph(Scene&, rg::RenderGraph&);
+    void clearRenderGraphResources();
+    void compileRenderGraph(Scene&, rg::RenderGraph&, bool refresh_resources_only);
+    void refreshImportedTextures(Scene&);
     void UpdateCameraFillMode(Scene&, wallpaper::FillMode);
 
     bool initRes();
@@ -94,6 +99,7 @@ struct VulkanRender::Impl {
     RenderingResources                 m_rendering_resources;
 
     std::vector<VulkanPass*> m_passes;
+
 };
 
 VulkanRender::VulkanRender(): pImpl(std::make_unique<Impl>()) {}
@@ -105,8 +111,12 @@ bool VulkanRender::init(RenderInitInfo info) { return pImpl->init(info); }
 void VulkanRender::destroy() { pImpl->destroy(); }
 void VulkanRender::drawFrame(Scene& scene) { pImpl->drawFrame(scene); };
 void VulkanRender::clearLastRenderGraph() { pImpl->clearLastRenderGraph(); };
-void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
-    pImpl->compileRenderGraph(scene, rg);
+void VulkanRender::clearRenderGraphResources() { pImpl->clearRenderGraphResources(); };
+void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg, bool refresh_resources_only) {
+    pImpl->compileRenderGraph(scene, rg, refresh_resources_only);
+};
+void VulkanRender::refreshImportedTextures(Scene& scene) {
+    pImpl->refreshImportedTextures(scene);
 };
 void VulkanRender::UpdateCameraFillMode(Scene& scene, wallpaper::FillMode fill) {
     pImpl->UpdateCameraFillMode(scene, fill);
@@ -288,6 +298,10 @@ void VulkanRender::Impl::DestroyRenderingResource(RenderingResources& rr) {}
 void VulkanRender::Impl::drawFrame(Scene& scene) {
     if (! (m_inited && m_pass_loaded)) return;
 
+    // The QuickJS host records getVideoTexture().play()/pause() decisions on Scene before the
+    // renderer polls GStreamer. Applying them here keeps hidden authored videos from decoding
+    // while prepared passes can still reuse the last uploaded frame when they are invisible.
+    m_device->video_tex_cache().ApplyPlaybackStates(scene.videoTexturePaused);
     m_device->video_tex_cache().Poll();
 
         // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);
@@ -313,6 +327,17 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
 #endif
 }
 
+void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {
+    if (!m_device) return;
+
+    for (const auto& key : scene.dirtyImportedTextureKeys) {
+        auto image = scene.imageParser ? scene.imageParser->Parse(key) : nullptr;
+        if (!image) continue;
+        m_device->tex_cache().CreateTex(*image);
+    }
+    scene.dirtyImportedTextureKeys.clear();
+}
+
 void VulkanRender::Impl::drawFrameSwapchain() {
     static size_t resource_index = 0;
 
@@ -329,6 +354,15 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     const auto& image = m_device->swapchain().images()[image_index];
 
     m_finpass->setPresent(image);
+
+    for (auto* p : m_passes) {
+        if (p->prepared()) {
+            // Dynamic passes copy current CPU-side vertex/index bytes into staging before the
+            // upload command is recorded. This keeps reused-source particle systems from binding a
+            // freshly grown suballocation whose GPU contents have not been uploaded yet.
+            p->updateBeforeUpload();
+        }
+    }
 
     (void)rr.command.Begin(VkCommandBufferBeginInfo {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -378,6 +412,15 @@ void VulkanRender::Impl::drawFrameOffscreen() {
 
     m_finpass->setPresent(image);
 
+    for (auto* p : m_passes) {
+        if (p->prepared()) {
+            // Offscreen rendering exports the result to GTK, making stale particle bytes visible as
+            // source-switch flicker. Pre-updating dynamic mesh data aligns the following m_dyn_buf
+            // upload with the frame that will be exported.
+            p->updateBeforeUpload();
+        }
+    }
+
     (void)rr.command.Begin(VkCommandBufferBeginInfo {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
@@ -414,6 +457,10 @@ void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) 
         if (rt.bind.enable && rt.bind.screen) {
             rt.width  = (i32)(rt.bind.scale * ext.width);
             rt.height = (i32)(rt.bind.scale * ext.height);
+            // Screen-sized render targets expose the full framebuffer as both their physical and
+            // logical extent. Only text-owned runtime targets intentionally diverge these values.
+            rt.mapWidth = rt.width;
+            rt.mapHeight = rt.height;
         }
     }
     for (auto& item : scene.renderTargets) {
@@ -426,6 +473,12 @@ void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) 
         }
         rt.width  = (i32)(rt.bind.scale * bind_rt->second.width);
         rt.height = (i32)(rt.bind.scale * bind_rt->second.height);
+        // Bound render targets inherit the sampled content rectangle from their source target so
+        // shader uniforms continue to describe the authored image area rather than the raw backing
+        // allocation. This keeps generic effect chains consistent whenever the source target uses
+        // a logical content rectangle that differs from its physical allocation.
+        rt.mapWidth = (i32)(rt.bind.scale * bind_rt->second.ContentWidth());
+        rt.mapHeight = (i32)(rt.bind.scale * bind_rt->second.ContentHeight());
     }
     for (auto& item : scene.renderTargets) {
         auto& rt = item.second;
@@ -492,6 +545,9 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
 }
 
 void VulkanRender::Impl::clearLastRenderGraph() {
+    // A topology rebuild invalidates the compiled pass list and the backing mesh buffers that were
+    // uploaded for the previous graph. Reallocating those buffers keeps the full rebuild path
+    // conservative and mirrors the historical behavior used when nodes were added or removed.
     for (auto& p : m_passes) {
         p->destory(*m_device, m_rendering_resources);
     }
@@ -506,9 +562,92 @@ void VulkanRender::Impl::clearLastRenderGraph() {
     m_dyn_buf->allocate();
 }
 
-void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
+void VulkanRender::Impl::clearRenderGraphResources() {
+    // Resource-only rebuilds are hot resource refreshes, not a miniature full rebuild. Particle
+    // effects already update every frame without clearing global caches; effect-backed text must
+    // follow the same rule. TextureCache::Query now detects per-key TextureKey changes and
+    // reallocates only the resized render target, so clearing the entire cache here would recreate
+    // unrelated offscreen images and reintroduce the minute-rollover hitch.
+}
+
+void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
+                                            bool refresh_resources_only) {
     if (! m_inited) return;
     m_pass_loaded = false;
+
+    auto submit_pending_uploads = [&]() -> bool {
+        VVK_CHECK_BOOL_RE(m_upload_cmd.Begin(VkCommandBufferBeginInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        }));
+        m_vertex_buf->recordUpload(m_upload_cmd);
+        // Resource refresh can now update dynamic text meshes and text-backed effect quads before
+        // the first post-refresh frame is recorded. Uploading the dynamic buffer here makes those
+        // writes visible immediately, instead of waiting for the next frame and briefly drawing
+        // resized text bridge passes with stale or uninitialized GPU subranges.
+        m_dyn_buf->recordUpload(m_upload_cmd);
+        VVK_CHECK_BOOL_RE(m_upload_cmd.End());
+        VkSubmitInfo sub_info {
+            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext              = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers    = m_upload_cmd.address(),
+        };
+        VVK_CHECK_BOOL_RE(m_device->graphics_queue().handle.Submit(sub_info, {}));
+        VVK_CHECK_BOOL_RE(m_device->handle().WaitIdle());
+        return true;
+    };
+
+    if (refresh_resources_only && !m_passes.empty()) {
+        setRenderTargetSize(scene, rg);
+
+        const auto dirty_render_targets = scene.dirtyRenderTargetKeys;
+        const auto dirty_text_layers = scene.dirtyTextLayerIds;
+        // A resource refresh can now be targeted either by render-target key or by text layer id.
+        // Treating an empty render-target set as "refresh everything" was correct before direct
+        // text had its own dirty set, but it would turn every Clock tick back into a full pass walk.
+        const bool has_targeted_dirty_resources =
+            !dirty_render_targets.empty() || !dirty_text_layers.empty();
+        const bool refresh_all =
+            scene.renderGraphAllResourcesDirty || !has_targeted_dirty_resources;
+        std::size_t refreshed_passes = 0;
+        std::size_t prepared_passes = 0;
+
+        WPShaderParser::InitGlslang("render-graph-resource-refresh");
+        for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
+            auto* p = m_passes[pass_index];
+            if (p == nullptr) continue;
+
+            const bool affected =
+                refresh_all || p->referencesAnyRenderTarget(dirty_render_targets) ||
+                p->referencesAnyTextLayer(dirty_text_layers);
+            if (!affected) continue;
+
+            if (p->prepared()) {
+                // Text bridge updates are now target-scoped like particle resources: refresh only
+                // passes that touch the resized render targets so a one-pixel glyph-width change
+                // cannot force every static shader pass in the wallpaper to rebind resources.
+                p->refreshResources(scene, *m_device, m_rendering_resources);
+                refreshed_passes++;
+            }
+            if (!p->prepared()) {
+                p->prepare(scene, *m_device, m_rendering_resources);
+                prepared_passes++;
+            }
+        }
+        WPShaderParser::FinalGlslang("render-graph-resource-refresh");
+
+        // Resource-only refreshes are intentionally silent in production; the counters stay local
+        // so the branch preserves targeted text-bridge behavior without making minute rollovers
+        // spend time formatting render-graph diagnostics.
+        (void)refresh_all;
+        (void)refreshed_passes;
+        (void)prepared_passes;
+        if (!submit_pending_uploads()) return;
+        m_pass_loaded = true;
+        return;
+    }
 
     auto nodes             = rg.topologicalOrder();
     auto node_release_texs = rg.getLastReadTexs(nodes);
@@ -537,30 +676,22 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
 
     setRenderTargetSize(scene, rg);
 
-    glslang::InitializeProcess();
-    for (auto* p : m_passes) {
-        if (! p->prepared()) {
+    WPShaderParser::InitGlslang("render-graph-compile");
+    for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
+        auto* p = m_passes[pass_index];
+        LOG_INFO("RenderGraphCompile: prepare index=%zu type=%s prepared=%s",
+                 pass_index,
+                 p != nullptr ? typeid(*p).name() : "(null)",
+                 p != nullptr && p->prepared() ? "true" : "false");
+        if (refresh_resources_only && p != nullptr && p->prepared()) {
+            p->refreshResources(scene, *m_device, m_rendering_resources);
+        }
+        if (p != nullptr && !p->prepared()) {
             p->prepare(scene, *m_device, m_rendering_resources);
         }
     }
-    glslang::FinalizeProcess();
+    WPShaderParser::FinalGlslang("render-graph-compile");
 
-    VVK_CHECK_VOID_RE(m_upload_cmd.Begin(VkCommandBufferBeginInfo {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    }));
-    m_vertex_buf->recordUpload(m_upload_cmd);
-    VVK_CHECK_VOID_RE(m_upload_cmd.End());
-    {
-        VkSubmitInfo sub_info {
-            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext              = nullptr,
-            .commandBufferCount = 1,
-            .pCommandBuffers    = m_upload_cmd.address(),
-        };
-        VVK_CHECK_VOID_RE(m_device->graphics_queue().handle.Submit(sub_info, {}));
-        VVK_CHECK_VOID_RE(m_device->handle().WaitIdle());
-    }
+    if (!submit_pending_uploads()) return;
     m_pass_loaded = true;
 };

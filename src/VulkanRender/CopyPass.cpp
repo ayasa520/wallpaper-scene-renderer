@@ -11,6 +11,13 @@ CopyPass::CopyPass(const Desc& desc): m_desc(desc) {}
 
 CopyPass::~CopyPass() {};
 
+bool CopyPass::referencesRenderTarget(std::string_view render_target) const {
+    // Copy passes only need a resource refresh when their source or destination render target was
+    // resized/recreated. Skipping unrelated copies keeps text bridge updates from walking the
+    // entire graph just to refresh handles that still point at valid images.
+    return m_desc.src == render_target || m_desc.dst == render_target;
+}
+
 void CopyPass::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
     if (scene.renderTargets.count(m_desc.src) == 0) {
         LOG_ERROR("%s not found", m_desc.src.c_str());
@@ -49,7 +56,39 @@ void CopyPass::prepare(Scene& scene, const Device& device, RenderingResources& r
 
     setPrepared();
 };
+
+void CopyPass::refreshResources(Scene& scene, const Device& device, RenderingResources&) {
+    // Resource-only refreshes only need to look up the recreated source/destination render-target
+    // handles. The copy pass has no pipeline state of its own, so re-querying the cache is enough
+    // to make the next execute use the resized images without paying the full prepare cost.
+    std::array<std::string, 2>      textures    = { m_desc.src, m_desc.dst };
+    std::array<ImageParameters*, 2> vk_textures = { &m_desc.vk_src, &m_desc.vk_dst };
+    for (usize i = 0; i < textures.size(); i++) {
+        auto& tex_name = textures[i];
+        if (tex_name.empty()) continue;
+
+        if (!IsSpecTex(tex_name) || scene.renderTargets.count(tex_name) == 0) {
+            setPrepared(false);
+            return;
+        }
+        auto& rt = scene.renderTargets.at(tex_name);
+        auto  opt = device.tex_cache().Query(tex_name, ToTexKey(rt), !rt.allowReuse);
+        if (!opt.has_value()) {
+            setPrepared(false);
+            return;
+        }
+        *vk_textures[i] = opt.value();
+    }
+}
+
 void CopyPass::execute(const Device& device, RenderingResources& rr) {
+    if (m_desc.should_execute && !m_desc.should_execute()) {
+        // The render graph still declares this copy as an ordering edge, but runtime visibility can
+        // make the actual transfer unnecessary for the current frame. Returning here is what keeps
+        // visible toggles cheap and avoids rebuilding the graph just to skip one effect branch.
+        return;
+    }
+
     auto& cmd = rr.command;
     auto& src = m_desc.vk_src;
     auto& dst = m_desc.vk_dst;
@@ -152,4 +191,9 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
         device.tex_cache().RecGenerateMipmaps(cmd, dst);
     }
 };
-void CopyPass::destory(const Device&, RenderingResources&) {}
+void CopyPass::destory(const Device&, RenderingResources&) {
+    // Copy passes also keep their pass objects across resource-only refreshes. Resetting the
+    // prepared state guarantees that recreated render targets are rebound from the texture cache
+    // instead of reusing stale source/destination image handles captured by the previous prepare.
+    setPrepared(false);
+}

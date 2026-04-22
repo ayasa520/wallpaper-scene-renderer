@@ -53,6 +53,8 @@ public:
 
     Type type() const noexcept;
     bool isNull() const noexcept;
+    bool equals(const WPDynamicValue& other) const noexcept;
+    std::string describe() const;
 
     template<typename T>
     bool tryGet(T* out_value) const;

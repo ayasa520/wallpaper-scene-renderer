@@ -4,6 +4,8 @@
 #include "Parameters.hpp"
 #include "vk_mem_alloc.h"
 
+#include <vector>
+
 namespace wallpaper
 {
 namespace vulkan
@@ -34,15 +36,24 @@ public:
     void destroy();
 
     bool allocateSubRef(VkDeviceSize size, StagingBufferRef&, VkDeviceSize alignment = 1);
-    void unallocateSubRef(const StagingBufferRef&);
+    void unallocateSubRef(StagingBufferRef&);
     bool writeToBuf(const StagingBufferRef&, std::span<uint8_t>, size_t offset = 0);
     bool fillBuf(const StagingBufferRef& ref, size_t offset, size_t size, uint8_t c);
 
     bool recordUpload(vvk::CommandBuffer&);
 
     VkBuffer gpuBuf() const;
+    VkDeviceSize stageBytes() const;
+    VkDeviceSize gpuBytes() const;
+    VkDeviceSize trackedBytes() const;
+    size_t       blockCount() const;
 
 private:
+    struct DirtyRange {
+        VkDeviceSize offset { 0 };
+        VkDeviceSize size { 0 };
+    };
+
     struct VirtualBlock {
         VmaVirtualBlock handle {};
         bool            enabled { false };
@@ -54,6 +65,8 @@ private:
     VkResult      mapStageBuf();
     VirtualBlock* newVirtualBlock(VkDeviceSize);
     bool          increaseBuf(VkDeviceSize);
+    void          markDirty(VkDeviceSize offset, VkDeviceSize size);
+    void          markAllDirty();
 
     const Device& m_device;
     VkDeviceSize  m_size_step;
@@ -65,6 +78,10 @@ private:
 
     VmaBufferParameters m_stage_buf;
     VmaBufferParameters m_gpu_buf;
+    // Dynamic staging buffers can become much larger than the bytes touched in a frame. Tracking
+    // merged dirty ranges keeps per-frame flush/copy work proportional to real writes instead of
+    // to the total backing allocation reserved for possible future particle growth.
+    std::vector<DirtyRange> m_dirty_ranges;
 };
 
 } // namespace vulkan

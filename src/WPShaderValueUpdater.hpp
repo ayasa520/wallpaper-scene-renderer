@@ -39,6 +39,8 @@ struct WPUniformInfo {
     bool has_TEXELSIZEHALF { false };
     bool has_SCREEN { false };
     bool has_LP { false };
+    std::array<bool, 3> has_audio_spectrum_left { false, false, false };
+    std::array<bool, 3> has_audio_spectrum_right { false, false, false };
 
     struct Tex {
         bool has_resolution { false };
@@ -132,7 +134,18 @@ public:
     void SetTexelSize(float x, float y) override;
 
     void SetNodeData(void*, const WPShaderValueData&);
-    void SetCameraParallax(const WPCameraParallax& value) { m_parallax = value; }
+    const WPShaderValueData* GetNodeData(const void* node_addr) const;
+    WPShaderValueData*       GetNodeData(const void* node_addr);
+    void SetCameraParallax(const WPCameraParallax& value) {
+        m_parallax = value;
+        // Camera parallax changes alter the derived model transforms even when the authored layer
+        // transform data is unchanged. Clear the per-frame caches immediately so a runtime toggle
+        // cannot leave puppet/model layers using offsets computed with the previous global state.
+        m_modelTransformCache.clear();
+        m_parallaxOffsetCache.clear();
+        m_attachmentTransformCache.clear();
+    }
+    uint64_t NextPuppetFrameSerial() const noexcept { return m_puppet_frame_serial + 1; }
 
     void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
 
