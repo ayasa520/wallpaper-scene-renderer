@@ -37,15 +37,19 @@ public:
     virtual ~WPSoundStream() = default;
 
     uint64_t NextPcmData(void* pData, uint32_t frameCount) override {
+        if (m_soundPaths.empty()) return 0;
+
         // first
         if (! m_curActive) {
             Switch();
         }
+        if (! m_curActive) return 0;
 
         // loop
         uint64_t frameReads = m_curActive->NextPcmData(pData, frameCount);
         if (frameReads == 0) {
             Switch();
+            if (! m_curActive) return 0;
             frameReads = m_curActive->NextPcmData(pData, frameCount);
         }
         // volume
@@ -64,9 +68,33 @@ public:
         m_curIndex = m_soundPaths.empty() ? 0 : static_cast<uint32_t>(m_soundPaths.size() - 1);
     }
     void Switch() {
-        std::string path = m_soundPaths[LoopIndex()];
-        // LOG_INFO("Switch to audio file: %s", path.c_str());
-        m_curActive = audio::CreateSoundStream(vfs.Open("/assets/" + path), m_desc);
+        if (m_soundPaths.empty()) return;
+
+        const std::string path = m_soundPaths[LoopIndex()];
+        auto              stream = vfs.Open("/assets/" + path);
+        if (! stream) {
+            // Keep missing packaged assets visible in run.log with the authored path. Without this
+            // log a failed music selection only looks like silence from the script side.
+            LOG_ERROR("SceneSoundSwitch: asset-open-failed path='%s'", path.c_str());
+            m_curActive.reset();
+            return;
+        }
+
+        m_curActive = audio::CreateSoundStream(std::move(stream), m_desc);
+        if (! m_curActive) {
+            // Decoder creation is deferred until the stream is actually played, so the switch log
+            // carries the sound asset path that the generic SoundManager layer cannot know.
+            LOG_ERROR("SceneSoundSwitch: decoder-create-failed path='%s' channels=%u sample-rate=%u",
+                      path.c_str(),
+                      m_desc.channels,
+                      m_desc.sampleRate);
+            return;
+        }
+
+        LOG_INFO("SceneSoundSwitch: path='%s' channels=%u sample-rate=%u",
+                 path.c_str(),
+                 m_desc.channels,
+                 m_desc.sampleRate);
     }
     uint32_t LoopIndex() {
         m_curIndex++;
@@ -92,5 +120,21 @@ audio::SoundHandle WPSoundParser::Parse(const wpscene::WPSoundObject& obj, fs::V
                                    .mode    = ToPlaybackMode(obj.playbackmode) };
 
     auto ss = std::make_unique<WPSoundStream>(obj.sound, vfs, config);
-    return sm.MountStream(std::move(ss), obj.volume, obj.visible);
+    // startsilent is a playback gate, not a visibility gate.  Sound layers must still be mounted so
+    // thisScene.getLayer(name) can resolve them, while autoplay stays disabled until script calls
+    // play() on the selected layer.
+    const bool autoplay = obj.visible && ! obj.startsilent;
+    const auto handle   = sm.MountStream(std::move(ss), obj.volume, autoplay);
+    LOG_INFO("SceneSoundMount: layer=%d name='%s' handle=%u sounds=%zu volume=%.3f visible=%s "
+             "startsilent=%s autoplay=%s playbackmode='%s'",
+             obj.id,
+             obj.name.c_str(),
+             handle,
+             obj.sound.size(),
+             obj.volume,
+             obj.visible ? "true" : "false",
+             obj.startsilent ? "true" : "false",
+             autoplay ? "true" : "false",
+             obj.playbackmode.c_str());
+    return handle;
 }

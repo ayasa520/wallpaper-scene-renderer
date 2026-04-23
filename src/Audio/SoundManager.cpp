@@ -81,11 +81,13 @@ private:
 struct BStreamWrapper {
     std::shared_ptr<wallpaper::fs::IBinaryStream> stream;
     size_t                                        Read(void* pBufferOut, size_t bytesToRead) {
-                                               size_t reads = stream->Read(pBufferOut, bytesToRead);
-                                               // LOG_INFO("r:%u, %u",bytesToRead, reads);
-                                               return reads;
+        if (! stream) return 0;
+        size_t reads = stream->Read(pBufferOut, bytesToRead);
+        // LOG_INFO("r:%u, %u",bytesToRead, reads);
+        return reads;
     }
     bool Seek(idx offset, ma_seek_origin origin) {
+        if (! stream) return false;
         bool result { false };
         switch (origin) {
         case ma_seek_origin_start: result = stream->SeekSet(offset); break;
@@ -116,9 +118,22 @@ private:
 std::unique_ptr<SoundStream>
 wallpaper::audio::CreateSoundStream(std::shared_ptr<wallpaper::fs::IBinaryStream> stream,
                                     const SoundStream::Desc&                      desc) {
+    if (! stream) {
+        // Audio assets are often opened lazily by scene scripts.  Returning nullptr instead of
+        // constructing a decoder over a null stream lets the caller log the authored asset path and
+        // prevents a silent null dereference inside miniaudio callbacks.
+        LOG_ERROR("CreateSoundStream: stream is null");
+        return nullptr;
+    }
+
     BStreamWrapper sw { stream };
     auto           decoder = std::make_unique<miniaudio::Decoder<BStreamWrapper>>(std::move(sw));
-    decoder->Init(ToSSDesc(desc));
+    if (! decoder->Init(ToSSDesc(desc))) {
+        // Propagate decoder initialization failure to the sound-layer wrapper.  The wrapper owns
+        // the Wallpaper Engine asset path, so it can emit a more useful per-layer diagnostic after
+        // this generic audio layer reports the codec failure.
+        return nullptr;
+    }
     return std::make_unique<SoundStream_impl<miniaudio::Decoder<BStreamWrapper>>>(
         std::move(decoder));
 }
@@ -136,6 +151,13 @@ SoundManager::SoundManager(): pImpl(std::make_unique<impl>()) {}
 SoundManager::~SoundManager() {}
 
 SoundHandle SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss, float volume, bool autoplay) {
+    if (! ss) {
+        // Dynamic and authored sound layers share this entry point.  A zero handle keeps callers
+        // from registering a script-visible layer whose backing audio stream cannot ever play.
+        LOG_ERROR("SoundManager::MountStream failed: null sound stream");
+        return 0;
+    }
+
     const SoundHandle handle = pImpl->next_handle++;
     auto channel = std::make_shared<Channel_Impl>(std::move(ss), volume, autoplay);
     pImpl->channels.emplace(handle, channel);

@@ -1215,6 +1215,557 @@ inline std::string RewriteIntegerForLoops(std::string_view text) {
     return result;
 }
 
+inline bool ContainsString(const std::vector<std::string>& values, std::string_view needle) {
+    for (const auto& value : values) {
+        if (value == needle) return true;
+    }
+    return false;
+}
+
+inline bool IsUnsignedIntegerLiteral(std::string_view source) {
+    source = TrimWhitespace(source);
+    if (source.size() < 2) return false;
+    const char suffix = source.back();
+    if (suffix != 'u' && suffix != 'U') return false;
+
+    source.remove_suffix(1);
+    if (source.empty()) return false;
+
+    if (source.size() > 2 && source[0] == '0' && (source[1] == 'x' || source[1] == 'X')) {
+        for (size_t i = 2; i < source.size(); i++) {
+            if (! std::isxdigit(static_cast<unsigned char>(source[i]))) return false;
+        }
+        return source.size() > 2;
+    }
+
+    for (const char ch : source) {
+        if (! std::isdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+inline std::string RewriteIntegerLiteralsAsUnsigned(std::string_view source) {
+    std::string result;
+    result.reserve(source.size() + 4);
+
+    size_t pos { 0 };
+    while (pos < source.size()) {
+        const char ch = source[pos];
+        if (! std::isdigit(static_cast<unsigned char>(ch)) ||
+            (pos > 0 && (IsIdentifierContinue(source[pos - 1]) || source[pos - 1] == '.'))) {
+            result.push_back(ch);
+            pos++;
+            continue;
+        }
+
+        const size_t literal_begin = pos;
+        bool         hexadecimal { false };
+        bool         floating_point { false };
+        if (pos + 1 < source.size() && source[pos] == '0' &&
+            (source[pos + 1] == 'x' || source[pos + 1] == 'X')) {
+            hexadecimal = true;
+            pos += 2;
+            while (pos < source.size() &&
+                   std::isxdigit(static_cast<unsigned char>(source[pos]))) {
+                pos++;
+            }
+        } else {
+            while (pos < source.size() &&
+                   std::isdigit(static_cast<unsigned char>(source[pos]))) {
+                pos++;
+            }
+            if (pos < source.size() && source[pos] == '.') {
+                floating_point = true;
+                pos++;
+                while (pos < source.size() &&
+                       std::isdigit(static_cast<unsigned char>(source[pos]))) {
+                    pos++;
+                }
+            }
+            if (pos < source.size() && (source[pos] == 'e' || source[pos] == 'E')) {
+                floating_point = true;
+                pos++;
+                if (pos < source.size() && (source[pos] == '+' || source[pos] == '-')) pos++;
+                while (pos < source.size() &&
+                       std::isdigit(static_cast<unsigned char>(source[pos]))) {
+                    pos++;
+                }
+            }
+        }
+
+        const size_t suffix_begin = pos;
+        while (pos < source.size() && IsIdentifierContinue(source[pos])) {
+            pos++;
+        }
+
+        const auto literal = source.substr(literal_begin, pos - literal_begin);
+        const auto suffix  = source.substr(suffix_begin, pos - suffix_begin);
+        result.append(literal);
+        // Wallpaper Engine compatibility shaders freely mix uint variables with unsuffixed
+        // integer constants. glslang keeps `%` and neighboring integer arithmetic strictly typed,
+        // so constants inside a uint modulo operand need an unsigned suffix before the operand is
+        // wrapped or the inner expression can still fail as `uint + int`.
+        if (! floating_point && (hexadecimal || suffix.empty()) &&
+            suffix.find_first_of("uU") == std::string_view::npos) {
+            result.push_back('u');
+        }
+    }
+
+    return result;
+}
+
+inline size_t FindMatchingOpenBackward(std::string_view source, size_t close_pos, char open_ch,
+                                       char close_ch) {
+    if (close_pos >= source.size() || source[close_pos] != close_ch) return std::string::npos;
+
+    int depth { 0 };
+    for (size_t pos = close_pos + 1; pos > 0; pos--) {
+        const size_t i = pos - 1;
+        if (source[i] == close_ch) {
+            depth++;
+        } else if (source[i] == open_ch) {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+inline size_t IncludeIdentifierBeforeOperand(std::string_view source, size_t operand_begin) {
+    size_t cursor = operand_begin;
+    while (cursor > 0 && std::isspace(static_cast<unsigned char>(source[cursor - 1]))) {
+        cursor--;
+    }
+    if (cursor == 0 || ! IsIdentifierContinue(source[cursor - 1])) return operand_begin;
+
+    size_t ident_begin = cursor;
+    while (ident_begin > 0 && IsIdentifierContinue(source[ident_begin - 1])) {
+        ident_begin--;
+    }
+    return ident_begin;
+}
+
+inline size_t FindModuloLeftOperandBegin(std::string_view source, size_t modulo_pos) {
+    size_t cursor = modulo_pos;
+    while (cursor > 0 && std::isspace(static_cast<unsigned char>(source[cursor - 1]))) {
+        cursor--;
+    }
+    if (cursor == 0) return std::string::npos;
+
+    const char ch = source[cursor - 1];
+    if (ch == ')') {
+        const auto open = FindMatchingOpenBackward(source, cursor - 1, '(', ')');
+        if (open == std::string::npos) return std::string::npos;
+        return IncludeIdentifierBeforeOperand(source, open);
+    }
+    if (ch == ']') {
+        const auto open = FindMatchingOpenBackward(source, cursor - 1, '[', ']');
+        if (open == std::string::npos) return std::string::npos;
+        return IncludeIdentifierBeforeOperand(source, open);
+    }
+
+    size_t begin = cursor;
+    while (begin > 0) {
+        const char prev = source[begin - 1];
+        if (! IsIdentifierContinue(prev) && prev != '.') break;
+        begin--;
+    }
+    return begin == cursor ? std::string::npos : begin;
+}
+
+inline size_t FindModuloRightOperandEnd(std::string_view source, size_t operand_pos) {
+    size_t cursor = SkipWhitespace(source, operand_pos);
+    if (cursor >= source.size()) return std::string::npos;
+
+    if (IsIdentifierStart(source[cursor])) {
+        cursor = SkipIdentifier(source, cursor);
+        auto after_identifier = SkipWhitespace(source, cursor);
+        if (after_identifier < source.size() && source[after_identifier] == '(') {
+            const auto close = SkipBalanced(source, after_identifier, '(', ')');
+            if (close == std::string::npos) return std::string::npos;
+            cursor = close;
+        }
+
+        for (;;) {
+            auto next = SkipWhitespace(source, cursor);
+            if (next < source.size() && source[next] == '.') {
+                next++;
+                if (next >= source.size() || ! IsIdentifierStart(source[next])) break;
+                cursor = SkipIdentifier(source, next);
+                continue;
+            }
+            if (next < source.size() && source[next] == '[') {
+                const auto close = SkipBalanced(source, next, '[', ']');
+                if (close == std::string::npos) return std::string::npos;
+                cursor = close;
+                continue;
+            }
+            break;
+        }
+        return cursor;
+    }
+
+    if (source[cursor] == '(') {
+        return SkipBalanced(source, cursor, '(', ')');
+    }
+
+    if (std::isdigit(static_cast<unsigned char>(source[cursor]))) {
+        bool hexadecimal { false };
+        if (cursor + 1 < source.size() && source[cursor] == '0' &&
+            (source[cursor + 1] == 'x' || source[cursor + 1] == 'X')) {
+            hexadecimal = true;
+            cursor += 2;
+            while (cursor < source.size() &&
+                   std::isxdigit(static_cast<unsigned char>(source[cursor]))) {
+                cursor++;
+            }
+        } else {
+            while (cursor < source.size() &&
+                   std::isdigit(static_cast<unsigned char>(source[cursor]))) {
+                cursor++;
+            }
+            if (cursor < source.size() && source[cursor] == '.') {
+                cursor++;
+                while (cursor < source.size() &&
+                       std::isdigit(static_cast<unsigned char>(source[cursor]))) {
+                    cursor++;
+                }
+            }
+            if (cursor < source.size() && (source[cursor] == 'e' || source[cursor] == 'E')) {
+                cursor++;
+                if (cursor < source.size() && (source[cursor] == '+' || source[cursor] == '-')) {
+                    cursor++;
+                }
+                while (cursor < source.size() &&
+                       std::isdigit(static_cast<unsigned char>(source[cursor]))) {
+                    cursor++;
+                }
+            }
+        }
+        while (cursor < source.size() && IsIdentifierContinue(source[cursor])) {
+            cursor++;
+        }
+        (void)hexadecimal;
+        return cursor;
+    }
+
+    return std::string::npos;
+}
+
+inline std::string NormalizeUintModuloOperand(std::string_view operand) {
+    std::string normalized = RewriteIntegerLiteralsAsUnsigned(TrimWhitespace(operand));
+    const auto  trimmed    = TrimWhitespace(normalized);
+    if (trimmed.empty()) return normalized;
+    if (IsUnsignedIntegerLiteral(trimmed)) return std::string(trimmed);
+
+    std::string_view ctor;
+    std::string_view args;
+    if (TryParseConstructorCall(trimmed, ctor, args) && ctor == "uint") {
+        return std::string(trimmed);
+    }
+
+    return "uint(" + std::string(trimmed) + ")";
+}
+
+inline bool RewriteModuloOperandsForUint(std::string& expression) {
+    bool   changed { false };
+    size_t pos { 0 };
+
+    while ((pos = expression.find('%', pos)) != std::string::npos) {
+        if (pos + 1 < expression.size() && expression[pos + 1] == '=') {
+            pos++;
+            continue;
+        }
+
+        const auto lhs_begin = FindModuloLeftOperandBegin(expression, pos);
+        const auto rhs_end   = FindModuloRightOperandEnd(expression, pos + 1);
+        if (lhs_begin == std::string::npos || rhs_end == std::string::npos ||
+            lhs_begin >= pos || rhs_end <= pos + 1) {
+            pos++;
+            continue;
+        }
+
+        const auto lhs = std::string_view(expression).substr(lhs_begin, pos - lhs_begin);
+        const auto rhs = std::string_view(expression).substr(pos + 1, rhs_end - pos - 1);
+        const auto replacement =
+            NormalizeUintModuloOperand(lhs) + " % " + NormalizeUintModuloOperand(rhs);
+        expression.replace(lhs_begin, rhs_end - lhs_begin, replacement);
+        pos = lhs_begin + replacement.size();
+        changed = true;
+    }
+
+    return changed;
+}
+
+inline bool TryParseUintDeclarationLhs(std::string_view lhs, std::string_view& name) {
+    lhs = TrimWhitespace(lhs);
+    if (lhs.empty()) return false;
+
+    size_t pos { 0 };
+    while (pos < lhs.size()) {
+        if (! IsIdentifierStart(lhs[pos])) return false;
+
+        const auto token_end = SkipIdentifier(lhs, pos);
+        const auto token     = lhs.substr(pos, token_end - pos);
+        if (token == "layout") {
+            pos = SkipWhitespace(lhs, token_end);
+            if (pos >= lhs.size() || lhs[pos] != '(') return false;
+            pos = SkipBalanced(lhs, pos, '(', ')');
+            if (pos == std::string::npos) return false;
+            pos = SkipWhitespace(lhs, pos);
+            continue;
+        }
+
+        if (IsShaderDeclarationQualifier(token)) {
+            pos = SkipWhitespace(lhs, token_end);
+            continue;
+        }
+
+        if (token != "uint") return false;
+        pos = SkipWhitespace(lhs, token_end);
+        if (pos >= lhs.size() || ! IsIdentifierStart(lhs[pos])) return false;
+
+        const auto name_end = SkipIdentifier(lhs, pos);
+        name                = lhs.substr(pos, name_end - pos);
+        auto tail           = SkipWhitespace(lhs, name_end);
+        if (tail < lhs.size() && lhs[tail] == '[') {
+            tail = SkipBalanced(lhs, tail, '[', ']');
+            if (tail == std::string::npos) return false;
+            tail = SkipWhitespace(lhs, tail);
+        }
+        return tail == lhs.size();
+    }
+
+    return false;
+}
+
+inline bool TryParseUintDeclarationStatement(std::string_view statement, std::string& name) {
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+
+    const auto assignment_pos = FindTopLevelAssignmentOperator(statement);
+    const auto lhs = assignment_pos.has_value()
+        ? statement.substr(0, *assignment_pos)
+        : statement;
+
+    std::string_view parsed_name;
+    if (! TryParseUintDeclarationLhs(lhs, parsed_name)) return false;
+    name = std::string(parsed_name);
+    return true;
+}
+
+inline bool TryRewriteUintModuloStatement(std::string_view statement,
+                                          const std::vector<std::string>& uint_variables,
+                                          std::string& replacement) {
+    const auto leading = statement.find_first_not_of(" \t\r\n");
+    const auto prefix = leading == std::string_view::npos ? std::string_view {} :
+        statement.substr(0, leading);
+
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+
+    const auto assignment_pos = FindTopLevelAssignmentOperator(statement);
+    if (! assignment_pos.has_value()) return false;
+
+    const auto lhs = TrimWhitespace(statement.substr(0, *assignment_pos));
+    const auto rhs = TrimWhitespace(statement.substr(*assignment_pos + 1));
+    if (lhs.empty() || rhs.find('%') == std::string_view::npos) return false;
+
+    std::string_view declared_uint_name;
+    std::string_view assigned_name;
+    const bool target_is_uint =
+        TryParseUintDeclarationLhs(lhs, declared_uint_name) ||
+        (TryParseStandaloneIdentifier(lhs, assigned_name) &&
+         ContainsString(uint_variables, assigned_name));
+    if (! target_is_uint) return false;
+
+    std::string rewritten_rhs(rhs);
+    if (! RewriteModuloOperandsForUint(rewritten_rhs)) return false;
+
+    // Wallpaper Engine's shader compatibility layer allows values such as
+    // `uint wrapped = floatFrequency % 64;`. GLSL requires `%` operands to be integral, and
+    // unsigned arithmetic must use unsigned constants. Rewriting every uint-target modulo
+    // assignment here keeps the behavior generic for workshop shaders without adding
+    // per-shader source exceptions.
+    replacement = std::string(prefix) + std::string(lhs) + " = " + rewritten_rhs + ";";
+    return true;
+}
+
+inline std::string RewriteUintModuloAssignments(std::string_view text) {
+    std::string result;
+    result.reserve(text.size() + 64);
+
+    std::vector<std::string> uint_variables;
+    size_t                   cursor { 0 };
+    size_t                   pos { 0 };
+    while (pos < text.size()) {
+        const auto stmt_end = FindStatementTerminator(text, pos);
+        if (stmt_end == std::string::npos) break;
+
+        const auto statement = text.substr(pos, stmt_end - pos + 1);
+        std::string replacement;
+        if (TryRewriteUintModuloStatement(statement, uint_variables, replacement)) {
+            result.append(text.substr(cursor, pos - cursor));
+            result.append(replacement);
+            cursor = stmt_end + 1;
+        }
+
+        std::string declared_name;
+        if (TryParseUintDeclarationStatement(statement, declared_name) &&
+            ! ContainsString(uint_variables, declared_name)) {
+            uint_variables.push_back(declared_name);
+        }
+
+        pos = stmt_end + 1;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
+inline bool TryParseScalarDeclarationStatement(std::string_view statement, std::string_view type,
+                                               std::string& name) {
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+
+    const auto assignment_pos = FindTopLevelAssignmentOperator(statement);
+    const auto lhs = assignment_pos.has_value()
+        ? TrimWhitespace(statement.substr(0, *assignment_pos))
+        : TrimWhitespace(statement);
+    if (! StartsWithToken(lhs, type)) return false;
+
+    auto pos = SkipWhitespace(lhs, type.size());
+    if (pos >= lhs.size() || ! IsIdentifierStart(lhs[pos])) return false;
+
+    const auto name_end = SkipIdentifier(lhs, pos);
+    name                = std::string(lhs.substr(pos, name_end - pos));
+    pos                 = SkipWhitespace(lhs, name_end);
+    return pos == lhs.size();
+}
+
+inline std::optional<size_t> FindTopLevelCompoundAssignment(std::string_view text,
+                                                            std::string_view op) {
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+    int  brace_depth { 0 };
+
+    for (size_t pos = 0; pos + op.size() <= text.size(); pos++) {
+        const char ch = text[pos];
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == '{') brace_depth++;
+        else if (ch == '}' && brace_depth > 0) brace_depth--;
+        else if (paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 &&
+                 text.substr(pos, op.size()) == op) {
+            return pos;
+        }
+    }
+
+    return std::nullopt;
+}
+
+inline bool TryRewriteFloatBoolMultiplyStatement(std::string_view statement,
+                                                 const std::vector<std::string>& float_variables,
+                                                 const std::vector<std::string>& bool_variables,
+                                                 std::string& replacement) {
+    const auto leading = statement.find_first_not_of(" \t\r\n");
+    const auto prefix = leading == std::string_view::npos ? std::string_view {} :
+        statement.substr(0, leading);
+
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+
+    const auto op_pos = FindTopLevelCompoundAssignment(statement, "*=");
+    if (! op_pos.has_value()) return false;
+
+    const auto lhs = TrimWhitespace(statement.substr(0, *op_pos));
+    const auto rhs = TrimWhitespace(statement.substr(*op_pos + 2));
+
+    std::string_view lhs_name;
+    std::string_view rhs_name;
+    if (! TryParseStandaloneIdentifier(lhs, lhs_name) ||
+        ! TryParseStandaloneIdentifier(rhs, rhs_name)) {
+        return false;
+    }
+    if (! ContainsString(float_variables, lhs_name) || ! ContainsString(bool_variables, rhs_name)) {
+        return false;
+    }
+
+    // Wallpaper Engine compatibility shaders use bool values as 0/1 masks in scalar math, for
+    // example `floatMask *= boolCondition`. Desktop GLSL does not implicitly convert bool to
+    // float, so this pass makes only the proven float-times-bool compound assignment explicit
+    // instead of changing unrelated boolean logic.
+    replacement = std::string(prefix) + std::string(lhs_name) + " *= float(" +
+                  std::string(rhs_name) + ");";
+    return true;
+}
+
+inline std::string RewriteFloatBoolMultiplyAssignments(std::string_view text) {
+    std::string result;
+    result.reserve(text.size() + 64);
+
+    std::vector<std::string> float_variables;
+    std::vector<std::string> bool_variables;
+    size_t                   cursor { 0 };
+    size_t                   pos { 0 };
+    while (pos < text.size()) {
+        const auto stmt_end = FindStatementTerminator(text, pos);
+        if (stmt_end == std::string::npos) break;
+
+        const auto statement = text.substr(pos, stmt_end - pos + 1);
+        std::string replacement;
+        if (TryRewriteFloatBoolMultiplyStatement(
+                statement, float_variables, bool_variables, replacement)) {
+            result.append(text.substr(cursor, pos - cursor));
+            result.append(replacement);
+            cursor = stmt_end + 1;
+        }
+
+        std::string declared_name;
+        if (TryParseScalarDeclarationStatement(statement, "float", declared_name) &&
+            ! ContainsString(float_variables, declared_name)) {
+            float_variables.push_back(declared_name);
+        } else if (TryParseScalarDeclarationStatement(statement, "bool", declared_name) &&
+                   ! ContainsString(bool_variables, declared_name)) {
+            bool_variables.push_back(declared_name);
+        }
+
+        pos = stmt_end + 1;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
 inline void CollectPreprocessorInfo(const std::string& src, WPPreprocessorInfo& process_info) {
     process_info.input.clear();
     process_info.output.clear();
@@ -2186,6 +2737,8 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
 
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
     result = RewriteIntegerForLoops(result);
+    result = RewriteUintModuloAssignments(result);
+    result = RewriteFloatBoolMultiplyAssignments(result);
     result = TrimOverlongVectorConstructors(result);
     result = RewriteVec2AssignmentsForVec4TexCoord(result);
 

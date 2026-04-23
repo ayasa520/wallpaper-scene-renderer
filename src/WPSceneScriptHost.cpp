@@ -5876,15 +5876,33 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         const auto sound_handle = FindSoundHandleByLayerId(opaque, layer_id);
         if (sound_handle.has_value()) {
             if (command == "play") {
-                opaque->scene->soundManager->Play(*sound_handle);
+                // Sound play/stop/pause is script-driven for music selection layers.  Logging each
+                // command with the resolved handle makes run.log show whether silence comes from the
+                // script bridge, SoundManager state, or a later decoder/stream failure.
+                const bool applied = opaque->scene->soundManager->Play(*sound_handle);
+                LOG_INFO("SceneSoundCall: layer=%d command='play' handle=%u applied=%s playing=%s",
+                         layer_id,
+                         *sound_handle,
+                         applied ? "true" : "false",
+                         opaque->scene->soundManager->IsPlaying(*sound_handle) ? "true" : "false");
                 return JS_UNDEFINED;
             }
             if (command == "stop") {
-                opaque->scene->soundManager->Stop(*sound_handle);
+                const bool applied = opaque->scene->soundManager->Stop(*sound_handle);
+                LOG_INFO("SceneSoundCall: layer=%d command='stop' handle=%u applied=%s playing=%s",
+                         layer_id,
+                         *sound_handle,
+                         applied ? "true" : "false",
+                         opaque->scene->soundManager->IsPlaying(*sound_handle) ? "true" : "false");
                 return JS_UNDEFINED;
             }
             if (command == "pause") {
-                opaque->scene->soundManager->Pause(*sound_handle);
+                const bool applied = opaque->scene->soundManager->Pause(*sound_handle);
+                LOG_INFO("SceneSoundCall: layer=%d command='pause' handle=%u applied=%s playing=%s",
+                         layer_id,
+                         *sound_handle,
+                         applied ? "true" : "false",
+                         opaque->scene->soundManager->IsPlaying(*sound_handle) ? "true" : "false");
                 return JS_UNDEFINED;
             }
             if (command == "isPlaying") {

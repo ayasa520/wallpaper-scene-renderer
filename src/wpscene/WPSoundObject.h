@@ -23,6 +23,11 @@ struct WPSoundObject {
     float                    mintime { 0.0f };
     float                    volume { 1.0f };
     bool                     visible { true };
+    // Wallpaper Engine uses startsilent for script-controlled sound layers: the layer is present
+    // and visible to the scripting API, but the decoder must not start producing audio until
+    // layer.play() is called.  Keeping this authored flag separate from visible prevents music
+    // selection scripts from being forced through an implicit autoplay/stop race.
+    bool                     startsilent { false };
     VisibleBinding           visible_binding;
     std::string              name;
     std::vector<std::string> sound;
@@ -34,6 +39,7 @@ struct WPSoundObject {
         GET_JSON_NAME_VALUE_NOWARN(json, "mintime", mintime);
         GET_JSON_NAME_VALUE_NOWARN(json, "maxtime", maxtime);
         GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+        GET_JSON_NAME_VALUE_NOWARN(json, "startsilent", startsilent);
         if (json.contains("visible") && json.at("visible").is_object()) {
             const auto& visible_json = json.at("visible");
             GET_JSON_NAME_VALUE_NOWARN(visible_json, "value", visible_binding.value);
