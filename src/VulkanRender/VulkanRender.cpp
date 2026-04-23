@@ -26,6 +26,7 @@
 #include "Core/ArrayHelper.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -505,40 +506,80 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     double fboAspect = width / (double)height, sAspect = sw / sh;
     auto&  gCam    = *scene.cameras.at("global");
     auto&  gPerCam = *scene.cameras.at("global_perspective");
-    // assum cam
+
+    // Camera-layer animation mutates the same shared "global" camera object that fill mode uses to
+    // adapt a 16:9 project to the monitor aspect. Preserve the live zoom value here so the render
+    // side remains the single source of truth for framebuffer-relative width/height while authored
+    // zoom still narrows that already aspect-correct view.
+    double active_global_zoom = scene.defaultGlobalCameraZoom;
+    if (!std::isfinite(active_global_zoom) || active_global_zoom <= 0.0001) {
+        active_global_zoom = 1.0;
+    }
+
+    // Perspective camera layers can animate FOV directly. Keep that authored value when the active
+    // layer explicitly targets the shared perspective camera; otherwise derive FOV from the
+    // orthographic framing so perspective particles continue to match the visible crop/fit window.
+    bool  use_active_global_perspective_fov = false;
+    float active_global_perspective_fov = 50.0f;
+    if (scene.activeCameraLayerId != 0) {
+        auto active_layer_it = scene.cameraLayers.find(scene.activeCameraLayerId);
+        if (active_layer_it != scene.cameraLayers.end()) {
+            const auto& active_layer = active_layer_it->second;
+            if (active_layer.camera_name.empty() || active_layer.camera_name == "global") {
+                if (std::isfinite(active_layer.zoom) && active_layer.zoom > 0.0001) {
+                    active_global_zoom = active_layer.zoom;
+                } else {
+                    active_global_zoom = 1.0;
+                }
+            } else if (active_layer.camera_name == "global_perspective" &&
+                       std::isfinite(active_layer.fov) && active_layer.fov > 0.0001f) {
+                use_active_global_perspective_fov = true;
+                active_global_perspective_fov = active_layer.fov;
+            }
+        }
+    }
+
+    double framed_width = sw;
+    double framed_height = sh;
+    double perspective_aspect = sAspect;
+
     switch (fillmode) {
     case FillMode::STRETCH:
-        gCam.SetWidth(sw);
-        gCam.SetHeight(sh);
-        gPerCam.SetAspect(sAspect);
-        gPerCam.SetFov(algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
+        framed_width = sw;
+        framed_height = sh;
+        perspective_aspect = sAspect;
         break;
     case FillMode::ASPECTFIT:
         if (fboAspect < sAspect) {
-            // scale height
-            gCam.SetWidth(sw);
-            gCam.SetHeight(sw / fboAspect);
+            // Preserve the full scene width and add vertical space when the output is taller.
+            framed_width = sw;
+            framed_height = sw / fboAspect;
         } else {
-            gCam.SetWidth(sh * fboAspect);
-            gCam.SetHeight(sh);
+            framed_width = sh * fboAspect;
+            framed_height = sh;
         }
-        gPerCam.SetAspect(fboAspect);
-        gPerCam.SetFov(algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
+        perspective_aspect = fboAspect;
         break;
     case FillMode::ASPECTCROP:
     default:
         if (fboAspect > sAspect) {
-            // scale height
-            gCam.SetWidth(sw);
-            gCam.SetHeight(sw / fboAspect);
+            // Preserve the full scene width and crop vertically when the output is wider.
+            framed_width = sw;
+            framed_height = sw / fboAspect;
         } else {
-            gCam.SetWidth(sh * fboAspect);
-            gCam.SetHeight(sh);
+            framed_width = sh * fboAspect;
+            framed_height = sh;
         }
-        gPerCam.SetAspect(fboAspect);
-        gPerCam.SetFov(algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
+        perspective_aspect = fboAspect;
         break;
     }
+
+    gCam.SetWidth(std::max(1.0, framed_width / active_global_zoom));
+    gCam.SetHeight(std::max(1.0, framed_height / active_global_zoom));
+    gPerCam.SetAspect(perspective_aspect);
+    gPerCam.SetFov(use_active_global_perspective_fov
+                       ? active_global_perspective_fov
+                       : algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
     gCam.Update();
     gPerCam.Update();
     scene.UpdateLinkedCamera("global");

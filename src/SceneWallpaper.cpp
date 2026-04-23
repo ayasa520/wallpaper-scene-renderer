@@ -377,6 +377,12 @@ private:
             if (m_scene->scriptHost) {
                 m_scene->scriptHost->FrameBegin(frame_time);
             }
+            // Property animations update camera-layer zoom/origin through the script host before
+            // shader uniforms are refreshed. Reapplying the renderer-side fill-mode camera
+            // framing here keeps those animated camera values in monitor-relative coordinates
+            // instead of letting the animation path snap the shared global camera back to the
+            // project's native aspect until a later resize/fill-mode event repairs it.
+            m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
             RefreshRenderGraphIfNeeded();
             m_render->refreshImportedTextures(*m_scene);
 
