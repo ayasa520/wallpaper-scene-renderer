@@ -41,6 +41,19 @@ public:
         std::string          alignment { "center" };
     };
 
+    struct CameraLayerRuntimeState {
+        // Wallpaper Engine camera layers are represented in scene.json as transform-only objects
+        // with camera-specific properties. Keep the authored values beside the render node so
+        // scripts and keyframe animations can round-trip the WE-facing origin/zoom values while
+        // Hanabi stores the attached SceneCamera node in renderer coordinates.
+        std::string                camera_name { "global" };
+        std::shared_ptr<SceneNode> node;
+        std::array<float, 3>       origin { 0.0f, 0.0f, 0.0f };
+        std::array<float, 3>       angles { 0.0f, 0.0f, 0.0f };
+        double                     zoom { 1.0 };
+        float                      fov { 50.0f };
+    };
+
     struct LayerParentBinding {
         int32_t     parent_id { 0 };
         std::string attachment;
@@ -60,6 +73,9 @@ public:
     bool IsLayerVisible(int32_t layer_id) const;
     void ApplyLayerVisibility(int32_t layer_id);
     void ApplyAllLayerVisibility();
+    Eigen::Vector3f ResolveCameraLayerNodeTranslation(
+        const std::array<float, 3>& authored_origin) const;
+    void UpdateActiveCameraLayer();
 
     SceneImageEffect*       FindImageEffect(int32_t owner_layer_id, uint32_t effect_index);
     const SceneImageEffect* FindImageEffect(int32_t owner_layer_id, uint32_t effect_index) const;
@@ -100,6 +116,8 @@ public:
     std::unordered_map<int32_t, uint32_t>                 objectRuntimeSoundHandles;
     std::unordered_map<int32_t, ImageLayerRuntimeState>   imageLayers;
     std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
+    std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
+    std::vector<int32_t>                                  cameraLayerOrder;
     std::unordered_map<SceneNode*, int32_t> nodeOwners;
     std::unordered_map<int32_t, std::string> initialLayerConfigJson;
     std::unordered_map<std::string, int32_t> layerNameToId;
@@ -145,6 +163,9 @@ public:
     bool                            cursorLeftDown { false };
 
     SceneCamera* activeCamera;
+    std::shared_ptr<SceneNode> defaultGlobalCameraNode;
+    double                     defaultGlobalCameraZoom { 1.0 };
+    int32_t                    activeCameraLayerId { 0 };
 
     i32                  ortho[2] { 1920, 1080 }; // w, h
     std::array<float, 3> clearColor { 1.0f, 1.0f, 1.0f };

@@ -336,6 +336,15 @@ LayerValueHint LayerValueType(std::string_view property_name) {
     return {};
 }
 
+LayerValueHint CameraLayerValueType(std::string_view property_name) {
+    if (property_name == "visible") return { WPDynamicValue::Type::Boolean, true };
+    if (property_name == "origin") return { WPDynamicValue::Type::Float3, true };
+    if (property_name == "angles") return { WPDynamicValue::Type::Float3, true };
+    if (property_name == "zoom") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "fov") return { WPDynamicValue::Type::Float, true };
+    return {};
+}
+
 LayerValueHint AnimationLayerValueType(std::string_view property_name) {
     if (property_name == "visible") return { WPDynamicValue::Type::Boolean, true };
     if (property_name == "rate") return { WPDynamicValue::Type::Float, true };
@@ -395,9 +404,11 @@ const char* TargetKindName(WPSceneScriptTargetKind target_kind) {
     switch (target_kind) {
     case WPSceneScriptTargetKind::Scene: return "scene";
     case WPSceneScriptTargetKind::Sound: return "sound";
+    case WPSceneScriptTargetKind::Camera: return "camera";
     case WPSceneScriptTargetKind::Layer: return "layer";
     case WPSceneScriptTargetKind::AnimationLayer: return "animationLayer";
     case WPSceneScriptTargetKind::Effect: return "effect";
+    case WPSceneScriptTargetKind::MaterialUniform: return "materialUniform";
     }
     return "layer";
 }
@@ -2118,8 +2129,12 @@ PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque* opaq
                                                  std::string_view animation_name) {
     if (opaque == nullptr || node == nullptr) return nullptr;
     for (auto& animation : opaque->property_animations) {
+        // Camera layers expose property animations through the same script-facing layer object as
+        // empty/image layers. Include camera targets here so thisLayer.getAnimation("zoom") can
+        // resolve the authored camera timeline instead of disappearing behind the target split.
         if (animation.registration.node != node ||
-            animation.registration.target_kind != WPSceneScriptTargetKind::Layer) {
+            (animation.registration.target_kind != WPSceneScriptTargetKind::Layer &&
+             animation.registration.target_kind != WPSceneScriptTargetKind::Camera)) {
             continue;
         }
 
@@ -2141,9 +2156,13 @@ const PropertyAnimationInstance* FindPropertyAnimation(const WPSceneScriptHost::
                                                        std::string_view property_name) {
     if (opaque == nullptr || node == nullptr) return nullptr;
     for (const auto& animation : opaque->property_animations) {
+        // Runtime property reads use the same node identity for layer and camera registrations;
+        // keeping both target kinds discoverable prevents camera keyframes from being treated as
+        // unrelated state when scripts query animation handles by property name.
         if (animation.registration.node == node &&
             animation.registration.property_name == property_name &&
-            animation.registration.target_kind == WPSceneScriptTargetKind::Layer) {
+            (animation.registration.target_kind == WPSceneScriptTargetKind::Layer ||
+             animation.registration.target_kind == WPSceneScriptTargetKind::Camera)) {
             return &animation;
         }
     }
@@ -4500,6 +4519,99 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
     return false;
 }
 
+const Scene::CameraLayerRuntimeState*
+FindCameraLayerState(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
+    if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
+    auto it = opaque->scene->cameraLayers.find(layer_id);
+    return it == opaque->scene->cameraLayers.end() ? nullptr : &it->second;
+}
+
+Scene::CameraLayerRuntimeState*
+FindCameraLayerState(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
+    return const_cast<Scene::CameraLayerRuntimeState*>(
+        FindCameraLayerState(static_cast<const WPSceneScriptHost::Opaque*>(opaque), layer_id));
+}
+
+std::optional<WPDynamicValue>
+ReadCameraLayerPropertyValue(const WPSceneScriptHost::Opaque* opaque,
+                             const WPSceneScriptRegistration& registration) {
+    const auto* camera_layer = FindCameraLayerState(opaque, registration.object_id);
+    if (camera_layer == nullptr || opaque == nullptr || opaque->scene == nullptr) {
+        return std::nullopt;
+    }
+
+    if (registration.property_name == "visible") {
+        return WPDynamicValue(opaque->scene->GetLayerLocalVisibility(registration.object_id));
+    }
+    if (registration.property_name == "origin") return WPDynamicValue(camera_layer->origin);
+    if (registration.property_name == "angles") return WPDynamicValue(camera_layer->angles);
+    if (registration.property_name == "zoom") {
+        return WPDynamicValue(static_cast<float>(camera_layer->zoom));
+    }
+    if (registration.property_name == "fov") return WPDynamicValue(camera_layer->fov);
+
+    return std::nullopt;
+}
+
+bool ApplyCameraLayerPropertyValue(WPSceneScriptHost::Opaque*       opaque,
+                                   const WPSceneScriptRegistration& registration,
+                                   const WPDynamicValue&            value) {
+    auto* camera_layer = FindCameraLayerState(opaque, registration.object_id);
+    if (camera_layer == nullptr || opaque == nullptr || opaque->scene == nullptr) return false;
+
+    if (registration.property_name == "visible") {
+        bool visible = false;
+        if (! value.tryGet(&visible)) return false;
+        // Camera visibility is still authored as layer visibility, but changing it must also
+        // reselect the active camera immediately because Wallpaper Engine falls back to the next
+        // visible camera layer as soon as this property changes.
+        opaque->scene->SetLayerLocalVisibility(registration.object_id, visible);
+        opaque->scene->ApplyLayerVisibility(registration.object_id);
+        return true;
+    }
+
+    if (registration.property_name == "origin") {
+        std::array<float, 3> origin {};
+        if (! value.tryGet(&origin)) return false;
+        camera_layer->origin = origin;
+        if (camera_layer->node) {
+            camera_layer->node->SetTranslate(
+                opaque->scene->ResolveCameraLayerNodeTranslation(origin));
+        }
+        opaque->scene->UpdateActiveCameraLayer();
+        return true;
+    }
+
+    if (registration.property_name == "angles") {
+        std::array<float, 3> angles {};
+        if (! value.tryGet(&angles)) return false;
+        camera_layer->angles = angles;
+        if (camera_layer->node) {
+            camera_layer->node->SetRotation(Eigen::Vector3f { angles[0], angles[1], angles[2] });
+        }
+        opaque->scene->UpdateActiveCameraLayer();
+        return true;
+    }
+
+    float scalar = 0.0f;
+    if (! value.tryGet(&scalar) || !std::isfinite(scalar)) return false;
+    if (registration.property_name == "zoom") {
+        // Store the authored zoom even when the layer is inactive. UpdateActiveCameraLayer() will
+        // apply it only if this camera layer currently owns the view, matching WE's visibility
+        // driven camera selection without throwing away offscreen camera animation state.
+        camera_layer->zoom = scalar;
+        opaque->scene->UpdateActiveCameraLayer();
+        return true;
+    }
+    if (registration.property_name == "fov") {
+        camera_layer->fov = scalar;
+        opaque->scene->UpdateActiveCameraLayer();
+        return true;
+    }
+
+    return false;
+}
+
 std::optional<WPDynamicValue> ReadScenePropertyValue(const WPSceneScriptHost::Opaque* opaque,
                                                      std::string_view property_name) {
     if (opaque == nullptr || opaque->scene == nullptr) return std::nullopt;
@@ -4783,6 +4895,9 @@ LayerValueHint RegistrationValueType(const WPSceneScriptRegistration& registrati
     if (registration.target_kind == WPSceneScriptTargetKind::Sound) {
         return SoundValueType(registration.property_name);
     }
+    if (registration.target_kind == WPSceneScriptTargetKind::Camera) {
+        return CameraLayerValueType(registration.property_name);
+    }
     if (registration.target_kind == WPSceneScriptTargetKind::AnimationLayer) {
         return AnimationLayerValueType(registration.property_name);
     }
@@ -4802,6 +4917,9 @@ std::optional<WPDynamicValue> ReadRegistrationValue(const WPSceneScriptHost::Opa
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Sound) {
         return ReadSoundPropertyValue(opaque, registration.object_id, registration.property_name);
+    }
+    if (registration.target_kind == WPSceneScriptTargetKind::Camera) {
+        return ReadCameraLayerPropertyValue(opaque, registration);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Layer) {
         if (const auto text_value = ReadTextLayerPropertyValue(
@@ -4858,6 +4976,9 @@ bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
     if (registration.target_kind == WPSceneScriptTargetKind::Sound) {
         return ApplySoundPropertyValue(
             opaque, registration.object_id, registration.property_name, value);
+    }
+    if (registration.target_kind == WPSceneScriptTargetKind::Camera) {
+        return ApplyCameraLayerPropertyValue(opaque, registration, value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
         return ApplyMaterialUniformPropertyValue(opaque, registration, value);

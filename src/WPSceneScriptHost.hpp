@@ -26,6 +26,10 @@ enum class WPSceneScriptTargetKind
     // their own dispatch kind so user-bound volume changes can update the mounted SoundManager
     // channel even though the sound object has no mesh node in the scene graph.
     Sound,
+    // Camera targets are authored camera layers. They own a SceneNode like regular empty layers,
+    // but their origin/zoom/visibility properties must update the active SceneCamera instead of
+    // only moving an invisible transform container.
+    Camera,
     Layer,
     AnimationLayer,
     Effect,

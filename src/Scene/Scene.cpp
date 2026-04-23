@@ -1,11 +1,14 @@
 #include "Scene.h"
 
+#include "SceneCamera.h"
+
 #include "Fs/VFS.h"
 #include "Interface/IImageParser.h"
 #include "Interface/IShaderValueUpdater.h"
 #include "Particle/ParticleSystem.h"
 #include "Utils/Logging.h"
 
+#include <cmath>
 #include <unordered_set>
 
 namespace wallpaper 
@@ -121,6 +124,46 @@ void ApplyLayerVisibilityRecursive(Scene& scene, int32_t layer_id, std::unordere
         }
     }
 }
+
+std::pair<int32_t, Scene::CameraLayerRuntimeState*> FindActiveCameraLayer(Scene& scene) {
+    // Wallpaper Engine uses the bottom-most visible camera layer as the active view. Scene JSON is
+    // parsed in layer order, so walking the recorded camera layer order backwards gives later
+    // camera layers precedence while still letting user/script visibility changes disable them.
+    for (auto it = scene.cameraLayerOrder.rbegin(); it != scene.cameraLayerOrder.rend(); ++it) {
+        auto layer_it = scene.cameraLayers.find(*it);
+        if (layer_it == scene.cameraLayers.end() || !layer_it->second.node) continue;
+        if (!scene.IsLayerVisible(*it)) continue;
+        return { *it, &layer_it->second };
+    }
+    return { 0, nullptr };
+}
+
+double SanitizeCameraZoom(double zoom, int32_t layer_id) {
+    if (std::isfinite(zoom) && zoom > 0.0001) return zoom;
+
+    // Invalid authored/user zoom values would collapse the orthographic projection to infinity.
+    // Log the offending camera layer and keep a neutral zoom so the wallpaper remains visible.
+    LOG_ERROR("SceneCameraLayer: invalid zoom %.6f on layer=%d, using 1.0", zoom, layer_id);
+    return 1.0;
+}
+
+void ApplyCameraProjectionState(Scene& scene,
+                                const std::string& camera_name,
+                                SceneCamera& camera,
+                                double zoom,
+                                float fov,
+                                int32_t layer_id) {
+    if (camera.IsPerspective()) {
+        camera.SetFov(fov);
+    } else {
+        const double safe_zoom = SanitizeCameraZoom(zoom, layer_id);
+        camera.SetWidth(std::max(1.0, static_cast<double>(scene.ortho[0]) / safe_zoom));
+        camera.SetHeight(std::max(1.0, static_cast<double>(scene.ortho[1]) / safe_zoom));
+    }
+
+    camera.Update();
+    scene.UpdateLinkedCamera(camera_name);
+}
 } // namespace
 
 Scene::Scene(): sceneGraph(std::make_shared<SceneNode>()) ,paritileSys(std::make_unique<ParticleSystem>(*this)) {}
@@ -173,6 +216,7 @@ bool Scene::IsLayerVisible(int32_t layer_id) const {
 void Scene::ApplyLayerVisibility(int32_t layer_id) {
     std::unordered_set<int32_t> visited;
     ApplyLayerVisibilityRecursive(*this, layer_id, visited);
+    if (!cameraLayers.empty()) UpdateActiveCameraLayer();
 }
 
 void Scene::ApplyAllLayerVisibility() {
@@ -182,6 +226,68 @@ void Scene::ApplyAllLayerVisibility() {
     }
     for (const auto& [layer_id, _] : layerNodes) {
         ApplyLayerVisibilityRecursive(*this, layer_id, visited);
+    }
+    if (!cameraLayers.empty()) UpdateActiveCameraLayer();
+}
+
+Eigen::Vector3f Scene::ResolveCameraLayerNodeTranslation(
+    const std::array<float, 3>& authored_origin) const {
+    // WE 2D camera origins are authored around the static camera origin, where 0/0 means the
+    // default centered wallpaper view. Hanabi's orthographic camera node is centered in render
+    // coordinates, so add the canvas half-size before attaching the SceneCamera to this layer.
+    return Eigen::Vector3f {
+        static_cast<float>(ortho[0]) * 0.5f + authored_origin[0],
+        static_cast<float>(ortho[1]) * 0.5f + authored_origin[1],
+        authored_origin[2],
+    };
+}
+
+void Scene::UpdateActiveCameraLayer() {
+    auto [next_layer_id, camera_layer] = FindActiveCameraLayer(*this);
+
+    std::string camera_name = "global";
+    std::shared_ptr<SceneNode> camera_node = defaultGlobalCameraNode;
+    double zoom = defaultGlobalCameraZoom;
+    float fov = 50.0f;
+
+    if (camera_layer != nullptr) {
+        camera_name = camera_layer->camera_name.empty() ? "global" : camera_layer->camera_name;
+        camera_node = camera_layer->node;
+        zoom = camera_layer->zoom;
+        fov = camera_layer->fov;
+    }
+
+    auto camera_it = cameras.find(camera_name);
+    if (camera_it == cameras.end() || !camera_it->second) {
+        LOG_ERROR("SceneCameraLayer: target camera '%s' for layer=%d is missing",
+                  camera_name.c_str(),
+                  next_layer_id);
+        camera_it = cameras.find("global");
+        camera_name = "global";
+    }
+    if (camera_it == cameras.end() || !camera_it->second || !camera_node) return;
+
+    camera_it->second->AttatchNode(camera_node);
+    ApplyCameraProjectionState(*this,
+                               camera_name,
+                               *camera_it->second,
+                               zoom,
+                               fov,
+                               next_layer_id);
+    activeCamera = camera_it->second.get();
+
+    if (activeCameraLayerId != next_layer_id) {
+        // This transition log is intentionally sparse: it proves which authored camera layer owns
+        // the view without flooding frame logs while keyframed zoom/origin values animate.
+        LOG_INFO("SceneCameraLayerActive: previous=%d active=%d camera='%s' zoom=%.3f origin=[%.3f, %.3f, %.3f]",
+                 activeCameraLayerId,
+                 next_layer_id,
+                 camera_name.c_str(),
+                 zoom,
+                 camera_layer != nullptr ? camera_layer->origin[0] : 0.0f,
+                 camera_layer != nullptr ? camera_layer->origin[1] : 0.0f,
+                 camera_layer != nullptr ? camera_layer->origin[2] : 0.0f);
+        activeCameraLayerId = next_layer_id;
     }
 }
 

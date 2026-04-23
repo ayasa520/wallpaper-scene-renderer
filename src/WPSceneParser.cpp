@@ -294,6 +294,11 @@ struct WPEmptyObject {
     VisibleBinding       visible_binding;
     int32_t              parent { 0 };
     std::string          attachment;
+    bool                 is_camera_layer { false };
+    std::string          camera_name;
+    std::string          camera_path;
+    float                fov { 50.0f };
+    float                zoom { 1.0f };
 
     bool FromJson(const nlohmann::json& json, fs::VFS&) {
         GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
@@ -317,6 +322,22 @@ struct WPEmptyObject {
         }
         GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
         GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
+        if (json.contains("camera") && json.at("camera").is_string()) {
+            // Camera assets do not have an image/particle/text discriminator, so they otherwise
+            // arrive here as empty layers. Preserve their camera marker and authored projection
+            // values so ParseEmptyObj can register a runtime camera target instead of a harmless
+            // transform-only placeholder.
+            GET_JSON_NAME_VALUE_NOWARN(json, "camera", camera_name);
+            is_camera_layer = true;
+        }
+        if (json.contains("path") && json.at("path").is_string()) {
+            GET_JSON_NAME_VALUE_NOWARN(json, "path", camera_path);
+            if (camera_path.find("scripts/camera_paths_") == 0) {
+                is_camera_layer = true;
+            }
+        }
+        GET_JSON_NAME_VALUE_NOWARN(json, "fov", fov);
+        GET_JSON_NAME_VALUE_NOWARN(json, "zoom", zoom);
         return true;
     }
 };
@@ -457,6 +478,24 @@ bool JsonPropertyHasRuntimeMember(const nlohmann::json* property_json, const cha
 const nlohmann::json* FindVisibleProperty(const nlohmann::json& json) {
     if (!json.is_object() || !json.contains("visible")) return nullptr;
     return &json.at("visible");
+}
+
+bool IsCameraLayerObjectJson(const nlohmann::json& object_json) {
+    if (!object_json.is_object()) return false;
+    if (object_json.contains("camera") && object_json.at("camera").is_string()) return true;
+    if (!object_json.contains("path") || !object_json.at("path").is_string()) return false;
+
+    // Camera assets can be serialized as otherwise-empty objects that only carry a camera path.
+    // Treat those as camera layers too, because their zoom/origin properties still drive the
+    // active view even when the path file itself contains no authored points.
+    const auto path = object_json.at("path").get<std::string>();
+    return path.find("scripts/camera_paths_") == 0;
+}
+
+bool IsCameraLayerRuntimeProperty(std::string_view property_name) {
+    return property_name == "visible" || property_name == "origin" ||
+           property_name == "angles" || property_name == "zoom" ||
+           property_name == "fov";
 }
 
 bool ReadAuthoredVisibleValue(const nlohmann::json& json, bool default_visible = true) {
@@ -1624,6 +1663,8 @@ void ParseCamera(ParseContext& context, wpscene::WPSceneGeneral& general) {
     context.global_camera_node = std::make_shared<SceneNode>(cori, cscale, cangle);
     scene.activeCamera->AttatchNode(context.global_camera_node);
     scene.sceneGraph->AppendChild(context.global_camera_node);
+    scene.defaultGlobalCameraNode = context.global_camera_node;
+    scene.defaultGlobalCameraZoom = std::max(0.0001f, general.zoom);
 
     scene.cameras["global_perspective"] =
         std::make_shared<SceneCamera>((float)context.ortho_w / (float)context.ortho_h,
@@ -2835,7 +2876,10 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
 }
 
 void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
-    auto node = std::make_shared<SceneNode>(Vector3f(empty_obj.origin.data()),
+    const auto node_origin = empty_obj.is_camera_layer
+                                 ? context.scene->ResolveCameraLayerNodeTranslation(empty_obj.origin)
+                                 : Vector3f(empty_obj.origin.data());
+    auto node = std::make_shared<SceneNode>(node_origin,
                                             Vector3f(empty_obj.scale.data()),
                                             Vector3f(empty_obj.angles.data()),
                                             empty_obj.name);
@@ -2865,6 +2909,50 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     RegisterLayerSceneState(
         context, empty_obj.id, empty_obj.parent, empty_obj.attachment, empty_obj.visible);
     context.scene->ApplyLayerVisibility(empty_obj.id);
+
+    if (empty_obj.is_camera_layer) {
+        Scene::CameraLayerRuntimeState camera_layer;
+        // Wallpaper Engine writes "default" for the normal scene camera. Hanabi's matching
+        // orthographic camera is named "global", so normalize the authored token once and keep
+        // the rest of the runtime path name-based for future camera targets.
+        camera_layer.camera_name =
+            empty_obj.camera_name.empty() || empty_obj.camera_name == "default"
+                ? "global"
+                : empty_obj.camera_name;
+        camera_layer.node = node;
+        camera_layer.origin = empty_obj.origin;
+        camera_layer.angles = empty_obj.angles;
+        camera_layer.zoom = empty_obj.zoom;
+        camera_layer.fov = empty_obj.fov;
+        const bool first_camera_registration =
+            context.scene->cameraLayers.count(empty_obj.id) == 0;
+        context.scene->cameraLayers[empty_obj.id] = camera_layer;
+        if (first_camera_registration) context.scene->cameraLayerOrder.push_back(empty_obj.id);
+        context.scene->UpdateActiveCameraLayer();
+
+        size_t camera_path_count = 0;
+        if (!empty_obj.camera_path.empty()) {
+            nlohmann::json path_json;
+            const std::string asset_path = "/assets/" + empty_obj.camera_path;
+            if (context.vfs != nullptr && context.vfs->Contains(asset_path) &&
+                PARSE_JSON(fs::GetFileContent(*context.vfs, asset_path), path_json) &&
+                path_json.contains("paths") && path_json.at("paths").is_array()) {
+                camera_path_count = path_json.at("paths").size();
+            }
+        }
+        LOG_INFO("SceneCameraLayerParsed: id=%d name='%s' camera='%s' origin=[%.3f, %.3f, %.3f] zoom=%.3f fov=%.3f visible=%s path='%s' path-count=%zu",
+                 empty_obj.id,
+                 empty_obj.name.c_str(),
+                 camera_layer.camera_name.c_str(),
+                 empty_obj.origin[0],
+                 empty_obj.origin[1],
+                 empty_obj.origin[2],
+                 empty_obj.zoom,
+                 empty_obj.fov,
+                 context.scene->IsLayerVisible(empty_obj.id) ? "true" : "false",
+                 empty_obj.camera_path.c_str(),
+                 camera_path_count);
+    }
 }
 
 void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
@@ -3089,10 +3177,13 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
         return;
     }
 
-    // Property animation registrations still target SceneNode-backed values. Sound streams are
-    // mounted outside the scene graph, so their live volume user binding is handled by
-    // RegisterScenePropertyBinding instead of entering the property animation table.
-    if (context.object_nodes.count(object_id) == 0) return;
+    // Property animation registrations still target SceneNode-backed values. Camera layers keep a
+    // node too, but they must dispatch through the camera target so origin/zoom keyframes update
+    // the active SceneCamera instead of only the invisible layer node.
+    const bool camera_registration =
+        IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
+    const auto object_node_it = context.object_nodes.find(object_id);
+    if (object_node_it == context.object_nodes.end()) return;
 
     WPPropertyAnimationDefinition animation_definition;
     if (!ParsePropertyAnimationDefinition(property_json, hint, animation_definition)) return;
@@ -3116,8 +3207,9 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = context.object_nodes.at(object_id).get(),
-        .target_kind   = WPSceneScriptTargetKind::Layer,
+        .node          = object_node_it->second.get(),
+        .target_kind   = camera_registration ? WPSceneScriptTargetKind::Camera
+                                             : WPSceneScriptTargetKind::Layer,
         .target_index  = 0,
         .value_type    = hint,
         .base_value    = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
@@ -3133,6 +3225,12 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
                                  registration.value_type,
                                  registration.setting,
                                  registration.base_value);
+    }
+    if (camera_registration) {
+        LOG_INFO("SceneCameraLayerRegister: layer=%d property='%.*s' kind=animation target=camera",
+                 object_id,
+                 static_cast<int>(property_name.size()),
+                 property_name.data());
     }
 }
 
@@ -3173,16 +3271,21 @@ void RegisterSceneScriptBinding(ParseContext& context, const nlohmann::json& obj
         object_name = std::to_string(object_id);
     }
 
-    // Script bindings still dispatch through a SceneNode-backed target. Sound volume live edits
-    // are plain user-property bindings and are registered in RegisterScenePropertyBinding below.
-    if (context.object_nodes.count(object_id) == 0) return;
+    // Script bindings still dispatch through a SceneNode-backed target. Camera layers use the
+    // camera target so parser/runtime scripts see normal layer objects while writes are routed to
+    // the active SceneCamera state.
+    const bool camera_registration =
+        IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
+    const auto object_node_it = context.object_nodes.find(object_id);
+    if (object_node_it == context.object_nodes.end()) return;
 
     context.scene->scriptRegistrations.push_back(WPSceneScriptRegistration {
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = context.object_nodes.at(object_id).get(),
-        .target_kind   = WPSceneScriptTargetKind::Layer,
+        .node          = object_node_it->second.get(),
+        .target_kind   = camera_registration ? WPSceneScriptTargetKind::Camera
+                                             : WPSceneScriptTargetKind::Layer,
         .target_index  = 0,
         .value_type    = hint,
         .base_value    = setting.value,
@@ -3197,6 +3300,12 @@ void RegisterSceneScriptBinding(ParseContext& context, const nlohmann::json& obj
                                  registration.value_type,
                                  registration.setting,
                                  registration.base_value);
+    }
+    if (camera_registration) {
+        LOG_INFO("SceneCameraLayerRegister: layer=%d property='%.*s' kind=script target=camera",
+                 object_id,
+                 static_cast<int>(property_name.size()),
+                 property_name.data());
     }
 }
 
@@ -3229,6 +3338,8 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
     const bool sound_volume_binding =
         property_name == "volume" && context.scene != nullptr &&
         context.scene->objectRuntimeSoundHandles.count(object_id) != 0;
+    const bool camera_registration =
+        IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
     const auto object_node_it = context.object_nodes.find(object_id);
     if (object_node_it == context.object_nodes.end() && !sound_volume_binding) return;
 
@@ -3253,7 +3364,8 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
         .property_name = std::string(property_name),
         .node = sound_volume_binding ? nullptr : object_node_it->second.get(),
         .target_kind = sound_volume_binding ? WPSceneScriptTargetKind::Sound
-                                            : WPSceneScriptTargetKind::Layer,
+                                            : (camera_registration ? WPSceneScriptTargetKind::Camera
+                                                                   : WPSceneScriptTargetKind::Layer),
         .target_index = 0,
         .value_type = hint,
         .base_value = setting.value,
@@ -3274,6 +3386,12 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
                                  registration.value_type,
                                  registration.setting,
                                  registration.base_value);
+    }
+    if (camera_registration) {
+        LOG_INFO("SceneCameraLayerRegister: layer=%d property='%.*s' kind=user target=camera",
+                 object_id,
+                 static_cast<int>(property_name.size()),
+                 property_name.data());
     }
 }
 
@@ -3796,6 +3914,21 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
         RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
 
+        if (IsCameraLayerObjectJson(object_json)) {
+            // Camera zoom/fov are not normal drawable layer properties, so they are scanned only
+            // for authored camera layers and routed through the camera target kind registered
+            // above. Origin/visible are already part of the shared layer scan and are retargeted
+            // by RegisterScene*Binding when the object is a camera layer.
+            RegisterScenePropertyBinding(context, object_json, "zoom", WPDynamicValue::Type::Float);
+            RegisterScenePropertyBinding(context, object_json, "fov", WPDynamicValue::Type::Float);
+            RegisterScenePropertyAnimationBinding(
+                context, object_json, "zoom", WPDynamicValue::Type::Float);
+            RegisterScenePropertyAnimationBinding(
+                context, object_json, "fov", WPDynamicValue::Type::Float);
+            RegisterSceneScriptBinding(context, object_json, "zoom", WPDynamicValue::Type::Float);
+            RegisterSceneScriptBinding(context, object_json, "fov", WPDynamicValue::Type::Float);
+        }
+
         RegisterEffectVisibilityBindings(context, object_json);
 
         if (!object_json.contains("animationlayers") || !object_json.at("animationlayers").is_array()) {
@@ -3965,6 +4098,20 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterSceneScriptBinding(
         context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
     RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+
+    if (IsCameraLayerObjectJson(object_json)) {
+        // Dynamic camera layers need the same camera-only zoom/fov registration as scene-load
+        // camera layers; otherwise scripts that create or re-materialize camera assets would keep
+        // origin live but leave zoom frozen at the authored parse value.
+        RegisterScenePropertyBinding(context, object_json, "zoom", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(context, object_json, "fov", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "zoom", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "fov", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(context, object_json, "zoom", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(context, object_json, "fov", WPDynamicValue::Type::Float);
+    }
 
     RegisterEffectVisibilityBindings(context, object_json);
 
