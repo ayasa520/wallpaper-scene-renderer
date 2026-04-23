@@ -540,15 +540,14 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
             GET_JSON_NAME_VALUE_NOWARN(wpj, "drag", drag);
             GET_JSON_NAME_VALUE_NOWARN(wpj, "gravity", gravity);
             Vector3d vecG = Vector3f(gravity.data()).cast<double>();
-            // Cherry_Blossoms_2.json has gravity="0 -50 0". linux-wallpaperengine flips particle
-            // gravity Y before integration, otherwise the blossom bends away from the reference star
-            // trajectory immediately after mapsequencearoundcontrolpoint launches it.
-            vecG.y() = -vecG.y();
             return [=](const ParticleInfo& info) {
                 for (auto& p : info.particles) {
-                    // Match linux-wallpaperengine for this wallpaper's movement operator: move using
-                    // the current mapsequence velocity first, then apply gravity and drag for the
-                    // next frame. Force-before-move collapses the five arms into dense streaks.
+                    // Keep the authored gravity vector untouched so every particle system follows
+                    // the scene's normal coordinate convention. Flipping Y here made generic
+                    // effects such as fireworks accelerate upward after they exploded.
+                    //
+                    // Integrate position from the current velocity first, then apply gravity and
+                    // drag to the velocity that will be used on the next frame.
                     PM::MoveByTime(p, info.time_pass);
                     PM::Accelerate(p, speed * vecG, info.time_pass);
 
