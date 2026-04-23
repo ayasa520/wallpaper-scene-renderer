@@ -41,6 +41,7 @@ constexpr double kBaseTextResolutionDpi { 96.0 };
 constexpr float  kMinTextVisualScaleFactor { 0.0625f };
 constexpr int    kTextGlyphAtlasMaxExtent { 1024 };
 constexpr int    kTextGlyphAtlasPadding { 1 };
+constexpr float  kScreenAnchoredTextStackGap { 1.0f };
 
 uint16_t ResolveTextMeshExtent(float value) {
     return static_cast<uint16_t>(std::max(1, static_cast<int>(std::lround(value))));
@@ -1714,6 +1715,283 @@ bool IsCameraLinkedFromScene(const Scene& scene, std::string_view camera_name) {
         });
 }
 
+bool HasExplicitTextScreenAnchor(const wpscene::WPTextObject& object) {
+    return ! object.anchor.empty() && object.anchor != "none";
+}
+
+bool TextAnchorContains(std::string_view anchor, std::string_view token) {
+    return anchor.find(token) != std::string_view::npos;
+}
+
+struct ScreenAnchorFrame {
+    double view_left { 0.0 };
+    double view_right { 0.0 };
+    double view_bottom { 0.0 };
+    double view_top { 0.0 };
+    double scene_left { 0.0 };
+    double scene_right { 0.0 };
+    double scene_bottom { 0.0 };
+    double scene_top { 0.0 };
+    double scene_center_x { 0.0 };
+    double scene_center_y { 0.0 };
+    double view_center_x { 0.0 };
+    double view_center_y { 0.0 };
+};
+
+std::optional<ScreenAnchorFrame> ResolveScreenAnchorFrame(const Scene& scene) {
+    const auto* camera = scene.activeCamera;
+    if (camera == nullptr || camera->IsPerspective() || scene.ortho[0] <= 0 || scene.ortho[1] <= 0) {
+        return std::nullopt;
+    }
+
+    const auto camera_position = camera->GetPosition();
+    ScreenAnchorFrame frame;
+    frame.view_left = camera_position.x() - camera->Width() * 0.5;
+    frame.view_right = camera_position.x() + camera->Width() * 0.5;
+    frame.view_bottom = camera_position.y() - camera->Height() * 0.5;
+    frame.view_top = camera_position.y() + camera->Height() * 0.5;
+    frame.scene_left = 0.0;
+    frame.scene_right = static_cast<double>(scene.ortho[0]);
+    frame.scene_bottom = 0.0;
+    frame.scene_top = static_cast<double>(scene.ortho[1]);
+    frame.scene_center_x = frame.scene_right * 0.5;
+    frame.scene_center_y = frame.scene_top * 0.5;
+    frame.view_center_x = (frame.view_left + frame.view_right) * 0.5;
+    frame.view_center_y = (frame.view_bottom + frame.view_top) * 0.5;
+    return frame;
+}
+
+std::array<float, 3> ResolveScreenAnchoredTextOrigin(const ScreenAnchorFrame& frame,
+                                                     const wpscene::WPTextObject& object) {
+    std::array<float, 3> origin = object.origin;
+    const std::string_view anchor = object.anchor;
+    // Wallpaper Engine's text `anchor` is a screen-anchor contract, not just a local glyph-box
+    // alignment hint. When fill mode narrows or widens the active orthographic camera, authored
+    // edge coordinates such as dino_run's x=341.43 must follow the visible camera edge; otherwise
+    // right/top anchored UI text can be clipped even though the scene.json coordinates are valid.
+    if (TextAnchorContains(anchor, "left")) {
+        origin[0] += static_cast<float>(frame.view_left - frame.scene_left);
+    } else if (TextAnchorContains(anchor, "right")) {
+        origin[0] += static_cast<float>(frame.view_right - frame.scene_right);
+    } else {
+        origin[0] += static_cast<float>(frame.view_center_x - frame.scene_center_x);
+    }
+
+    if (TextAnchorContains(anchor, "bottom")) {
+        origin[1] += static_cast<float>(frame.view_bottom - frame.scene_bottom);
+    } else if (TextAnchorContains(anchor, "top")) {
+        origin[1] += static_cast<float>(frame.view_top - frame.scene_top);
+    } else {
+        origin[1] += static_cast<float>(frame.view_center_y - frame.scene_center_y);
+    }
+
+    return origin;
+}
+
+struct ScreenAnchoredTextBounds {
+    float left { 0.0f };
+    float right { 0.0f };
+    float bottom { 0.0f };
+    float top { 0.0f };
+};
+
+struct ScreenAnchoredTextPlacement {
+    int32_t                layer_id { 0 };
+    TextLayerRuntimeState* state { nullptr };
+    SceneNode*             node { nullptr };
+    Eigen::Vector3f        translation { 0.0f, 0.0f, 0.0f };
+    ScreenAnchoredTextBounds bounds;
+};
+
+ScreenAnchoredTextBounds ResolveScreenAnchoredTextBounds(const TextLayerRuntimeState& state,
+                                                         const Eigen::Vector3f& translation) {
+    const auto visible_display_size = ResolveVisibleTextDisplaySize(state);
+    const auto scaled_visible_size = ScaleTextDisplayMetric(visible_display_size, state.object.scale);
+    const float half_width = scaled_visible_size[0] * 0.5f;
+    const float half_height = scaled_visible_size[1] * 0.5f;
+    return {
+        translation.x() - half_width,
+        translation.x() + half_width,
+        translation.y() - half_height,
+        translation.y() + half_height,
+    };
+}
+
+bool ScreenAnchoredTextOverlapsHorizontally(const ScreenAnchoredTextBounds& lhs,
+                                            const ScreenAnchoredTextBounds& rhs) {
+    return lhs.left < rhs.right && rhs.left < lhs.right;
+}
+
+void MoveScreenAnchoredTextPlacementY(ScreenAnchoredTextPlacement& placement, float delta_y) {
+    placement.translation.y() += delta_y;
+    placement.bounds.bottom += delta_y;
+    placement.bounds.top += delta_y;
+}
+
+void MoveScreenAnchoredTextPlacementX(ScreenAnchoredTextPlacement& placement, float delta_x) {
+    placement.translation.x() += delta_x;
+    placement.bounds.left += delta_x;
+    placement.bounds.right += delta_x;
+}
+
+void SnapScreenAnchoredTextPlacementToFrame(ScreenAnchoredTextPlacement& placement,
+                                            const ScreenAnchorFrame&       frame) {
+    const auto* state = placement.state;
+    if (state == nullptr) return;
+
+    const std::string_view anchor = state->object.anchor;
+    if (TextAnchorContains(anchor, "left")) {
+        const float authored_left_inset = std::max(
+            0.0f, state->object.origin[0] - static_cast<float>(frame.scene_left));
+        MoveScreenAnchoredTextPlacementX(
+            placement,
+            static_cast<float>(frame.view_left) + authored_left_inset - placement.bounds.left);
+    } else if (TextAnchorContains(anchor, "right")) {
+        const float authored_right_inset = std::max(
+            0.0f, static_cast<float>(frame.scene_right) - state->object.origin[0]);
+        MoveScreenAnchoredTextPlacementX(
+            placement,
+            static_cast<float>(frame.view_right) - authored_right_inset - placement.bounds.right);
+    }
+
+    if (TextAnchorContains(anchor, "bottom")) {
+        const float authored_bottom_inset = std::max(
+            0.0f, state->object.origin[1] - static_cast<float>(frame.scene_bottom));
+        MoveScreenAnchoredTextPlacementY(
+            placement,
+            static_cast<float>(frame.view_bottom) + authored_bottom_inset - placement.bounds.bottom);
+    } else if (TextAnchorContains(anchor, "top")) {
+        // The screen anchor must be resolved against the actual visible glyph rectangle after
+        // Pango/Freetype cropping, not merely against the authored `origin`. Preserve the authored
+        // inset from the project canvas edge so Windows-style HUD labels keep their small breathing
+        // room while still removing Linux font-metric slack from the visible edge calculation.
+        const float authored_top_inset = std::max(
+            0.0f, static_cast<float>(frame.scene_top) - state->object.origin[1]);
+        MoveScreenAnchoredTextPlacementY(
+            placement,
+            static_cast<float>(frame.view_top) - authored_top_inset - placement.bounds.top);
+    }
+}
+
+bool ResolveTopScreenAnchoredTextStack(std::vector<ScreenAnchoredTextPlacement>& placements) {
+    std::vector<size_t> top_indices;
+    for (size_t index = 0; index < placements.size(); ++index) {
+        const auto* state = placements[index].state;
+        if (state != nullptr && TextAnchorContains(state->object.anchor, "top")) {
+            top_indices.push_back(index);
+        }
+    }
+
+    std::sort(top_indices.begin(), top_indices.end(), [&](size_t lhs, size_t rhs) {
+        const auto& left = placements[lhs];
+        const auto& right = placements[rhs];
+        const float left_authored_y = left.state != nullptr ? left.state->object.origin[1] : left.bounds.top;
+        const float right_authored_y =
+            right.state != nullptr ? right.state->object.origin[1] : right.bounds.top;
+        if (std::abs(left_authored_y - right_authored_y) > 0.0001f) {
+            return left_authored_y > right_authored_y;
+        }
+        return left.layer_id < right.layer_id;
+    });
+
+    bool changed_any = false;
+    for (size_t ordered_index = 1; ordered_index < top_indices.size(); ++ordered_index) {
+        auto& current = placements[top_indices[ordered_index]];
+        float required_down_shift = 0.0f;
+        for (size_t previous_order = 0; previous_order < ordered_index; ++previous_order) {
+            const auto& previous = placements[top_indices[previous_order]];
+            if (! ScreenAnchoredTextOverlapsHorizontally(current.bounds, previous.bounds)) continue;
+
+            // Multiple top-anchored Wallpaper Engine labels can deliberately share the same screen
+            // corner, as dino_run does with `label_coins` and `label_top`. Linux/Pango text bounds
+            // can be taller than the authored Windows raster, so use the actual visible rectangles
+            // and keep the lower label below the previous one instead of trusting the raw origin
+            // delta to be enough for every font backend.
+            const float target_top = previous.bounds.bottom - kScreenAnchoredTextStackGap;
+            if (current.bounds.top > target_top) {
+                required_down_shift = std::max(required_down_shift, current.bounds.top - target_top);
+            }
+        }
+        if (required_down_shift > 0.0001f) {
+            MoveScreenAnchoredTextPlacementY(current, -required_down_shift);
+            changed_any = true;
+        }
+    }
+    return changed_any;
+}
+
+bool ResolveBottomScreenAnchoredTextStack(std::vector<ScreenAnchoredTextPlacement>& placements) {
+    std::vector<size_t> bottom_indices;
+    for (size_t index = 0; index < placements.size(); ++index) {
+        const auto* state = placements[index].state;
+        if (state != nullptr && TextAnchorContains(state->object.anchor, "bottom")) {
+            bottom_indices.push_back(index);
+        }
+    }
+
+    std::sort(bottom_indices.begin(), bottom_indices.end(), [&](size_t lhs, size_t rhs) {
+        const auto& left = placements[lhs];
+        const auto& right = placements[rhs];
+        const float left_authored_y =
+            left.state != nullptr ? left.state->object.origin[1] : left.bounds.bottom;
+        const float right_authored_y =
+            right.state != nullptr ? right.state->object.origin[1] : right.bounds.bottom;
+        if (std::abs(left_authored_y - right_authored_y) > 0.0001f) {
+            return left_authored_y < right_authored_y;
+        }
+        return left.layer_id < right.layer_id;
+    });
+
+    bool changed_any = false;
+    for (size_t ordered_index = 1; ordered_index < bottom_indices.size(); ++ordered_index) {
+        auto& current = placements[bottom_indices[ordered_index]];
+        float required_up_shift = 0.0f;
+        for (size_t previous_order = 0; previous_order < ordered_index; ++previous_order) {
+            const auto& previous = placements[bottom_indices[previous_order]];
+            if (! ScreenAnchoredTextOverlapsHorizontally(current.bounds, previous.bounds)) continue;
+
+            // Bottom-anchored labels need the mirror image of the top stack: preserve the authored
+            // ordering from the edge, but raise later labels only when their actual visible glyph
+            // rectangles collide with earlier labels on the same horizontal run.
+            const float target_bottom = previous.bounds.top + kScreenAnchoredTextStackGap;
+            if (current.bounds.bottom < target_bottom) {
+                required_up_shift = std::max(required_up_shift, target_bottom - current.bounds.bottom);
+            }
+        }
+        if (required_up_shift > 0.0001f) {
+            MoveScreenAnchoredTextPlacementY(current, required_up_shift);
+            changed_any = true;
+        }
+    }
+    return changed_any;
+}
+
+void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id, SceneNode* node) {
+    if (node == nullptr) return;
+
+    auto camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
+    if (camera_names_it == scene.objectRuntimeCameraNames.end()) return;
+
+    for (const auto& camera_name : camera_names_it->second) {
+        auto camera_it = scene.cameras.find(camera_name);
+        if (camera_it == scene.cameras.end() || ! camera_it->second->HasImgEffect()) continue;
+
+        auto* effect_layer = camera_it->second->GetImgEffect().get();
+        if (effect_layer == nullptr) continue;
+
+        // Screen-anchor adjustments mutate the visible world node, so effect-backed text needs the
+        // same final-composite resynchronization that script-driven origin/scale writes already
+        // perform. The offscreen source camera stays in local text space; only the resolved output
+        // node follows the anchored world transform.
+        if (effect_layer->WorldNode() != nullptr) {
+            effect_layer->SyncResolvedNodeToWorld();
+        } else {
+            effect_layer->SyncResolvedNodeToMatrix(
+                Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
+        }
+    }
+}
+
 } // namespace
 
 std::string wallpaper::ResolveTextLayerSceneAlignment(const wpscene::WPTextObject& object) {
@@ -2367,6 +2645,67 @@ std::array<float, 3> wallpaper::ResolveTextLayerNodeTranslation(const TextLayerR
         origin[2],
     };
     return resolved;
+}
+
+bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
+    const auto frame = ResolveScreenAnchorFrame(scene);
+    if (! frame.has_value()) {
+        return false;
+    }
+
+    std::vector<ScreenAnchoredTextPlacement> placements;
+    for (auto& [layer_id, state] : scene.textLayers) {
+        if (scene.deferredRuntimeTextLayerIds.count(layer_id) != 0) continue;
+        if (! HasExplicitTextScreenAnchor(state.object)) continue;
+
+        const auto binding = scene.GetLayerParentBinding(layer_id);
+        if (binding.parent_id != 0 || ! binding.attachment.empty()) {
+            continue;
+        }
+
+        auto layer_node_it = scene.layerNodes.find(layer_id);
+        if (layer_node_it == scene.layerNodes.end() || layer_node_it->second == nullptr) {
+            continue;
+        }
+
+        SceneNode* layer_node = layer_node_it->second;
+        const auto anchored_origin = ResolveScreenAnchoredTextOrigin(*frame, state.object);
+        const auto resolved = ResolveTextLayerNodeTranslation(state, anchored_origin);
+        const Eigen::Vector3f next_translation { resolved[0], resolved[1], resolved[2] };
+        placements.push_back(ScreenAnchoredTextPlacement {
+            .layer_id = layer_id,
+            .state = &state,
+            .node = layer_node,
+            .translation = next_translation,
+            .bounds = ResolveScreenAnchoredTextBounds(state, next_translation),
+        });
+        SnapScreenAnchoredTextPlacementToFrame(placements.back(), *frame);
+    }
+
+    // Resolve all screen-anchored text placements together before writing scene nodes. This keeps
+    // same-corner HUD labels deterministic: each placement starts from the authored origin shifted
+    // into the active camera frame, then only actual visible-glyph collisions introduce an extra
+    // local stack offset.
+    ResolveTopScreenAnchoredTextStack(placements);
+    ResolveBottomScreenAnchoredTextStack(placements);
+
+    bool changed_any_node = false;
+    for (const auto& placement : placements) {
+        const Eigen::Vector3f delta = placement.node->Translate() - placement.translation;
+        if (delta.squaredNorm() <= 0.000001f) {
+            continue;
+        }
+
+        // This write is intentionally recomputed from the authored origin on every camera framing
+        // update instead of accumulating deltas. Fill-mode changes can run every frame when camera
+        // layers animate, and using the authored origin as the base keeps screen-anchored text
+        // deterministic while preserving script-visible `thisLayer.origin` values.
+        placement.node->SetTranslate(placement.translation);
+        SyncTextLayerEffectTransform(scene, placement.layer_id, placement.node);
+        changed_any_node = true;
+    }
+
+    return changed_any_node;
 }
 
 bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_id) {

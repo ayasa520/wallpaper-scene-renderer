@@ -82,6 +82,7 @@ TextLayerPropertyUpdateStrategy ResolveTextLayerPropertyUpdateStrategy(
     std::string_view             property_name);
 std::array<float, 3> ResolveTextLayerNodeTranslation(const TextLayerRuntimeState& state,
                                                      std::array<float, 3>         origin);
+bool ApplyTextLayerScreenAnchorTransforms(Scene& scene);
 bool        HasTextLayerProperty(std::string_view property_name);
 std::optional<WPDynamicValue> ReadTextLayerProperty(const TextLayerRuntimeState& state,
                                                     std::string_view             property_name);
