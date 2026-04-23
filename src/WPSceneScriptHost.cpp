@@ -319,6 +319,7 @@ LayerValueHint LayerValueType(std::string_view property_name) {
     if (property_name == "font") return { WPDynamicValue::Type::String, true };
     if (property_name == "color") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "colorn") return { WPDynamicValue::Type::Float3, true };
+    if (property_name == "rate") return { WPDynamicValue::Type::Float, true };
     if (property_name == "alpha") return { WPDynamicValue::Type::Float, true };
     if (property_name == "brightness") return { WPDynamicValue::Type::Float, true };
     if (property_name == "backgroundcolor") return { WPDynamicValue::Type::Float3, true };
@@ -375,6 +376,13 @@ bool IsParticleSizeProperty(std::string_view property_name) {
     return property_name == "size";
 }
 
+bool IsParticleRateProperty(std::string_view property_name) {
+    // Nested particle scripts are registered as layer targets with the authored override name.
+    // Keeping the name plain `rate` lets the existing script/user-property dispatcher stay shared
+    // while ApplyParticlePropertyValue() routes it to ParticleSubSystem instead of image layers.
+    return property_name == "rate";
+}
+
 std::optional<std::array<float, 3>> NormalizeParticleColorValue(
     std::string_view property_name, const WPDynamicValue& value) {
     std::array<float, 3> color {};
@@ -398,6 +406,16 @@ std::optional<float> NormalizeParticleSizeValue(const WPDynamicValue& value) {
     float size = 0.0f;
     if (!value.tryGet(&size) || !std::isfinite(size)) return std::nullopt;
     return size;
+}
+
+std::optional<float> NormalizeParticleRateValue(const WPDynamicValue& value) {
+    float rate = 0.0f;
+    if (!value.tryGet(&rate) || !std::isfinite(rate)) return std::nullopt;
+
+    // Negative particle time would make lifetime decay and emitter timers run backward, which is
+    // not a supported Wallpaper particle override. Clamp live script output to the same forward
+    // clock domain used by property-animation rate setters elsewhere in the runtime.
+    return std::max(0.0f, rate);
 }
 
 const char* TargetKindName(WPSceneScriptTargetKind target_kind) {
@@ -1830,7 +1848,8 @@ struct WPSceneScriptHost::Opaque {
 std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost::Opaque* opaque,
                                                         int32_t layer_id,
                                                         std::string_view property_name) {
-    if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name)) ||
+    if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name) &&
+         !IsParticleRateProperty(property_name)) ||
         opaque == nullptr || opaque->scene == nullptr || layer_id == 0) {
         return std::nullopt;
     }
@@ -1850,13 +1869,19 @@ std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost:
                 return WPDynamicValue(*size);
             }
         }
+        if (IsParticleRateProperty(property_name)) {
+            if (auto rate = subsystem->RuntimeRateOverride(); rate.has_value()) {
+                return WPDynamicValue(*rate);
+            }
+        }
     }
     return std::nullopt;
 }
 
 bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                                 std::string_view property_name, const WPDynamicValue& value) {
-    if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name)) ||
+    if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name) &&
+         !IsParticleRateProperty(property_name)) ||
         opaque == nullptr || opaque->scene == nullptr || layer_id == 0) {
         return false;
     }
@@ -1911,6 +1936,46 @@ bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer
                  (*color)[1],
                  (*color)[2],
                  target_count);
+        return true;
+    }
+
+    if (IsParticleRateProperty(property_name)) {
+        const auto rate = NormalizeParticleRateValue(value);
+        if (!rate.has_value()) {
+            LOG_ERROR("SceneParticleRateApply: layer=%d property='%.*s' invalid-value=%s",
+                      layer_id,
+                      static_cast<int>(property_name.size()),
+                      property_name.data(),
+                      value.describe().c_str());
+            return false;
+        }
+
+        if (particle_it == opaque->scene->objectRuntimeParticleSubsystems.end()) {
+            if (opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) != 0) {
+                // A deferred particle layer has no live subsystem yet. Accept the script value so
+                // hidden layers do not fail their update loop; once visibility materializes the
+                // subsystem, the next script tick will write the same clock multiplier to it.
+                LOG_INFO("SceneParticleRateDeferred: layer=%d property='%.*s' rate=%.3f",
+                         layer_id,
+                         static_cast<int>(property_name.size()),
+                         property_name.data(),
+                         *rate);
+                return true;
+            }
+            return false;
+        }
+
+        std::size_t target_count = 0;
+        for (auto* subsystem : particle_it->second) {
+            if (subsystem == nullptr) continue;
+            subsystem->SetRuntimeRateOverride(*rate);
+            target_count++;
+        }
+
+        if (target_count == 0) return false;
+        // Audio-reactive particle rate scripts commonly return a value every frame. Keep the
+        // successful hot path silent so real diagnostics such as invalid values or deferred-layer
+        // materialization remain visible without flooding the log or perturbing frame pacing.
         return true;
     }
 

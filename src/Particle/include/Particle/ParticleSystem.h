@@ -85,6 +85,8 @@ public:
     void      SetSceneNode(SceneNode* node);
     void      SetRuntimeColorOverride(const std::array<float, 3>& color);
     std::optional<std::array<float, 3>> RuntimeColorOverride() const;
+    void      SetRuntimeRateOverride(float rate);
+    std::optional<float> RuntimeRateOverride() const;
     void      SetRuntimeSizeReference(float size);
     void      SetRuntimeSizeOverride(float size);
     std::optional<float> RuntimeSizeOverride() const;
@@ -113,7 +115,15 @@ private:
 
     ParticleRawGenSpecOp m_genSpecOp;
     u32                  m_maxcount;
+    // Wallpaper particle `instanceoverride.rate` scales the subsystem simulation clock, not just
+    // the spawn count. Keep it mutable so audio/user scripts nested under instanceoverride can
+    // speed up gravity, lifetime decay, and emitter timers after the particle system was parsed.
     double               m_rate;
+    // Keep the live rate override separate from the parsed particle clock so script init can
+    // distinguish "no runtime value has been applied yet" from a parser fallback. Audio-reactive
+    // rate scripts commonly capture init(value) as their base multiplier; returning parsed m_rate
+    // here would seed them with the already-reduced cold value and shrink every update twice.
+    std::optional<float> m_runtime_rate_override;
     double               m_time;
 
     std::vector<std::unique_ptr<ParticleSubSystem>> m_children;

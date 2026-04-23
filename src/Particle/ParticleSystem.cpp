@@ -128,6 +128,25 @@ std::optional<std::array<float, 3>> ParticleSubSystem::RuntimeColorOverride() co
     return m_runtime_color_override;
 }
 
+void ParticleSubSystem::SetRuntimeRateOverride(float rate) {
+    if (!std::isfinite(rate)) return;
+
+    // Wallpaper treats particle override rate as a non-negative simulation clock multiplier. The
+    // same layer-level override is parsed into child emitters, so propagate live script/user edits
+    // recursively to keep event-follow trails and their parent particles in the same time domain.
+    const float normalized_rate = std::max(0.0f, rate);
+    m_rate = normalized_rate;
+    m_runtime_rate_override = normalized_rate;
+
+    for (auto& child : m_children) {
+        if (child) child->SetRuntimeRateOverride(normalized_rate);
+    }
+}
+
+std::optional<float> ParticleSubSystem::RuntimeRateOverride() const {
+    return m_runtime_rate_override;
+}
+
 void ParticleSubSystem::ApplyRuntimeSizeDeltaToParticle(Particle& particle,
                                                         float     size_delta) const {
     particle.init.size *= size_delta;

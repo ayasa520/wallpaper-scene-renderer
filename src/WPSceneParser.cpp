@@ -3470,6 +3470,76 @@ void RegisterSceneParticleOverridePropertyBinding(ParseContext& context,
                  : "");
 }
 
+void RegisterSceneParticleOverrideScriptBinding(ParseContext& context,
+                                                const nlohmann::json& object_json,
+                                                std::string_view property_name,
+                                                WPDynamicValue::Type hint) {
+    if (!object_json.is_object() || !object_json.contains("id") || !object_json.contains("name") ||
+        !object_json.contains("particle") || object_json.at("particle").is_null() ||
+        !object_json.contains("instanceoverride") ||
+        !object_json.at("instanceoverride").is_object()) {
+        return;
+    }
+
+    const auto& override_json = object_json.at("instanceoverride");
+    if (!override_json.contains(property_name)) return;
+
+    const auto& property_json = override_json.at(property_name);
+    if (!property_json.is_object() || !property_json.contains("script")) return;
+
+    int32_t object_id { 0 };
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("id"),
+                      object_id,
+                      false,
+                      "",
+                      false)) {
+        return;
+    }
+
+    const auto object_node_it = context.object_nodes.find(object_id);
+    if (object_node_it == context.object_nodes.end()) return;
+
+    WPUserSetting setting;
+    if (!ParseUserSetting(property_json, setting, hint) || !setting.hasScript()) return;
+
+    std::string object_name;
+    if (!GetJsonValue(__SHORT_FILE__,
+                      __FUNCTION__,
+                      __LINE__,
+                      object_json.at("name"),
+                      object_name,
+                      false,
+                      "",
+                      false)) {
+        object_name = std::to_string(object_id);
+    }
+
+    // Particle override scripts are authored under instanceoverride, but the script runtime only
+    // knows how to dispatch persistent scripts to concrete scene targets. Register the nested
+    // value as a layer target with the bare override name so ApplyParticlePropertyValue() can
+    // forward it to ParticleSubSystem instead of losing audio-reactive particle clocks after parse.
+    context.scene->scriptRegistrations.push_back(WPSceneScriptRegistration {
+        .object_id     = object_id,
+        .object_name   = std::move(object_name),
+        .property_name = std::string(property_name),
+        .node          = object_node_it->second.get(),
+        .target_kind   = WPSceneScriptTargetKind::Layer,
+        .target_index  = 0,
+        .value_type    = hint,
+        .base_value    = setting.value,
+        .setting       = std::move(setting),
+    });
+
+    LOG_INFO("SceneParticleOverrideRegister: layer=%d property='instanceoverride.%.*s' "
+             "kind=script target=particle",
+             object_id,
+             static_cast<int>(property_name.size()),
+             property_name.data());
+}
+
 void LogUnsupportedEffectMaterialScripts(const nlohmann::json& object_json,
                                          const nlohmann::json& effect_json,
                                          int32_t object_id,
@@ -3813,16 +3883,20 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterScenePropertyBinding(context, object_json, "text", WPDynamicValue::Type::String);
         RegisterScenePropertyBinding(context, object_json, "font", WPDynamicValue::Type::String);
         RegisterScenePropertyBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
-        // Particle trail controls such as mouse-tail `colorn` and scalar `size` are nested below
-        // instanceoverride, so the generic top-level scans above never see them. Register the
-        // normalized color, byte-color, and size override names here so user-property edits can
-        // reach live particles.
+        // Particle controls such as mouse-tail `colorn`, scalar `size`, and audio-reactive
+        // `rate` are nested below instanceoverride, so the generic top-level scans above never see
+        // them. Register the nested override names here so user-property edits and persistent
+        // scripts can reach live particles instead of being frozen at parse-time values.
         RegisterSceneParticleOverridePropertyBinding(
             context, object_json, "colorn", WPDynamicValue::Type::Float3);
         RegisterSceneParticleOverridePropertyBinding(
             context, object_json, "color", WPDynamicValue::Type::Float3);
         RegisterSceneParticleOverridePropertyBinding(
             context, object_json, "size", WPDynamicValue::Type::Float);
+        RegisterSceneParticleOverridePropertyBinding(
+            context, object_json, "rate", WPDynamicValue::Type::Float);
+        RegisterSceneParticleOverrideScriptBinding(
+            context, object_json, "rate", WPDynamicValue::Type::Float);
         RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
         RegisterScenePropertyBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
         // Sound-layer volume is authored beside visual layer properties, but its runtime target is
@@ -4000,14 +4074,18 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterScenePropertyBinding(context, object_json, "font", WPDynamicValue::Type::String);
     RegisterScenePropertyBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
     // Dynamic layer materialization uses this per-object registration path, so particle
-    // instanceoverride color and size bindings must be added here as well as during the initial
-    // full-scene scan above.
+    // instanceoverride color, size, and rate bindings must be added here as well as during the
+    // initial full-scene scan above.
     RegisterSceneParticleOverridePropertyBinding(
         context, object_json, "colorn", WPDynamicValue::Type::Float3);
     RegisterSceneParticleOverridePropertyBinding(
         context, object_json, "color", WPDynamicValue::Type::Float3);
     RegisterSceneParticleOverridePropertyBinding(
         context, object_json, "size", WPDynamicValue::Type::Float);
+    RegisterSceneParticleOverridePropertyBinding(
+        context, object_json, "rate", WPDynamicValue::Type::Float);
+    RegisterSceneParticleOverrideScriptBinding(
+        context, object_json, "rate", WPDynamicValue::Type::Float);
     RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
     RegisterScenePropertyBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
     // Dynamic materialization reuses the same registration helper, so keep sound volume in this
