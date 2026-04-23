@@ -905,14 +905,17 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "some\n"
         << "  // authored pointer-follow scripts read input.cursorWorldPosition.x every frame "
            "without a\n"
-        << "  // guard. Keep fallback Vec instances in the wrapper so a missing field becomes a "
-           "stable\n"
-        << "  // zero vector until the next native input update overwrites it with real "
-           "coordinates.\n"
-        << "  if (!input.cursorWorldPosition || typeof input.cursorWorldPosition !== 'object') "
-           "input.cursorWorldPosition = new Vec3();\n"
-        << "  if (!input.cursorScreenPosition || typeof input.cursorScreenPosition !== 'object') "
-           "input.cursorScreenPosition = new Vec2();\n"
+        << "  // guard. Upgrade plain native {x,y,z} cursor objects to Vec instances as well, "
+           "because\n"
+        << "  // Wallpaper Engine scripts commonly call vector helpers such as add() and subtract() "
+           "on\n"
+        << "  // input cursor positions during drag handling.\n"
+        << "  if (!input.cursorWorldPosition || typeof input.cursorWorldPosition !== 'object' || "
+           "typeof input.cursorWorldPosition.add !== 'function') input.cursorWorldPosition = new "
+           "Vec3(input.cursorWorldPosition);\n"
+        << "  if (!input.cursorScreenPosition || typeof input.cursorScreenPosition !== 'object' || "
+           "typeof input.cursorScreenPosition.add !== 'function') input.cursorScreenPosition = "
+           "new Vec2(input.cursorScreenPosition);\n"
         << "  const WEMath = (globalThis.WEMath && typeof globalThis.WEMath === 'object')\n"
         << "    ? globalThis.WEMath\n"
         << "    : (globalThis.WEMath = {\n"
@@ -4080,14 +4083,10 @@ bool InstanceReceivesCursor(const WPSceneScriptHost::Opaque* opaque, const Scrip
 JSValue MakeCursorEventObject(JSContext* context, const CursorPositionState& cursor,
                               bool left_down) {
     JSValue event  = JS_NewObject(context);
-    JSValue world  = JS_NewObject(context);
-    JSValue screen = JS_NewObject(context);
-
-    JS_SetPropertyStr(context, world, "x", JS_NewFloat64(context, cursor.world_x));
-    JS_SetPropertyStr(context, world, "y", JS_NewFloat64(context, cursor.world_y));
-    JS_SetPropertyStr(context, world, "z", JS_NewFloat64(context, 0.0));
-    JS_SetPropertyStr(context, screen, "x", JS_NewFloat64(context, cursor.screen_x));
-    JS_SetPropertyStr(context, screen, "y", JS_NewFloat64(context, cursor.screen_y));
+    // Cursor event positions must be real WE-style Vec instances rather than plain objects:
+    // draggable scene scripts call event.worldPosition.add()/subtract() while computing offsets.
+    JSValue world  = NumericVectorToJS(context, { cursor.world_x, cursor.world_y, 0.0 });
+    JSValue screen = NumericVectorToJS(context, { cursor.screen_x, cursor.screen_y });
 
     JS_SetPropertyStr(context, event, "worldPosition", world);
     JS_SetPropertyStr(context, event, "screenPosition", screen);
