@@ -39,6 +39,7 @@ using WPScriptPropertyMap = std::unordered_map<std::string, WPScriptValue>;
 struct WPScriptEvaluationContext {
     WPScriptPropertyMap    script_properties;
     std::array<double, 2>  canvas_size { 0.0, 0.0 };
+    std::string            property_name;
 };
 
 class WPScriptRuntime {

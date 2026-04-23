@@ -271,6 +271,7 @@ std::string BuildWrappedScript(std::string_view script_source) {
     wrapper << "(function() {\n"
             << "  const __props = globalThis.__scriptProps;\n"
             << "  const __rawInitialValue = globalThis.__currentValue;\n"
+            << "  const __propertyName = String(globalThis.__propertyName ?? '');\n"
             << "  const __seedShared = (globalThis.shared && typeof globalThis.shared === 'object')\n"
             << "    ? globalThis.shared\n"
             << "    : {};\n"
@@ -539,6 +540,11 @@ std::string BuildWrappedScript(std::string_view script_source) {
             << "      const had = Object.prototype.hasOwnProperty.call(bucket, storageKey);\n"
             << "      delete bucket[storageKey];\n"
             << "      return had;\n"
+            << "    },\n"
+            << "    remove(key, location = 'screen') {\n"
+            << "      // Wallpaper Engine accepts remove() as the single-key delete alias; parser-time\n"
+            << "      // probing needs the same alias before the persistent script host takes over.\n"
+            << "      return this.delete(key, location);\n"
             << "    }\n"
             << "  };\n"
             << "  const thisObject = (globalThis.thisObject && typeof globalThis.thisObject === 'object')\n"
@@ -550,9 +556,21 @@ std::string BuildWrappedScript(std::string_view script_source) {
             << "  let thisLayer = (globalThis.thisLayer && typeof globalThis.thisLayer === 'object')\n"
             << "    ? globalThis.thisLayer\n"
             << "    : (globalThis.thisLayer = {});\n"
+            << "  if (__propertyName) {\n"
+            << "    // Parser-time script probing reuses one lightweight QuickJS runtime across many\n"
+            << "    // properties and layers. Always replace the member currently being probed so stale\n"
+            << "    // thisLayer.origin data from an earlier script cannot leak into a later origin probe\n"
+            << "    // and collapse the authored value back to the generic zero fallback.\n"
+            << "    thisLayer[__propertyName] = __initialValue;\n"
+            << "  }\n"
             << "  if (thisLayer.origin === undefined) thisLayer.origin = new Vec3();\n"
             << "  if (thisLayer.scale === undefined) thisLayer.scale = new Vec3(1, 1, 1);\n"
             << "  if (thisLayer.angles === undefined) thisLayer.angles = new Vec3();\n"
+            << "  // The parser evaluator has no real scene-layer JSON, but authored reset helpers may\n"
+            << "  // still reference thisLayer.originalOrigin while scripts are being probed. Mirror the\n"
+            << "  // current origin as a safe immutable-looking fallback so parse-time execution does not\n"
+            << "  // fail before the persistent native host can supply the true authored original value.\n"
+            << "  if (__propertyName === 'origin' || thisLayer.originalOrigin === undefined) thisLayer.originalOrigin = new Vec3(thisLayer.origin);\n"
             << "  if (thisLayer.size === undefined) thisLayer.size = new Vec2();\n"
             << "  if (thisLayer.visible === undefined) thisLayer.visible = typeof __initialValue === 'boolean' ? __initialValue : true;\n"
             << "  if (typeof thisObject.getMaterial !== 'function') thisObject.getMaterial = () => ({});\n"
@@ -773,6 +791,12 @@ std::optional<WPScriptValue> WPScriptRuntime::evaluate(std::string_view         
     JSValue global = JS_GetGlobalObject(js_context);
     InstallGlobalValue(js_context, global, "__scriptProps", JS_DupValue(js_context, script_props));
     InstallGlobalValue(js_context, global, "__currentValue", ScriptValueToJS(js_context, current_value));
+    InstallGlobalValue(js_context,
+                       global,
+                       "__propertyName",
+                       JS_NewStringLen(js_context,
+                                       context.property_name.c_str(),
+                                       context.property_name.size()));
     InstallGlobalValue(js_context, global, "engine", engine);
 
     const std::string wrapped = BuildWrappedScript(script_source);
@@ -784,6 +808,7 @@ std::optional<WPScriptValue> WPScriptRuntime::evaluate(std::string_view         
 
     InstallGlobalValue(js_context, global, "__scriptProps", JS_UNDEFINED);
     InstallGlobalValue(js_context, global, "__currentValue", JS_UNDEFINED);
+    InstallGlobalValue(js_context, global, "__propertyName", JS_UNDEFINED);
     InstallGlobalValue(js_context, global, "engine", JS_UNDEFINED);
     JS_FreeValue(js_context, global);
     JS_FreeValue(js_context, script_props);

@@ -318,7 +318,8 @@ WPScriptRuntime& GetScriptRuntime() {
     return runtime;
 }
 
-std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& node) {
+std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& node,
+                                                        std::string_view      property_name = {}) {
     if (! node.is_object() || ! node.contains("script") || ! node.at("script").is_string()) {
         return std::nullopt;
     }
@@ -332,6 +333,11 @@ std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& no
     }
 
     WPScriptEvaluationContext context;
+    // Parser-time script evaluation runs before the persistent host exists, so pass the authored
+    // property name through to the lightweight runtime. That lets the wrapper seed exactly
+    // thisLayer.origin, thisLayer.scale, etc. with the current base value instead of leaving every
+    // layer property at a generic zero fallback.
+    context.property_name = std::string(property_name);
     if (g_json_scene_root != nullptr) {
         if (const auto canvas_size = TryReadCanvasSize(*g_json_scene_root);
             canvas_size.has_value() && canvas_size->valid) {
@@ -358,7 +364,7 @@ std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& no
     }
 
     const auto evaluated =
-        runtime.evaluate(node.at("script").get<std::string>(), *current_value, context);
+        runtime.evaluate(node.at("script").get_ref<const std::string&>(), *current_value, context);
     if (! evaluated.has_value()) {
         // Parser-time script execution is only a best-effort value probe. The persistent
         // QuickJS host will run the real Wallpaper Engine callbacks after the scene is loaded,
@@ -517,10 +523,11 @@ bool ParseJson(const char* file, const char* func, int line, const std::string& 
 
 template<typename T>
 inline bool _GetJsonValue(const nlohmann::json&                  json,
-                          typename utils::is_std_array<T>::type& value) {
+                          typename utils::is_std_array<T>::type& value,
+                          std::string_view                       property_name = {}) {
     if (TryGetUserPropertyOverride(json, value)) return true;
 
-    const auto scripted = TryResolveScriptValueNode(json);
+    const auto scripted = TryResolveScriptValueNode(json, property_name);
     const auto& njson   = scripted.has_value() ? *scripted : ResolvePropertyValueNode(json);
 
     using Tv = typename T::value_type;
@@ -557,10 +564,12 @@ inline bool _GetJsonValue(const nlohmann::json&                  json,
 }
 
 template<typename T>
-inline bool _GetJsonValue(const nlohmann::json& json, T& value) {
+inline bool _GetJsonValue(const nlohmann::json& json, T& value,
+                          std::string_view property_name = {}) {
     if (TryGetUserPropertyOverride(json, value)) return true;
 
-    if (const auto scripted = TryResolveScriptValueNode(json); scripted.has_value()) {
+    if (const auto scripted = TryResolveScriptValueNode(json, property_name);
+        scripted.has_value()) {
         value = scripted->get<T>();
         return true;
     }
@@ -578,7 +587,9 @@ inline bool _GetJsonValue(const char* file, const char* func, int line, const nl
     std::string nameinfo;
     if (name != nullptr) nameinfo = std::string("(key: ") + name + ")";
     try {
-        return _GetJsonValue<T>(json, value);
+        const std::string_view property_name =
+            name != nullptr ? std::string_view(name) : std::string_view {};
+        return _GetJsonValue<T>(json, value, property_name);
     } catch (const njson::type_error& e) {
         WallpaperLog(LOGLEVEL_INFO,
                      file,

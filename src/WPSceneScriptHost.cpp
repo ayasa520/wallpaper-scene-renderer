@@ -1016,7 +1016,9 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "value, String(location)); },\n"
         << "    clear(location = 'screen') { __native.localStorageClear(String(location)); },\n"
         << "    delete(key, location = 'screen') { return "
-           "!!__native.localStorageDelete(String(key), String(location)); }\n"
+           "!!__native.localStorageDelete(String(key), String(location)); },\n"
+        << "    // Wallpaper Engine scene scripts use remove() as a single-key delete alias.\n"
+        << "    remove(key, location = 'screen') { return this.delete(key, location); }\n"
         << "  };\n"
         << "  globalThis.localStorage = localStorage;\n"
         << "  function createScriptProperties() {\n"
@@ -1844,6 +1846,40 @@ struct WPSceneScriptHost::Opaque {
     std::unordered_set<uint32_t> hovered_instances;
     std::unordered_set<uint32_t> pressed_instances;
 };
+
+std::optional<WPDynamicValue> ReadOriginalLayerPropertyValue(
+    const WPSceneScriptHost::Opaque* opaque, int32_t layer_id, std::string_view property_name) {
+    if (property_name != "originalOrigin" || opaque == nullptr || opaque->scene == nullptr)
+        return std::nullopt;
+
+    const auto initial_it = opaque->scene->initialLayerConfigJson.find(layer_id);
+    if (initial_it == opaque->scene->initialLayerConfigJson.end()) return std::nullopt;
+
+    nlohmann::json layer_config;
+    try {
+        layer_config = nlohmann::json::parse(initial_it->second);
+    } catch (const std::exception& e) {
+        LOG_ERROR("failed to parse initial layer configuration JSON for layer %d: %s",
+                  layer_id,
+                  e.what());
+        return std::nullopt;
+    }
+
+    if (! layer_config.is_object()) return std::nullopt;
+    auto property_it = layer_config.find("origin");
+    if (property_it == layer_config.end()) return std::nullopt;
+
+    const nlohmann::json* value_node = &(*property_it);
+    if (value_node->is_object()) {
+        const auto nested_value = value_node->find("value");
+        if (nested_value != value_node->end()) value_node = &(*nested_value);
+    }
+
+    // Wallpaper Engine exposes originalOrigin as the authored base layer origin, not the
+    // script-updated runtime origin. Dynamic origin properties are stored as objects with a "value"
+    // field, so unwrap that field before converting it to the script-facing Vec3.
+    return WPDynamicValue::FromJsonLiteral(*value_node, WPDynamicValue::Type::Float3);
+}
 
 std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost::Opaque* opaque,
                                                         int32_t layer_id,
@@ -4172,6 +4208,16 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
         }
         return WPDynamicValue(node->Visible());
     }
+    const auto text_layer_id = opaque != nullptr ? FindNodeId(opaque, node) : 0;
+    const auto* text_layer =
+        text_layer_id != 0 ? FindTextLayerById(opaque, text_layer_id) : nullptr;
+    if (text_layer != nullptr && property_name == "origin") {
+        // Text nodes store a resolved scene translation that includes alignment and cropped-glyph
+        // offsets. Wallpaper Engine scripts, however, read and persist thisLayer.origin as the
+        // authored logical origin. Returning the resolved node translation here corrupts draggable
+        // text scripts because cursorUp saves that shifted value and init later applies it again.
+        return WPDynamicValue(text_layer->object.origin);
+    }
     if (property_name == "origin") {
         const auto& value = node->Translate();
         return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
@@ -5097,6 +5143,15 @@ JSValue NativeGetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
     std::string property_name;
     if (! ReadJSString(context, argv[1], &property_name)) return JS_UNDEFINED;
 
+    if (const auto original_value = ReadOriginalLayerPropertyValue(opaque, node_id, property_name);
+        original_value.has_value()) {
+        // originalOrigin must be read before the generic layer fallback because it is a virtual
+        // Wallpaper Engine API member backed by the initial authored layer JSON, not by mutable
+        // SceneNode transform fields.
+        const auto script_value = original_value->toScriptValue();
+        return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
+    }
+
     if (const auto sound_handle = FindSoundHandleByLayerId(opaque, node_id);
         sound_handle.has_value()) {
         if (property_name == "name") {
@@ -5284,6 +5339,14 @@ JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValue
 
     std::string member_name;
     if (! ReadJSString(context, argv[1], &member_name)) return JS_FALSE;
+    if (member_name == "originalOrigin") {
+        // Report originalOrigin as a real layer API only when the layer still has an initial
+        // configuration record. That keeps deleted/dynamic lookup failures observable while
+        // allowing reset-position scripts to test for originalOrigin just like in Wallpaper Engine.
+        return JS_NewBool(context,
+                          opaque != nullptr && opaque->scene != nullptr &&
+                              opaque->scene->initialLayerConfigJson.contains(node_id));
+    }
     if (member_name == "size") {
         return JS_NewBool(context,
                           opaque != nullptr && (FindImageLayerById(opaque, node_id) != nullptr ||
