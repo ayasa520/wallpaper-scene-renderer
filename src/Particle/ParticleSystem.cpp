@@ -259,6 +259,34 @@ void ParticleSubSystem::UpdateLinkedControlpoints() {
     }
 }
 
+Eigen::Vector3f ParticleSubSystem::ResolveEventAnchorPosition(
+    const Eigen::Vector3f& parent_position) {
+    if (m_node == nullptr) return parent_position;
+
+    const Eigen::Matrix4d local_transform = m_node->GetLocalTrans();
+    const Eigen::Matrix3d local_linear    = local_transform.block<3, 3>(0, 0);
+    const double          determinant     = local_linear.determinant();
+    if (!std::isfinite(determinant) ||
+        std::abs(determinant) <= kControlPointTransformDeterminantEpsilon) {
+        if (!m_logged_event_anchor_transform_error) {
+            // Event-spawned children are anchored at a parent particle position, then their own
+            // child transform is applied by the scene node. The anchor must therefore be expressed
+            // in the inverse child basis; if that basis is singular, keep the old raw anchor and
+            // log once so the broken authored transform can be diagnosed without flooding frames.
+            LOG_ERROR("ParticleEventAnchor: non-invertible child transform for event particle");
+            m_logged_event_anchor_transform_error = true;
+        }
+        return parent_position;
+    }
+
+    // Wallpaper's event child transform is applied around the spawned child system, not around the
+    // parent particle that triggered it. Convert only the followed parent coordinate through the
+    // inverse child linear basis so child scale/rotation enlarge and rotate the glow/trail itself
+    // without pushing the glow away from the firefly center. The child translation remains authored
+    // as the event offset and is intentionally left out of this inverse.
+    return (local_linear.inverse() * parent_position.cast<double>()).cast<float>();
+}
+
 void ParticleSubSystem::AddChild(std::unique_ptr<ParticleSubSystem>&& child) {
     m_children.emplace_back(std::move(child));
 }
@@ -331,7 +359,7 @@ void ParticleSubSystem::Emitt() {
             std::span particles = bounded_data.parent->Particles();
             if (bounded_data.particle_idx != -1 && bounded_data.particle_idx < particles.size()) {
                 auto& p          = particles[bounded_data.particle_idx];
-                bounded_data.pos = ParticleModify::GetPos(p);
+                bounded_data.pos = ResolveEventAnchorPosition(ParticleModify::GetPos(p));
                 // only update pos once when event_death
                 if (m_spawn_type == SpawnType::EVENT_DEATH) bounded_data.particle_idx = -1;
 

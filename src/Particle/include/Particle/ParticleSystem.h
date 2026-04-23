@@ -96,6 +96,7 @@ public:
 
 private:
     void UpdateLinkedControlpoints();
+    Eigen::Vector3f ResolveEventAnchorPosition(const Eigen::Vector3f& parent_position);
     void ApplyRuntimeColorOverrideToParticle(Particle& particle) const;
     void ApplyRuntimeColorOverrideToInstances();
     void ApplyRuntimeSizeDeltaToParticle(Particle& particle, float size_delta) const;
@@ -133,6 +134,7 @@ private:
     double    m_probability { 1.0f };
     SpawnType m_spawn_type { SpawnType::STATIC };
     SceneNode* m_node { nullptr };
+    bool       m_logged_event_anchor_transform_error { false };
     // Wallpaper particle `instanceoverride.colorn` is an initializer-time color during cold parse,
     // while user-property edits arrive after the initializer list has already produced live
     // particles. Store the normalized runtime color separately so both future spawns and already
