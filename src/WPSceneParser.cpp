@@ -1434,36 +1434,171 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
     }
 }
 
+struct ResolvedUserShaderValueBinding {
+    std::string        user_property_name;
+    std::string        material_value_name;
+    std::string        gl_uniform_name;
+    const ShaderValue* property { nullptr };
+    bool               legacy_reversed { false };
+};
+
+std::string ResolveMaterialValueUniformName(const WPShaderInfo& info,
+                                            const std::string&  material_value_name) {
+    if (const auto alias_it = info.alias.find(material_value_name); alias_it != info.alias.end()) {
+        return alias_it->second;
+    }
+
+    for (const auto& el : info.alias) {
+        if (el.second == material_value_name) {
+            return el.second;
+        }
+
+        // Some shader metadata stores material aliases like `color1`, while the parsed GLSL
+        // uniform is named `g_Color1`. Keep this suffix match so user-facing project properties
+        // can still target old stock shaders whose material JSON uses the shorter alias instead
+        // of the final GLSL symbol.
+        if (el.second.size() > 2 && el.second.substr(2) == material_value_name) {
+            return el.second;
+        }
+    }
+
+    return material_value_name;
+}
+
+std::vector<ResolvedUserShaderValueBinding>
+ResolveUserShaderValueBindings(const wpscene::WPMaterial& wpmat, const WPShaderInfo& info,
+                               const UserPropertyMap* user_properties, bool log_missing) {
+    std::vector<ResolvedUserShaderValueBinding> bindings;
+    if (user_properties == nullptr) return bindings;
+
+    bindings.reserve(wpmat.usershadervalues.size());
+    for (const auto& us : wpmat.usershadervalues) {
+        // Wallpaper Engine writes `usershadervalues` as
+        // `{ "<project user property>": "<shader material value>" }`. Eagle Flag is a compact
+        // example: `schemecolor -> color1`, `flagcolor1 -> color2`, and `flagcolor2 -> color3`.
+        // Looking up the value side as a user property misses the authored colors and leaves the
+        // shader on its black/white defaults, which makes the red and green flag regions vanish.
+        std::string user_property_name  = us.first;
+        std::string material_value_name = us.second;
+        bool        legacy_reversed     = false;
+        const auto* property = LookupUserPropertyShaderValue(user_properties, user_property_name);
+        if (property == nullptr) {
+            // Older local builds interpreted the mapping in the opposite direction. This fallback
+            // keeps any locally-authored scenes that accidentally depended on that reversed
+            // behavior visible, while logging the mismatch so the material JSON can be fixed.
+            const auto* legacy_property =
+                LookupUserPropertyShaderValue(user_properties, material_value_name);
+            if (legacy_property != nullptr) {
+                legacy_reversed = true;
+                std::swap(user_property_name, material_value_name);
+                property = legacy_property;
+            } else {
+                if (log_missing) {
+                    LOG_INFO("UserShaderValue: property '%s' not provided for material value '%s'",
+                             user_property_name.c_str(),
+                             material_value_name.c_str());
+                }
+                continue;
+            }
+        }
+
+        const auto gl_uniform_name = ResolveMaterialValueUniformName(info, material_value_name);
+        bindings.push_back(ResolvedUserShaderValueBinding {
+            .user_property_name  = std::move(user_property_name),
+            .material_value_name = std::move(material_value_name),
+            .gl_uniform_name     = gl_uniform_name,
+            .property            = property,
+            .legacy_reversed     = legacy_reversed,
+        });
+    }
+
+    return bindings;
+}
+
+WPDynamicValue::Type DynamicTypeForShaderValue(const ShaderValue& value) {
+    switch (value.size()) {
+        case 2:
+            return WPDynamicValue::Type::Float2;
+        case 3:
+            return WPDynamicValue::Type::Float3;
+        case 4:
+            return WPDynamicValue::Type::Float4;
+        case 1:
+            return WPDynamicValue::Type::Float;
+        default:
+            return WPDynamicValue::Type::FloatVector;
+    }
+}
+
+void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMaterial& wpmat,
+                                     const WPShaderInfo& info, SceneNode* node,
+                                     int32_t object_id, std::string_view object_name) {
+    if (context.scene == nullptr || node == nullptr || node->Mesh() == nullptr ||
+        node->Mesh()->Material() == nullptr) {
+        return;
+    }
+
+    for (const auto& binding :
+         ResolveUserShaderValueBindings(wpmat, info, context.user_properties, false)) {
+        if (binding.property == nullptr) continue;
+
+        const auto value_type = DynamicTypeForShaderValue(*binding.property);
+        auto       base_value =
+            WPDynamicValue::FromUserPropertyValue(UserPropertyValue(*binding.property), value_type)
+                .value_or(WPDynamicValue {});
+
+        WPUserSetting setting;
+        setting.value = base_value;
+        setting.property = UserPropertyBinding {
+            .name = binding.user_property_name,
+            .condition = {},
+        };
+
+        // `usershadervalues` bindings are not layer properties: they write directly into the
+        // material uniform map. Registering them here makes live user-property edits follow the
+        // same uniform name that the cold parse resolved from shader metadata.
+        context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+            .object_id     = object_id,
+            .object_name   = std::string(object_name),
+            .property_name = binding.gl_uniform_name,
+            .node          = node,
+            .target_kind   = WPSceneScriptTargetKind::MaterialUniform,
+            .target_index  = 0,
+            .value_type    = value_type,
+            .base_value    = base_value,
+            .setting       = std::move(setting),
+        });
+
+        LOG_INFO("UserShaderValueRegister: layer=%d name='%.*s' user-property='%s' "
+                 "material-value='%s' uniform='%s' components=%zu legacy-reversed=%s",
+                 object_id,
+                 static_cast<int>(object_name.size()),
+                 object_name.data(),
+                 binding.user_property_name.c_str(),
+                 binding.material_value_name.c_str(),
+                 binding.gl_uniform_name.c_str(),
+                 binding.property->size(),
+                 binding.legacy_reversed ? "true" : "false");
+    }
+}
+
 void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                          const WPShaderInfo& info, const UserPropertyMap* user_properties) {
-    if (!user_properties)
-        return;
-
-    for (const auto& us : wpmat.usershadervalues) {
-        const auto* property = LookupUserPropertyShaderValue(user_properties, us.second);
-        if (property == nullptr) {
-            LOG_INFO("UserShaderValue: property '%s' not provided for uniform '%s'",
-                     us.second.c_str(), us.first.c_str());
-            continue;
+    for (const auto& binding :
+         ResolveUserShaderValueBindings(wpmat, info, user_properties, true)) {
+        if (binding.legacy_reversed) {
+            LOG_INFO("UserShaderValue: legacy reversed mapping user-property '%s' -> material value '%s'",
+                     binding.user_property_name.c_str(),
+                     binding.material_value_name.c_str());
         }
 
-        std::string glname;
-        if (info.alias.count(us.first) != 0) {
-            glname = info.alias.at(us.first);
-        } else {
-            for (const auto& el : info.alias) {
-                if (el.second == us.first || el.second.substr(2) == us.first) {
-                    glname = el.second;
-                    break;
-                }
-            }
-            if (glname.empty())
-                glname = us.first;
-        }
-
-        LOG_INFO("UserShaderValue: %s -> %s (%zu)",
-                 us.second.c_str(), glname.c_str(), property->size());
-        material.customShader.constValues[glname] = *property;
+        LOG_INFO("UserShaderValue: property '%s' -> material value '%s' -> uniform '%s' (%zu)",
+                 binding.user_property_name.c_str(),
+                 binding.material_value_name.c_str(),
+                 binding.gl_uniform_name.c_str(),
+                 binding.property != nullptr ? binding.property->size() : 0);
+        if (binding.property != nullptr)
+            material.customShader.constValues[binding.gl_uniform_name] = *binding.property;
     }
 }
 
@@ -1804,6 +1939,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     }
     mesh.AddMaterial(std::move(material));
     spImgNode->AddMesh(spMesh);
+    RegisterUserShaderValueBindings(
+        context, wpimgobj.material, shaderInfo, spImgNode.get(), wpimgobj.id, wpimgobj.name);
 
     if (puppet) {
         svData.puppet_layer = WPPuppetLayer(puppet->puppet);
@@ -2056,6 +2193,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 }
                 spMesh->AddMaterial(std::move(material));
                 spEffNode->AddMesh(spMesh);
+                RegisterUserShaderValueBindings(
+                    context, wpmat, wpEffShaderInfo, spEffNode.get(), wpimgobj.id, wpimgobj.name);
 
                 context.shader_updater->SetNodeData(spEffNode.get(), svData);
                 context.scene->nodeOwners[spEffNode.get()] = wpimgobj.id;
@@ -2342,6 +2481,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 effect_node_data.effect_projection_mesh = &imgEffectLayer->FinalMesh();
                 spMesh->AddMaterial(std::move(effect_material));
                 spEffectNode->AddMesh(spMesh);
+                RegisterUserShaderValueBindings(
+                    context, material_source, effect_shader_info, spEffectNode.get(), text_obj.id, text_obj.name);
                 context.shader_updater->SetNodeData(spEffectNode.get(), effect_node_data);
                 context.scene->nodeOwners[spEffectNode.get()] = text_obj.id;
                 img_effect->nodes.push_back({ material_output, spEffectNode });
@@ -2565,6 +2706,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         return;
     }
     LoadConstvalue(material, particle_obj.material, shaderInfo);
+    LoadUserShaderValue(material, particle_obj.material, shaderInfo, context.user_properties);
     auto  spMesh             = std::make_shared<SceneMesh>(true);
     auto& mesh               = *spMesh;
     auto  animationmode      = ToAnimMode(particle_obj.animationmode);
@@ -2619,6 +2761,8 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     mesh.AddMaterial(std::move(material));
     spNode->AddMesh(spMesh);
+    RegisterUserShaderValueBindings(
+        context, particle_obj.material, shaderInfo, spNode.get(), wppartobj.id, wppartobj.name);
 
     if (!is_child) {
         ConfigureBoneAttachment(context,

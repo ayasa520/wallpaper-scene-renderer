@@ -29,6 +29,11 @@ enum class WPSceneScriptTargetKind
     Layer,
     AnimationLayer,
     Effect,
+    // MaterialUniform targets are shader-level user bindings declared by material
+    // `usershadervalues`, for example Eagle Flag's `schemecolor -> g_Color1` tint path.
+    // They are separate from ordinary layer `color` because stock shaders can expose many
+    // custom color uniforms that are not represented by g_Color/g_Color4.
+    MaterialUniform,
 };
 
 struct WPSceneScriptRegistration {
