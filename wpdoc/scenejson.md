@@ -24,6 +24,36 @@ A compiler config JSON file to control how your texture is compiled
 - combos (OBJECT): Defines combo constants (preprocessor) set when compiling the shader. Use this to enable/disables features and build an 'uber shader'.
 - usershadervalues (OBJECT): Links uniform values to user values, which show up in the wallpaper settings dialog for a user to change.
 
+<!-- Documentation note: the renderer accepts many Wallpaper Engine value wrappers directly from
+scene.json. Documenting the shared wrapper shape here avoids repeating the same rule for each layer,
+material, text, effect, and script-controlled property. -->
+## User-bound, scripted, and animated values
+Many numeric, vector, color, text, visibility, material, and transform fields may be authored either as a literal value or as an object that wraps the value.
+
+- value (VARYING): Set `"value"` to the fallback or initial value that should be used before user bindings, scripts, or animations update the property.
+- user (STRING or OBJECT): Bind the value to a user property. A string uses that property name directly; an object can provide `"name"` and `"condition"` so the binding only applies when the user property condition matches.
+- script (STRING): Evaluate a SceneScript property script. The renderer supports the common parser-time and runtime `init` / `update` flow for scene, layer, text, material, sound, and effect properties.
+- scriptproperties (OBJECT): Supplies nested properties for a property script. Each nested property may use the same literal/user/script/animation wrapper form.
+- animation (OBJECT): Defines keyframed property animation data. Loop and mirror animation modes are supported for numeric and vector properties.
+
+## Particle systems
+Particle JSON is parsed from the Wallpaper Engine particle object data.
+
+- Initializers: `colorrandom`, `lifetimerandom`, `sizerandom`, `alpharandom`, `velocityrandom`, `rotationrandom`, `angularvelocityrandom`, and `turbulentvelocityrandom`.
+- Emitters: `boxrandom` and `sphererandom`.
+- Operators: `movement`, `angularmovement`, `sizechange`, `alphafade`, `alphachange`, `colorchange`, `oscillatealpha`, `oscillatesize`, `oscillateposition`, `turbulence`, `vortex`, and `controlpointattract`.
+
+### controlpointattract operator
+The `controlpointattract` operator applies acceleration between particles and a selected control point.
+
+- controlpoint (INT): Selects the control point index. Wallpaper Engine scenes commonly use indices from 0 to 7.
+- scale (FLOAT): Controls force strength. Positive values attract particles toward the control point; negative values repel particles away from it.
+- threshold (FLOAT): Maximum distance at which the force is applied.
+- threadhold (FLOAT): Historical misspelling accepted by many authored Wallpaper Engine assets. The renderer reads both `threshold` and `threadhold`, with the later parsed field taking the final value.
+- offset (ARRAY of FLOAT): Positional offset from the control point center.
+
+Particles exactly at the force center are ignored by a tiny dead-zone so the normalized force direction remains finite.
+
 ## Models
 3D models will be compiled from .obj or .fbx files into the custom .mdl format. Only the .mdl file is required to use a model in Wallpaper Engine.  
 An optional JSON file can be used to configure how your model is compiled  
