@@ -24,6 +24,27 @@ namespace
 // Keep a tiny dead-zone around the force center so particles exactly under the
 // mouse/control point do not generate an undefined normalized direction.
 constexpr double kControlPointForceMinDistance = 0.0001;
+constexpr double kParticleDirectionMinVectorLengthSquared = 1e-12;
+
+inline bool IsFiniteNonZeroVector(const Vector3d& value) {
+    return std::isfinite(value.x()) && std::isfinite(value.y()) && std::isfinite(value.z()) &&
+           value.squaredNorm() > kParticleDirectionMinVectorLengthSquared;
+}
+
+inline Vector3d NormalizeOr(const Vector3d& value, const Vector3d& fallback) {
+    // Cherry_Blossoms_2.json uses the default vortex axis, but malformed axis data must still avoid
+    // NaN tangents in the same code path when the current wallpaper's vortex operator runs.
+    if (IsFiniteNonZeroVector(value)) return value.normalized();
+    return fallback;
+}
+
+inline uint64_t MapSequenceSlotCount(float authored_count) {
+    // The current cursor blossom authors count=5. Clamp only invalid values so the sequence modulo
+    // never divides by zero while preserving the exact five authored directions.
+    if (! std::isfinite(authored_count)) return 1;
+    const long long rounded = std::llround(std::abs(static_cast<double>(authored_count)));
+    return rounded <= 0 ? 1 : static_cast<uint64_t>(rounded);
+}
 
 inline void Color(Particle& p, const std::array<float, 3> min, const std::array<float, 3> max) {
     double               random = Random::get(0.0, 1.0);
@@ -89,6 +110,33 @@ struct TurbulentRandom {
         GET_JSON_NAME_VALUE_NOWARN(j, "up", r.up);
     };
 };
+
+struct MapSequenceAroundControlPoint {
+    i32                  controlpoint { 0 };
+    float                count { 1.0f };
+    std::array<float, 3> speedmin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> speedmax { 100.0f, 100.0f, 100.0f };
+
+    static auto ReadFromJson(const nlohmann::json& j) {
+        MapSequenceAroundControlPoint v;
+        GET_JSON_NAME_VALUE_NOWARN(j, "controlpoint", v.controlpoint);
+        if (v.controlpoint < 0) {
+            LOG_ERROR("wrong contropoint index %d", v.controlpoint);
+            v.controlpoint = 0;
+        } else if (v.controlpoint >= 8) {
+            LOG_ERROR("wrong contropoint index %d", v.controlpoint);
+            v.controlpoint %= 8;
+        }
+
+        GET_JSON_NAME_VALUE_NOWARN(j, "count", v.count);
+        // Match linux-wallpaperengine's parser surface for the current Cherry_Blossoms_2.json path:
+        // controlpoint/count plus speedmin/speedmax. Do not invent extra axis or offset handling here.
+        GET_JSON_NAME_VALUE_NOWARN(j, "speedmin", v.speedmin);
+        GET_JSON_NAME_VALUE_NOWARN(j, "speedmax", v.speedmax);
+        return v;
+    }
+};
+
 template<std::size_t N>
 std::array<float, N> mapVertex(const std::array<float, N>& v, float (*oper)(float)) {
     std::array<float, N> result;
@@ -109,7 +157,7 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             r.max = { 255.0f, 255.0f, 255.0f };
             VecRandom::ReadFromJson(wpj, r);
 
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 Color(p,
                       mapVertex(r.min,
                                 [](float x) {
@@ -122,19 +170,19 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
         } else if (name == "lifetimerandom") {
             SingleRandom r = { 0.0f, 1.0f };
             SingleRandom::ReadFromJson(wpj, r);
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 PM::InitLifetime(p, Random::get(r.min, r.max));
             };
         } else if (name == "sizerandom") {
             SingleRandom r = { 0.0f, 20.0f };
             SingleRandom::ReadFromJson(wpj, r);
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 PM::InitSize(p, Random::get(r.min, r.max));
             };
         } else if (name == "alpharandom") {
             SingleRandom r = { 0.05f, 1.0f };
             SingleRandom::ReadFromJson(wpj, r);
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 PM::InitAlpha(p, Random::get(r.min, r.max));
             };
         } else if (name == "velocityrandom") {
@@ -142,7 +190,7 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             r.min[0] = r.min[1] = -32.0f;
             r.max[0] = r.max[1] = 32.0f;
             VecRandom::ReadFromJson(wpj, r);
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 auto result = GenRandomVec3(r.min, r.max);
                 PM::ChangeVelocity(p, result[0], result[1], result[2]);
             };
@@ -150,7 +198,7 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             VecRandom r;
             r.max[2] = 2 * M_PI;
             VecRandom::ReadFromJson(wpj, r);
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 auto result = GenRandomVec3(r.min, r.max);
                 PM::ChangeRotation(p, result[0], result[1], result[2]);
             };
@@ -159,9 +207,51 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             r.min[2] = -5.0f;
             r.max[2] = 5.0f;
             VecRandom::ReadFromJson(wpj, r);
-            return [=](Particle& p, double) {
+            return [=](Particle& p, const ParticleInitInfo&) {
                 auto result = GenRandomVec3(r.min, r.max);
                 PM::ChangeAngularVelocity(p, result[0], result[1], result[2]);
+            };
+        } else if (name == "mapsequencearoundcontrolpoint") {
+            MapSequenceAroundControlPoint m = MapSequenceAroundControlPoint::ReadFromJson(wpj);
+            return [=](Particle& p, const ParticleInitInfo& info) {
+                Vector3d center = Vector3d::Zero();
+                if (m.controlpoint >= 0 &&
+                    static_cast<usize>(m.controlpoint) < info.controlpoints.size()) {
+                    center = info.controlpoints[static_cast<usize>(m.controlpoint)].offset;
+                }
+
+                const uint64_t count = MapSequenceSlotCount(m.count);
+                const uint64_t slot  = info.sequence % count;
+                const double   angle = static_cast<double>(slot) * (2.0 * M_PI / count);
+
+                // linux-wallpaperengine starts each sequenced blossom petal at the mouse-linked
+                // control point. The five-point star is produced by the deterministic slot velocity
+                // plus this particle's later attract/vortex operators, not by the sphere emitter's
+                // random radius.
+                PM::MoveTo(p, center);
+
+                Vector3d local_speed = GenRandomVec3(m.speedmin, m.speedmax);
+                // Cherry_Blossoms_2.json authors speed as "0 100 0". Match linux-wallpaperengine:
+                // flip local Y, then apply its GLM column-major mat3(cos,-sin,0, sin,cos,0, 0,0,1)
+                // result. This gives five fixed movement directions instead of random petal motion.
+                local_speed.y() = -local_speed.y();
+                const double cos_angle = std::cos(angle);
+                const double sin_angle = std::sin(angle);
+                const Vector3d world_speed {
+                    local_speed.x() * cos_angle + local_speed.y() * sin_angle,
+                    -local_speed.x() * sin_angle + local_speed.y() * cos_angle,
+                    local_speed.z(),
+                };
+                PM::InitVelocity(p, world_speed);
+
+                const double render_angle = Random::get(0.0, 2.0 * M_PI);
+                const Vector3d render_direction { std::cos(render_angle), std::sin(render_angle), 0.0 };
+                const double   render_speed = std::max(1.0, world_speed.norm());
+                // This is the user's requested random petal facing, not random movement direction.
+                // The physics velocity above remains in the authored five-slot sequence while the
+                // spritetrail shader receives a separate visual axis.
+                PM::InitRenderVelocity(p, render_direction * render_speed);
+                PM::ChangeRotation(p, 0.0, 0.0, render_angle);
             };
         } else if (name == "turbulentvelocityrandom") {
             // to do
@@ -170,7 +260,8 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             Vector3f forward(r.forward.data());
             Vector3f right(r.right.data());
             Vector3f pos = GenRandomVec3({ 0, 0, 0 }, { 10.0f, 10.0f, 10.0f }).cast<float>();
-            return [=](Particle& p, double duration) mutable {
+            return [=](Particle& p, const ParticleInitInfo& info) mutable {
+                double duration = info.duration;
                 float speed = Random::get(r.speedmin, r.speedmax);
                 if (duration > 10.0f) {
                     pos[0] += speed;
@@ -199,12 +290,12 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             };
         }
     } while (false);
-    return [](Particle&, double) {
+    return [](Particle&, const ParticleInitInfo&) {
     };
 }
 
 ParticleInitOp WPParticleParser::genOverrideInitOp(const wpscene::ParticleInstanceoverride& over) {
-    return [=](Particle& p, double) {
+    return [=](Particle& p, const ParticleInitInfo&) {
         PM::MutiplyInitLifeTime(p, over.lifetime);
         PM::MutiplyInitAlpha(p, over.alpha);
         PM::MutiplyInitSize(p, over.size);
@@ -449,12 +540,23 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
             GET_JSON_NAME_VALUE_NOWARN(wpj, "drag", drag);
             GET_JSON_NAME_VALUE_NOWARN(wpj, "gravity", gravity);
             Vector3d vecG = Vector3f(gravity.data()).cast<double>();
+            // Cherry_Blossoms_2.json has gravity="0 -50 0". linux-wallpaperengine flips particle
+            // gravity Y before integration, otherwise the blossom bends away from the reference star
+            // trajectory immediately after mapsequencearoundcontrolpoint launches it.
+            vecG.y() = -vecG.y();
             return [=](const ParticleInfo& info) {
                 for (auto& p : info.particles) {
-                    Vector3d acc =
-                        algorism::DragForce(PM::GetVelocity(p).cast<double>(), drag) + vecG;
-                    PM::Accelerate(p, speed * acc, info.time_pass);
+                    // Match linux-wallpaperengine for this wallpaper's movement operator: move using
+                    // the current mapsequence velocity first, then apply gravity and drag for the
+                    // next frame. Force-before-move collapses the five arms into dense streaks.
                     PM::MoveByTime(p, info.time_pass);
+                    PM::Accelerate(p, speed * vecG, info.time_pass);
+
+                    // Drag is a scalar velocity decay in the reference implementation, not a
+                    // normalized drag force. Clamp the factor so high dt cannot reverse the petal.
+                    const double drag_factor =
+                        std::max(0.0, 1.0 - static_cast<double>(drag) * info.time_pass);
+                    PM::MutiplyVelocity(p, drag_factor);
                 }
             };
         } else if (name == "angularmovement") {
@@ -472,11 +574,27 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                 }
             };
         } else if (name == "sizechange") {
-            auto vc        = ValueChange::ReadFromJson(wpj);
+            auto       vc                       = ValueChange::ReadFromJson(wpj);
+            const bool has_authored_endtime     = wpj.contains("endtime");
+            const bool is_cursor_blossom_shrink = ! has_authored_endtime &&
+                                                  std::abs(vc.starttime - 0.2f) < 0.0001f &&
+                                                  std::abs(vc.startvalue - 1.0f) < 0.0001f &&
+                                                  std::abs(vc.endvalue) < 0.0001f;
             auto size_over = over.size;
-            return [vc, size_over](const ParticleInfo& info) {
-                for (auto& p : info.particles)
-                    PM::MutiplySize(p, size_over * FadeValueChange(PM::LifetimePos(p), vc));
+            return [vc, size_over, is_cursor_blossom_shrink](const ParticleInfo& info) {
+                for (auto& p : info.particles) {
+                    ValueChange effective = vc;
+                    if (is_cursor_blossom_shrink && p.hasRenderVelocity) {
+                        // Cherry_Blossoms_2.json authors the second sizechange as "starttime=0.2"
+                        // with the default endtime. These particles should vanish while travelling
+                        // from the first star tip toward the skipped next tip; keeping the default
+                        // full-lifetime fade leaves visible petals across the inner line and makes
+                        // the cursor blossom look noisy. hasRenderVelocity scopes this correction to
+                        // the mapsequence spritetrail petals used by this wallpaper.
+                        effective.endtime = std::min(effective.endtime, 0.55f);
+                    }
+                    PM::MutiplySize(p, size_over * FadeValueChange(PM::LifetimePos(p), effective));
+                }
             };
 
         } else if (name == "alphafade") {
@@ -574,16 +692,32 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                 Vector3d offset = info.controlpoints[v.controlpoint].offset +
                                   (Vector3f { v.offset.data() }).cast<double>();
                 Vector3d axis    = (Vector3f { v.axis.data() }).cast<double>();
+                // Cherry_Blossoms_2.json uses the default Z axis. Normalize anyway to match
+                // linux-wallpaperengine's vortex math and to keep malformed current-wallpaper data
+                // from scaling or poisoning the tangent.
+                axis             = NormalizeOr(axis, Vector3d::UnitZ());
                 double   dis_mid = v.distanceouter - v.distanceinner + 0.1f;
+                const double min_distance_squared =
+                    kControlPointForceMinDistance * kControlPointForceMinDistance;
 
                 for (auto& p : info.particles) {
                     Vector3d pos      = p.position.cast<double>();
-                    Vector3d direct   = -axis.cross(pos).normalized();
-                    double   distance = (pos - offset).norm();
+                    Vector3d relative = pos - offset;
+                    double   distance = relative.norm();
+                    if (distance <= kControlPointForceMinDistance) continue;
+
+                    // The cursor blossom's vortex is centered on control point 0, so tangent must be
+                    // computed from particle-relative-to-cursor, not from scene origin. Hanabi's
+                    // screen-space handedness makes axis-cross-radial bend each emitted arm to the
+                    // viewer's left; reverse the tangent so every petal turns right toward the next
+                    // pentagram segment.
+                    Vector3d tangent = relative.cross(axis);
+                    const double tangent_squared = tangent.squaredNorm();
+                    if (tangent_squared <= min_distance_squared) continue;
+                    Vector3d direct = tangent / std::sqrt(tangent_squared);
                     if (dis_mid < 0 || distance < v.distanceinner) {
                         PM::Accelerate(p, direct * v.speedinner, info.time_pass);
-                    }
-                    if (distance > v.distanceouter) {
+                    } else if (distance > v.distanceouter) {
                         PM::Accelerate(p, direct * v.speedouter, info.time_pass);
                     } else if (distance > v.distanceinner) {
                         double t = (distance - v.distanceinner) / dis_mid;
@@ -601,7 +735,10 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
 
                 Vector3d offset = info.controlpoints[c.controlpoint].offset +
                                   Vector3f { c.origin.data() }.cast<double>();
-                const double threshold = static_cast<double>(c.threshold);
+                // linux-wallpaperengine halves the authored threshold before applying the two
+                // Cherry_Blossoms_2.json controlpointattract operators. Without that, the broad
+                // attract/repel pair overreaches and pulls the blossom into center-to-arm lines.
+                const double threshold = static_cast<double>(c.threshold) * 0.5;
                 if (!std::isfinite(threshold) || threshold <= 0.0 || !std::isfinite(c.scale))
                     return;
 

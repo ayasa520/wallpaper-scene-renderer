@@ -7,6 +7,7 @@
 #include <functional>
 #include <array>
 #include <span>
+#include <cstdint>
 
 #include "Core/Literals.hpp"
 
@@ -27,7 +28,16 @@ struct ParticleInfo {
     double                                time_pass;
 };
 
-using ParticleInitOp = std::function<void(Particle&, double)>;
+struct ParticleInitInfo {
+    // The cursor blossom in Cherry_Blossoms_2.json uses mapsequencearoundcontrolpoint, which needs
+    // the live mouse-linked control point and a stable 0..4 spawn slot. Keep this context limited to
+    // initializers so ordinary operators still receive the existing ParticleInfo path.
+    double                                duration { 0.0 };
+    std::span<const ParticleControlpoint> controlpoints;
+    uint64_t                              sequence { 0 };
+};
+
+using ParticleInitOp = std::function<void(Particle&, const ParticleInitInfo&)>;
 // particle index lifetime-percent passTime
 using ParticleOperatorOp = std::function<void(const ParticleInfo&)>;
 

@@ -104,9 +104,13 @@ inline usize GenParticleData(std::span<const std::unique_ptr<ParticleInstance>> 
             offset += 4;
 
             if (opt.thick_format) {
+                const auto& render_velocity = ParticleModify::GetRenderVelocity(p);
+                // Cherry_Blossoms_2.json uses spritetrail/genericparticle, where this attribute is
+                // the visual trail axis. Prefer a mapsequence-supplied render axis when present so
+                // random petal facing does not perturb the physics velocity that draws the star.
                 AssignVertexTimes(
                     { data + offset, totle_size },
-                    std::array { p.velocity[0], p.velocity[1], p.velocity[2], lifetime },
+                    std::array { render_velocity[0], render_velocity[1], render_velocity[2], lifetime },
                     4);
                 offset += 4;
             }
