@@ -141,6 +141,8 @@ struct AssetFontCacheEntry {
 struct AssetFontCacheState {
     std::mutex mutex;
     std::unordered_map<std::string, AssetFontCacheEntry> entries;
+    std::unordered_map<std::string, std::string> scene_asset_content_keys;
+    std::unordered_set<std::string> missing_scene_asset_keys;
     std::unordered_set<std::string> registered_config_font_paths;
 };
 
@@ -165,6 +167,23 @@ std::string MakeAssetFontCacheKey(std::string_view request_path,
     key.append(content_hash);
     key.push_back('\n');
     key.append(std::to_string(byte_count));
+    return key;
+}
+
+std::string MakeSceneAssetFontCacheKey(uint64_t         vfs_identity,
+                                       std::string_view request_path,
+                                       std::string_view asset_path) {
+    // Scene reuse keeps the renderer object alive, but every load builds a new VFS. Keying the fast
+    // path by that VFS identity plus the authored and normalized font paths lets runtime text ticks
+    // reuse the already resolved family without collapsing two different wallpapers that both use
+    // "fonts/foo.ttf" into the same cache entry.
+    std::string key;
+    key.reserve(request_path.size() + asset_path.size() + 48);
+    key.append(std::to_string(vfs_identity));
+    key.push_back('\n');
+    key.append(request_path);
+    key.push_back('\n');
+    key.append(asset_path);
     return key;
 }
 
@@ -564,15 +583,51 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
         return NormalizeSystemFontAlias(font);
     }
 
-    const auto asset_path = NormalizeAssetPath(vfs, font);
-    auto       stream     = vfs.Open(asset_path);
+    const auto asset_path      = NormalizeAssetPath(vfs, font);
+    const auto vfs_identity    = vfs.Identity();
+    const auto scene_cache_key = MakeSceneAssetFontCacheKey(vfs_identity, font, asset_path);
+    auto&      cache_state     = GetAssetFontCacheState();
+
+    {
+        std::scoped_lock lock(cache_state.mutex);
+        if (cache_state.missing_scene_asset_keys.count(scene_cache_key) != 0) {
+            return std::nullopt;
+        }
+        if (const auto scene_it = cache_state.scene_asset_content_keys.find(scene_cache_key);
+            scene_it != cache_state.scene_asset_content_keys.end()) {
+            if (const auto entry_it = cache_state.entries.find(scene_it->second);
+                entry_it != cache_state.entries.end()) {
+                // The same scene can reraster animated text many times per second. Once a font has
+                // been resolved for this VFS, return through the Pango visibility bridge directly
+                // instead of re-opening and hashing large font files on every scripted text update.
+                if (EnsureAssetFontVisibleToCurrentPangoFontMap(cache_state, entry_it->second)) {
+                    return entry_it->second.family;
+                }
+
+                LOG_ERROR("rebuilding scene text font entry after visibility failure: request=%s asset=%s temp=%s hash=%s bytes=%zu",
+                          entry_it->second.request_path.c_str(),
+                          entry_it->second.asset_path.c_str(),
+                          entry_it->second.temp_font_path.c_str(),
+                          entry_it->second.content_hash.c_str(),
+                          entry_it->second.byte_count);
+                cache_state.entries.erase(entry_it);
+            }
+            cache_state.scene_asset_content_keys.erase(scene_it);
+        }
+    }
+
+    auto       stream             = vfs.Open(asset_path);
     if (! stream) {
+        std::scoped_lock lock(cache_state.mutex);
+        cache_state.missing_scene_asset_keys.insert(scene_cache_key);
         LOG_ERROR("text layer font asset not found: %s", font.c_str());
         return std::nullopt;
     }
 
     std::string bytes = stream->ReadAllStr();
     if (bytes.empty()) {
+        std::scoped_lock lock(cache_state.mutex);
+        cache_state.missing_scene_asset_keys.insert(scene_cache_key);
         LOG_ERROR("text layer font asset is empty: %s", font.c_str());
         return std::nullopt;
     }
@@ -580,24 +635,28 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
     const auto content_hash = utils::genSha1(std::span<const char>(bytes.data(), bytes.size()));
     const auto byte_count   = bytes.size();
     const auto cache_key    = MakeAssetFontCacheKey(font, asset_path, content_hash, byte_count);
-    auto&      cache_state  = GetAssetFontCacheState();
-    std::scoped_lock lock(cache_state.mutex);
 
-    if (const auto it = cache_state.entries.find(cache_key); it != cache_state.entries.end()) {
-        // A cache hit only proves that we already parsed this asset font and generated its temp file.
-        // It does not prove that the PangoFcFontMap owned by the current thread has refreshed after
-        // that app-font registration, so every hit still runs the visibility bridge before returning.
-        if (EnsureAssetFontVisibleToCurrentPangoFontMap(cache_state, it->second)) {
-            return it->second.family;
+    {
+        std::scoped_lock lock(cache_state.mutex);
+        if (const auto it = cache_state.entries.find(cache_key); it != cache_state.entries.end()) {
+            cache_state.scene_asset_content_keys[scene_cache_key] = cache_key;
+            // A content-cache hit only proves that another scene already parsed these same bytes and
+            // generated the temp file. It does not prove that the PangoFcFontMap owned by this thread
+            // has refreshed after that app-font registration, so every hit still runs the visibility
+            // bridge before returning.
+            if (EnsureAssetFontVisibleToCurrentPangoFontMap(cache_state, it->second)) {
+                return it->second.family;
+            }
+
+            LOG_ERROR("rebuilding cached text font entry after visibility failure: request=%s asset=%s temp=%s hash=%s bytes=%zu",
+                      it->second.request_path.c_str(),
+                      it->second.asset_path.c_str(),
+                      it->second.temp_font_path.c_str(),
+                      it->second.content_hash.c_str(),
+                      it->second.byte_count);
+            cache_state.entries.erase(it);
+            cache_state.scene_asset_content_keys.erase(scene_cache_key);
         }
-
-        LOG_ERROR("rebuilding cached text font entry after visibility failure: request=%s asset=%s temp=%s hash=%s bytes=%zu",
-                  it->second.request_path.c_str(),
-                  it->second.asset_path.c_str(),
-                  it->second.temp_font_path.c_str(),
-                  it->second.content_hash.c_str(),
-                  it->second.byte_count);
-        cache_state.entries.erase(it);
     }
 
     FT_Library library { nullptr };
@@ -613,6 +672,8 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
                            0,
                            &face) != 0) {
         FT_Done_FreeType(library);
+        std::scoped_lock lock(cache_state.mutex);
+        cache_state.missing_scene_asset_keys.insert(scene_cache_key);
         LOG_ERROR("FreeType failed to load text font: %s", font.c_str());
         return std::nullopt;
     }
@@ -640,6 +701,7 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
     // file-backed app fonts visible to layout engines. The cache stores the authored request, the VFS
     // asset path, and the content identity so later scene reuse can hit the cache without inventing a
     // separate per-wallpaper font namespace.
+    std::scoped_lock lock(cache_state.mutex);
     if (! WriteAssetFontTempFile(entry, bytes)) {
         return std::nullopt;
     }
@@ -648,6 +710,7 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
     }
 
     cache_state.entries.emplace(cache_key, entry);
+    cache_state.scene_asset_content_keys[scene_cache_key] = cache_key;
     return entry.family;
 }
 

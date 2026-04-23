@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <cstdint>
 #include <vector>
 #include <memory>
 #include <string>
@@ -35,8 +37,15 @@ public:
 		}
 	};
 public:
-	VFS() = default;
+	VFS(): m_identity(s_next_identity.fetch_add(1, std::memory_order_relaxed)) {}
 	~VFS() = default;
+
+    uint64_t Identity() const {
+        // Scene reloads build a fresh VFS even when the same SceneWallpaper instance is reused.
+        // Runtime caches can therefore use this stable per-VFS identity to keep same-path assets
+        // isolated between wallpapers without re-reading large immutable files on every text tick.
+        return m_identity;
+    }
 
 	bool Mount(std::string_view mountpoint, std::unique_ptr<Fs> fs, std::string_view name="") {
 		if(!MountedFs::CheckMountPoint(mountpoint) || !fs) return false;
@@ -99,6 +108,8 @@ public:
 	}
 private:
 	std::vector<MountedFs> m_mountedFss;
+    uint64_t m_identity { 0 };
+    inline static std::atomic<uint64_t> s_next_identity { 1 };
 };
 
 inline std::string GetFileContent(fs::VFS& vfs, std::string_view path) {
