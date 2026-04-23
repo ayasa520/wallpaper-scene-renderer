@@ -1799,13 +1799,20 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             BuildEffectVisibilityContract(wpeffobj, context.user_properties);
         if (!effect_visibility.can_prune_at_parse_time) count_eff++;
     }
-    bool hasEffect = count_eff > 0;
+    const bool hasAuthoredEffect = count_eff > 0;
     bool isCompose = (wpimgobj.image == "models/util/composelayer.json");
     const bool isProjectLayer =
         wpimgobj.projectlayer || wpimgobj.image == "models/util/projectlayer.json";
     const bool is_offscreen_dependency_source =
         context.scene != nullptr &&
         context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0;
+    // Wallpaper Engine `dependencies` expose a layer through `_rt_imageLayerComposite_<id>`
+    // even when the source layer has no authored effects. Such layers still need a private source
+    // render target because the visible consumer samples that source while the layer itself remains
+    // hidden in the main scene. Treating dependency-only image layers as effect-backed sources lets
+    // the existing effect camera/ping-pong path materialize the raw image or mask without drawing
+    // it directly into `_rt_default`.
+    bool hasEffect = hasAuthoredEffect || is_offscreen_dependency_source;
     // Detached effect world nodes still need to inherit the parent transform even though they
     // cannot become real scene-graph children of that parent. SceneScript/property-animation
     // also needs a dedicated logical/world node for image layers with effects, otherwise runtime
@@ -2027,12 +2034,17 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         effect_ppong_a = WE_EFFECT_PPONG_PREFIX_A.data() + nodeAddr;
         effect_ppong_b = WE_EFFECT_PPONG_PREFIX_B.data() + nodeAddr;
         // set image effect
-        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(
-            use_detached_effect_world_node ? spWorldNode.get() : nullptr,
-            wpimgobj.size[0],
-            wpimgobj.size[1],
-            effect_ppong_a,
-            effect_ppong_b);
+        // Compose layers keep their source node in the normal scene tree, but their final authored
+        // effect pass is still a detached render-graph node. Give the effect layer a world node even
+        // when the source node is not detached so final output can inherit virtual parent transforms
+        // from render-order proxy groups instead of drawing at the compose layer's local coordinates.
+        auto* effect_world_node =
+            (use_detached_effect_world_node || isCompose) ? spWorldNode.get() : nullptr;
+        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(effect_world_node,
+                                                                      wpimgobj.size[0],
+                                                                      wpimgobj.size[1],
+                                                                      effect_ppong_a,
+                                                                      effect_ppong_b);
         {
             imgEffectLayer->SetFinalBlend(imgBlendMode);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
@@ -2059,11 +2071,18 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_a);
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_b);
         }
-        ConfigureEffectFinalComposite(context,
-                                      *imgEffectLayer,
-                                      effect_ppong_a,
-                                      wpimgobj.id,
-                                      wpimgobj.name);
+        if (hasAuthoredEffect) {
+            // The neutral final composite is only useful when an authored effect chain can have a
+            // hidden final output pass. Dependency-only sources intentionally stop at the first
+            // ping-pong target so `_rt_imageLayerComposite_<id>` samples the raw source texture
+            // instead of adding an unreachable screen-space fallback node that could overwrite the
+            // link-source bookkeeping.
+            ConfigureEffectFinalComposite(context,
+                                          *imgEffectLayer,
+                                          effect_ppong_a,
+                                          wpimgobj.id,
+                                          wpimgobj.name);
+        }
         int32_t i_eff = -1;
         for (const auto& wpeffobj : wpimgobj.effects) {
             i_eff++;

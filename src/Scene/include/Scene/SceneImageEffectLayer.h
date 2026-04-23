@@ -85,7 +85,9 @@ public:
     void        SyncResolvedNodeToWorld();
     void        SyncResolvedNodeToMatrix(const Eigen::Affine3f& world_affine);
 
-    void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam);
+    void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam,
+                       bool keep_final_output_private = false,
+                       const Eigen::Affine3f* resolved_world_affine = nullptr);
 
 private:
     SceneNode*  m_worldNode;
@@ -97,6 +99,11 @@ private:
     std::unique_ptr<SceneMesh> m_final_mesh;
     std::unique_ptr<SceneNode> m_final_node;
     SceneNode*                 m_resolved_output_node { nullptr };
+    // Visible effect layers resolve their final authored pass in scene space, so runtime transform
+    // updates must keep that node synchronized with the layer world node. Hidden dependency sources
+    // resolve into a private offscreen texture instead; their final pass must stay in the effect
+    // camera's local fullscreen space or `_rt_imageLayerComposite_<id>` samples a shifted source.
+    bool                       m_resolved_output_follows_world { true };
     // The synthetic final composite is a narrow fallback, not the normal output path. Keep the
     // authored final effect as the resolved screen writer while it is visible, and only enable the
     // passthrough composite when that exact final effect becomes runtime-hidden.

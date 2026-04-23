@@ -20,7 +20,27 @@ struct RuntimeState {
     JSContext* context { nullptr };
 };
 
+void ReplaceAll(std::string& source, std::string_view needle, std::string_view replacement) {
+    std::string::size_type pos = 0;
+    while ((pos = source.find(needle, pos)) != std::string::npos) {
+        source.replace(pos, needle.size(), replacement);
+        pos += replacement.size();
+    }
+}
+
+void NormalizeScriptWhitespace(std::string& source) {
+    // Workshop scripts occasionally use U+00A0 non-breaking spaces between
+    // module keywords and declarations, for example `export var` rendered as
+    // `export\xc2\xa0var`. QuickJS treats that as valid whitespace, but our
+    // module-stripping pass used to search only for ASCII spaces and therefore
+    // left the `export` token in parser-time scripts. Normalize those spaces
+    // first so authored Wallpaper Engine module syntax is removed reliably.
+    ReplaceAll(source, "\xC2\xA0", " ");
+}
+
 std::string StripScriptModuleSyntax(std::string source) {
+    NormalizeScriptWhitespace(source);
+
     std::string::size_type pos = 0;
     while ((pos = source.find("'use strict';", pos)) != std::string::npos) {
         source.erase(pos, 13);

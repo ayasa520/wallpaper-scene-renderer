@@ -57,7 +57,10 @@ void LogNodeTransform(const char* prefix, const SceneNode* node) {
 }
 } // namespace
 
-SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float w, float h,
+// The width and height parameters remain in the public constructor to preserve the existing parser
+// call contract; effect geometry is copied from the resolved source/final meshes during
+// ResolveEffect(), so the constructor only records the world node and ping-pong target names.
+SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float /*w*/, float /*h*/,
                                              std::string_view pingpong_a,
                                              std::string_view pingpong_b)
     : m_worldNode(node),
@@ -121,6 +124,12 @@ void SceneImageEffectLayer::SetFinalCompositeSource(std::string source) {
 
 void SceneImageEffectLayer::SyncResolvedOutputMesh() {
     if (m_resolved_output_node == nullptr || m_resolved_output_node->Mesh() == nullptr) return;
+    if (!m_resolved_output_follows_world) {
+        // Private dependency outputs deliberately use the effect camera's unit fullscreen mesh.
+        // Runtime resize/transform refreshes should not copy the layer's world-space final mesh into
+        // that node, otherwise offscreen dependencies render as if they were visible scene quads.
+        return;
+    }
 
     // Resource-only render-graph refreshes keep the already-resolved effect nodes alive and only
     // recreate their GPU resources. Runtime text updates therefore cannot rely on ResolveEffect()
@@ -147,13 +156,16 @@ void SceneImageEffectLayer::SyncResolvedNodeToWorld() {
     if (m_worldNode == nullptr) return;
 
     m_worldNode->UpdateTrans();
-    m_final_node->CopyTrans(*m_worldNode);
+    // Final effect nodes are emitted as render-graph-only nodes, not as real children of the
+    // authored scene node. Copying only the local TRS loses virtual parent transforms used by
+    // render-order proxy groups such as Wallpaper Engine compose layers. Resolve the full world
+    // matrix here so the final screen writer lands in the same place as the authored layer.
+    Eigen::Affine3f world_affine;
+    world_affine.matrix() = m_worldNode->ModelTrans().cast<float>();
+    m_final_node->SetLocalAffine(world_affine);
+    m_final_node->UpdateTrans();
 
-    const auto modelTrans = m_worldNode->ModelTrans();
-    m_final_node->SetTranslate(
-        Eigen::Vector3f((float)modelTrans(0, 3), (float)modelTrans(1, 3), (float)modelTrans(2, 3)));
-
-    if (m_resolved_output_node != nullptr) {
+    if (m_resolved_output_node != nullptr && m_resolved_output_follows_world) {
         m_resolved_output_node->CopyTrans(*m_final_node);
         m_resolved_output_node->UpdateTrans();
     }
@@ -163,23 +175,37 @@ void SceneImageEffectLayer::SyncResolvedNodeToMatrix(const Eigen::Affine3f& worl
     m_final_node->SetLocalAffine(world_affine);
     m_final_node->UpdateTrans();
 
-    if (m_resolved_output_node != nullptr) {
+    if (m_resolved_output_node != nullptr && m_resolved_output_follows_world) {
         m_resolved_output_node->CopyTrans(*m_final_node);
         m_resolved_output_node->UpdateTrans();
     }
 }
 
 void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
-                                          std::string_view effect_cam) {
+                                          std::string_view effect_cam,
+                                          bool keep_final_output_private,
+                                          const Eigen::Affine3f* resolved_world_affine) {
     std::string_view ppong_a = m_pingpong_a, ppong_b = m_pingpong_b;
     auto             swap_pp = [&ppong_a, &ppong_b]() {
         std::swap(ppong_a, ppong_b);
     };
     auto default_node = SceneNode();
+    auto sync_resolved_world = [&]() {
+        if (resolved_world_affine != nullptr) {
+            // Render-order proxy routes keep some authored children root-owned in the physical
+            // SceneNode tree while still drawing them under a virtual parent. When the render graph
+            // already resolved that routed world matrix, trust it here instead of asking the node's
+            // physical parent chain, which would drop the virtual parent transform.
+            SyncResolvedNodeToMatrix(*resolved_world_affine);
+            return;
+        }
+        SyncResolvedNodeToWorld();
+    };
 
     m_resolved_output_node = nullptr;
     m_final_output_effect  = nullptr;
-    SyncResolvedNodeToWorld();
+    m_resolved_output_follows_world = true;
+    sync_resolved_world();
 
     SceneImageEffectNode* fallback_last_output { nullptr };
     for (auto& eff : m_effects) {
@@ -230,7 +256,7 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         // and samples the bypassed ping-pong target so the layer still contributes its unmodified
         // input instead of going blank.
         SetFinalCompositeSource(std::string(ppong_a));
-        SyncResolvedNodeToWorld();
+        sync_resolved_world();
         auto& mesh          = *m_final_node->Mesh();
         auto& material      = *mesh.Material();
         {
@@ -248,12 +274,12 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         }
     }
 
-    if (fallback_last_output != nullptr) {
+    if (fallback_last_output != nullptr && !keep_final_output_private) {
         // Keep the historical visible path: the final authored shader writes the screen/default
         // output directly, preserving shaders whose visual result depends on being the final
         // compositor. The synthetic final composite remains dormant unless this effect is hidden.
         m_resolved_output_node = fallback_last_output->sceneNode.get();
-        SyncResolvedNodeToWorld();
+        sync_resolved_world();
         fallback_last_output->output = SpecTex_Default;
         auto& mesh                   = *(fallback_last_output->sceneNode->Mesh());
         auto& material               = *mesh.Material();
@@ -262,6 +288,24 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
             fallback_last_output->sceneNode->SetCamera(std::string());
             fallback_last_output->sceneNode->CopyTrans(*m_final_node);
             mesh.ChangeMeshDataFrom(*m_final_mesh);
+        }
+    } else if (fallback_last_output != nullptr) {
+        // Effect dependencies sampled through `_rt_imageLayerComposite_<id>` need the opposite
+        // final-output contract from visible screen layers. They are hidden source layers whose
+        // final authored effect must continue writing the private ping-pong target so the consumer
+        // samples the fully resolved source image. Rewriting that final effect to `_rt_default`
+        // would also make the pass fail the hidden-dependency execution rule and leave the linked
+        // texture with an intermediate result.
+        m_resolved_output_node = fallback_last_output->sceneNode.get();
+        m_resolved_output_follows_world = false;
+        sync_resolved_world();
+        auto& mesh                   = *(fallback_last_output->sceneNode->Mesh());
+        auto& material               = *mesh.Material();
+        {
+            material.blenmode = BlendMode::Normal;
+            fallback_last_output->sceneNode->SetCamera(effect_cam.data());
+            fallback_last_output->sceneNode->CopyTrans(default_node);
+            mesh.ChangeMeshDataFrom(default_mesh);
         }
     }
 }

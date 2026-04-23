@@ -493,6 +493,148 @@ inline bool TryParseConstructorCall(std::string_view source, std::string_view& c
     return true;
 }
 
+struct ShaderVectorVariable {
+    std::string name;
+    int         components { 0 };
+};
+
+inline int ShaderVectorComponents(std::string_view type) {
+    if (type == "float" || type == "float1") return 1;
+    if (type == "vec2" || type == "float2") return 2;
+    if (type == "vec3" || type == "float3") return 3;
+    if (type == "vec4" || type == "float4") return 4;
+    return 0;
+}
+
+inline bool IsShaderDeclarationQualifier(std::string_view token) {
+    return token == "const" || token == "in" || token == "out" || token == "attribute" ||
+        token == "varying" || token == "uniform" || token == "flat" || token == "smooth" ||
+        token == "noperspective" || token == "centroid" || token == "sample" ||
+        token == "patch" || token == "readonly" || token == "writeonly" ||
+        token == "coherent" || token == "volatile" || token == "restrict" ||
+        token == "highp" || token == "mediump" || token == "lowp";
+}
+
+inline bool TryParseVectorDeclarationLine(std::string_view line, std::string_view& type,
+                                          std::string_view& name) {
+    const auto comment_pos = line.find("//");
+    if (comment_pos != std::string_view::npos) line = line.substr(0, comment_pos);
+
+    const auto semicolon_pos = line.find(';');
+    if (semicolon_pos == std::string_view::npos) return false;
+
+    line = TrimWhitespace(line.substr(0, semicolon_pos + 1));
+    if (line.empty() || line.back() != ';') return false;
+    line.remove_suffix(1);
+    line = TrimWhitespace(line);
+    if (line.empty()) return false;
+
+    size_t pos { 0 };
+    while (pos < line.size()) {
+        if (! IsIdentifierStart(line[pos])) return false;
+
+        const auto token_end = SkipIdentifier(line, pos);
+        const auto token     = line.substr(pos, token_end - pos);
+        if (token == "layout") {
+            pos = SkipWhitespace(line, token_end);
+            if (pos >= line.size() || line[pos] != '(') return false;
+            pos = SkipBalanced(line, pos, '(', ')');
+            if (pos == std::string::npos) return false;
+            pos = SkipWhitespace(line, pos);
+            continue;
+        }
+
+        if (IsShaderDeclarationQualifier(token)) {
+            pos = SkipWhitespace(line, token_end);
+            continue;
+        }
+
+        if (ShaderVectorComponents(token) == 0) return false;
+        type = token;
+        pos  = SkipWhitespace(line, token_end);
+        break;
+    }
+
+    if (pos >= line.size() || ! IsIdentifierStart(line[pos])) return false;
+
+    const auto name_end = SkipIdentifier(line, pos);
+    name                = line.substr(pos, name_end - pos);
+
+    pos = SkipWhitespace(line, name_end);
+    if (pos < line.size() && line[pos] == '[') {
+        pos = SkipBalanced(line, pos, '[', ']');
+        if (pos == std::string::npos) return false;
+        pos = SkipWhitespace(line, pos);
+    }
+
+    return pos >= line.size() || line[pos] == '=' || line[pos] == ',';
+}
+
+inline void UpsertShaderVectorVariable(std::vector<ShaderVectorVariable>& variables,
+                                       std::string_view name, int components) {
+    for (auto it = variables.rbegin(); it != variables.rend(); ++it) {
+        if (it->name == name) {
+            it->components = components;
+            return;
+        }
+    }
+    variables.push_back(ShaderVectorVariable { .name = std::string(name), .components = components });
+}
+
+inline int FindShaderVectorComponents(const std::vector<ShaderVectorVariable>& variables,
+                                      std::string_view name) {
+    for (auto it = variables.rbegin(); it != variables.rend(); ++it) {
+        if (it->name == name) return it->components;
+    }
+    return 0;
+}
+
+inline std::string_view NarrowingSwizzle(int components) {
+    if (components == 2) return ".xy";
+    if (components == 3) return ".xyz";
+    return {};
+}
+
+inline bool TryParseSimpleUntypedAssignmentLine(std::string_view line, std::string_view& lhs,
+                                                std::string_view& rhs, size_t& rhs_begin,
+                                                size_t& rhs_len) {
+    const auto comment_pos = line.find("//");
+    const auto search_end =
+        comment_pos == std::string_view::npos ? line.size() : comment_pos;
+    line = line.substr(0, search_end);
+
+    const auto semicolon_pos = line.find(';');
+    if (semicolon_pos == std::string_view::npos) return false;
+
+    const auto eq_pos = line.find('=');
+    if (eq_pos == std::string_view::npos || eq_pos > semicolon_pos) return false;
+    if (line.find('=', eq_pos + 1) != std::string_view::npos) return false;
+    if (eq_pos > 0) {
+        const char prev = line[eq_pos - 1];
+        if (prev == '=' || prev == '<' || prev == '>' || prev == '!' || prev == '+' ||
+            prev == '-' || prev == '*' || prev == '/' || prev == '%') {
+            return false;
+        }
+    }
+    if (eq_pos + 1 < line.size() && line[eq_pos + 1] == '=') return false;
+
+    std::string_view parsed_lhs;
+    if (! TryParseStandaloneIdentifier(line.substr(0, eq_pos), parsed_lhs)) return false;
+
+    const auto rhs_segment = line.substr(eq_pos + 1, semicolon_pos - eq_pos - 1);
+    const auto rhs_first   = rhs_segment.find_first_not_of(" \t\r\n");
+    if (rhs_first == std::string_view::npos) return false;
+
+    std::string_view parsed_rhs;
+    if (! TryParseStandaloneIdentifier(rhs_segment, parsed_rhs)) return false;
+
+    lhs       = parsed_lhs;
+    rhs       = parsed_rhs;
+    rhs_begin = eq_pos + 1 + rhs_first;
+    rhs_len   = parsed_rhs.size();
+    return true;
+}
+
 inline size_t FindStatementTerminator(std::string_view text, size_t pos) {
     bool in_block_comment { false };
     bool in_string { false };
@@ -1501,6 +1643,60 @@ inline std::string RewriteVec2AssignmentsForVec4TexCoord(std::string_view source
     return result;
 }
 
+inline std::string RewriteVectorNarrowingAssignments(std::string_view source) {
+    std::string result;
+    result.reserve(source.size() + 64);
+
+    std::vector<ShaderVectorVariable> variables;
+    size_t                            pos { 0 };
+    while (pos < source.size()) {
+        const auto line_end = source.find('\n', pos);
+        const auto line_len =
+            line_end == std::string_view::npos ? source.size() - pos : line_end - pos;
+        const auto line = source.substr(pos, line_len);
+
+        std::string_view declared_type;
+        std::string_view declared_name;
+        if (TryParseVectorDeclarationLine(line, declared_type, declared_name)) {
+            UpsertShaderVectorVariable(
+                variables,
+                declared_name,
+                ShaderVectorComponents(declared_type));
+        }
+
+        std::string_view lhs;
+        std::string_view rhs;
+        size_t           rhs_begin { 0 };
+        size_t           rhs_len { 0 };
+        if (TryParseSimpleUntypedAssignmentLine(line, lhs, rhs, rhs_begin, rhs_len)) {
+            const int lhs_components = FindShaderVectorComponents(variables, lhs);
+            const int rhs_components = FindShaderVectorComponents(variables, rhs);
+            const auto swizzle       = NarrowingSwizzle(lhs_components);
+            if (lhs_components > 0 && rhs_components > lhs_components && !swizzle.empty()) {
+                // Wallpaper Engine's shader sources are authored for its legacy GLSL/HLSL-like
+                // compatibility layer, where assigning a wider vector into a narrower vector is
+                // treated as an implicit leading-component truncation. glslang's Vulkan frontend
+                // rejects that form, so the compatibility pass makes the truncation explicit for
+                // any already-declared vector assignment instead of adding shader-name exceptions.
+                std::string rewritten(line);
+                rewritten.replace(rhs_begin, rhs_len, std::string(rhs) + std::string(swizzle));
+                result.append(rewritten);
+                if (line_end == std::string_view::npos) break;
+                result.push_back('\n');
+                pos = line_end + 1;
+                continue;
+            }
+        }
+
+        result.append(line);
+        if (line_end == std::string_view::npos) break;
+        result.push_back('\n');
+        pos = line_end + 1;
+    }
+
+    return result;
+}
+
 inline bool TryParseShaderMetadataJson(std::string_view line, const char* kind,
                                        nlohmann::json& result) {
     const size_t json_start = line.find_first_of('{');
@@ -1985,6 +2181,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     // Some Wallpaper Engine effect shaders survive preprocessing with invalid simple
     // declarations. Normalize those with a token-aware statement rewrite.
     result = RewriteSimpleShaderStatements(result);
+    result = RewriteVectorNarrowingAssignments(result);
     result = RewriteSwizzledSelfMixAssignments(result);
 
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.

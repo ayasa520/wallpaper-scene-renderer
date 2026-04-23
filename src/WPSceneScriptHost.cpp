@@ -623,7 +623,27 @@ std::unordered_map<std::string, std::string> BuildInitialGeneralSettings() {
     };
 }
 
+void ReplaceAll(std::string& source, std::string_view needle, std::string_view replacement) {
+    std::string::size_type pos = 0;
+    while ((pos = source.find(needle, pos)) != std::string::npos) {
+        source.replace(pos, needle.size(), replacement);
+        pos += replacement.size();
+    }
+}
+
+void NormalizeScriptWhitespace(std::string& source) {
+    // Workshop scripts can contain U+00A0 non-breaking spaces around module
+    // syntax copied from localized snippets. QuickJS parses those as
+    // whitespace, while the local compatibility pass used to miss
+    // `export\xc2\xa0function` and `export\xc2\xa0var`. Normalize before
+    // stripping so persistent runtime callbacks compile the same scripts that
+    // Wallpaper Engine accepts.
+    ReplaceAll(source, "\xC2\xA0", " ");
+}
+
 std::string StripScriptModuleSyntax(std::string source) {
+    NormalizeScriptWhitespace(source);
+
     std::string::size_type pos = 0;
     while ((pos = source.find("'use strict';", pos)) != std::string::npos) {
         source.erase(pos, 13);

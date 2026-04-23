@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -136,6 +137,24 @@ struct ExtraInfo {
     bool                       use_mipmap_framebuffer { false };
 };
 
+static bool IsOffscreenDependencyLayer(const ExtraInfo& extra, i32 imgId) {
+    return extra.scene != nullptr && imgId != 0 &&
+        extra.scene->offscreenDependencyLayerIds.count(imgId) != 0;
+}
+
+static bool ShouldPublishLayerLinkOutput(const ExtraInfo& extra, i32 imgId,
+                                         std::string_view output) {
+    if (!IsOffscreenDependencyLayer(extra, imgId)) return true;
+    if (output != SpecTex_Default) return true;
+
+    // `_rt_imageLayerComposite_<id>` is a source-texture contract, not a screen-composite contract.
+    // Hidden dependency layers may still contain historical final passes that target `_rt_default`,
+    // but those passes are deliberately blocked from executing while the layer is invisible. Letting
+    // such a skipped screen pass replace the layer's link source makes the consumer sample the
+    // wallpaper/default target instead of the dependency's raw or effect-resolved offscreen image.
+    return false;
+}
+
 struct OrderedRenderGraphChild {
     SceneNode* node { nullptr };
     bool       proxy { false };
@@ -163,6 +182,27 @@ static bool IsEffectLocalProxyDependency(SceneNode* node, const ExtraInfo& extra
     if (extra.scene == nullptr || node == nullptr) return false;
     const int32_t layer_id = NodeLayerId(*extra.scene, node);
     return layer_id != 0 && extra.scene->offscreenDependencyLayerIds.count(layer_id) != 0;
+}
+
+static Eigen::Matrix4d ResolveRouteModel(SceneNode* node,
+                                         const std::optional<Eigen::Matrix4d>& route_model) {
+    if (route_model.has_value()) return *route_model;
+    if (node == nullptr) return Eigen::Matrix4d::Identity();
+
+    node->UpdateTrans();
+    return node->ModelTrans();
+}
+
+static std::optional<Eigen::Matrix4d> BuildChildRouteModel(
+    SceneNode* parent, SceneNode* child, bool routed_child,
+    const std::optional<Eigen::Matrix4d>& parent_route_model) {
+    if (parent == nullptr || child == nullptr) return std::nullopt;
+    if (!routed_child && !parent_route_model.has_value()) return std::nullopt;
+
+    // Proxy routing is order-only in the physical SceneNode tree, but render-time transforms still
+    // need to follow Wallpaper Engine's authored parent. Propagating a resolved route matrix lets
+    // effect final passes use the same virtual parent chain that shader uniforms use later.
+    return ResolveRouteModel(parent, parent_route_model) * child->GetLocalTrans();
 }
 
 static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode* node,
@@ -304,7 +344,9 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                                                           .type = rg::TexNode::TexType::Temp },
                                       true);
             builder.write(output_node);
-            extra.id_link_map[(usize)imgId] = output_node;
+            if (ShouldPublishLayerLinkOutput(extra, imgId, output)) {
+                extra.id_link_map[(usize)imgId] = output_node;
+            }
         });
 }
 
@@ -340,14 +382,17 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
                                                           .type = rg::TexNode::TexType::Temp },
                                       true);
             builder.write(output_node);
-            extra.id_link_map[(usize)imgId] = output_node;
+            if (ShouldPublishLayerLinkOutput(extra, imgId, output)) {
+                extra.id_link_map[(usize)imgId] = output_node;
+            }
             (void)pass;
         });
 }
 
 static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 imgId,
                         ExtraInfo& extra, std::function<bool()> node_execute_gate = {},
-                        bool routed_node = false) {
+                        bool routed_node = false,
+                        std::optional<Eigen::Matrix4d> route_model = std::nullopt) {
     auto& scene = *extra.scene;
 
     if (node != nullptr && !routed_node) {
@@ -367,6 +412,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
 
     std::string_view         output = inherited_output;
     SceneImageEffectLayer*   imgeff { nullptr };
+    const auto resolved_route_model = ResolveRouteModel(node, route_model);
     if (node != nullptr && !node->Camera().empty()) {
         auto camera_it = scene.cameras.find(node->Camera());
         if (camera_it != scene.cameras.end() && camera_it->second->HasImgEffect()) {
@@ -403,7 +449,12 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                             NodeLayerId(scene, source_node),
                             extra,
                             {},
-                            true);
+                            true,
+                            // Detached source nodes render through their own effect camera, but
+                            // the image-effect final writer belongs to the visible world node.
+                            // Forward the world route matrix so the final pass inherits virtual
+                            // render-order parents while intermediate effect passes stay local.
+                            std::optional<Eigen::Matrix4d> { resolved_route_model });
             }
         }
     }
@@ -456,7 +507,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                         NodeLayerId(scene, child.node),
                         extra,
                         {},
-                        child.proxy);
+                        child.proxy,
+                        BuildChildRouteModel(node, child.node, child.proxy, route_model));
         }
     }
 
@@ -464,7 +516,16 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         // Composite source nodes may now be transform-only containers whose children draw into the
         // effect source target. Resolving the effect after all descendants have emitted their passes
         // keeps those composite layers correct without requiring each child to manage effect timing.
-        imgeff->ResolveEffect(scene.default_effect_mesh, "effect");
+        // Hidden dependency layers are not visible screen compositors. When a later effect samples
+        // `_rt_imageLayerComposite_<id>`, the dependency's final authored effect must still resolve
+        // into its private ping-pong target; otherwise the generic visible-layer rewrite would move
+        // that final pass to `_rt_default`, where the hidden-layer execution gate correctly skips it.
+        const auto resolved_effect_world_affine =
+            Eigen::Affine3f(resolved_route_model.cast<float>());
+        imgeff->ResolveEffect(scene.default_effect_mesh,
+                              "effect",
+                              IsOffscreenDependencyLayer(extra, imgId),
+                              &resolved_effect_world_affine);
 
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
             auto& eff     = imgeff->GetEffect(i);
@@ -513,7 +574,12 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                         inherited_output,
                         imgId,
                         extra,
-                        hidden_final_fallback_gate);
+                        hidden_final_fallback_gate,
+                        false,
+                        // The synthetic fallback is another detached final writer for the same
+                        // image effect, so it must share the resolved route matrix used by the
+                        // authored final output instead of recomputing from its physical tree.
+                        std::optional<Eigen::Matrix4d> { resolved_route_model });
         }
     }
 
@@ -529,7 +595,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                     NodeLayerId(scene, child.node),
                     extra,
                     {},
-                    true);
+                    true,
+                    BuildChildRouteModel(node, child.node, true, route_model));
     }
 }
 
