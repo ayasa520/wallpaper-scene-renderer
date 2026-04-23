@@ -21,6 +21,10 @@ namespace PM = ParticleModify;
 namespace
 {
 
+// Keep a tiny dead-zone around the force center so particles exactly under the
+// mouse/control point do not generate an undefined normalized direction.
+constexpr double kControlPointForceMinDistance = 0.0001;
+
 inline void Color(Particle& p, const std::array<float, 3> min, const std::array<float, 3> max) {
     double               random = Random::get(0.0, 1.0);
     std::array<float, 3> result;
@@ -419,6 +423,10 @@ struct ControlPointForce {
         v.controlpoint %= 8;
 
         GET_JSON_NAME_VALUE_NOWARN(j, "scale", v.scale);
+        // Wallpaper Engine assets commonly serialize this field with the historical
+        // "threadhold" typo, while hand-authored tests and docs often use "threshold".
+        // Reading both names keeps the operator compatible with either spelling.
+        GET_JSON_NAME_VALUE_NOWARN(j, "threshold", v.threshold);
         GET_JSON_NAME_VALUE_NOWARN(j, "threadhold", v.threshold);
 
         GET_JSON_NAME_VALUE_NOWARN(j, "offset", v.origin);
@@ -586,18 +594,32 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                 }
             };
         } else if (name == "controlpointattract") {
-            break;
-
             ControlPointForce c = ControlPointForce::ReadFromJson(wpj);
             return [=](const ParticleInfo& info) {
+                if (c.controlpoint < 0 || static_cast<usize>(c.controlpoint) >= info.controlpoints.size())
+                    return;
+
                 Vector3d offset = info.controlpoints[c.controlpoint].offset +
                                   Vector3f { c.origin.data() }.cast<double>();
+                const double threshold = static_cast<double>(c.threshold);
+                if (!std::isfinite(threshold) || threshold <= 0.0 || !std::isfinite(c.scale))
+                    return;
+
+                const double threshold_squared = threshold * threshold;
+                const double min_distance_squared =
+                    kControlPointForceMinDistance * kControlPointForceMinDistance;
                 for (auto& p : info.particles) {
-                    Vector3d diff     = offset - PM::GetPos(p).cast<double>();
-                    double   distance = diff.norm();
-                    if (distance < c.threshold) {
-                        PM::Accelerate(p, diff.normalized() * c.scale, info.time_pass);
-                    }
+                    const Vector3d diff = offset - PM::GetPos(p).cast<double>();
+                    const double distance_squared = diff.squaredNorm();
+                    if (distance_squared >= threshold_squared ||
+                        distance_squared <= min_distance_squared)
+                        continue;
+
+                    // Control Point Force accelerates toward the selected control point. Negative
+                    // authored scale naturally reverses that direction, producing the expected
+                    // mouse-repel behavior for pointer-locked control points.
+                    const Vector3d direction = diff / std::sqrt(distance_squared);
+                    PM::Accelerate(p, direction * static_cast<double>(c.scale), info.time_pass);
                 }
             };
         }

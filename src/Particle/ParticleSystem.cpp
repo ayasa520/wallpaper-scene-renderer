@@ -22,9 +22,20 @@ struct ParticleSystemStats {
 };
 
 constexpr float kRuntimeSizeEpsilon = 0.000001f;
+constexpr double kControlPointTransformDeterminantEpsilon = 0.000000001;
 
 float SafeRuntimeSizeReference(float size) {
     return std::abs(size) > kRuntimeSizeEpsilon ? size : 1.0f;
+}
+
+Eigen::Vector3d TransformPoint(const Eigen::Matrix4d& transform, const Eigen::Vector3d& point) {
+    const Eigen::Vector4d transformed = transform * Eigen::Vector4d { point.x(), point.y(), point.z(), 1.0 };
+    if (std::abs(transformed.w()) <= kControlPointTransformDeterminantEpsilon) {
+        // Homogeneous scene transforms should keep w near one. Falling back to the un-divided xyz
+        // vector prevents a malformed matrix from turning the linked control point into infinity.
+        return transformed.head<3>();
+    }
+    return transformed.head<3>() / transformed.w();
 }
 } // namespace
 
@@ -194,17 +205,38 @@ void ParticleSubSystem::UpdateLinkedControlpoints() {
     if (!has_linked_controlpoint) return;
 
     Eigen::Vector3d mouse_scene = m_sys.MouseScenePosition();
-    Eigen::Vector3d node_origin = Eigen::Vector3d::Zero();
+    Eigen::Matrix4d scene_to_particle_local = Eigen::Matrix4d::Identity();
     if (m_node != nullptr) {
         m_node->UpdateTrans();
         const auto model = m_node->ModelTrans();
-        node_origin = Eigen::Vector3d { model(0, 3), model(1, 3), model(2, 3) };
+        const double determinant = model.determinant();
+        if (!std::isfinite(determinant) ||
+            std::abs(determinant) <= kControlPointTransformDeterminantEpsilon) {
+            // A linked control point must live in the same local coordinate space as particle
+            // positions. If the node transform cannot be inverted, keep the previous offset instead
+            // of applying forces from a nonsense location.
+            LOG_ERROR("ParticleControlPoint: non-invertible node transform for linked mouse control point");
+            return;
+        }
+        scene_to_particle_local = model.inverse();
     }
 
     for (auto& controlpoint : m_controlpoints) {
         if (!controlpoint.link_mouse) continue;
-        controlpoint.offset = controlpoint.base_offset +
-                              (controlpoint.worldspace ? mouse_scene : (mouse_scene - node_origin));
+        if (controlpoint.worldspace) {
+            // World-space control point offsets are authored in scene coordinates. Convert the final
+            // world target back into particle-local space because emitters/operators compare against
+            // Particle::position, which is generated before the SceneNode model transform is applied.
+            controlpoint.offset =
+                TransformPoint(scene_to_particle_local, mouse_scene + controlpoint.base_offset);
+        } else {
+            // Pointer-locked local control points still need the pointer converted through the full
+            // inverse node transform. A plain mouse-origin subtraction misses layer scale and
+            // rotation, which made scaled particle systems (for example fireflies) ignore the force
+            // distance threshold.
+            controlpoint.offset =
+                controlpoint.base_offset + TransformPoint(scene_to_particle_local, mouse_scene);
+        }
     }
 }
 
