@@ -472,6 +472,7 @@ void LogStagingAllocRequest(std::string_view kind, const CustomShaderPass::Desc&
 }
 
 constexpr VkDeviceSize kInitialDynamicSuballocationSize = 64 * 1024;
+constexpr VkDeviceSize kDynamicIndexQuadFloorSize = sizeof(uint16_t) * 6;
 
 VkDeviceSize InitialDynamicSuballocationSize(VkDeviceSize capacity,
                                              VkDeviceSize live_size,
@@ -502,13 +503,16 @@ VkDeviceSize DynamicVertexUploadSize(const wallpaper::SceneVertexArray& vertex) 
 }
 
 VkDeviceSize DynamicIndexUploadSize(const wallpaper::SceneIndexArray& indice) {
-    // Index buffers follow the same bootstrap rule as vertices. A single quad's index footprint is
-    // used as the non-empty floor because empty dynamic meshes still need a sane first allocation
-    // when the scene begins spawning particles later.
+    // Index buffers follow the same bootstrap rule as vertices, but CustomShaderPass binds them as
+    // VK_INDEX_TYPE_UINT16 at draw time. SceneIndexArray stores both 32-bit model indices and packed
+    // 16-bit particle indices behind the same byte-count API, so the non-empty dynamic floor must
+    // match the GPU binding size. The effect-dependency route added for private image composites can
+    // expose one-quad particle helpers with only 12 bytes of authored capacity; using a 24-byte
+    // uint32_t floor makes those valid helpers fail before their first dynamic upload.
     return InitialDynamicSuballocationSize(
         static_cast<VkDeviceSize>(indice.CapacitySizeof()),
         static_cast<VkDeviceSize>(indice.DataSizeOf()),
-        static_cast<VkDeviceSize>(sizeof(uint32_t) * 6));
+        kDynamicIndexQuadFloorSize);
 }
 
 VkDeviceSize GrowDynamicSuballocationSize(VkDeviceSize current_size,
@@ -918,7 +922,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
                     auto ensure_index_subref = [&](const wallpaper::SceneIndexArray& indice) {
                         const auto required_live_size =
                             static_cast<VkDeviceSize>(std::max<usize>(indice.DataSizeOf(),
-                                                                      sizeof(uint32_t) * 6));
+                                                                      kDynamicIndexQuadFloorSize));
                         if (index_buf && index_buf.size >= required_live_size) return true;
 
                         const auto required_size = GrowDynamicSuballocationSize(

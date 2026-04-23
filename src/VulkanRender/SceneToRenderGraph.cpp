@@ -155,6 +155,21 @@ static bool ShouldPublishLayerLinkOutput(const ExtraInfo& extra, i32 imgId,
     return false;
 }
 
+static bool ShouldKeepEffectFinalOutputPrivate(const ExtraInfo& extra, SceneNode* node, i32 imgId,
+                                               std::string_view inherited_output) {
+    if (!IsOffscreenDependencyLayer(extra, imgId)) return false;
+
+    const bool visible_default_route =
+        node != nullptr && node->Visible() && inherited_output == SpecTex_Default;
+    // A layer can be both an offscreen dependency source and a normal visible wallpaper layer. The
+    // dependency route needs the final authored effect to stay in ping-pong space so
+    // `_rt_imageLayerComposite_<id>` samples a resolved private texture. The visible default route is
+    // the opposite contract: the authored final effect is the screen writer, while the synthetic
+    // fallback is gated off whenever that final effect is visible. Keeping this visible route private
+    // leaves `_rt_default` untouched and produces the gray frame reported by Rika/943626357.
+    return !visible_default_route;
+}
+
 struct OrderedRenderGraphChild {
     SceneNode* node { nullptr };
     bool       proxy { false };
@@ -522,9 +537,25 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         // that final pass to `_rt_default`, where the hidden-layer execution gate correctly skips it.
         const auto resolved_effect_world_affine =
             Eigen::Affine3f(resolved_route_model.cast<float>());
+        const bool keep_final_output_private =
+            ShouldKeepEffectFinalOutputPrivate(extra, node, imgId, inherited_output);
+        LOG_INFO("SceneRenderGraphEffectResolve: layer=%d name='%s' inherited-output='%.*s' "
+                 "effect-output='%.*s' offscreen-dependency=%s visible=%s local-visible=%s "
+                 "routed=%s keep-final-private=%s",
+                 NodeLayerId(scene, node),
+                 node != nullptr ? node->Name().c_str() : "",
+                 static_cast<int>(inherited_output.size()),
+                 inherited_output.data(),
+                 static_cast<int>(output.size()),
+                 output.data(),
+                 IsOffscreenDependencyLayer(extra, imgId) ? "true" : "false",
+                 node != nullptr && node->Visible() ? "true" : "false",
+                 node != nullptr && node->LocalVisible() ? "true" : "false",
+                 routed_node ? "true" : "false",
+                 keep_final_output_private ? "true" : "false");
         imgeff->ResolveEffect(scene.default_effect_mesh,
                               "effect",
-                              IsOffscreenDependencyLayer(extra, imgId),
+                              keep_final_output_private,
                               &resolved_effect_world_affine);
 
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
