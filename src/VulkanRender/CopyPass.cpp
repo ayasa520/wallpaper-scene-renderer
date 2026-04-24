@@ -36,7 +36,10 @@ void CopyPass::prepare(Scene& scene, const Device& device, RenderingResources& r
         if (tex_name.empty()) continue;
 
         ImageParameters img;
-        if (IsSpecTex(tex_name)) {
+        if (scene.renderTargets.count(tex_name) != 0) {
+            // CopyPass operates on render targets, not material assets. Effect-local FBO names can
+            // be plain authored names after uniquification, so the scene render-target table is the
+            // correct capability check here rather than the `_rt_` prefix alone.
             auto& rt  = scene.renderTargets.at(tex_name);
             auto  opt = device.tex_cache().Query(tex_name, ToTexKey(rt), ! rt.allowReuse);
             if (opt.has_value())
@@ -67,7 +70,9 @@ void CopyPass::refreshResources(Scene& scene, const Device& device, RenderingRes
         auto& tex_name = textures[i];
         if (tex_name.empty()) continue;
 
-        if (!IsSpecTex(tex_name) || scene.renderTargets.count(tex_name) == 0) {
+        if (scene.renderTargets.count(tex_name) == 0) {
+            // Resource refresh follows the same render-target-table rule as prepare(), because
+            // non-prefixed effect FBOs are still recreated and rebound through the texture cache.
             setPrepared(false);
             return;
         }

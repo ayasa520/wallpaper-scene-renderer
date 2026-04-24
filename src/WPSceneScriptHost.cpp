@@ -1164,8 +1164,30 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      }\n"
         << "    });\n"
         << "  }\n"
-        << "  // Effect proxies intentionally expose only effect.visible in this refactor; shader "
-           "constants remain parser-logged unsupported work.\n"
+        << "  // Effect material proxies route authored WE material properties through native "
+           "alias resolution, so script names like raythreshold can update GLSL uniforms such "
+           "as g_Threshold on the matching post-process pass.\n"
+        << "  function createEffectMaterialProxy(nodeId, effectIndex, materialIndex = 0) {\n"
+        << "    if (!__native.hasEffectMaterial(nodeId, effectIndex, materialIndex)) return "
+           "undefined;\n"
+        << "    return new Proxy({}, {\n"
+        << "      get(_target, prop) {\n"
+        << "        if (typeof prop !== 'string') return undefined;\n"
+        << "        return __native.getEffectMaterialProperty(nodeId, effectIndex, "
+           "materialIndex, prop);\n"
+        << "      },\n"
+        << "      set(_target, prop, value) {\n"
+        << "        if (typeof prop !== 'string') return false;\n"
+        << "        return !!__native.setEffectMaterialProperty(nodeId, effectIndex, "
+           "materialIndex, prop, value);\n"
+        << "      },\n"
+        << "      has(_target, prop) {\n"
+        << "        if (typeof prop !== 'string') return false;\n"
+        << "        return !!__native.hasEffectMaterialMember(nodeId, effectIndex, "
+           "materialIndex, prop);\n"
+        << "      }\n"
+        << "    });\n"
+        << "  }\n"
         << "  function createEffectProxy(nodeId, effectIndex, instanceId = 0) {\n"
         << "    if (!__native.hasEffect(nodeId, effectIndex)) return undefined;\n"
         << "    return new Proxy({}, {\n"
@@ -1176,6 +1198,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "__native.resolvePropertyAnimation(instanceId, name) : 0;\n"
         << "          return animationId > 0 ? createTimelineAnimation(animationId) : undefined;\n"
         << "        };\n"
+        << "        if (prop === 'getMaterial') return (materialIndex = 0) => "
+           "createEffectMaterialProxy(nodeId, effectIndex, materialIndex);\n"
         << "        return __native.getEffectProperty(nodeId, effectIndex, prop);\n"
         << "      },\n"
         << "      set(_target, prop, value) {\n"
@@ -1184,7 +1208,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      },\n"
         << "      has(_target, prop) {\n"
         << "        if (typeof prop !== 'string') return false;\n"
-        << "        if (prop === 'getAnimation') return true;\n"
+        << "        if (prop === 'getAnimation' || prop === 'getMaterial') return true;\n"
         << "        return !!__native.hasEffectMember(nodeId, effectIndex, prop);\n"
         << "      }\n"
         << "    });\n"
@@ -3622,6 +3646,117 @@ void ForEachEffectLayerMaterial(WPSceneScriptHost::Opaque* opaque, int32_t layer
     }
 }
 
+const ShaderValue* FindMaterialUniformValue(const SceneMaterial& material,
+                                            std::string_view     uniform_name);
+std::optional<WPDynamicValue> DynamicValueFromShaderValue(const ShaderValue& value,
+                                                          WPDynamicValue::Type hint);
+
+struct EffectMaterialTarget {
+    SceneImageEffect* effect { nullptr };
+    SceneNode*        node { nullptr };
+    SceneMaterial*    material { nullptr };
+};
+
+std::optional<EffectMaterialTarget>
+FindEffectMaterialTarget(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
+                         uint32_t effect_index, uint32_t material_index) {
+    if (opaque == nullptr || opaque->scene == nullptr) return std::nullopt;
+
+    auto* effect = opaque->scene->FindImageEffect(layer_id, effect_index);
+    if (effect == nullptr) return std::nullopt;
+
+    uint32_t current_material_index = 0;
+    for (auto& effect_node : effect->nodes) {
+        auto* node = effect_node.sceneNode.get();
+        if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr)
+            continue;
+
+        // Wallpaper Engine exposes post-process material passes by their authored order inside the
+        // effect. The render graph may carry additional output names, but script getMaterial(n)
+        // needs to walk only the concrete shader materials so indexes such as godrays 0/1 resolve
+        // to the downsample and cast passes that own the ray controls.
+        if (current_material_index == material_index) {
+            return EffectMaterialTarget {
+                .effect   = effect,
+                .node     = node,
+                .material = node->Mesh()->Material(),
+            };
+        }
+        current_material_index++;
+    }
+
+    return std::nullopt;
+}
+
+std::string ResolveRuntimeMaterialUniformName(const SceneMaterial& material,
+                                              std::string_view     property_name) {
+    const std::string authored_name(property_name);
+    if (const auto alias_it = material.uniformAliases.find(authored_name);
+        alias_it != material.uniformAliases.end()) {
+        return alias_it->second;
+    }
+
+    for (const auto& [alias_name, uniform_name] : material.uniformAliases) {
+        if (uniform_name == authored_name) return uniform_name;
+
+        // Shader metadata commonly advertises `material:"raythreshold"` next to a GLSL uniform
+        // named `g_Threshold`. This suffix fallback mirrors the parser-side user-property
+        // resolver, so runtime scripts can use either the authored material name or the final
+        // uniform name without hard-coding a project-specific alias table in the JS wrapper.
+        if (uniform_name.size() > 2 && uniform_name.substr(2) == authored_name) {
+            return uniform_name;
+        }
+        (void)alias_name;
+    }
+
+    return authored_name;
+}
+
+const ShaderValue* FindRuntimeMaterialUniformValue(const SceneMaterial& material,
+                                                   std::string_view     property_name,
+                                                   std::string* out_uniform_name = nullptr) {
+    const std::string authored_name(property_name);
+    std::string       uniform_name = ResolveRuntimeMaterialUniformName(material, authored_name);
+    auto*             uniform      = FindMaterialUniformValue(material, uniform_name);
+    if (uniform == nullptr && uniform_name != authored_name) {
+        // If an authored alias points at a shader symbol that was optimized away or renamed, try
+        // the original property name before reporting failure. This preserves direct uniform
+        // writes for projects that already script GLSL names while still making alias misses
+        // visible through the caller's diagnostics.
+        uniform_name = authored_name;
+        uniform      = FindMaterialUniformValue(material, uniform_name);
+    }
+    if (out_uniform_name != nullptr) *out_uniform_name = uniform_name;
+    return uniform;
+}
+
+WPDynamicValue::Type RuntimeDynamicTypeForShaderValue(const ShaderValue& value) {
+    // Runtime material setters do not have the parser's registration metadata, so infer the JS
+    // conversion shape from the live uniform width. That keeps scalar godrays controls as numbers
+    // and still supports Vec2/Vec3/Vec4 material uniforms for other effect scripts.
+    switch (value.size()) {
+        case 2:
+            return WPDynamicValue::Type::Float2;
+        case 3:
+            return WPDynamicValue::Type::Float3;
+        case 4:
+            return WPDynamicValue::Type::Float4;
+        case 1:
+            return WPDynamicValue::Type::Float;
+        default:
+            return WPDynamicValue::Type::FloatVector;
+    }
+}
+
+JSValue ShaderUniformValueToJS(JSContext* context, const ShaderValue& uniform) {
+    const auto value =
+        DynamicValueFromShaderValue(uniform, RuntimeDynamicTypeForShaderValue(uniform));
+    if (! value.has_value()) return JS_UNDEFINED;
+
+    const auto script_value = value->toScriptValue();
+    return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
+}
+
 WPDynamicValue EvaluateRegistrationSetting(const WPSceneScriptRegistration& registration,
                                            const UserPropertyMap*           user_properties,
                                            const WPScriptEvaluationContext& base_context) {
@@ -5293,7 +5428,8 @@ JSValue NativeHasEffectMember(JSContext* context, JSValueConst, int argc, JSValu
     return JS_NewBool(
         context,
         opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index)) != nullptr &&
-            (EffectValueType(member_name).supported || member_name == "getAnimation"));
+            (EffectValueType(member_name).supported || member_name == "getAnimation" ||
+             member_name == "getMaterial"));
 }
 
 JSValue NativeGetEffectProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -5347,6 +5483,172 @@ JSValue NativeSetEffectProperty(JSContext* context, JSValueConst, int argc, JSVa
             opaque->scene->renderGraphTopologyDirty ? "true" : "false");
     }
     return JS_NewBool(context, applied);
+}
+
+JSValue NativeHasEffectMaterial(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 3) return JS_FALSE;
+
+    int32_t layer_id       = 0;
+    int32_t effect_index   = 0;
+    int32_t material_index = 0;
+    if (JS_ToInt32(context, &layer_id, argv[0]) != 0 ||
+        JS_ToInt32(context, &effect_index, argv[1]) != 0 ||
+        JS_ToInt32(context, &material_index, argv[2]) != 0 || effect_index < 0 ||
+        material_index < 0) {
+        return JS_FALSE;
+    }
+
+    const auto target = FindEffectMaterialTarget(opaque,
+                                                 layer_id,
+                                                 static_cast<uint32_t>(effect_index),
+                                                 static_cast<uint32_t>(material_index));
+    return JS_NewBool(context, target.has_value());
+}
+
+JSValue
+NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 4) return JS_FALSE;
+
+    int32_t layer_id       = 0;
+    int32_t effect_index   = 0;
+    int32_t material_index = 0;
+    if (JS_ToInt32(context, &layer_id, argv[0]) != 0 ||
+        JS_ToInt32(context, &effect_index, argv[1]) != 0 ||
+        JS_ToInt32(context, &material_index, argv[2]) != 0 || effect_index < 0 ||
+        material_index < 0) {
+        return JS_FALSE;
+    }
+
+    std::string property_name;
+    if (! ReadJSString(context, argv[3], &property_name)) return JS_FALSE;
+
+    const auto target = FindEffectMaterialTarget(opaque,
+                                                 layer_id,
+                                                 static_cast<uint32_t>(effect_index),
+                                                 static_cast<uint32_t>(material_index));
+    if (! target.has_value()) return JS_FALSE;
+
+    // Report only properties that resolve to a real live uniform. Returning false for unknown
+    // names keeps strict-mode script assignments noisy instead of silently accepting misspelled
+    // material controls.
+    return JS_NewBool(context,
+                      FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr);
+}
+
+JSValue
+NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 4) return JS_UNDEFINED;
+
+    int32_t layer_id       = 0;
+    int32_t effect_index   = 0;
+    int32_t material_index = 0;
+    if (JS_ToInt32(context, &layer_id, argv[0]) != 0 ||
+        JS_ToInt32(context, &effect_index, argv[1]) != 0 ||
+        JS_ToInt32(context, &material_index, argv[2]) != 0 || effect_index < 0 ||
+        material_index < 0) {
+        return JS_UNDEFINED;
+    }
+
+    std::string property_name;
+    if (! ReadJSString(context, argv[3], &property_name)) return JS_UNDEFINED;
+
+    const auto target = FindEffectMaterialTarget(opaque,
+                                                 layer_id,
+                                                 static_cast<uint32_t>(effect_index),
+                                                 static_cast<uint32_t>(material_index));
+    if (! target.has_value()) return JS_UNDEFINED;
+
+    const auto* uniform = FindRuntimeMaterialUniformValue(*target->material, property_name);
+    return uniform != nullptr ? ShaderUniformValueToJS(context, *uniform) : JS_UNDEFINED;
+}
+
+JSValue
+NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 5) return JS_FALSE;
+
+    int32_t layer_id       = 0;
+    int32_t effect_index   = 0;
+    int32_t material_index = 0;
+    if (JS_ToInt32(context, &layer_id, argv[0]) != 0 ||
+        JS_ToInt32(context, &effect_index, argv[1]) != 0 ||
+        JS_ToInt32(context, &material_index, argv[2]) != 0 || effect_index < 0 ||
+        material_index < 0) {
+        return JS_FALSE;
+    }
+
+    std::string property_name;
+    if (! ReadJSString(context, argv[3], &property_name)) return JS_FALSE;
+
+    const auto target = FindEffectMaterialTarget(opaque,
+                                                 layer_id,
+                                                 static_cast<uint32_t>(effect_index),
+                                                 static_cast<uint32_t>(material_index));
+    if (! target.has_value()) return JS_FALSE;
+
+    std::string       uniform_name;
+    const auto* const current_uniform =
+        FindRuntimeMaterialUniformValue(*target->material, property_name, &uniform_name);
+    if (current_uniform == nullptr) {
+        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
+                  "material='%s' property='%s' unresolved uniform='%s'",
+                  layer_id,
+                  effect_index,
+                  material_index,
+                  target->material->name.c_str(),
+                  property_name.c_str(),
+                  uniform_name.c_str());
+        return JS_FALSE;
+    }
+
+    const auto value =
+        ReadDynamicValueFromJS(context, argv[4], RuntimeDynamicTypeForShaderValue(*current_uniform));
+    if (! value.has_value()) {
+        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
+                  "material='%s' property='%s' uniform='%s' invalid JS value",
+                  layer_id,
+                  effect_index,
+                  material_index,
+                  target->material->name.c_str(),
+                  property_name.c_str(),
+                  uniform_name.c_str());
+        return JS_FALSE;
+    }
+
+    const auto shader_value = ShaderValueFromDynamicValue(*value);
+    if (! shader_value.has_value()) {
+        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
+                  "material='%s' property='%s' uniform='%s' invalid value %s",
+                  layer_id,
+                  effect_index,
+                  material_index,
+                  target->material->name.c_str(),
+                  property_name.c_str(),
+                  uniform_name.c_str(),
+                  value->describe().c_str());
+        return JS_FALSE;
+    }
+
+    // Effect passes read SceneMaterial::customShader.constValues while drawing, so storing the
+    // resolved uniform here updates the next post-process pass without rebuilding cameras or
+    // changing the effect's own visibility state. This is intentionally separate from
+    // setEffectProperty(), which remains limited to effect.visible.
+    target->material->customShader.constValues[uniform_name] = *shader_value;
+    LOG_INFO("SceneEffectMaterialUniformApply: layer=%d effect-index=%d effect-id=%d effect='%s' "
+             "material-index=%d material='%s' property='%s' uniform='%s' value=%s",
+             layer_id,
+             effect_index,
+             target->effect != nullptr ? target->effect->EffectId() : 0,
+             target->effect != nullptr ? target->effect->EffectName().c_str() : "",
+             material_index,
+             target->material->name.c_str(),
+             property_name.c_str(),
+             uniform_name.c_str(),
+             value->describe().c_str());
+    return JS_TRUE;
 }
 
 JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -7323,6 +7625,25 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
                       m_impl->native_bridge,
                       "setEffectProperty",
                       JS_NewCFunction(context, NativeSetEffectProperty, "setEffectProperty", 4));
+    JS_SetPropertyStr(context,
+                      m_impl->native_bridge,
+                      "hasEffectMaterial",
+                      JS_NewCFunction(context, NativeHasEffectMaterial, "hasEffectMaterial", 3));
+    JS_SetPropertyStr(
+        context,
+        m_impl->native_bridge,
+        "hasEffectMaterialMember",
+        JS_NewCFunction(context, NativeHasEffectMaterialMember, "hasEffectMaterialMember", 4));
+    JS_SetPropertyStr(
+        context,
+        m_impl->native_bridge,
+        "getEffectMaterialProperty",
+        JS_NewCFunction(context, NativeGetEffectMaterialProperty, "getEffectMaterialProperty", 4));
+    JS_SetPropertyStr(
+        context,
+        m_impl->native_bridge,
+        "setEffectMaterialProperty",
+        JS_NewCFunction(context, NativeSetEffectMaterialProperty, "setEffectMaterialProperty", 5));
     JS_SetPropertyStr(context,
                       m_impl->native_bridge,
                       "getLayerRelation",

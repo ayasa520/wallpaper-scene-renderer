@@ -73,11 +73,19 @@ TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc =
     return copy;
 }
 
-static TexNode::Desc createTexDesc(std::string path) {
+static bool IsRuntimeRenderTarget(const Scene* scene, const std::string& path) {
+    // Authored effect FBO names are not guaranteed to carry Wallpaper Engine's `_rt_` prefix after
+    // the parser uniquifies them with the effect-layer address. The render-target table is the
+    // authoritative runtime contract, so graph construction must consult it before classifying a
+    // texture edge as an imported asset.
+    return IsSpecTex(path) || (scene != nullptr && scene->renderTargets.count(path) != 0);
+}
+
+static TexNode::Desc createTexDesc(std::string path, const Scene* scene = nullptr) {
     return TexNode::Desc { .name = path,
                            .key  = path,
-                           .type = IsSpecTex(path) ? TexNode::TexType::Temp
-                                                   : TexNode::TexType::Imported };
+                           .type = IsRuntimeRenderTarget(scene, path) ? TexNode::TexType::Temp
+                                                                      : TexNode::TexType::Imported };
 }
 } // namespace wallpaper::rg
 
@@ -336,10 +344,15 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                     rg::TexNode::Desc desc;
                     desc.key  = url;
                     desc.name = url;
-                    desc.type = ! IsSpecTex(url) ? rg::TexNode::TexType::Imported
-                                                 : rg::TexNode::TexType::Temp;
+                    // Some effect-local FBOs use plain names such as `blur_start_2_<addr>`.
+                    // Treat any key already registered in Scene::renderTargets as temporary graph
+                    // storage so those edges order like internal render targets, not external
+                    // material textures.
+                    desc.type = ! rg::IsRuntimeRenderTarget(&scene, url)
+                        ? rg::TexNode::TexType::Imported
+                        : rg::TexNode::TexType::Temp;
                     input     = builder.createTexNode(desc);
-                    if (IsSpecTex(url)) builder.markVirtualWrite(input);
+                    if (rg::IsRuntimeRenderTarget(&scene, url)) builder.markVirtualWrite(input);
                     if (sstart_with(url, WE_MIP_MAPPED_FRAME_BUFFER))
                         extra.use_mipmap_framebuffer = true;
                 }
@@ -572,8 +585,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             for (auto& effect_node : eff->nodes) {
                 if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
                     rg::addCopyPass(*extra.rgraph,
-                                    rg::createTexDesc(cmdItor->src),
-                                    rg::createTexDesc(cmdItor->dst),
+                                    rg::createTexDesc(cmdItor->src, extra.scene),
+                                    rg::createTexDesc(cmdItor->dst, extra.scene),
                                     effect_visible_gate);
                     cmdItor++;
                 }
@@ -588,8 +601,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                 // effects sample the current frame, not the stale texture from the last visible
                 // frame.
                 rg::addCopyPass(*extra.rgraph,
-                                rg::createTexDesc(eff->BypassSource()),
-                                rg::createTexDesc(eff->BypassTarget()),
+                                rg::createTexDesc(eff->BypassSource(), extra.scene),
+                                rg::createTexDesc(eff->BypassTarget(), extra.scene),
                                 effect_hidden_gate);
             }
         }

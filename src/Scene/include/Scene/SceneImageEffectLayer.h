@@ -79,6 +79,7 @@ public:
     bool        HasFinalComposite() const;
     bool        ShouldRunFinalCompositeFallback() const;
     void        SetFinalCompositeSource(std::string source);
+    void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
     SceneNode*  WorldNode() const { return m_worldNode; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
     void        SyncResolvedOutputMesh();
@@ -94,7 +95,11 @@ private:
     std::string m_pingpong_a;
     std::string m_pingpong_b;
 
-    bool fullscreen { false };
+    // Fullscreen utility layers, such as Wallpaper Engine's postprocess framebuffer layer, are
+    // authored in clip-space sized 2x2 quads. Their final effect pass must therefore stay on the
+    // effect camera/fullscreen mesh path; resolving that pass through the active scene camera turns
+    // a shader such as godrays_combine into a tiny world-space quad and makes the rays disappear.
+    bool m_fullscreen { false };
     //    std::vector<float> m_size;
     std::unique_ptr<SceneMesh> m_final_mesh;
     std::unique_ptr<SceneNode> m_final_node;

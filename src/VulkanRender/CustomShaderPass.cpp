@@ -551,18 +551,11 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
         }
 
         ImageSlotsRef img_slots;
-        if (wallpaper::IsSpecTex(tex_name)) {
-            const auto render_target_it = scene.renderTargets.find(tex_name);
-            if (render_target_it == scene.renderTargets.end()) {
-                LOG_ERROR("CustomShaderPassRefresh: missing input render target node='%s' "
-                          "output='%s' slot=%zu texture='%s'",
-                          desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
-                          desc.output.c_str(),
-                          static_cast<size_t>(i),
-                          tex_name.c_str());
-                desc.vk_textures[i] = {};
-                continue;
-            }
+        const auto render_target_it = scene.renderTargets.find(tex_name);
+        if (render_target_it != scene.renderTargets.end()) {
+            // The scene render-target table is the authoritative source for internal effect FBOs.
+            // Some authored blur chains use plain names like `blur_start_2_<addr>`, so relying only
+            // on the `_rt_` prefix would send valid runtime targets through the material-file parser.
             auto& rt  = render_target_it->second;
             auto  opt = device.tex_cache().Query(
                 tex_name, wallpaper::vulkan::ToTexKey(rt), !rt.allowReuse);
@@ -578,6 +571,15 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
             }
             img_slots.slots.clear();
             img_slots.slots.push_back(opt.value());
+        } else if (wallpaper::IsSpecTex(tex_name)) {
+            LOG_ERROR("CustomShaderPassRefresh: missing input render target node='%s' "
+                      "output='%s' slot=%zu texture='%s'",
+                      desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                      desc.output.c_str(),
+                      static_cast<size_t>(i),
+                      tex_name.c_str());
+            desc.vk_textures[i] = {};
+            continue;
         } else {
             auto image = scene.imageParser->Parse(tex_name);
             if (image) {
@@ -605,14 +607,11 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
     }
 
     auto& tex_name = desc.output;
-    if (!wallpaper::IsSpecTex(tex_name)) {
-        LOG_ERROR("CustomShaderPassRefresh: non-render-target output node='%s' output='%s'",
-                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
-                  tex_name.c_str());
-        return false;
-    }
     const auto output_it = scene.renderTargets.find(tex_name);
     if (output_it == scene.renderTargets.end()) {
+        // Outputs must be registered render targets, but they do not have to be `_rt_`-prefixed:
+        // effect-local FBOs are uniquified from their authored names and are still valid Vulkan
+        // framebuffer destinations once WPSceneParser has inserted them into scene.renderTargets.
         LOG_ERROR("CustomShaderPassRefresh: missing output render target node='%s' output='%s'",
                   desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
                   tex_name.c_str());

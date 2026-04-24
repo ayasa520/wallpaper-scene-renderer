@@ -2274,6 +2274,23 @@ inline bool TryParseShaderMetadataJson(std::string_view line, const char* kind,
     return false;
 }
 
+inline bool TextureSlotCanEnableCombo(i32 index, idx texcount,
+                                      const std::vector<WPShaderTexInfo>& texinfos,
+                                      std::string_view default_texture) {
+    if (index < 0) return false;
+
+    const auto texture_index = static_cast<usize>(index);
+    const bool slot_has_bound_texture =
+        index < texcount && texture_index < texinfos.size() && texinfos[texture_index].enabled;
+
+    // Texture-driven combos guard shader branches that sample g_TextureN. Authored materials may
+    // reserve an empty slot for an optional mask, so slot presence alone is not enough: enabling the
+    // combo for an unbound sampler can make full-screen passes read an undefined or stale descriptor.
+    // A shader-authored default texture is still considered bound because LoadMaterial installs it
+    // after metadata parsing when the material did not provide a real texture for the slot.
+    return slot_has_bound_texture || ! default_texture.empty();
+}
+
 inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                           const std::vector<WPShaderTexInfo>& texinfos) {
     auto& combos       = pWPShaderInfo->combos;
@@ -2325,12 +2342,18 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                         STRTONUM(name.substr(9), index);
                         if (! wput.default_.empty()) defTexs.push_back({ index, wput.default_ });
                         if (! wput.combo.empty()) {
-                            if (index >= texcount)
-                                combos[wput.combo] = "0";
-                            else
-                                combos[wput.combo] = "1";
+                            const bool combo_enabled =
+                                TextureSlotCanEnableCombo(index, texcount, texinfos,
+                                                          wput.default_);
+                            combos[wput.combo] = combo_enabled ? "1" : "0";
+                            if (! combo_enabled) {
+                                LOG_INFO("ParseWPShader: texture combo '%s' disabled for "
+                                         "g_Texture%d because the slot has no bound texture",
+                                         wput.combo.c_str(),
+                                         index);
+                            }
                         }
-                        if (index < texcount && texinfos[(usize)index].enabled) {
+                        if (index >= 0 && index < texcount && texinfos[(usize)index].enabled) {
                             auto& compos = texinfos[(usize)index].composEnabled;
 
                             usize num = std::min(std::size(compos), std::size(wput.components));
@@ -2849,7 +2872,7 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, co
 inline std::string GenPreShaderSha1(std::string_view expanded_src,
                                     std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "pre-shader-v1\n";
+    out << "pre-shader-v2-texture-combo-boundness\n";
     out << utils::genSha1(expanded_src) << '\n';
     for (const auto& texinfo : texinfos) {
         out << static_cast<int>(texinfo.enabled);

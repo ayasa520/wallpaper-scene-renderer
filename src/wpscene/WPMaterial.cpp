@@ -2,6 +2,46 @@
 
 using namespace wallpaper::wpscene;
 
+namespace
+{
+
+wallpaper::WPDynamicValue::Type ShaderValueTypeForConstantVector(const std::vector<float>& value) {
+    switch (value.size()) {
+        case 1:
+            return wallpaper::WPDynamicValue::Type::Float;
+        case 2:
+            return wallpaper::WPDynamicValue::Type::Float2;
+        case 3:
+            return wallpaper::WPDynamicValue::Type::Float3;
+        case 4:
+            return wallpaper::WPDynamicValue::Type::Float4;
+        default:
+            return wallpaper::WPDynamicValue::Type::FloatVector;
+    }
+}
+
+void StoreDynamicConstantShaderValue(
+    std::unordered_map<std::string, wallpaper::WPUserSetting>& bindings,
+    const std::string&                                         name,
+    const nlohmann::json&                                      value_json,
+    const std::vector<float>&                                  resolved_value) {
+    if (! value_json.is_object()) return;
+
+    wallpaper::WPUserSetting setting;
+    if (! wallpaper::ParseUserSetting(
+            value_json, setting, ShaderValueTypeForConstantVector(resolved_value))) {
+        return;
+    }
+    if (! setting.hasUserBinding()) return;
+
+    // Constant shader values can be authored as plain numbers, arrays, or objects with user
+    // bindings. The resolved numeric value is already stored in `constantshadervalues`; keeping this
+    // sidecar setting records the live binding contract that would otherwise disappear after parse.
+    bindings[name] = std::move(setting);
+}
+
+} // namespace
+
 bool WPMaterialPassBindItem::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "name", name);
     GET_JSON_NAME_VALUE(json, "index", index);
@@ -44,6 +84,9 @@ void WPMaterialPass::Update(const WPMaterialPass& p) {
     for(const auto& el:p.constantshadervalues) {
         constantshadervalues[el.first] = el.second;
     }
+    for (const auto& el : p.constantshadervaluebindings) {
+        constantshadervaluebindings[el.first] = el.second;
+    }
     for(const auto& el:p.usershadervalues) {
         usershadervalues[el.first] = el.second;
     }
@@ -73,6 +116,9 @@ void WPMaterial::MergePass(const WPMaterialPass& p) {
     }
     for(const auto& el:p.constantshadervalues) {
         constantshadervalues[el.first] = el.second;
+    }
+    for (const auto& el : p.constantshadervaluebindings) {
+        constantshadervaluebindings[el.first] = el.second;
     }
     for(const auto& el:p.usershadervalues) {
         usershadervalues[el.first] = el.second;
@@ -106,6 +152,8 @@ bool WPMaterialPass::FromJson(const nlohmann::json& json) {
             GET_JSON_VALUE(jC.key(), name);
             GET_JSON_VALUE(jC.value(), value);
             constantshadervalues[name] = value;
+            StoreDynamicConstantShaderValue(
+                constantshadervaluebindings, name, jC.value(), value);
         }
     }
     if(json.contains("usershadervalues")) {
@@ -175,6 +223,8 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
             GET_JSON_VALUE(jC.key(), name);
             GET_JSON_VALUE(jC.value(), value);
             constantshadervalues[name] = value;
+            StoreDynamicConstantShaderValue(
+                constantshadervaluebindings, name, jC.value(), value);
         }
     }
     if(jContent.contains("usershadervalues")) {

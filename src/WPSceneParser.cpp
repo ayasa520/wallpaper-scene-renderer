@@ -899,6 +899,14 @@ void ApplyKnownShaderSourceFixes(std::string_view shader_name, ShaderType stage,
     }
 }
 
+bool IsMaterialRuntimeRenderTarget(const Scene* scene, const std::string& name) {
+    // Wallpaper Engine effect FBOs are runtime render targets even when their authored names do not
+    // use the `_rt_` prefix. Checking the scene table keeps names like `blur_start_2_<addr>` on the
+    // render-target path instead of probing `/assets/materials/<name>.tex` and logging false VFS
+    // errors.
+    return scene != nullptr && scene->renderTargets.count(name) != 0;
+}
+
 bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, SceneNode* pNode,
                   SceneMaterial* pMaterial, WPShaderValueData* pSvData,
                   const UserPropertyMap* user_properties = nullptr,
@@ -937,38 +945,6 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         ApplyKnownShaderSourceFixes(wpmat.shader, unit.stage, unit.src);
     }
 
-    std::vector<WPShaderTexInfo>                 texinfos;
-    std::unordered_map<std::string, ImageHeader> texHeaders;
-    for (const auto& el : wpmat.textures) {
-        if (el.empty()) {
-            texinfos.push_back({ false });
-        } else if (! IsSpecTex(el)) {
-            const auto& texh = pScene->imageParser->ParseHeader(el);
-            texHeaders[el]   = texh;
-            if (texh.extraHeader.count("compo1") == 0) {
-                texinfos.push_back({ false });
-                continue;
-            }
-            texinfos.push_back({ true,
-                                 {
-                                     (bool)texh.extraHeader.at("compo1").val,
-                                     (bool)texh.extraHeader.at("compo2").val,
-                                     (bool)texh.extraHeader.at("compo3").val,
-                                 } });
-        } else
-            texinfos.push_back({ true });
-    }
-
-    for (auto& unit : sd_units) {
-        unit.src = WPShaderParser::PreShaderSrc(vfs, unit.src, pWPShaderInfo, texinfos);
-    }
-
-    shader->default_uniforms = pWPShaderInfo->svs;
-
-    for (const auto& el : wpmat.combos) {
-        pWPShaderInfo->combos[el.first] = std::to_string(el.second);
-    }
-
     auto textures = wpmat.textures;
     if (wpmat.usertextures.size() > textures.size()) {
         textures.resize(wpmat.usertextures.size());
@@ -982,7 +958,8 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                 EnsureSystemTextureRegistered(*pScene, WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE);
             } else if (binding.name == "$mediaPreviousThumbnail") {
                 textures[i] = std::string(WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
-                EnsureSystemTextureRegistered(*pScene, WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
+                EnsureSystemTextureRegistered(*pScene,
+                                              WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
             }
             continue;
         }
@@ -992,6 +969,46 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
 
         textures[i] = *property;
     }
+
+    std::vector<WPShaderTexInfo>                 texinfos;
+    std::unordered_map<std::string, ImageHeader> texHeaders;
+    // The shader parser uses this effective texture list to decide whether a texture-driven combo
+    // may expose a sampler branch. User texture bindings must be resolved before this point so a
+    // real selected texture still enables its combo, while an empty optional mask slot stays off.
+    for (const auto& el : textures) {
+        if (el.empty()) {
+            texinfos.push_back({ false });
+        } else if (! IsSpecTex(el) && ! IsMaterialRuntimeRenderTarget(pScene, el)) {
+            const auto& texh = pScene->imageParser->ParseHeader(el);
+            texHeaders[el]   = texh;
+            if (texh.extraHeader.count("compo1") == 0) {
+                texinfos.push_back({ false });
+                continue;
+            }
+            texinfos.push_back({ true,
+                                 {
+                                     (bool)texh.extraHeader.at("compo1").val,
+                                     (bool)texh.extraHeader.at("compo2").val,
+                                     (bool)texh.extraHeader.at("compo3").val,
+                                 } });
+        } else {
+            // Runtime render targets should expose sampler metadata to the shader preprocessor just
+            // like `_rt_` textures. Their exact dimensions are resolved below from SceneRenderTarget,
+            // so no material header lookup is needed here.
+            texinfos.push_back({ true });
+        }
+    }
+
+    for (auto& unit : sd_units) {
+        unit.src = WPShaderParser::PreShaderSrc(vfs, unit.src, pWPShaderInfo, texinfos);
+    }
+
+    shader->default_uniforms = pWPShaderInfo->svs;
+
+    for (const auto& el : wpmat.combos) {
+        pWPShaderInfo->combos[el.first] = std::to_string(el.second);
+    }
+
     if (pWPShaderInfo->defTexs.size() > 0) {
         for (auto& t : pWPShaderInfo->defTexs) {
             if (textures.size() > t.first) {
@@ -1015,7 +1032,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         }
 
         std::array<i32, 4> resolution {};
-        if (IsSpecTex(name)) {
+        if (IsSpecTex(name) || IsMaterialRuntimeRenderTarget(pScene, name)) {
             if (IsSpecLinkTex(name)) {
                 svData.renderTargets.push_back({ i, name });
             } else if (pScene->renderTargets.count(name) == 0) {
@@ -1105,6 +1122,11 @@ const auto& f1     = texh.spriteAnim.GetCurFrame();
     }
     material.customShader = materialShader;
     material.name         = wpmat.shader;
+    // Store the material-name to GLSL-uniform alias table on the live SceneMaterial. Runtime WE
+    // scripts can then write properties such as `thisObject.getMaterial(0).raythreshold` and have
+    // the script bridge resolve them to the actual shader uniform (`g_Threshold`) that this parse
+    // pass discovered from the shader metadata comments.
+    material.uniformAliases = pWPShaderInfo->alias;
 
     return true;
 }
@@ -1604,6 +1626,13 @@ WPDynamicValue::Type DynamicTypeForShaderValue(const ShaderValue& value) {
     }
 }
 
+bool SceneMaterialHasUniform(const SceneMaterial& material, std::string_view uniform_name) {
+    const std::string uniform_key(uniform_name);
+    if (material.customShader.constValues.count(uniform_key) != 0) return true;
+    return material.customShader.shader != nullptr &&
+           material.customShader.shader->default_uniforms.count(uniform_key) != 0;
+}
+
 void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMaterial& wpmat,
                                      const WPShaderInfo& info, SceneNode* node,
                                      int32_t object_id, std::string_view object_name) {
@@ -1653,6 +1682,70 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
                  binding.gl_uniform_name.c_str(),
                  binding.property->size(),
                  binding.legacy_reversed ? "true" : "false");
+    }
+}
+
+void RegisterConstantShaderValueBindings(ParseContext& context,
+                                         const wpscene::WPMaterial& wpmat,
+                                         const WPShaderInfo& info,
+                                         SceneNode* node,
+                                         int32_t object_id,
+                                         std::string_view object_name,
+                                         int32_t effect_id,
+                                         int32_t effect_index,
+                                         usize material_index) {
+    if (context.scene == nullptr || node == nullptr || node->Mesh() == nullptr ||
+        node->Mesh()->Material() == nullptr) {
+        return;
+    }
+
+    for (const auto& [material_value_name, setting] : wpmat.constantshadervaluebindings) {
+        if (! setting.hasUserBinding()) continue;
+
+        const auto gl_uniform_name =
+            ResolveMaterialValueUniformName(info, material_value_name);
+        if (! SceneMaterialHasUniform(*node->Mesh()->Material(), gl_uniform_name)) {
+            LOG_INFO("ConstantShaderValueRegister: layer=%d effect-id=%d effect-index=%d "
+                     "material-index=%zu material-value='%s' unresolved uniform='%s'",
+                     object_id,
+                     effect_id,
+                     effect_index,
+                     material_index,
+                     material_value_name.c_str(),
+                     gl_uniform_name.c_str());
+            continue;
+        }
+
+        // Effect pass constants are parsed into SceneMaterial::constValues for cold start, but
+        // authored user bindings such as workshop Bloom's `strength` slider must also be registered
+        // against the concrete pass node. The existing MaterialUniform dispatcher can then update
+        // `u_strength` on the next user-property change without rebuilding the post-process chain.
+        context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+            .object_id     = object_id,
+            .object_name   = std::string(object_name),
+            .property_name = gl_uniform_name,
+            .node          = node,
+            .target_kind   = WPSceneScriptTargetKind::MaterialUniform,
+            .target_index  = static_cast<uint32_t>(material_index),
+            .target_id     = effect_id,
+            .value_type    = setting.value.type(),
+            .base_value    = setting.value,
+            .setting       = setting,
+        });
+
+        LOG_INFO("ConstantShaderValueRegister: layer=%d name='%.*s' effect-id=%d "
+                 "effect-index=%d material-index=%zu user-property='%s' material-value='%s' "
+                 "uniform='%s' value-type=%s",
+                 object_id,
+                 static_cast<int>(object_name.size()),
+                 object_name.data(),
+                 effect_id,
+                 effect_index,
+                 material_index,
+                 setting.property.has_value() ? setting.property->name.c_str() : "",
+                 material_value_name.c_str(),
+                 gl_uniform_name.c_str(),
+                 DynamicValueTypeName(setting.value.type()));
     }
 }
 
@@ -2081,6 +2174,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                                                       effect_ppong_a,
                                                                       effect_ppong_b);
         {
+            // Fullscreen image-effect layers are postprocess-style framebuffer passes. Remember
+            // that authored shape here so ResolveEffect() can keep their final shader on the
+            // effect-camera fullscreen quad instead of projecting the 2x2 utility mesh through the
+            // active scene camera.
+            imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalBlend(imgBlendMode);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
             imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
@@ -2290,6 +2388,15 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 spEffNode->AddMesh(spMesh);
                 RegisterUserShaderValueBindings(
                     context, wpmat, wpEffShaderInfo, spEffNode.get(), wpimgobj.id, wpimgobj.name);
+                RegisterConstantShaderValueBindings(context,
+                                                    wpmat,
+                                                    wpEffShaderInfo,
+                                                    spEffNode.get(),
+                                                    wpimgobj.id,
+                                                    wpimgobj.name,
+                                                    wpeffobj.id,
+                                                    i_eff,
+                                                    i_mat);
 
                 context.shader_updater->SetNodeData(spEffNode.get(), svData);
                 context.scene->nodeOwners[spEffNode.get()] = wpimgobj.id;

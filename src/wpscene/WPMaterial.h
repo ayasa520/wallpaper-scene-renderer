@@ -1,5 +1,6 @@
 #pragma once
 #include "WPJson.hpp"
+#include "WPUserSetting.hpp"
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -33,6 +34,10 @@ public:
     std::vector<WPUserTextureBinding>                   usertextures;
     std::unordered_map<std::string, int32_t>            combos;
     std::unordered_map<std::string, std::vector<float>> constantshadervalues;
+    // User-bound constant shader values need to survive parsing separately from their resolved
+    // numeric fallback. `constantshadervalues` keeps the cold-start value used by existing uniform
+    // setup, while this table preserves the authored `{ "user": ... }` binding for live updates.
+    std::unordered_map<std::string, WPUserSetting>       constantshadervaluebindings;
     std::unordered_map<std::string, std::string>        usershadervalues;
     std::string                                         target;
     std::vector<WPMaterialPassBindItem>                 bind;
@@ -51,6 +56,10 @@ public:
     std::vector<WPUserTextureBinding>                   usertextures;
     std::unordered_map<std::string, int32_t>            combos;
     std::unordered_map<std::string, std::vector<float>> constantshadervalues;
+    // See WPMaterialPass::constantshadervaluebindings. Merged effect passes store the live
+    // user-property bindings here so already-created post-process materials can update uniforms
+    // such as workshop Bloom's `strength -> u_strength` without reloading the effect.
+    std::unordered_map<std::string, WPUserSetting>       constantshadervaluebindings;
     std::unordered_map<std::string, std::string>        usershadervalues;
 
     bool use_puppet { false };

@@ -256,10 +256,28 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         // and samples the bypassed ping-pong target so the layer still contributes its unmodified
         // input instead of going blank.
         SetFinalCompositeSource(std::string(ppong_a));
-        sync_resolved_world();
         auto& mesh          = *m_final_node->Mesh();
         auto& material      = *mesh.Material();
-        {
+        if (m_fullscreen) {
+            // The synthetic fallback uses a generic image shader with an MVP uniform. Fullscreen
+            // postprocess layers are 2x2 clip-space quads, so the fallback must stay on the effect
+            // camera/default mesh path; routing it through the active scene camera would shrink the
+            // hidden-effect passthrough into world units instead of covering the framebuffer.
+            material.blenmode = BlendMode::Normal;
+            m_final_node->SetCamera(effect_cam.data());
+            m_final_node->CopyTrans(default_node);
+            mesh.ChangeMeshDataFrom(default_mesh);
+            LOG_INFO("SceneEffectFinalCompositeResolve: layer=%d name='%s' fullscreen=true "
+                     "camera='%.*s' output='%s' source='%s' blend=%d",
+                     m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                     m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                     static_cast<int>(effect_cam.size()),
+                     effect_cam.data(),
+                     SpecTex_Default.data(),
+                     ppong_a.data(),
+                     static_cast<int>(material.blenmode));
+        } else {
+            sync_resolved_world();
             material.blenmode = m_final_blend;
             m_final_node->SetCamera(std::string());
             mesh.ChangeMeshDataFrom(*m_final_mesh);
@@ -279,11 +297,31 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         // output directly, preserving shaders whose visual result depends on being the final
         // compositor. The synthetic final composite remains dormant unless this effect is hidden.
         m_resolved_output_node = fallback_last_output->sceneNode.get();
-        sync_resolved_world();
         fallback_last_output->output = SpecTex_Default;
         auto& mesh                   = *(fallback_last_output->sceneNode->Mesh());
         auto& material               = *mesh.Material();
-        {
+        if (m_fullscreen) {
+            // Fullscreen postprocess final passes, including dino_run's godrays_combine shader,
+            // already draw the unit effect mesh and may still multiply by
+            // g_ModelViewProjectionMatrix. Keep that final pass on the effect camera so the 2x2
+            // utility quad remains a full-frame clip-space composite instead of becoming a tiny
+            // active-camera world quad that leaves the rays effectively invisible.
+            m_resolved_output_follows_world = false;
+            material.blenmode = BlendMode::Normal;
+            fallback_last_output->sceneNode->SetCamera(effect_cam.data());
+            fallback_last_output->sceneNode->CopyTrans(default_node);
+            mesh.ChangeMeshDataFrom(default_mesh);
+            LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=true "
+                     "camera='%.*s' output='%s' material='%s' blend=%d",
+                     m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                     m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                     static_cast<int>(effect_cam.size()),
+                     effect_cam.data(),
+                     SpecTex_Default.data(),
+                     material.name.c_str(),
+                     static_cast<int>(material.blenmode));
+        } else {
+            sync_resolved_world();
             material.blenmode = m_final_blend;
             fallback_last_output->sceneNode->SetCamera(std::string());
             fallback_last_output->sceneNode->CopyTrans(*m_final_node);
