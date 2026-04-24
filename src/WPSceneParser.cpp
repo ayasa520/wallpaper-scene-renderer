@@ -780,7 +780,34 @@ ParticleAnimationMode ToAnimMode(const std::string& str) {
     }
 }
 
-void LoadControlPoint(ParticleSubSystem& pSys, const wpscene::Particle& wp) {
+void ApplyLayerControlPointOverrides(ParticleSubSystem& pSys,
+                                     const wpscene::ParticleInstanceoverride& over,
+                                     int32_t layer_id,
+                                     const std::string& layer_name) {
+    std::span<ParticleControlpoint> pcs = pSys.Controlpoints();
+    const usize override_count = std::min(pcs.size(), over.controlpointOffsets.size());
+    for (usize i = 0; i < override_count; i++) {
+        if (! over.controlpointOffsets[i].has_value()) continue;
+
+        // Instance overrides are authored at the scene layer level, after the particle asset has
+        // supplied default control point flags. Only the offset is replaced here so link_mouse and
+        // worldspace semantics continue to come from the particle asset definition.
+        pcs[i].base_offset =
+            Eigen::Vector3d { array_cast<double>(*over.controlpointOffsets[i]).data() };
+        pcs[i].offset = pcs[i].base_offset;
+        LOG_INFO("SceneParticleControlPointOverride: layer=%d name='%s' index=%zu offset=[%.3f, %.3f, %.3f]",
+                 layer_id,
+                 layer_name.c_str(),
+                 i,
+                 pcs[i].offset.x(),
+                 pcs[i].offset.y(),
+                 pcs[i].offset.z());
+    }
+}
+
+void LoadControlPoint(ParticleSubSystem& pSys, const wpscene::Particle& wp,
+                      const wpscene::ParticleInstanceoverride& over, int32_t layer_id,
+                      const std::string& layer_name) {
     std::span<ParticleControlpoint> pcs = pSys.Controlpoints();
     usize                           s   = std::min(pcs.size(), wp.controlpoints.size());
     for (usize i = 0; i < s; i++) {
@@ -792,6 +819,7 @@ void LoadControlPoint(ParticleSubSystem& pSys, const wpscene::Particle& wp) {
         pcs[i].worldspace =
             wp.controlpoints[i].flags[wpscene::ParticleControlpoint::FlagEnum::worldspace];
     }
+    ApplyLayerControlPointOverrides(pSys, over, layer_id, layer_name);
 }
 void LoadInitializer(ParticleSubSystem& pSys, const wpscene::Particle& wp,
                      const wpscene::ParticleInstanceoverride& over) {
@@ -2979,7 +3007,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     LoadEmitter(*particleSub, particle_obj, override.count, render_rope);
     LoadInitializer(*particleSub, particle_obj, override);
     LoadOperator(*particleSub, particle_obj, override);
-    LoadControlPoint(*particleSub, particle_obj);
+    LoadControlPoint(*particleSub, particle_obj, override, wppartobj.id, wppartobj.name);
 
     mesh.AddMaterial(std::move(material));
     spNode->AddMesh(spMesh);

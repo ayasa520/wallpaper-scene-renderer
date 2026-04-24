@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <vector>
 #include <array>
+#include <optional>
 #include "Utils/BitFlags.hpp"
 #include "Core/Literals.hpp"
 
@@ -16,6 +17,8 @@ class VFS;
 }
 namespace wpscene
 {
+
+inline constexpr std::size_t kParticleControlpointSlotCount = 8;
 
 class ParticleControlpoint {
 public:
@@ -147,6 +150,11 @@ public:
     float                size { 1.0f };
     std::array<float, 3> color { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> colorn { 1.0f, 1.0f, 1.0f };
+    // Particle layers may override the particle asset's fixed control point slots independently.
+    // std::optional keeps the absence of an override explicit instead of coupling a parallel
+    // boolean array with a default offset value that should not be applied.
+    std::array<std::optional<std::array<float, 3>>, kParticleControlpointSlotCount>
+        controlpointOffsets {};
 };
 
 class WPParticleObject {
