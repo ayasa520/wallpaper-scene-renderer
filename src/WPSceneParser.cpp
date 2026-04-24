@@ -2401,8 +2401,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
                     svData.effect_projection_node = &imgEffectLayer->FinalNode();
                     svData.effect_projection_mesh = &imgEffectLayer->FinalMesh();
-                    if (!needs_inherited_parent_binding &&
-                        (wpimgobj.parent == 0 || wpimgobj.attachment.empty())) {
+                    if (needs_inherited_parent_binding) {
+                        // Effect pass nodes are not normal scene-graph children of the authored
+                        // parent: they live in the image-effect chain and are later reused as the
+                        // visible final writer when the last authored effect renders directly to
+                        // `_rt_default`. That final writer still computes its MVP through the
+                        // generic shader updater, so it must inherit the same parent-anchored
+                        // parallax contract as the visible world node. Without this anchor, a
+                        // child compose/effect layer under a zero-parallax parent can drift with
+                        // its own authored `parallaxDepth` even though Wallpaper Engine keeps it
+                        // visually locked to the parent.
                         if (auto parent = FindParentNode(context, wpimgobj.parent)) {
                             svData.SetParallaxAnchor(parent.get());
                         }
@@ -2460,7 +2468,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     if (puppet) {
         context.object_puppets[wpimgobj.id] = puppet->puppet.get();
     }
-    context.shader_updater->SetNodeData(spImgNode.get(), svData);
+    // Effect-backed image layers usually use a detached source node plus a separate world node:
+    // the source node keeps `svData` so it can render into the private effect camera, while the
+    // world node keeps `worldNodeData` so authored parent transforms and parent-anchored parallax
+    // match Wallpaper Engine's scene hierarchy. Compose layers are the exception because their
+    // image node and world node are the same object. In that case, register the inherited
+    // world-node data on the shared node; otherwise a child compose layer with its own
+    // `parallaxDepth` would ignore a zero-parallax parent and incorrectly drift with the cursor.
+    context.shader_updater->SetNodeData(
+        spImgNode.get(),
+        spImgNode.get() == spWorldNode.get() && hasEffect ? worldNodeData : svData);
     if (spImgNode.get() != spWorldNode.get()) {
         context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
         context.scene->sceneGraph->AppendChild(spImgNode);
