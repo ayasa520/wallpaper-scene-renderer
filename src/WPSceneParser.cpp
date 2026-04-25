@@ -2361,6 +2361,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 std::string effmataddr = getAddr(spEffNode.get());
                 const bool isSyntheticColorBlendEffect =
                     wpeffobj.name == kSyntheticColorBlendEffectName;
+                const bool isSingleSyntheticColorBlendWriter =
+                    isSyntheticColorBlendEffect && count_eff == 1;
                 ShaderValueMap effectBaseConstSvs = baseConstSvs;
                 if (isSyntheticColorBlendEffect) {
                     // The passthrough blend pass should preserve the source render target's alpha,
@@ -2401,18 +2403,38 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
                     svData.effect_projection_node = &imgEffectLayer->FinalNode();
                     svData.effect_projection_mesh = &imgEffectLayer->FinalMesh();
-                    if (needs_inherited_parent_binding) {
-                        // Effect pass nodes are not normal scene-graph children of the authored
-                        // parent: they live in the image-effect chain and are later reused as the
-                        // visible final writer when the last authored effect renders directly to
-                        // `_rt_default`. That final writer still computes its MVP through the
-                        // generic shader updater, so it must inherit the same parent-anchored
-                        // parallax contract as the visible world node. Without this anchor, a
-                        // child compose/effect layer under a zero-parallax parent can drift with
-                        // its own authored `parallaxDepth` even though Wallpaper Engine keeps it
-                        // visually locked to the parent.
+                    if (needs_inherited_parent_binding &&
+                        (isCompose || isSingleSyntheticColorBlendWriter)) {
+                        // This decision is based on render topology, not on authored parallax
+                        // values. Compose layers and image layers whose only effect is Hanabi's
+                        // synthetic color-blend pass have no authored effect projection that should
+                        // own a separate child-space parallax result; their resolved screen writer
+                        // is the layer image itself, merely routed through the image-effect path.
+                        // Match the no-effect image-layer contract by inheriting the authored
+                        // parent's parallax anchor, so virtual render-order parents such as the
+                        // 3521337568 Earth container keep the visible compose and atmosphere pixels
+                        // locked together.
+                        //
+                        // Detached chains with real authored effects intentionally do not enter this
+                        // branch. Their final writer belongs to the effect pipeline, and the world
+                        // route matrix already supplies the parent transform. Re-anchoring that
+                        // authored final writer to the parent changes the effect-chain projection
+                        // contract and moves layers such as the lantern media cover and audio rings
+                        // away from their authored local center.
                         if (auto parent = FindParentNode(context, wpimgobj.parent)) {
                             svData.SetParallaxAnchor(parent.get());
+                            LOG_INFO("SceneEffectParallaxAnchor: layer=%d name='%s' effect-id=%d "
+                                     "effect-index=%d effect='%s' material-index=%zu parent-layer=%d "
+                                     "compose=%s synthetic-color-blend-only=%s",
+                                     wpimgobj.id,
+                                     wpimgobj.name.c_str(),
+                                     wpeffobj.id,
+                                     i_eff,
+                                     wpeffobj.name.c_str(),
+                                     i_mat,
+                                     wpimgobj.parent,
+                                     isCompose ? "true" : "false",
+                                     isSingleSyntheticColorBlendWriter ? "true" : "false");
                         }
                     }
                     if (puppet && wpmat.use_puppet) {
