@@ -269,8 +269,12 @@ private:
         if (requires_topology_rebuild) {
             m_rg = sceneToRenderGraph(*m_scene);
         }
-        m_render->compileRenderGraph(*m_scene, *m_rg, !requires_topology_rebuild);
+        // Custom shader uniforms are written during pass preparation and uploaded before the first
+        // draw after a graph rebuild. Keep the framebuffer-relative camera dimensions current before
+        // preparing passes, otherwise the first uploaded UBO can still contain the project's native
+        // orthographic aspect and only correct itself on the following frame.
         m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
+        m_render->compileRenderGraph(*m_scene, *m_rg, !requires_topology_rebuild);
         m_scene->ClearRenderGraphDirty();
         const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - started_at)
@@ -454,8 +458,11 @@ private:
             m_rg = sceneToRenderGraph(*m_scene);
 
             if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
-            m_render->compileRenderGraph(*m_scene, *m_rg, false);
+            // The initial render graph compile performs the first uniform write and immediately
+            // submits the dynamic-buffer upload. Apply fill mode first so scene switches do not show a
+            // one-frame native-aspect projection before draw-time uniform refreshes catch up.
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
+            m_render->compileRenderGraph(*m_scene, *m_rg, false);
             m_scene->ClearRenderGraphDirty();
 
             auto pos = m_mouse_pos.load();
