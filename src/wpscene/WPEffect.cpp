@@ -77,6 +77,30 @@ bool WPImageEffect::IsEffectBlacklisted(const std::string& filePath) {
     return false;
 }
 
+bool WPImageEffect::HasEnabledCombo(const std::string& combo_name) const {
+    const auto combo_is_enabled = [&combo_name](const auto& combos) {
+        const auto combo_it = combos.find(combo_name);
+        return combo_it != combos.end() && combo_it->second != 0;
+    };
+
+    // Effect pass overrides are the author-facing place where Wallpaper Engine stores switches such
+    // as DIRECTDRAW. Keep that lookup inside the parsed effect model so object parsers can ask for a
+    // semantic capability without knowing whether the switch came from the scene override or from
+    // the resolved material data.
+    for (const auto& pass : passes) {
+        if (combo_is_enabled(pass.combos)) return true;
+    }
+
+    // Some packed workshop assets can bake combo state into the resolved material rather than the
+    // scene-level pass override. Treat that as the same enabled combo so callers do not have to
+    // duplicate the fallback search whenever they need to identify a shader feature.
+    for (const auto& material : materials) {
+        if (combo_is_enabled(material.combos)) return true;
+    }
+
+    return false;
+}
+
 bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     std::string filePath;
     GET_JSON_NAME_VALUE(json, "file", filePath);

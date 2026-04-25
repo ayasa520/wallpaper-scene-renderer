@@ -3556,11 +3556,22 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     }
 }
 
+bool ShapeEffectRequestsDirectDraw(const WPShapeObject& shape_obj) {
+    // Wallpaper Engine marks shader-authored shape output with the DIRECTDRAW combo on the effect
+    // chain. Ask the parsed effect model for that shader contract instead of inferring it from the
+    // outer shape geometry string; the geometry name only says what primitive the editor displayed,
+    // while DIRECTDRAW is the actual render-path switch that means no image/model source exists.
+    return std::any_of(shape_obj.effects.begin(), shape_obj.effects.end(), [](const auto& effect) {
+        return effect.HasEnabledCombo("DIRECTDRAW");
+    });
+}
+
 void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
                    bool force_runtime_materialization = false) {
     if (!shape_obj.visible && !force_runtime_materialization) return;
 
-    if (shape_obj.shape != "quad" || shape_obj.effects.empty()) {
+    const bool direct_draw_shape = ShapeEffectRequestsDirectDraw(shape_obj);
+    if (!direct_draw_shape) {
         // Unsupported or effect-less shape layers still need to behave like transform containers.
         // Registering a normal empty object preserves parent bindings, scripts, and child ordering
         // while making the missing drawable path explicit in the log instead of silently dropping
@@ -3605,11 +3616,14 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     }
     transparent_source_material.textures[0] = std::string(kSyntheticDirectDrawShapeTextureName);
     // Direct-draw shape effects author their visible pixels inside the effect shader and leave
-    // untouched areas with alpha zero. The synthetic source material's blend mode is captured as
-    // the final screen blend for the visible authored effect, so force alpha blending here; using
-    // the passthrough material's normal overwrite mode would draw transparent black texels over the
-    // wallpaper and make the light shaft layer look like an opaque full-screen mask.
-    transparent_source_material.blending = "translucent";
+    // untouched areas with alpha zero. Treat the final synthetic source as additive for every
+    // shape direct-draw layer: the shader output is authored as generated contribution over the
+    // existing scene, and translucent alpha compositing would multiply the destination by
+    // `1 - alpha`, causing rays and other generated highlights to darken the wallpaper instead of
+    // adding energy. The source texture itself is transparent, so additive blending keeps empty
+    // regions neutral while preserving the intended brightening behavior.
+    const std::string_view direct_draw_final_blend = "additive";
+    transparent_source_material.blending = std::string(direct_draw_final_blend);
 
     const std::array<float, 2> resolved_size = shape_obj.has_size
         ? shape_obj.size
@@ -3618,10 +3632,10 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
               static_cast<float>(std::max(1, context.ortho_h)),
           };
 
-    // Wallpaper Engine serializes direct-draw light-shaft layers as `shape: "quad"` with no image
-    // asset. The effect shader owns the visible pixels (`DIRECTDRAW=1`), so we synthesize a fully
-    // transparent image source only to reuse the established image-effect camera, ping-pong render
-    // targets, visibility contracts, and final composite path.
+    // Shape direct-draw layers have no image asset because the effect shader owns the visible
+    // pixels (`DIRECTDRAW=1`). Synthesize a fully transparent image source only to reuse the
+    // established image-effect camera, ping-pong render targets, visibility contracts, and final
+    // composite path; the authored shape string stays metadata, not a render-path discriminator.
     wpscene::WPImageObject image_obj;
     image_obj.id               = shape_obj.id;
     image_obj.name             = shape_obj.name;
@@ -3635,7 +3649,7 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     image_obj.brightness       = shape_obj.brightness;
     image_obj.visible          = shape_obj.visible;
     image_obj.visible_binding  = shape_obj.visible_binding;
-    image_obj.image            = "__hanabi_shape_quad_directdraw";
+    image_obj.image            = "__hanabi_shape_directdraw";
     image_obj.parent           = shape_obj.parent;
     image_obj.attachment       = shape_obj.attachment;
     image_obj.effectSourceSize = resolved_size;
@@ -3644,7 +3658,7 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     image_obj.nopadding        = true;
 
     LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
-             "size=[%.3f, %.3f] authored-size=%s transparent-texture='%.*s' final-blend='%s'",
+             "size=[%.3f, %.3f] authored-size=%s transparent-texture='%.*s' final-blend='%.*s'",
              image_obj.id,
              image_obj.name.c_str(),
              shape_obj.shape.c_str(),
@@ -3654,7 +3668,8 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
              shape_obj.has_size ? "true" : "false",
              static_cast<int>(kSyntheticDirectDrawShapeTextureName.size()),
              kSyntheticDirectDrawShapeTextureName.data(),
-             transparent_source_material.blending.c_str());
+             static_cast<int>(direct_draw_final_blend.size()),
+             direct_draw_final_blend.data());
 
     ParseImageObj(context, image_obj, force_runtime_materialization);
 }

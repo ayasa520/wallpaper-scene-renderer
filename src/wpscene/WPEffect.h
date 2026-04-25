@@ -48,6 +48,9 @@ private:
 public:
     bool                         FromJson(const nlohmann::json&, fs::VFS& vfs);
     bool                         FromFileJson(const nlohmann::json&, fs::VFS& vfs);
+    // Returns true when a parsed effect enables a shader combo either through scene pass overrides
+    // or through the resolved material, giving object parsers one semantic query for feature gates.
+    bool                         HasEnabledCombo(const std::string& combo_name) const;
     int32_t                      id { 0 };
     std::string                  name;
     bool                         visible { true };
