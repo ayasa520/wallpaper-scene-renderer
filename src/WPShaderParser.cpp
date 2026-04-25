@@ -1766,6 +1766,91 @@ inline std::string RewriteFloatBoolMultiplyAssignments(std::string_view text) {
     return result;
 }
 
+inline bool RewriteFloatArrayIndexStatement(std::string_view statement,
+                                            const std::vector<std::string>& float_variables,
+                                            std::string& replacement) {
+    if (float_variables.empty() || statement.find('[') == std::string_view::npos) {
+        return false;
+    }
+
+    bool        changed { false };
+    std::string rewritten;
+    rewritten.reserve(statement.size() + 16);
+
+    size_t cursor { 0 };
+    size_t pos { 0 };
+    while (pos < statement.size()) {
+        const auto open_pos = statement.find('[', pos);
+        if (open_pos == std::string_view::npos) {
+            rewritten.append(statement.substr(cursor));
+            break;
+        }
+
+        const auto close_pos = SkipBalanced(statement, open_pos, '[', ']');
+        if (close_pos == std::string::npos) {
+            return false;
+        }
+
+        std::string_view index_name;
+        const auto index_expr = statement.substr(open_pos + 1, close_pos - open_pos - 2);
+        if (! TryParseStandaloneIdentifier(index_expr, index_name) ||
+            ! ContainsString(float_variables, index_name)) {
+            pos = close_pos;
+            continue;
+        }
+
+        rewritten.append(statement.substr(cursor, open_pos + 1 - cursor));
+        rewritten.append("int(");
+        rewritten.append(index_name);
+        rewritten.push_back(')');
+        cursor  = close_pos - 1;
+        pos     = close_pos;
+        changed = true;
+    }
+
+    if (! changed) return false;
+
+    // Wallpaper Engine effect shaders often compute an array slot with `floor()` but store the
+    // result in a float temporary before indexing audio arrays. Desktop GLSL requires scalar
+    // integer array indices, so only proven float temporaries used as the complete bracket
+    // expression are wrapped here; vector swizzles, array declarations, and compound expressions
+    // are left untouched for glslang to validate normally.
+    replacement = std::move(rewritten);
+    return true;
+}
+
+inline std::string RewriteFloatArrayIndices(std::string_view text) {
+    std::string result;
+    result.reserve(text.size() + 64);
+
+    std::vector<std::string> float_variables;
+    size_t                   cursor { 0 };
+    size_t                   pos { 0 };
+    while (pos < text.size()) {
+        const auto stmt_end = FindStatementTerminator(text, pos);
+        if (stmt_end == std::string::npos) break;
+
+        const auto statement = text.substr(pos, stmt_end - pos + 1);
+        std::string replacement;
+        if (RewriteFloatArrayIndexStatement(statement, float_variables, replacement)) {
+            result.append(text.substr(cursor, pos - cursor));
+            result.append(replacement);
+            cursor = stmt_end + 1;
+        }
+
+        std::string declared_name;
+        if (TryParseScalarDeclarationStatement(statement, "float", declared_name) &&
+            ! ContainsString(float_variables, declared_name)) {
+            float_variables.push_back(declared_name);
+        }
+
+        pos = stmt_end + 1;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
 inline void CollectPreprocessorInfo(const std::string& src, WPPreprocessorInfo& process_info) {
     process_info.input.clear();
     process_info.output.clear();
@@ -2757,6 +2842,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     result = RewriteIntegerForLoops(result);
     result = RewriteUintModuloAssignments(result);
     result = RewriteFloatBoolMultiplyAssignments(result);
+    result = RewriteFloatArrayIndices(result);
     result = TrimOverlongVectorConstructors(result);
     result = RewriteVec2AssignmentsForVec4TexCoord(result);
 
@@ -2852,7 +2938,7 @@ inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStrea
 
 inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, const Combos& combos) {
     std::ostringstream out;
-    out << "prepared-shader-v4\n";
+    out << "prepared-shader-v5-float-array-index\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';
