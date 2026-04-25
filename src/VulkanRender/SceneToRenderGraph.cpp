@@ -690,5 +690,45 @@ std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
                                             .type = rg::TexNode::TexType::Temp });
     }
 
+    if (!scene.bloom.nodes.empty()) {
+        // Scene Bloom is authored in `general`, so it belongs after the complete layer traversal.
+        // Wallpaper Engine implements it as an ordered post-process chain. Binding each synthetic
+        // node with its explicit output target preserves the quarter/eighth render-target feedback
+        // contract, while the first pass still uses `u_enabled` to make runtime toggles cheap.
+        if (scene.bloom.nodes.size() != scene.bloom.outputs.size()) {
+            LOG_ERROR("SceneBloomGraphBind: pass/output mismatch passes=%zu outputs=%zu",
+                      scene.bloom.nodes.size(),
+                      scene.bloom.outputs.size());
+        } else {
+            LOG_INFO("SceneBloomGraphBind: passes=%zu enabled=%s strength=%.3f threshold=%.3f",
+                     scene.bloom.nodes.size(),
+                     scene.bloom.enabled ? "true" : "false",
+                     scene.bloom.strength,
+                     scene.bloom.threshold);
+            for (usize i = 0; i < scene.bloom.nodes.size(); ++i) {
+                if (scene.bloom.nodes[i] == nullptr) {
+                    LOG_ERROR("SceneBloomGraphBind: missing pass index=%zu output='%s'",
+                              i,
+                              scene.bloom.outputs[i].c_str());
+                    continue;
+                }
+                LOG_INFO("SceneBloomGraphBind: pass=%zu node='%s' output='%s'",
+                         i,
+                         scene.bloom.nodes[i]->Name().c_str(),
+                         scene.bloom.outputs[i].c_str());
+                AddNodePass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra);
+            }
+        }
+    } else if (scene.bloom.node != nullptr) {
+        // This fallback is intentionally retained for older parsed scene objects that may still
+        // populate only the legacy single-node field before a full reparse has occurred.
+        LOG_INFO("SceneBloomGraphBind: legacy-output='%s' enabled=%s strength=%.3f threshold=%.3f",
+                 SpecTex_Default.data(),
+                 scene.bloom.enabled ? "true" : "false",
+                 scene.bloom.strength,
+                 scene.bloom.threshold);
+        AddNodePass(scene.bloom.node.get(), SpecTex_Default, 0, extra);
+    }
+
     return rgraph;
 }

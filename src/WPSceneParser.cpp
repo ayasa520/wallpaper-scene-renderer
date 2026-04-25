@@ -1849,6 +1849,16 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc, std:
     scene.clearColor = sc.general.clearcolor;
     scene.ambientColor = sc.general.ambientcolor;
     scene.skylightColor = sc.general.skylightcolor;
+    scene.bloom.enabled = sc.general.bloom;
+    scene.bloom.strength = sc.general.bloomstrength;
+    scene.bloom.threshold = sc.general.bloomthreshold;
+    scene.bloom.tint = sc.general.bloomtint;
+    scene.bloom.hdr = sc.general.bloomhdr;
+    scene.bloom.hdrStrength = sc.general.bloomhdrstrength;
+    scene.bloom.hdrThreshold = sc.general.bloomhdrthreshold;
+    scene.bloom.hdrScatter = sc.general.bloomhdrscatter;
+    scene.bloom.hdrFeather = sc.general.bloomhdrfeather;
+    scene.bloom.hdrIterations = sc.general.bloomhdriterations;
     scene.cameraParallax = sc.general.cameraparallax;
     scene.cameraParallaxAmount = sc.general.cameraparallaxamount;
     scene.cameraParallaxDelay = sc.general.cameraparallaxdelay;
@@ -1868,6 +1878,349 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc, std:
         cam_para.mouseinfluence = sc.general.cameraparallaxmouseinfluence;
         context.shader_updater->SetCameraParallax(cam_para);
     }
+}
+
+bool ConfigureSceneBloomPass(ParseContext& context) {
+    if (context.scene == nullptr || context.vfs == nullptr) return false;
+
+    auto& scene = *context.scene;
+    // Build the Bloom node even when the authored user toggle currently disables it, as long as the
+    // scene carries non-zero Bloom settings. Runtime toggles can then update `u_enabled` in place
+    // instead of forcing a render-graph rebuild just to add or remove this final post-process pass.
+    if (!scene.bloom.enabled && scene.bloom.strength <= 0.0f && !scene.bloom.hdr) {
+        LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f active=false",
+                 scene.bloom.enabled ? "true" : "false",
+                 scene.bloom.strength,
+                 scene.bloom.threshold);
+        return false;
+    }
+
+    const i32 scene_width = std::max(1, context.ortho_w);
+    const i32 scene_height = std::max(1, context.ortho_h);
+    const i32 quarter_width = std::max(1, scene_width / 4);
+    const i32 quarter_height = std::max(1, scene_height / 4);
+    const i32 eighth_width = std::max(1, scene_width / 8);
+    const i32 eighth_height = std::max(1, scene_height / 8);
+
+    constexpr std::string_view quarter_target = "__hanabi_scene_bloom_quarter";
+    constexpr std::string_view eighth_target = "__hanabi_scene_bloom_eighth";
+    constexpr std::string_view blur_target = "__hanabi_scene_bloom_blur";
+
+    // Wallpaper Engine's scene Bloom is implemented by the stock utility assets as a four-pass
+    // render-target chain: quarter-size extraction, eighth-size horizontal blur, eighth-size
+    // vertical blur, then additive combine into `_rt_default`. Rebuilding that topology here keeps
+    // the high-channel clipping and pink highlight rolloff aligned with the Windows renderer,
+    // instead of relying on a hand-tuned single-pass approximation.
+    scene.renderTargets[std::string(quarter_target)] = {
+        .width = quarter_width,
+        .height = quarter_height,
+        .mapWidth = quarter_width,
+        .mapHeight = quarter_height,
+        .bind = { .enable = true, .name = SpecTex_Default.data(), .scale = 0.25 },
+    };
+    scene.renderTargets[std::string(eighth_target)] = {
+        .width = eighth_width,
+        .height = eighth_height,
+        .mapWidth = eighth_width,
+        .mapHeight = eighth_height,
+        .bind = { .enable = true, .name = SpecTex_Default.data(), .scale = 0.125 },
+    };
+    scene.renderTargets[std::string(blur_target)] = {
+        .width = eighth_width,
+        .height = eighth_height,
+        .mapWidth = eighth_width,
+        .mapHeight = eighth_height,
+        .bind = { .enable = true, .name = SpecTex_Default.data(), .scale = 0.125 },
+    };
+
+    constexpr std::string_view fullscreen_vertex_source = R"(
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+
+varying vec2 v_TexCoord;
+
+void main() {
+    gl_Position = vec4(a_Position, 1.0);
+    v_TexCoord = a_TexCoord;
+}
+)";
+    constexpr std::string_view downsample_quarter_vertex_source = R"(
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+
+uniform vec2 g_TexelSize;
+
+varying vec2 v_TexCoord[4];
+
+void main() {
+    gl_Position = vec4(a_Position, 1.0);
+    v_TexCoord[0] = a_TexCoord - g_TexelSize;
+    v_TexCoord[1] = a_TexCoord + g_TexelSize;
+    v_TexCoord[2] = a_TexCoord + vec2(-g_TexelSize.x, g_TexelSize.y);
+    v_TexCoord[3] = a_TexCoord + vec2(g_TexelSize.x, -g_TexelSize.y);
+}
+)";
+    constexpr std::string_view downsample_quarter_fragment_source = R"(
+varying vec2 v_TexCoord[4];
+
+uniform sampler2D g_Texture0;
+
+uniform float u_enabled; // {"material":"Bloom enabled","default":0,"range":[0,1]}
+uniform float g_BloomStrength; // {"material":"bloomstrength","default":2,"range":[0,4]}
+uniform float g_BloomThreshold; // {"material":"bloomthreshold","default":0.65,"range":[0,0.999]}
+uniform vec3 g_BloomTint; // {"material":"bloomtint","default":"1 1 1"}
+
+void main() {
+    // Keep the generated render graph stable for runtime user-property toggles. A disabled scene
+    // Bloom still writes black into the private Bloom targets so the later additive combine becomes
+    // visually neutral without needing to destroy and rebuild graph nodes.
+    if (u_enabled <= 0.0 || g_BloomStrength <= 0.0) {
+        gl_FragColor = vec4(CAST3(0), 1.0);
+        return;
+    }
+
+    vec3 albedo = texSample2D(g_Texture0, v_TexCoord[0]).rgb +
+                    texSample2D(g_Texture0, v_TexCoord[1]).rgb +
+                    texSample2D(g_Texture0, v_TexCoord[2]).rgb +
+                    texSample2D(g_Texture0, v_TexCoord[3]).rgb;
+    albedo *= 0.25;
+
+    float scale = max(max(albedo.x, albedo.y), albedo.z);
+    albedo *= saturate(scale - g_BloomThreshold);
+
+    float grayscale = dot(vec3(0.2989, 0.5870, 0.1140), albedo);
+    float sat = 1.0;
+    albedo = -grayscale * sat + albedo * (1.0 + sat);
+
+    gl_FragColor = vec4(max(CAST3(0), albedo * g_BloomStrength * g_BloomTint), 1.0);
+}
+)";
+    constexpr std::string_view blur_x_vertex_source = R"(
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+
+uniform vec2 g_TexelSize;
+
+varying vec2 v_TexCoord[13];
+
+void main() {
+    gl_Position = vec4(a_Position, 1);
+
+    float localTexel = g_TexelSize.x * 8.0;
+    v_TexCoord[0] = vec2(a_TexCoord.x - localTexel * 6.0, a_TexCoord.y);
+    v_TexCoord[1] = vec2(a_TexCoord.x - localTexel * 5.0, a_TexCoord.y);
+    v_TexCoord[2] = vec2(a_TexCoord.x - localTexel * 4.0, a_TexCoord.y);
+    v_TexCoord[3] = vec2(a_TexCoord.x - localTexel * 3.0, a_TexCoord.y);
+    v_TexCoord[4] = vec2(a_TexCoord.x - localTexel * 2.0, a_TexCoord.y);
+    v_TexCoord[5] = vec2(a_TexCoord.x - localTexel * 1.0, a_TexCoord.y);
+    v_TexCoord[6] = a_TexCoord;
+    v_TexCoord[7] = vec2(a_TexCoord.x + localTexel * 1.0, a_TexCoord.y);
+    v_TexCoord[8] = vec2(a_TexCoord.x + localTexel * 2.0, a_TexCoord.y);
+    v_TexCoord[9] = vec2(a_TexCoord.x + localTexel * 3.0, a_TexCoord.y);
+    v_TexCoord[10] = vec2(a_TexCoord.x + localTexel * 4.0, a_TexCoord.y);
+    v_TexCoord[11] = vec2(a_TexCoord.x + localTexel * 5.0, a_TexCoord.y);
+    v_TexCoord[12] = vec2(a_TexCoord.x + localTexel * 6.0, a_TexCoord.y);
+}
+)";
+    constexpr std::string_view blur_y_vertex_source = R"(
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+
+uniform vec2 g_TexelSize;
+
+varying vec2 v_TexCoord[13];
+
+void main() {
+    gl_Position = vec4(a_Position, 1);
+
+    float localTexel = g_TexelSize.y * 8.0;
+    v_TexCoord[0] = vec2(a_TexCoord.x, a_TexCoord.y - localTexel * 6.0);
+    v_TexCoord[1] = vec2(a_TexCoord.x, a_TexCoord.y - localTexel * 5.0);
+    v_TexCoord[2] = vec2(a_TexCoord.x, a_TexCoord.y - localTexel * 4.0);
+    v_TexCoord[3] = vec2(a_TexCoord.x, a_TexCoord.y - localTexel * 3.0);
+    v_TexCoord[4] = vec2(a_TexCoord.x, a_TexCoord.y - localTexel * 2.0);
+    v_TexCoord[5] = vec2(a_TexCoord.x, a_TexCoord.y - localTexel * 1.0);
+    v_TexCoord[6] = a_TexCoord;
+    v_TexCoord[7] = vec2(a_TexCoord.x, a_TexCoord.y + localTexel * 1.0);
+    v_TexCoord[8] = vec2(a_TexCoord.x, a_TexCoord.y + localTexel * 2.0);
+    v_TexCoord[9] = vec2(a_TexCoord.x, a_TexCoord.y + localTexel * 3.0);
+    v_TexCoord[10] = vec2(a_TexCoord.x, a_TexCoord.y + localTexel * 4.0);
+    v_TexCoord[11] = vec2(a_TexCoord.x, a_TexCoord.y + localTexel * 5.0);
+    v_TexCoord[12] = vec2(a_TexCoord.x, a_TexCoord.y + localTexel * 6.0);
+}
+)";
+    constexpr std::string_view blur_fragment_source = R"(
+varying vec2 v_TexCoord[13];
+
+uniform sampler2D g_Texture0;
+
+void main() {
+    vec3 albedo = texSample2D(g_Texture0, v_TexCoord[0]).rgb * 0.006299 +
+                    texSample2D(g_Texture0, v_TexCoord[1]).rgb * 0.017298 +
+                    texSample2D(g_Texture0, v_TexCoord[2]).rgb * 0.039533 +
+                    texSample2D(g_Texture0, v_TexCoord[3]).rgb * 0.075189 +
+                    texSample2D(g_Texture0, v_TexCoord[4]).rgb * 0.119007 +
+                    texSample2D(g_Texture0, v_TexCoord[5]).rgb * 0.156756 +
+                    texSample2D(g_Texture0, v_TexCoord[6]).rgb * 0.171834 +
+                    texSample2D(g_Texture0, v_TexCoord[7]).rgb * 0.156756 +
+                    texSample2D(g_Texture0, v_TexCoord[8]).rgb * 0.119007 +
+                    texSample2D(g_Texture0, v_TexCoord[9]).rgb * 0.075189 +
+                    texSample2D(g_Texture0, v_TexCoord[10]).rgb * 0.039533 +
+                    texSample2D(g_Texture0, v_TexCoord[11]).rgb * 0.017298 +
+                    texSample2D(g_Texture0, v_TexCoord[12]).rgb * 0.006299;
+
+    gl_FragColor = vec4(albedo, 1.0);
+}
+)";
+    constexpr std::string_view combine_fragment_source = R"(
+varying vec2 v_TexCoord;
+
+uniform sampler2D g_Texture0;
+uniform sampler2D g_Texture1;
+
+void main() {
+    vec3 albedo = texSample2D(g_Texture0, v_TexCoord).rgb;
+    vec3 bloom = texSample2D(g_Texture1, v_TexCoord).rgb;
+    albedo += bloom;
+
+    gl_FragColor = vec4(albedo, 1.0);
+}
+)";
+
+    const auto compile_shader = [&](std::string name,
+                                    std::string_view vertex_source,
+                                    std::string_view fragment_source,
+                                    usize texture_count) -> std::shared_ptr<SceneShader> {
+        auto shader = std::make_shared<SceneShader>();
+        shader->name = std::move(name);
+
+        WPShaderInfo shader_info;
+        std::array units { WPShaderUnit {
+                               .stage = ShaderType::VERTEX,
+                               .src = std::string(vertex_source),
+                               .preprocess_info = {},
+                           },
+                           WPShaderUnit {
+                               .stage = ShaderType::FRAGMENT,
+                               .src = std::string(fragment_source),
+                               .preprocess_info = {},
+                           } };
+        std::vector<WPShaderTexInfo> texinfos(texture_count, WPShaderTexInfo { .enabled = true });
+        for (auto& unit : units) {
+            unit.src = WPShaderParser::PreShaderSrc(*context.vfs, unit.src, &shader_info, texinfos);
+        }
+        shader->default_uniforms = shader_info.svs;
+        if (!WPShaderParser::CompileToSpv(
+                scene.scene_id, units, shader->codes, *context.vfs, &shader_info, texinfos)) {
+            LOG_ERROR("SceneBloomConfig: compile failed pass='%s'", shader->name.c_str());
+            return nullptr;
+        }
+        return shader;
+    };
+
+    const std::array<float, 2> scene_texel_size {
+        1.0f / static_cast<float>(scene_width),
+        1.0f / static_cast<float>(scene_height),
+    };
+
+    auto downsample_shader = compile_shader("__hanabi_scene_bloom_downsample_quarter",
+                                            downsample_quarter_vertex_source,
+                                            downsample_quarter_fragment_source,
+                                            1);
+    auto blur_x_shader = compile_shader(
+        "__hanabi_scene_bloom_downsample_eighth_blur", blur_x_vertex_source, blur_fragment_source, 1);
+    auto blur_y_shader =
+        compile_shader("__hanabi_scene_bloom_blur", blur_y_vertex_source, blur_fragment_source, 1);
+    auto combine_shader =
+        compile_shader("__hanabi_scene_bloom_combine", fullscreen_vertex_source, combine_fragment_source, 2);
+    if (downsample_shader == nullptr || blur_x_shader == nullptr || blur_y_shader == nullptr ||
+        combine_shader == nullptr) {
+        return false;
+    }
+
+    const auto make_node = [&](std::string name,
+                               std::shared_ptr<SceneShader> shader,
+                               std::vector<std::string> textures,
+                               ShaderValues const_values) -> std::shared_ptr<SceneNode> {
+        SceneMaterial material;
+        material.name = name;
+        material.textures = std::move(textures);
+        material.defines.reserve(material.textures.size());
+        for (usize i = 0; i < material.textures.size(); ++i) {
+            material.defines.push_back("g_Texture" + std::to_string(i));
+        }
+        material.customShader.shader = std::move(shader);
+        material.customShader.constValues = std::move(const_values);
+        material.blenmode = BlendMode::Disable;
+
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
+        mesh->AddMaterial(std::move(material));
+
+        auto node = std::make_shared<SceneNode>();
+        node->SetName(name);
+        node->AddMesh(mesh);
+        scene.nodeOwners[node.get()] = 0;
+        context.shader_updater->SetNodeData(node.get(), WPShaderValueData {});
+        return node;
+    };
+
+    ShaderValues downsample_values;
+    downsample_values["g_TexelSize"] = ShaderValue(scene_texel_size);
+    downsample_values["u_enabled"] = ShaderValue(scene.bloom.enabled ? 1.0f : 0.0f);
+    downsample_values["g_BloomStrength"] = ShaderValue(scene.bloom.strength);
+    downsample_values["g_BloomThreshold"] = ShaderValue(scene.bloom.threshold);
+    downsample_values["g_BloomTint"] = ShaderValue(scene.bloom.tint);
+
+    ShaderValues blur_values;
+    blur_values["g_TexelSize"] = ShaderValue(scene_texel_size);
+
+    auto downsample_node = make_node("__hanabi_scene_bloom_downsample_quarter",
+                                     downsample_shader,
+                                     { SpecTex_Default.data() },
+                                     std::move(downsample_values));
+    auto blur_x_node = make_node("__hanabi_scene_bloom_downsample_eighth_blur",
+                                 blur_x_shader,
+                                 { std::string(quarter_target) },
+                                 blur_values);
+    auto blur_y_node = make_node("__hanabi_scene_bloom_blur",
+                                 blur_y_shader,
+                                 { std::string(eighth_target) },
+                                 blur_values);
+    auto combine_node = make_node("__hanabi_scene_bloom_combine",
+                                  combine_shader,
+                                  { SpecTex_Default.data(), std::string(blur_target) },
+                                  {});
+
+    scene.bloom.node = downsample_node;
+    scene.bloom.nodes = { downsample_node, blur_x_node, blur_y_node, combine_node };
+    scene.bloom.outputs = {
+        std::string(quarter_target),
+        std::string(eighth_target),
+        std::string(blur_target),
+        SpecTex_Default.data(),
+    };
+
+    LOG_INFO("SceneBloomConfig: enabled=true strength=%.3f threshold=%.3f tint=[%.3f,%.3f,%.3f] "
+             "hdr=%s hdr-strength=%.3f hdr-threshold=%.3f hdr-scatter=%.3f hdr-feather=%.3f "
+             "hdr-iterations=%d active=true passes=%zu quarter=%dx%d eighth=%dx%d",
+             scene.bloom.strength,
+             scene.bloom.threshold,
+             scene.bloom.tint[0],
+             scene.bloom.tint[1],
+             scene.bloom.tint[2],
+             scene.bloom.hdr ? "true" : "false",
+             scene.bloom.hdrStrength,
+             scene.bloom.hdrThreshold,
+             scene.bloom.hdrScatter,
+             scene.bloom.hdrFeather,
+             scene.bloom.hdrIterations,
+             scene.bloom.nodes.size(),
+             quarter_width,
+             quarter_height,
+             eighth_width,
+             eighth_height);
+    return true;
 }
 
 void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
@@ -4102,6 +4455,14 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "skylightcolor", WPDynamicValue::Type::Float3);
         RegisterSceneGeneralPropertyBinding(
+            context, general_json, "bloom", WPDynamicValue::Type::Boolean);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "bloomstrength", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "bloomthreshold", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "bloomtint", WPDynamicValue::Type::Float3);
+        RegisterSceneGeneralPropertyBinding(
             context, general_json, "cameraparallax", WPDynamicValue::Type::Boolean);
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "cameraparallaxamount", WPDynamicValue::Type::Float);
@@ -5090,10 +5451,12 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view   scene_id,
             .bind       = { .enable = true, .screen = true },
         };
     }
-
     context.scene->scene_id = scene_id;
-
     WPShaderParser::InitGlslang("scene-parse");
+    // Scene Bloom owns a synthetic shader, so it must be built only after the scene id is final
+    // and glslang has been initialized for this parse. Running this earlier can enter shader
+    // compilation with an uninitialized compiler lifetime and crash before any graph is created.
+    ConfigureSceneBloomPass(context);
 
     for (WPObjectVar& obj : wp_objs) {
         std::visit(visitor::overload {

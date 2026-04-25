@@ -59,6 +59,28 @@ public:
         std::string attachment;
     };
 
+    struct BloomSettings {
+        // Bloom is a scene option in Wallpaper Engine. It must run after the whole layer tree has
+        // produced `_rt_default`, so the render graph owns it as a dedicated global post-process
+        // node instead of attaching it to any authored layer.
+        bool                       enabled { false };
+        float                      strength { 0.0f };
+        float                      threshold { 1.0f };
+        std::array<float, 3>       tint { 1.0f, 1.0f, 1.0f };
+        bool                       hdr { false };
+        float                      hdrStrength { 0.0f };
+        float                      hdrThreshold { 1.0f };
+        float                      hdrScatter { 1.0f };
+        float                      hdrFeather { 0.0f };
+        int32_t                    hdrIterations { 0 };
+        std::shared_ptr<SceneNode> node;
+        // Scene Bloom is a small post-process chain in Wallpaper Engine assets, not a single
+        // shader. Keep the legacy `node` as the runtime-uniform anchor, and store the ordered
+        // pass nodes plus their output targets so SceneToRenderGraph can reproduce the chain.
+        std::vector<std::shared_ptr<SceneNode>> nodes;
+        std::vector<std::string>                outputs;
+    };
+
     Scene();
     ~Scene();
 
@@ -171,6 +193,7 @@ public:
     std::array<float, 3> clearColor { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> ambientColor { 0.2f, 0.2f, 0.2f };
     std::array<float, 3> skylightColor { 0.3f, 0.3f, 0.3f };
+    BloomSettings        bloom;
     bool                 cameraParallax { false };
     float                cameraParallaxAmount { 0.0f };
     float                cameraParallaxDelay { 0.0f };

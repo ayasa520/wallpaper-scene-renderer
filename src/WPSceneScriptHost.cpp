@@ -435,6 +435,10 @@ LayerValueHint SceneValueType(std::string_view property_name) {
     if (property_name == "clearcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "ambientcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "skylightcolor") return { WPDynamicValue::Type::Float3, true };
+    if (property_name == "bloom") return { WPDynamicValue::Type::Boolean, true };
+    if (property_name == "bloomstrength") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "bloomthreshold") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "bloomtint") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "cameraparallax") return { WPDynamicValue::Type::Boolean, true };
     if (property_name == "cameraparallaxamount") return { WPDynamicValue::Type::Float, true };
     if (property_name == "cameraparallaxdelay") return { WPDynamicValue::Type::Float, true };
@@ -4884,6 +4888,10 @@ std::optional<WPDynamicValue> ReadScenePropertyValue(const WPSceneScriptHost::Op
     if (property_name == "clearcolor") return WPDynamicValue(opaque->scene->clearColor);
     if (property_name == "ambientcolor") return WPDynamicValue(opaque->scene->ambientColor);
     if (property_name == "skylightcolor") return WPDynamicValue(opaque->scene->skylightColor);
+    if (property_name == "bloom") return WPDynamicValue(opaque->scene->bloom.enabled);
+    if (property_name == "bloomstrength") return WPDynamicValue(opaque->scene->bloom.strength);
+    if (property_name == "bloomthreshold") return WPDynamicValue(opaque->scene->bloom.threshold);
+    if (property_name == "bloomtint") return WPDynamicValue(opaque->scene->bloom.tint);
     if (property_name == "cameraparallax") return WPDynamicValue(opaque->scene->cameraParallax);
     if (property_name == "cameraparallaxamount") {
         return WPDynamicValue(opaque->scene->cameraParallaxAmount);
@@ -4906,6 +4914,20 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
                              const WPDynamicValue& value) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
 
+    const auto update_scene_bloom_uniform =
+        [&](std::string_view uniform_name, const ShaderValue& shader_value) -> bool {
+        if (opaque->scene->bloom.node == nullptr || opaque->scene->bloom.node->Mesh() == nullptr ||
+            opaque->scene->bloom.node->Mesh()->Material() == nullptr) {
+            return false;
+        }
+        // Scene Bloom's runtime-editable uniforms live on the first extraction pass. Later blur and
+        // combine passes intentionally stay parameter-free, matching Wallpaper Engine's utility
+        // materials while avoiding render-graph rebuilds for user-property changes.
+        opaque->scene->bloom.node->Mesh()->Material()->customShader.constValues
+            [std::string(uniform_name)] = shader_value;
+        return true;
+    };
+
     if (property_name == "clearcolor") {
         std::array<float, 3> clear_color {};
         if (! value.tryGet(&clear_color)) return false;
@@ -4926,6 +4948,37 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         UpdateSceneLightingUniforms(opaque);
         return true;
     }
+    if (property_name == "bloom") {
+        bool enabled = false;
+        if (! value.tryGet(&enabled)) return false;
+        opaque->scene->bloom.enabled = enabled;
+        // Scene-level Bloom follows the same stable-topology contract as authored image effects:
+        // the pass stays in the render graph and the user toggle only changes a uniform. Rebuilding
+        // the graph here would recreate Vulkan passes/framebuffers and make the highlight switch
+        // noticeably heavier than ordinary post-process visibility changes.
+        if (!update_scene_bloom_uniform("u_enabled", ShaderValue(enabled ? 1.0f : 0.0f))) {
+            LOG_INFO("SceneGeneralApply: property='bloom' value=%s bloom-node=missing",
+                     enabled ? "true" : "false");
+            return true;
+        }
+        LOG_INFO("SceneGeneralApply: property='bloom' value=%s topology-dirty=false",
+                 enabled ? "true" : "false");
+        return true;
+    }
+    if (property_name == "bloomtint") {
+        std::array<float, 3> tint {};
+        if (! value.tryGet(&tint)) return false;
+        opaque->scene->bloom.tint = tint;
+        // Write both the stock Wallpaper Engine uniform name and the older Hanabi alias so already
+        // parsed legacy single-pass Bloom nodes can still react during a runtime transition.
+        update_scene_bloom_uniform("g_BloomTint", ShaderValue(tint));
+        update_scene_bloom_uniform("u_tint", ShaderValue(tint));
+        LOG_INFO("SceneGeneralApply: property='bloomtint' value=[%.3f, %.3f, %.3f]",
+                 tint[0],
+                 tint[1],
+                 tint[2]);
+        return true;
+    }
     if (property_name == "cameraparallax") {
         bool enabled = false;
         if (! value.tryGet(&enabled)) return false;
@@ -4942,6 +4995,24 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         opaque->scene->cameraParallaxAmount = scalar;
         ApplySceneCameraParallax(opaque);
         LOG_INFO("SceneGeneralApply: property='cameraparallaxamount' value=%.3f", scalar);
+        return true;
+    }
+    if (property_name == "bloomstrength") {
+        opaque->scene->bloom.strength = scalar;
+        // The exact WE-compatible chain consumes `g_BloomStrength`; `u_strength` remains for
+        // compatibility with any in-memory legacy parser output created before this graph was built.
+        update_scene_bloom_uniform("g_BloomStrength", ShaderValue(scalar));
+        update_scene_bloom_uniform("u_strength", ShaderValue(scalar));
+        LOG_INFO("SceneGeneralApply: property='bloomstrength' value=%.3f", scalar);
+        return true;
+    }
+    if (property_name == "bloomthreshold") {
+        opaque->scene->bloom.threshold = scalar;
+        // The downsample/extract shader thresholds on the maximum RGB channel exactly like WE's
+        // stock shader, so runtime property updates must target the stock uniform name.
+        update_scene_bloom_uniform("g_BloomThreshold", ShaderValue(scalar));
+        update_scene_bloom_uniform("u_threshold", ShaderValue(scalar));
+        LOG_INFO("SceneGeneralApply: property='bloomthreshold' value=%.3f", scalar);
         return true;
     }
     if (property_name == "cameraparallaxdelay") {
