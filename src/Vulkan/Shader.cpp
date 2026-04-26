@@ -93,8 +93,12 @@ inline bool parse(const ShaderCompUnit& unit, const ShaderCompOpt& opt, EShMessa
     auto* data   = unit.src.c_str();
     auto  client = getClient(opt.client_ver);
     shader.setStrings(&data, 1);
+    // The shader unit already carries the real GLSL stage selected by the parser. Passing that
+    // stage into glslang keeps fragment-only intrinsics such as dFdx/dFdy legal for authored
+    // Wallpaper Engine fragment shaders, instead of accidentally validating every unit as vertex
+    // code and dropping model fragments like Neon Sunset's grid.
     shader.setEnvInput(opt.hlsl ? glslang::EShSourceHlsl : glslang::EShSourceGlsl,
-                       EShLanguage::EShLangVertex,
+                       unit.stage,
                        client,
                        ClientInputSemanticsVersion);
     shader.setEnvClient(client, opt.client_ver);

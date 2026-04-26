@@ -8,11 +8,21 @@
 #include "SpecTexs.hpp"
 #include "wpscene/WPMaterial.h"
 #include "WPShaderParser.hpp"
+#include <algorithm>
 
 using namespace wallpaper;
 
 namespace
 {
+constexpr uint32_t kStaticPositionTexcoordFlag = 9;
+constexpr uint32_t kStaticNormalFlag           = 11;
+constexpr uint32_t kStaticTangentSpaceFlag     = 15;
+constexpr uint32_t kStaticTangentSpaceSecondUvFlag = 39;
+constexpr uint32_t kStaticPositionTexcoordFloats = 5;
+constexpr uint32_t kStaticNormalFloats           = 8;
+constexpr uint32_t kStaticTangentSpaceFloats     = 12;
+constexpr uint32_t kStaticTangentSpaceSecondUvFloats = 14;
+constexpr uint32_t kStaticTriangleIndexBytes     = 2 * 3;
 
 WPPuppet::PlayMode ToPlayMode(std::string_view m) {
     if (m == "loop" || m.empty()) return WPPuppet::PlayMode::Loop;
@@ -59,6 +69,106 @@ bool SeekNextMDLSection(fs::IBinaryStream& f, std::span<const std::string_view> 
     f.SeekSet(start);
     return false;
 }
+
+uint32_t StaticVertexFloatCount(uint32_t mdl_flag) {
+    if (mdl_flag == kStaticPositionTexcoordFlag) return kStaticPositionTexcoordFloats;
+    if (mdl_flag == kStaticNormalFlag) return kStaticNormalFloats;
+    if (mdl_flag == kStaticTangentSpaceFlag) return kStaticTangentSpaceFloats;
+    if (mdl_flag == kStaticTangentSpaceSecondUvFlag) return kStaticTangentSpaceSecondUvFloats;
+    return 0;
+}
+
+bool StaticVertexHasNormal(uint32_t mdl_flag) {
+    return mdl_flag == kStaticNormalFlag || mdl_flag == kStaticTangentSpaceFlag ||
+           mdl_flag == kStaticTangentSpaceSecondUvFlag;
+}
+
+bool StaticVertexHasTangentSpace(uint32_t mdl_flag) {
+    return mdl_flag == kStaticTangentSpaceFlag || mdl_flag == kStaticTangentSpaceSecondUvFlag;
+}
+
+bool StaticVertexHasSecondUv(uint32_t mdl_flag) {
+    return mdl_flag == kStaticTangentSpaceSecondUvFlag;
+}
+
+void UpdateStaticBounds(WPMdl::StaticChunk& chunk) {
+    if (chunk.vertexs.empty()) return;
+
+    chunk.bounds_min = chunk.vertexs.front().position;
+    chunk.bounds_max = chunk.vertexs.front().position;
+    for (const auto& vertex : chunk.vertexs) {
+        for (uint i = 0; i < 3; i++) {
+            chunk.bounds_min[i] = std::min(chunk.bounds_min[i], vertex.position[i]);
+            chunk.bounds_max[i] = std::max(chunk.bounds_max[i], vertex.position[i]);
+        }
+    }
+}
+
+bool ReadStaticChunk(fs::IBinaryStream& f,
+                     uint32_t          mdl_flag,
+                     std::string       material_json_file,
+                     WPMdl::StaticChunk& chunk) {
+    const uint32_t vertex_float_count = StaticVertexFloatCount(mdl_flag);
+    if (vertex_float_count == 0) {
+        LOG_ERROR("static mdl has unknown vertex flag %u before material '%s'",
+                  mdl_flag,
+                  material_json_file.c_str());
+        return false;
+    }
+
+    f.ReadInt32(); // Static MDLV0014 chunks carry a reserved zero before the vertex byte block.
+
+    const uint32_t vertex_size = f.ReadUint32();
+    const uint32_t vertex_stride = vertex_float_count * sizeof(float);
+    if (vertex_size == 0 || vertex_size % vertex_stride != 0) {
+        LOG_ERROR("static mdl material '%s' has unsupported vertex byte size %u for stride %u",
+                  material_json_file.c_str(),
+                  vertex_size,
+                  vertex_stride);
+        return false;
+    }
+
+    chunk.material_json_file = std::move(material_json_file);
+    chunk.vertexs.resize(vertex_size / vertex_stride);
+    for (auto& vertex : chunk.vertexs) {
+        for (auto& v : vertex.position) v = f.ReadFloat();
+
+        if (StaticVertexHasNormal(mdl_flag)) {
+            // Formats 11, 15, and 39 store authored normals. The canonical runtime vertex still
+            // exposes a deterministic normal fallback for older position/UV-only files, keeping
+            // model shader attributes valid without weakening the stricter static MDL parser.
+            for (auto& v : vertex.normal) v = f.ReadFloat();
+        }
+
+        if (StaticVertexHasTangentSpace(mdl_flag)) {
+            for (auto& v : vertex.tangent4) v = f.ReadFloat();
+        }
+
+        for (auto& v : vertex.texcoord) v = f.ReadFloat();
+
+        if (StaticVertexHasSecondUv(mdl_flag)) {
+            // Arsenal's official static MDL uses flag 39, whose 14-float stride appends a second
+            // UV channel after the base texture UV. Its materials enable lightmap sampling, so this
+            // channel must be preserved as a real vertex attribute instead of being skipped.
+            for (auto& v : vertex.texcoord2) v = f.ReadFloat();
+        }
+    }
+
+    const uint32_t indices_size = f.ReadUint32();
+    if (indices_size == 0 || indices_size % kStaticTriangleIndexBytes != 0) {
+        LOG_ERROR("static mdl material '%s' has unsupported index byte size %u",
+                  chunk.material_json_file.c_str(),
+                  indices_size);
+        return false;
+    }
+
+    chunk.indices.resize(indices_size / kStaticTriangleIndexBytes);
+    for (auto& index : chunk.indices) {
+        for (auto& v : index) v = f.ReadUint16();
+    }
+    UpdateStaticBounds(chunk);
+    return true;
+}
 } // namespace
 
 // bytes * size
@@ -75,14 +185,66 @@ constexpr uint32_t alt_format_vertex_size_herald_value = 0x0180000F;
 
 constexpr uint32_t singile_bone_frame = 4 * 9;
 
+bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
+    auto str_path = std::string(path);
+    auto pfile    = vfs.Open("/assets/" + str_path);
+    if (! pfile) {
+        LOG_ERROR("static mdl open failed: %s", str_path.c_str());
+        return false;
+    }
+
+    auto memfile = fs::MemBinaryStream(*pfile);
+    auto& f      = memfile;
+
+    mdl = WPMdl {};
+    mdl.mdlv = ReadMDLVesion(f);
+    if (mdl.mdlv <= 0) {
+        LOG_ERROR("static mdl version read failed: %s", str_path.c_str());
+        return false;
+    }
+
+    const uint32_t mdl_flag = f.ReadUint32();
+    f.ReadUint32(); // Reserved field observed as 1 in MDLV0014 static model assets.
+    const uint32_t chunk_count = f.ReadUint32();
+    if (chunk_count == 0) {
+        LOG_ERROR("static mdl has no chunks: %s", str_path.c_str());
+        return false;
+    }
+
+    mdl.kind = WPMdl::MeshKind::Static;
+    mdl.static_chunks.clear();
+    mdl.static_chunks.reserve(chunk_count);
+
+    std::string material_json_file = f.ReadStr();
+    for (uint32_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+        if (material_json_file.empty()) {
+            LOG_ERROR("static mdl chunk %u has empty material path: %s",
+                      chunk_index,
+                      str_path.c_str());
+            return false;
+        }
+
+        WPMdl::StaticChunk chunk;
+        if (! ReadStaticChunk(f, mdl_flag, material_json_file, chunk)) return false;
+        mdl.static_chunks.push_back(std::move(chunk));
+
+        if (chunk_index + 1 < chunk_count) {
+            material_json_file = f.ReadStr();
+        }
+    }
+
+    return true;
+}
+
 bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     auto str_path = std::string(path);
     auto pfile    = vfs.Open("/assets/" + str_path);
-    auto memfile  = fs::MemBinaryStream(*pfile);
     if (! pfile) return false;
+    auto memfile  = fs::MemBinaryStream(*pfile);
     auto& f = memfile;
 
     mdl.mdlv = ReadMDLVesion(f);
+    mdl.kind = WPMdl::MeshKind::Puppet;
 
     int32_t mdl_flag = f.ReadInt32();
     if (mdl_flag == 9) {
@@ -400,6 +562,46 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
     size_t                u16_count = mdl.indices.size() * 3;
     indices.resize(u16_count / 2 + 1);
     memcpy(indices.data(), mdl.indices.data(), u16_count * sizeof(uint16_t));
+
+    mesh.AddVertexArray(std::move(vertex));
+    mesh.AddIndexArray(SceneIndexArray(indices));
+}
+
+void WPMdlParser::GenStaticMesh(SceneMesh& mesh, const WPMdl::StaticChunk& chunk) {
+    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 },
+                              { WE_IN_NORMAL.data(), VertexType::FLOAT3 },
+                              { WE_IN_TANGENT4.data(), VertexType::FLOAT4 },
+                              { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 },
+                              { WE_IN_TEXCOORDC2.data(), VertexType::FLOAT2 },
+                              { WE_IN_TEXCOORDVEC4.data(), VertexType::FLOAT4 } },
+                            chunk.vertexs.size());
+
+    // The static model vertex upload intentionally uses the padded SceneVertexArray contract:
+    // FLOAT3 attributes reserve four floats, FLOAT4 reserves four, and FLOAT2 reserves four. The
+    // filler values stay zero, giving Vulkan a stable 24-float stride while preserving the actual
+    // shader-facing attribute sizes reflected from the model shader. Static model shaders are not
+    // consistent about UV naming: older variants read a_TexCoord, some tools expose the secondary
+    // channel as a_TexCoordC2, and Arsenal's lightmapped generic shader reads both channels packed
+    // as a_TexCoordVec4.xyzw. Duplicating the two UV channels keeps all three contracts valid and
+    // prevents missing attributes from being silently rebound to offset zero.
+    std::array<float, 24> one_vert {};
+    for (uint i = 0; i < chunk.vertexs.size(); i++) {
+        const auto& v = chunk.vertexs[i];
+        one_vert.fill(0.0f);
+        memcpy(one_vert.data(), v.position.data(), sizeof(v.position));
+        memcpy(one_vert.data() + 4, v.normal.data(), sizeof(v.normal));
+        memcpy(one_vert.data() + 8, v.tangent4.data(), sizeof(v.tangent4));
+        memcpy(one_vert.data() + 12, v.texcoord.data(), sizeof(v.texcoord));
+        memcpy(one_vert.data() + 16, v.texcoord2.data(), sizeof(v.texcoord2));
+        memcpy(one_vert.data() + 20, v.texcoord.data(), sizeof(v.texcoord));
+        memcpy(one_vert.data() + 22, v.texcoord2.data(), sizeof(v.texcoord2));
+        vertex.SetVertexs(i, one_vert);
+    }
+
+    std::vector<uint32_t> indices;
+    size_t                u16_count = chunk.indices.size() * 3;
+    indices.resize(u16_count / 2 + 1);
+    memcpy(indices.data(), chunk.indices.data(), u16_count * sizeof(uint16_t));
 
     mesh.AddVertexArray(std::move(vertex));
     mesh.AddIndexArray(SceneIndexArray(indices));

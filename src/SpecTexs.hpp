@@ -32,6 +32,8 @@ constexpr std::string_view WE_EFFECT_PPONG_PREFIX_A { "_rt_effect_pingpong_a_" }
 constexpr std::string_view WE_EFFECT_PPONG_PREFIX_B { "_rt_effect_pingpong_b_" };
 
 constexpr std::string_view WE_IN_POSITION { "a_Position" };
+constexpr std::string_view WE_IN_NORMAL { "a_Normal" };
+constexpr std::string_view WE_IN_TANGENT4 { "a_Tangent4" };
 constexpr std::string_view WE_IN_TEXCOORD { "a_TexCoord" };
 constexpr std::string_view WE_IN_BLENDINDICES { "a_BlendIndices" };
 constexpr std::string_view WE_IN_BLENDWEIGHTS { "a_BlendWeights" };
@@ -62,6 +64,15 @@ constexpr std::string_view G_ETVP { "g_EffectTextureProjectionMatrix" };
 constexpr std::string_view G_ETVPI { "g_EffectTextureProjectionMatrixInverse" };
 constexpr std::string_view G_LP { "g_LightsPosition" };
 constexpr std::string_view G_LCP { "g_LightsColorPremultiplied" };
+// First-party 3D model shaders read this separate color/radius payload instead of the older
+// premultiplied light vector used by existing 2D shaders, so the updater gates it to model nodes.
+constexpr std::string_view G_LCR { "g_LightsColorRadius" };
+constexpr std::string_view G_EYE_POSITION { "g_EyePosition" };
+// These camera basis vectors are seeded and updated only for the model-only perspective camera;
+// keeping them named here avoids ad-hoc string literals without expanding the legacy 2D contract.
+constexpr std::string_view G_VIEWUP { "g_ViewUp" };
+constexpr std::string_view G_VIEWRIGHT { "g_ViewRight" };
+constexpr std::string_view G_VIEWFORWARD { "g_ViewForward" };
 
 constexpr std::string_view G_TIME { "g_Time" };
 constexpr std::string_view G_DAYTIME { "g_DayTime" };

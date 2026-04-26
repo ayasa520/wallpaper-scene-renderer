@@ -6,6 +6,7 @@
 #include "SpecTexs.hpp"
 #include "Vulkan/Shader.hpp"
 #include "Vulkan/VideoTextureCache.hpp"
+#include "vvk/vma_wrapper.hpp"
 #include "Utils/Logging.h"
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
@@ -25,12 +26,8 @@ using namespace wallpaper::vulkan;
 namespace
 {
 constexpr std::array<std::string_view, 6> kAudioSpectrumUniformNames {
-    "g_AudioSpectrum16Left",
-    "g_AudioSpectrum16Right",
-    "g_AudioSpectrum32Left",
-    "g_AudioSpectrum32Right",
-    "g_AudioSpectrum64Left",
-    "g_AudioSpectrum64Right",
+    "g_AudioSpectrum16Left",  "g_AudioSpectrum16Right", "g_AudioSpectrum32Left",
+    "g_AudioSpectrum32Right", "g_AudioSpectrum64Left",  "g_AudioSpectrum64Right",
 };
 
 bool HasAudioSpectrumUniforms(const ShaderReflected::Block& block) {
@@ -75,7 +72,7 @@ std::string DescribeMaterialUniformValue(const wallpaper::SceneMaterial& materia
     return oss.str();
 }
 
-template <typename Map>
+template<typename Map>
 std::string DescribeUniformMap(const Map& values) {
     std::ostringstream oss;
     oss << "{";
@@ -115,6 +112,53 @@ std::string DescribeTextureList(const wallpaper::SceneMaterial& material) {
     return oss.str();
 }
 
+std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent) {
+    // Model depth is allocated only for opt-in 3D model passes. The existing 2D render-target cache
+    // remains color-only, while separate model chunk passes can still behave like one depth-tested
+    // scene when they share the same output texture.
+    VmaImageParameters image;
+    VkImageCreateInfo  info {
+        .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext                 = nullptr,
+        .imageType             = VK_IMAGE_TYPE_2D,
+        .format                = VK_FORMAT_D32_SFLOAT,
+        .extent                = extent,
+        .mipLevels             = 1,
+        .arrayLayers           = 1,
+        .samples               = VK_SAMPLE_COUNT_1_BIT,
+        .tiling                = VK_IMAGE_TILING_OPTIMAL,
+        .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    image.extent       = extent;
+    image.mipmap_level = 1;
+
+    VmaAllocationCreateInfo vma_info {};
+    vma_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VVK_CHECK_ACT(return std::nullopt,
+                         vvk::CreateImage(device.vma_allocator(), info, vma_info, image.handle));
+
+    VkImageViewCreateInfo view_info {
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext    = nullptr,
+        .image    = *image.handle,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format   = VK_FORMAT_D32_SFLOAT,
+        .subresourceRange =
+            VkImageSubresourceRange {
+                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
+                .baseMipLevel   = 0,
+                .levelCount     = 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+    };
+    VVK_CHECK_ACT(return std::nullopt, device.handle().CreateImageView(view_info, image.view));
+    return image;
+}
+
 std::string DescribeDescTextureList(const std::vector<std::string>& textures) {
     std::ostringstream oss;
     oss << "[";
@@ -140,12 +184,12 @@ std::string DescribeBlockMemberList(const ShaderReflected::Block& block) {
     return oss.str();
 }
 
-void LogAudioUniformBlockLayout(const CustomShaderPass::Desc& desc,
+void LogAudioUniformBlockLayout(const CustomShaderPass::Desc&   desc,
                                 const wallpaper::SceneMaterial& material,
-                                const ShaderReflected::Block& block) {
-    if (!HasAudioSpectrumUniforms(block)) return;
+                                const ShaderReflected::Block&   block) {
+    if (! HasAudioSpectrumUniforms(block)) return;
 
-    const auto* node = desc.node;
+    const auto* node   = desc.node;
     const auto* shader = material.customShader.shader.get();
     LOG_INFO("SceneAudioUniformBlock: layer=%d name='%s' shader='%s' members=%s",
              node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
@@ -154,58 +198,61 @@ void LogAudioUniformBlockLayout(const CustomShaderPass::Desc& desc,
              DescribeBlockMemberList(block).c_str());
 }
 
-void LogAudioReactivePassConfig(const CustomShaderPass::Desc& desc,
+void LogAudioReactivePassConfig(const CustomShaderPass::Desc&   desc,
                                 const wallpaper::SceneMaterial& material,
-                                const ShaderReflected::Block& block) {
-    if (!HasAudioSpectrumUniforms(block)) return;
+                                const ShaderReflected::Block&   block) {
+    if (! HasAudioSpectrumUniforms(block)) return;
 
-    const auto* node = desc.node;
+    const auto* node   = desc.node;
     const auto* shader = material.customShader.shader.get();
-    LOG_INFO(
-        "SceneAudioPass: layer=%d name='%s' shader='%s' output='%s' visible=%s textures=%zu barCount=%s volumeFactor=%s barBounds=%s barOpacity=%s barSpacing=%s barColor=%s hideTs=%s dynamicHide=%s radius=%s segmentSpacing=%s segmentCount=%s segmentThreshold=%s textureList=%s",
-        node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
-        node != nullptr ? node->Name().c_str() : "<null>",
-        shader != nullptr ? shader->name.c_str() : "<null>",
-        desc.output.c_str(),
-        node != nullptr && node->Visible() ? "true" : "false",
-        desc.textures.size(),
-        DescribeMaterialUniformValue(material, "u_BarCount").c_str(),
-        DescribeMaterialUniformValue(material, "u_VolumeFactor").c_str(),
-        DescribeMaterialUniformValue(material, "u_BarBounds").c_str(),
-        DescribeMaterialUniformValue(material, "u_BarOpacity").c_str(),
-        DescribeMaterialUniformValue(material, "u_BarSpacing").c_str(),
-        DescribeMaterialUniformValue(material, "u_BarColor").c_str(),
-        DescribeMaterialUniformValue(material, "u_TsOfHiding").c_str(),
-        DescribeMaterialUniformValue(material, "u_DynamicHiding").c_str(),
-        DescribeMaterialUniformValue(material, "u_Radius").c_str(),
-        DescribeMaterialUniformValue(material, "u_SegmentSpacing").c_str(),
-        DescribeMaterialUniformValue(material, "u_SegmentCount").c_str(),
-        DescribeMaterialUniformValue(material, "u_SegmentThreshold").c_str(),
-        DescribeTextureList(material).c_str());
+    LOG_INFO("SceneAudioPass: layer=%d name='%s' shader='%s' output='%s' visible=%s textures=%zu "
+             "barCount=%s volumeFactor=%s barBounds=%s barOpacity=%s barSpacing=%s barColor=%s "
+             "hideTs=%s dynamicHide=%s radius=%s segmentSpacing=%s segmentCount=%s "
+             "segmentThreshold=%s textureList=%s",
+             node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
+             node != nullptr ? node->Name().c_str() : "<null>",
+             shader != nullptr ? shader->name.c_str() : "<null>",
+             desc.output.c_str(),
+             node != nullptr && node->Visible() ? "true" : "false",
+             desc.textures.size(),
+             DescribeMaterialUniformValue(material, "u_BarCount").c_str(),
+             DescribeMaterialUniformValue(material, "u_VolumeFactor").c_str(),
+             DescribeMaterialUniformValue(material, "u_BarBounds").c_str(),
+             DescribeMaterialUniformValue(material, "u_BarOpacity").c_str(),
+             DescribeMaterialUniformValue(material, "u_BarSpacing").c_str(),
+             DescribeMaterialUniformValue(material, "u_BarColor").c_str(),
+             DescribeMaterialUniformValue(material, "u_TsOfHiding").c_str(),
+             DescribeMaterialUniformValue(material, "u_DynamicHiding").c_str(),
+             DescribeMaterialUniformValue(material, "u_Radius").c_str(),
+             DescribeMaterialUniformValue(material, "u_SegmentSpacing").c_str(),
+             DescribeMaterialUniformValue(material, "u_SegmentCount").c_str(),
+             DescribeMaterialUniformValue(material, "u_SegmentThreshold").c_str(),
+             DescribeTextureList(material).c_str());
 }
 
-void LogAudioCompositePassConfig(const CustomShaderPass::Desc&  desc,
+void LogAudioCompositePassConfig(const CustomShaderPass::Desc&   desc,
                                  const wallpaper::SceneMaterial& material) {
-    const auto* node = desc.node;
+    const auto* node   = desc.node;
     const auto* shader = material.customShader.shader.get();
     if (shader == nullptr || shader->name != "genericimage3") return;
 
-    LOG_INFO(
-        "SceneAudioCompositeConfig: layer=%d name='%s' ptr=%p shader='%s' output='%s' visible=%s textures=%zu texture0='%s' blendMode=%d color4=%s alpha=%s userAlpha=%s brightness=%s textureList=%s",
-        node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
-        node != nullptr ? node->Name().c_str() : "<null>",
-        static_cast<const void*>(node),
-        shader->name.c_str(),
-        desc.output.c_str(),
-        node != nullptr && node->Visible() ? "true" : "false",
-        material.textures.size(),
-        !material.textures.empty() ? material.textures[0].c_str() : "<none>",
-        static_cast<int>(material.blenmode),
-        DescribeMaterialUniformValue(material, "g_Color4").c_str(),
-        DescribeMaterialUniformValue(material, "g_Alpha").c_str(),
-        DescribeMaterialUniformValue(material, "g_UserAlpha").c_str(),
-        DescribeMaterialUniformValue(material, "g_Brightness").c_str(),
-        DescribeTextureList(material).c_str());
+    LOG_INFO("SceneAudioCompositeConfig: layer=%d name='%s' ptr=%p shader='%s' output='%s' "
+             "visible=%s textures=%zu texture0='%s' blendMode=%d color4=%s alpha=%s userAlpha=%s "
+             "brightness=%s textureList=%s",
+             node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
+             node != nullptr ? node->Name().c_str() : "<null>",
+             static_cast<const void*>(node),
+             shader->name.c_str(),
+             desc.output.c_str(),
+             node != nullptr && node->Visible() ? "true" : "false",
+             material.textures.size(),
+             ! material.textures.empty() ? material.textures[0].c_str() : "<none>",
+             static_cast<int>(material.blenmode),
+             DescribeMaterialUniformValue(material, "g_Color4").c_str(),
+             DescribeMaterialUniformValue(material, "g_Alpha").c_str(),
+             DescribeMaterialUniformValue(material, "g_UserAlpha").c_str(),
+             DescribeMaterialUniformValue(material, "g_Brightness").c_str(),
+             DescribeTextureList(material).c_str());
     LOG_INFO("SceneAudioCompositeConfig: constValues=%s",
              DescribeUniformMap(material.customShader.constValues).c_str());
     if (shader != nullptr) {
@@ -215,7 +262,7 @@ void LogAudioCompositePassConfig(const CustomShaderPass::Desc&  desc,
 }
 
 void LogAudioReactivePassExecute(const CustomShaderPass::Desc& desc) {
-    const auto* node = desc.node;
+    const auto* node         = desc.node;
     auto*       mutable_node = const_cast<wallpaper::SceneNode*>(node);
     if (mutable_node == nullptr || mutable_node->Mesh() == nullptr ||
         mutable_node->Mesh()->Material() == nullptr) {
@@ -223,22 +270,22 @@ void LogAudioReactivePassExecute(const CustomShaderPass::Desc& desc) {
     }
 
     const auto& material = *mutable_node->Mesh()->Material();
-    const auto* shader = material.customShader.shader.get();
+    const auto* shader   = material.customShader.shader.get();
     if (shader == nullptr) return;
-    const bool is_audio_bar_shader =
-        shader->name.find("Simple_Audio_Bars") != std::string::npos;
-    if (!is_audio_bar_shader) return;
+    const bool is_audio_bar_shader = shader->name.find("Simple_Audio_Bars") != std::string::npos;
+    if (! is_audio_bar_shader) return;
 
     static std::unordered_map<int32_t, size_t> s_log_counts;
-    const auto layer_id = mutable_node->ID();
-    const auto count = ++s_log_counts[layer_id];
+    const auto                                 layer_id = mutable_node->ID();
+    const auto                                 count    = ++s_log_counts[layer_id];
     if (count != 1 && (count % 300) != 0) return;
 
     const auto& t = node->Translate();
     const auto& s = node->Scale();
     const auto& r = node->Rotation();
     LOG_INFO(
-        "SceneAudioPassExecute: layer=%d name='%s' output='%s' visible=%s drawCount=%u indexed=%s rt=%ux%u translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) rotation=(%.3f,%.3f,%.3f)",
+        "SceneAudioPassExecute: layer=%d name='%s' output='%s' visible=%s drawCount=%u indexed=%s "
+        "rt=%ux%u translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) rotation=(%.3f,%.3f,%.3f)",
         layer_id,
         node->Name().c_str(),
         desc.output.c_str(),
@@ -256,21 +303,20 @@ void LogAudioReactivePassExecute(const CustomShaderPass::Desc& desc) {
         r.x(),
         r.y(),
         r.z());
-    LOG_INFO("SceneAudioPassExecute: textures=%s",
-             DescribeTextureList(material).c_str());
+    LOG_INFO("SceneAudioPassExecute: textures=%s", DescribeTextureList(material).c_str());
     LOG_INFO("SceneAudioPassExecute: desc-textures=%s",
              DescribeDescTextureList(desc.textures).c_str());
 }
 
 void LogAudioCompositePassExecute(const CustomShaderPass::Desc& desc) {
-    const auto* node = desc.node;
+    const auto* node         = desc.node;
     auto*       mutable_node = const_cast<wallpaper::SceneNode*>(node);
     if (mutable_node == nullptr || mutable_node->Mesh() == nullptr ||
         mutable_node->Mesh()->Material() == nullptr) {
         return;
     }
 
-    const auto* shader = mutable_node->Mesh()->Material()->customShader.shader.get();
+    const auto* shader   = mutable_node->Mesh()->Material()->customShader.shader.get();
     const auto* material = mutable_node->Mesh()->Material();
     if (shader == nullptr || material == nullptr) return;
     if (shader->name != "genericimage3") {
@@ -278,42 +324,42 @@ void LogAudioCompositePassExecute(const CustomShaderPass::Desc& desc) {
     }
 
     static std::unordered_map<int32_t, size_t> s_log_counts;
-    const auto layer_id = mutable_node->ID();
-    const auto count = ++s_log_counts[layer_id];
+    const auto                                 layer_id = mutable_node->ID();
+    const auto                                 count    = ++s_log_counts[layer_id];
     if (count != 1 && (count % 300) != 0) return;
 
     const auto& t = node->Translate();
     const auto& s = node->Scale();
     const auto& r = node->Rotation();
-    LOG_INFO(
-        "SceneAudioCompositePassExecute: layer=%d name='%s' ptr=%p output='%s' visible=%s drawCount=%u indexed=%s rt=%ux%u translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) rotation=(%.3f,%.3f,%.3f)",
-        layer_id,
-        node->Name().c_str(),
-        static_cast<const void*>(node),
-        desc.output.c_str(),
-        node->Visible() ? "true" : "false",
-        desc.draw_count,
-        desc.index_buf ? "true" : "false",
-        desc.vk_output.extent.width,
-        desc.vk_output.extent.height,
-        t.x(),
-        t.y(),
-        t.z(),
-        s.x(),
-        s.y(),
-        s.z(),
-        r.x(),
-        r.y(),
-        r.z());
+    LOG_INFO("SceneAudioCompositePassExecute: layer=%d name='%s' ptr=%p output='%s' visible=%s "
+             "drawCount=%u indexed=%s rt=%ux%u translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) "
+             "rotation=(%.3f,%.3f,%.3f)",
+             layer_id,
+             node->Name().c_str(),
+             static_cast<const void*>(node),
+             desc.output.c_str(),
+             node->Visible() ? "true" : "false",
+             desc.draw_count,
+             desc.index_buf ? "true" : "false",
+             desc.vk_output.extent.width,
+             desc.vk_output.extent.height,
+             t.x(),
+             t.y(),
+             t.z(),
+             s.x(),
+             s.y(),
+             s.z(),
+             r.x(),
+             r.y(),
+             r.z());
     LOG_INFO("SceneAudioCompositePassExecute: texture0='%s'",
-             !material->textures.empty() ? material->textures[0].c_str() : "<none>");
-    LOG_INFO("SceneAudioCompositePassExecute: textures=%s",
-             DescribeTextureList(*material).c_str());
+             ! material->textures.empty() ? material->textures[0].c_str() : "<none>");
+    LOG_INFO("SceneAudioCompositePassExecute: textures=%s", DescribeTextureList(*material).c_str());
     LOG_INFO("SceneAudioCompositePassExecute: desc-textures=%s",
              DescribeDescTextureList(desc.textures).c_str());
 }
 
-}
+} // namespace
 
 CustomShaderPass::CustomShaderPass(const Desc& desc) {
     // The render graph builder already classifies hidden offscreen dependencies and gives passes
@@ -326,6 +372,10 @@ CustomShaderPass::CustomShaderPass(const Desc& desc) {
     m_desc.textures            = desc.textures;
     m_desc.output              = desc.output;
     m_desc.sprites_map         = desc.sprites_map;
+    m_desc.model_pass          = desc.model_pass;
+    m_desc.depth_test          = desc.depth_test;
+    m_desc.depth_write         = desc.depth_write;
+    m_desc.clear_depth         = desc.clear_depth;
 };
 CustomShaderPass::~CustomShaderPass() {}
 
@@ -340,9 +390,10 @@ bool CustomShaderPass::referencesRenderTarget(std::string_view render_target) co
     return false;
 }
 
-std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFormat format,
-                                                VkAttachmentLoadOp loadOp,
-                                                VkImageLayout      finalLayout) {
+std::optional<vvk::RenderPass>
+CreateRenderPass(const vvk::Device& device, VkFormat format, VkAttachmentLoadOp loadOp,
+                 VkImageLayout finalLayout, bool withDepth = false,
+                 VkAttachmentLoadOp depthLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR) {
     VkAttachmentDescription attachment {
         .format         = format,
         .samples        = VK_SAMPLE_COUNT_1_BIT,
@@ -363,25 +414,49 @@ std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFor
         .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
     };
 
+    VkAttachmentDescription depth_attachment {
+        .format         = VK_FORMAT_D32_SFLOAT,
+        .samples        = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp         = depthLoadOp,
+        .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout  = depthLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD
+                              ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                              : VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    VkAttachmentReference depth_attachment_ref {
+        .attachment = 1,
+        .layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    std::array<VkAttachmentDescription, 2> attachments { attachment, depth_attachment };
+
     VkSubpassDescription subpass {
-        .pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .colorAttachmentCount = 1,
-        .pColorAttachments    = &attachment_ref,
+        .pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount    = 1,
+        .pColorAttachments       = &attachment_ref,
+        .pDepthStencilAttachment = withDepth ? &depth_attachment_ref : nullptr,
     };
 
     VkSubpassDependency dependency {
-        .srcSubpass    = VK_SUBPASS_EXTERNAL,
-        .dstSubpass    = 0,
-        .srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcSubpass = VK_SUBPASS_EXTERNAL,
+        .dstSubpass = 0,
+        .srcStageMask =
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
         .srcAccessMask = {},
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
     };
 
     VkRenderPassCreateInfo creatinfo {
         .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &attachment,
+        .attachmentCount = withDepth ? 2u : 1u,
+        .pAttachments    = attachments.data(),
         .subpassCount    = 1,
         .pSubpasses      = &subpass,
         .dependencyCount = 1,
@@ -412,6 +487,17 @@ static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
     const size_t reflectedSize = uni->second.size;
     const size_t packedSize    = value_u8.size();
 
+    if (reflectedSize < packedSize) {
+        // Some first-party model shaders declare compact matrix uniforms such as `mat3
+        // g_ModelMatrix`, while the runtime updater naturally owns a full 4x4 scene transform.
+        // Writing the whole packed matrix would overflow the reflected member slot and corrupt the
+        // following uniforms, most visibly Fantastic Car's grid projection matrix. Clamp only at
+        // the upload boundary so 2D shader generation and the shared ShaderValue representation do
+        // not need a model-specific branch.
+        buf->writeToBuf(bufref, value_u8.subspan(0, reflectedSize), offset);
+        return;
+    }
+
     if (reflectedSize == packedSize || value.size() <= 1) {
         buf->writeToBuf(bufref, value_u8, offset);
         return;
@@ -425,10 +511,9 @@ static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
         const size_t stride = reflectedSize / value.size();
         if (stride >= sizeof(ShaderValue::value_type)) {
             for (size_t i = 0; i < value.size(); i++) {
-                std::span<uint8_t> elem {
-                    reinterpret_cast<uint8_t*>(const_cast<ShaderValue::value_type*>(&value[i])),
-                    sizeof(ShaderValue::value_type)
-                };
+                std::span<uint8_t> elem { reinterpret_cast<uint8_t*>(
+                                              const_cast<ShaderValue::value_type*>(&value[i])),
+                                          sizeof(ShaderValue::value_type) };
                 buf->writeToBuf(bufref, elem, offset + i * stride);
             }
             return;
@@ -438,13 +523,12 @@ static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
     buf->writeToBuf(bufref, value_u8, offset);
 }
 
-static void WriteMaterialUniforms(StagingBuffer*                    buf,
-                                  const StagingBufferRef&           bufref,
-                                  const ShaderReflected::Block&     block,
-                                  const wallpaper::SceneMaterial&   material) {
+static void WriteMaterialUniforms(StagingBuffer* buf, const StagingBufferRef& bufref,
+                                  const ShaderReflected::Block&   block,
+                                  const wallpaper::SceneMaterial& material) {
     auto write_values = [&](const auto& values) {
         for (const auto& [name, value] : values) {
-            if (!wallpaper::exists(block.member_map, name)) continue;
+            if (! wallpaper::exists(block.member_map, name)) continue;
             UpdateUniform(buf, bufref, block, name, value);
         }
     };
@@ -457,7 +541,8 @@ static void WriteMaterialUniforms(StagingBuffer*                    buf,
 
 void LogStagingAllocRequest(std::string_view kind, const CustomShaderPass::Desc& desc,
                             VkDeviceSize size) {
-    LOG_INFO("StagingAllocRequest: kind=%.*s node='%s' camera='%s' shader='%s' output='%s' size=%zu dyn=%s",
+    LOG_INFO("StagingAllocRequest: kind=%.*s node='%s' camera='%s' shader='%s' output='%s' "
+             "size=%zu dyn=%s",
              static_cast<int>(kind.size()),
              kind.data(),
              desc.node ? desc.node->Name().c_str() : "<null>",
@@ -472,19 +557,16 @@ void LogStagingAllocRequest(std::string_view kind, const CustomShaderPass::Desc&
 }
 
 constexpr VkDeviceSize kInitialDynamicSuballocationSize = 64 * 1024;
-constexpr VkDeviceSize kDynamicIndexQuadFloorSize = sizeof(uint16_t) * 6;
+constexpr VkDeviceSize kDynamicIndexQuadFloorSize       = sizeof(uint16_t) * 6;
 
-VkDeviceSize InitialDynamicSuballocationSize(VkDeviceSize capacity,
-                                             VkDeviceSize live_size,
+VkDeviceSize InitialDynamicSuballocationSize(VkDeviceSize capacity, VkDeviceSize live_size,
                                              VkDeviceSize element_size) {
     if (capacity == 0) return 0;
 
     const VkDeviceSize non_empty_element = std::max<VkDeviceSize>(element_size, 1);
-    const VkDeviceSize required_live = std::max<VkDeviceSize>(live_size, non_empty_element);
-    const VkDeviceSize bootstrap =
-        std::min<VkDeviceSize>(capacity,
-                               std::max<VkDeviceSize>(kInitialDynamicSuballocationSize,
-                                                      non_empty_element));
+    const VkDeviceSize required_live     = std::max<VkDeviceSize>(live_size, non_empty_element);
+    const VkDeviceSize bootstrap         = std::min<VkDeviceSize>(
+        capacity, std::max<VkDeviceSize>(kInitialDynamicSuballocationSize, non_empty_element));
 
     // Dynamic particle meshes often advertise a very large theoretical capacity while starting
     // with zero live vertices. Reserve only a small bootstrap range up front, but never choose a
@@ -496,51 +578,131 @@ VkDeviceSize DynamicVertexUploadSize(const wallpaper::SceneVertexArray& vertex) 
     // Vertex arrays expose both live bytes and authored capacity. Use the live byte count for the
     // first upload so character-rain style particle systems do not reserve their entire theoretical
     // maximum before any spawned particles exist.
-    return InitialDynamicSuballocationSize(
-        static_cast<VkDeviceSize>(vertex.CapacitySizeOf()),
-        static_cast<VkDeviceSize>(vertex.DataSizeOf()),
-        static_cast<VkDeviceSize>(vertex.OneSizeOf()));
+    return InitialDynamicSuballocationSize(static_cast<VkDeviceSize>(vertex.CapacitySizeOf()),
+                                           static_cast<VkDeviceSize>(vertex.DataSizeOf()),
+                                           static_cast<VkDeviceSize>(vertex.OneSizeOf()));
 }
 
 VkDeviceSize DynamicIndexUploadSize(const wallpaper::SceneIndexArray& indice) {
     // Index buffers follow the same bootstrap rule as vertices, but CustomShaderPass binds them as
-    // VK_INDEX_TYPE_UINT16 at draw time. SceneIndexArray stores both 32-bit model indices and packed
-    // 16-bit particle indices behind the same byte-count API, so the non-empty dynamic floor must
-    // match the GPU binding size. The effect-dependency route added for private image composites can
-    // expose one-quad particle helpers with only 12 bytes of authored capacity; using a 24-byte
-    // uint32_t floor makes those valid helpers fail before their first dynamic upload.
-    return InitialDynamicSuballocationSize(
-        static_cast<VkDeviceSize>(indice.CapacitySizeof()),
-        static_cast<VkDeviceSize>(indice.DataSizeOf()),
-        kDynamicIndexQuadFloorSize);
+    // VK_INDEX_TYPE_UINT16 at draw time. SceneIndexArray stores both 32-bit model indices and
+    // packed 16-bit particle indices behind the same byte-count API, so the non-empty dynamic floor
+    // must match the GPU binding size. The effect-dependency route added for private image
+    // composites can expose one-quad particle helpers with only 12 bytes of authored capacity;
+    // using a 24-byte uint32_t floor makes those valid helpers fail before their first dynamic
+    // upload.
+    return InitialDynamicSuballocationSize(static_cast<VkDeviceSize>(indice.CapacitySizeof()),
+                                           static_cast<VkDeviceSize>(indice.DataSizeOf()),
+                                           kDynamicIndexQuadFloorSize);
+}
+
+VkCullModeFlags ToVkCullMode(wallpaper::SceneCullMode mode) {
+    switch (mode) {
+    case wallpaper::SceneCullMode::None: return VK_CULL_MODE_NONE;
+    case wallpaper::SceneCullMode::Back: return VK_CULL_MODE_BACK_BIT;
+    case wallpaper::SceneCullMode::Front: return VK_CULL_MODE_FRONT_BIT;
+    }
+    return VK_CULL_MODE_NONE;
+}
+
+wallpaper::SceneCullMode ResolveModelCullMode(wallpaper::SceneCullMode mode,
+                                              bool                     mirrored_handedness) {
+    if (! mirrored_handedness) return mode;
+
+    // A floor reflection uses a negative scale, so the model transform changes handedness and the
+    // authored triangle winding is observed backwards by Vulkan. Flip only front/back model culling
+    // here; `None` stays double-sided for receiver materials such as reflection grids, and
+    // non-model custom shader passes never carry SceneModelRenderState at all.
+    switch (mode) {
+    case wallpaper::SceneCullMode::Back: return wallpaper::SceneCullMode::Front;
+    case wallpaper::SceneCullMode::Front: return wallpaper::SceneCullMode::Back;
+    case wallpaper::SceneCullMode::None: return wallpaper::SceneCullMode::None;
+    }
+    return mode;
+}
+
+bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
+                                  std::string_view camera_name) {
+    const bool is_model_pass = material.modelRenderState.has_value();
+    // Model shaders may output non-opaque alpha for their own material math. Fantastic Car's body
+    // shader writes alpha=0.4 even though the car is an opaque final scene object; allowing that
+    // alpha into `_rt_default` makes FinPass present a translucent frame and visually crushes the
+    // lighting. Keep the RGB blend factors intact for translucent model materials, but preserve the
+    // target alpha just like global 2D passes.
+    return ! is_model_pass &&
+        ! (camera_name.empty() || wallpaper::sstart_with(camera_name, "global"));
+}
+
+void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
+                        wallpaper::vulkan::CustomShaderPass::Desc& desc,
+                        VkAttachmentLoadOp&                        load_op) {
+    const auto& model_state = material.modelRenderState;
+    if (! model_state.has_value()) return;
+
+    desc.model_pass  = true;
+    desc.depth_test  = model_state->depthTest;
+    desc.depth_write = model_state->depthWrite;
+    // Model passes are the only custom-shader passes allowed to override the historical load/cull
+    // defaults. `preserveColor` lets consecutive opaque model chunks compose into the same render
+    // target without making ordinary 2D image/effect passes load stale framebuffer contents.
+    if (model_state->preserveColor) load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+}
+
+void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  material,
+                             const wallpaper::vulkan::CustomShaderPass::Desc& desc,
+                             GraphicsPipeline&                                pipeline) {
+    const auto& model_state = material.modelRenderState;
+    if (! model_state.has_value()) return;
+
+    // Only model materials can carry this optional state. Applying it here keeps culling separate
+    // from the old 2D custom-shader defaults while still using the existing pipeline construction
+    // path for shader reflection, descriptors, and mesh buffers.
+    pipeline.depth.depthTestEnable       = desc.depth_test;
+    pipeline.depth.depthWriteEnable      = desc.depth_write;
+    pipeline.depth.depthCompareOp        = VK_COMPARE_OP_LESS_OR_EQUAL;
+    pipeline.depth.depthBoundsTestEnable = false;
+    pipeline.depth.stencilTestEnable     = false;
+    const auto effective_cull_mode =
+        ResolveModelCullMode(model_state->cullMode, model_state->mirroredHandedness);
+    pipeline.raster.cullMode = ToVkCullMode(effective_cull_mode);
+    LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' preserve-color=%s "
+             "mirrored-handedness=%s depth-test=%s depth-write=%s depth-clear=%s cull=%u",
+             desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+             material.customShader.shader != nullptr ? material.customShader.shader->name.c_str()
+                                                     : "<null>",
+             desc.output.c_str(),
+             model_state->preserveColor ? "true" : "false",
+             model_state->mirroredHandedness ? "true" : "false",
+             desc.depth_test ? "true" : "false",
+             desc.depth_write ? "true" : "false",
+             desc.clear_depth ? "true" : "false",
+             static_cast<unsigned>(pipeline.raster.cullMode));
 }
 
 VkDeviceSize GrowDynamicSuballocationSize(VkDeviceSize current_size,
-                                          VkDeviceSize required_live_size,
-                                          VkDeviceSize capacity,
+                                          VkDeviceSize required_live_size, VkDeviceSize capacity,
                                           VkDeviceSize element_size) {
     if (capacity == 0) return 0;
 
     // Growth is geometric but clamped to authored capacity. That keeps normal particle expansion
     // amortized while still refusing to cross the renderer-side maximum promised by the scene data.
-    VkDeviceSize next_size = current_size == 0
-        ? InitialDynamicSuballocationSize(capacity, required_live_size, element_size)
-        : current_size;
-    const VkDeviceSize required =
-        std::min<VkDeviceSize>(capacity,
-                               std::max<VkDeviceSize>(required_live_size,
-                                                      std::max<VkDeviceSize>(element_size, 1)));
+    VkDeviceSize next_size =
+        current_size == 0
+            ? InitialDynamicSuballocationSize(capacity, required_live_size, element_size)
+            : current_size;
+    const VkDeviceSize required = std::min<VkDeviceSize>(
+        capacity,
+        std::max<VkDeviceSize>(required_live_size, std::max<VkDeviceSize>(element_size, 1)));
 
     while (next_size < required && next_size < capacity) {
         const VkDeviceSize doubled = next_size > capacity / 2 ? capacity : next_size * 2;
-        next_size = std::max<VkDeviceSize>(required, doubled);
-        next_size = std::min<VkDeviceSize>(next_size, capacity);
+        next_size                  = std::max<VkDeviceSize>(required, doubled);
+        next_size                  = std::min<VkDeviceSize>(next_size, capacity);
     }
     return next_size;
 }
 
-bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
-                                     const Device&    device,
+bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& device,
                                      CustomShaderPass::Desc& desc) {
     desc.vk_textures.resize(desc.textures.size());
     for (wallpaper::usize i = 0; i < desc.textures.size(); i++) {
@@ -551,15 +713,16 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
         }
 
         ImageSlotsRef img_slots;
-        const auto render_target_it = scene.renderTargets.find(tex_name);
+        const auto    render_target_it = scene.renderTargets.find(tex_name);
         if (render_target_it != scene.renderTargets.end()) {
             // The scene render-target table is the authoritative source for internal effect FBOs.
             // Some authored blur chains use plain names like `blur_start_2_<addr>`, so relying only
-            // on the `_rt_` prefix would send valid runtime targets through the material-file parser.
+            // on the `_rt_` prefix would send valid runtime targets through the material-file
+            // parser.
             auto& rt  = render_target_it->second;
             auto  opt = device.tex_cache().Query(
-                tex_name, wallpaper::vulkan::ToTexKey(rt), !rt.allowReuse);
-            if (!opt.has_value()) {
+                tex_name, wallpaper::vulkan::ToTexKey(rt), ! rt.allowReuse);
+            if (! opt.has_value()) {
                 LOG_ERROR("CustomShaderPassRefresh: query input failed node='%s' output='%s' "
                           "slot=%zu texture='%s'",
                           desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
@@ -591,7 +754,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
                     const bool initially_paused =
                         paused_it != scene.videoTexturePaused.end()
                             ? paused_it->second
-                            : (desc.node != nullptr && !desc.node->Visible());
+                            : (desc.node != nullptr && ! desc.node->Visible());
                     img_slots = device.video_tex_cache().Acquire(
                         tex_name, scene.textures.at(tex_name), *image, initially_paused);
                 } else {
@@ -606,7 +769,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
         desc.vk_textures[i] = img_slots;
     }
 
-    auto& tex_name = desc.output;
+    auto&      tex_name  = desc.output;
     const auto output_it = scene.renderTargets.find(tex_name);
     if (output_it == scene.renderTargets.end()) {
         // Outputs must be registered render targets, but they do not have to be `_rt_`-prefixed:
@@ -618,8 +781,8 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
         return false;
     }
     auto& rt = output_it->second;
-    if (auto opt = device.tex_cache().Query(
-            tex_name, wallpaper::vulkan::ToTexKey(rt), !rt.allowReuse);
+    if (auto opt =
+            device.tex_cache().Query(tex_name, wallpaper::vulkan::ToTexKey(rt), ! rt.allowReuse);
         opt.has_value()) {
         desc.vk_output = opt.value();
         return true;
@@ -630,9 +793,36 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene,
     return false;
 }
 
-bool RecreateCustomShaderPassFramebuffer(const Device& device, CustomShaderPass::Desc& desc) {
+VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingResources& rr,
+                                               CustomShaderPass::Desc& desc) {
+    auto&      depth      = rr.model_depth_images[desc.output];
+    const bool missing    = ! depth.view || ! depth.handle;
+    const bool wrong_size = depth.extent.width != desc.vk_output.extent.width ||
+                            depth.extent.height != desc.vk_output.extent.height ||
+                            depth.extent.depth != desc.vk_output.extent.depth;
+    if (missing || wrong_size) {
+        // A single output can receive many model chunk passes. Recreate the shared depth image only
+        // when the output extent changes, then later chunks can load the same depth written by the
+        // earlier chunks in render-graph order.
+        auto replacement = CreateModelDepthImage(device, desc.vk_output.extent);
+        if (! replacement.has_value()) {
+            LOG_ERROR("CustomShaderPassRefresh: cannot create shared model depth image node='%s' "
+                      "output='%s' extent=[%u,%u]",
+                      desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                      desc.output.c_str(),
+                      desc.vk_output.extent.width,
+                      desc.vk_output.extent.height);
+            return nullptr;
+        }
+        depth = std::move(replacement.value());
+    }
+    return &depth;
+}
+
+bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResources& rr,
+                                         CustomShaderPass::Desc& desc) {
     desc.fb.reset();
-    if (!desc.pipeline.pass || desc.vk_output.view == VK_NULL_HANDLE ||
+    if (! desc.pipeline.pass || desc.vk_output.view == VK_NULL_HANDLE ||
         desc.vk_output.extent.width == 0 || desc.vk_output.extent.height == 0) {
         LOG_ERROR("CustomShaderPassRefresh: cannot recreate framebuffer node='%s' output='%s' "
                   "hasRenderPass=%s hasView=%s extent=[%u,%u]",
@@ -644,12 +834,23 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, CustomShaderPass:
                   desc.vk_output.extent.height);
         return false;
     }
+    if (desc.model_pass) {
+        desc.depth_image_ref = QuerySharedModelDepthImage(device, rr, desc);
+        if (desc.depth_image_ref == nullptr) return false;
+    } else {
+        desc.depth_image_ref = nullptr;
+    }
+    std::array<VkImageView, 2> attachments {
+        desc.vk_output.view,
+        desc.depth_image_ref != nullptr && desc.depth_image_ref->view ? *desc.depth_image_ref->view
+                                                                      : VK_NULL_HANDLE,
+    };
     VkFramebufferCreateInfo info {
         .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .pNext           = nullptr,
         .renderPass      = *desc.pipeline.pass,
-        .attachmentCount = 1,
-        .pAttachments    = &desc.vk_output.view,
+        .attachmentCount = desc.model_pass ? 2u : 1u,
+        .pAttachments    = attachments.data(),
         .width           = desc.vk_output.extent.width,
         .height          = desc.vk_output.extent.height,
         .layers          = 1,
@@ -667,7 +868,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     // text bridge updates.
     m_desc.fb.reset();
     m_desc.vk_tex_binding.clear();
-    if (!RefreshCustomShaderPassTextures(scene, device, m_desc)) return;
+    if (! RefreshCustomShaderPassTextures(scene, device, m_desc)) return;
     SceneMesh& mesh = *(m_desc.node->Mesh());
 
     std::vector<Uni_ShaderSpv> spvs;
@@ -708,7 +909,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         }
     }
 
-    if (!ref.blocks.empty() && mesh.Material() != nullptr) {
+    if (! ref.blocks.empty() && mesh.Material() != nullptr) {
         LogAudioReactivePassConfig(m_desc, *mesh.Material(), ref.blocks.front());
         LogAudioCompositePassConfig(m_desc, *mesh.Material());
     }
@@ -741,7 +942,8 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             for (auto& item : ref.input_location_map) {
                 auto& name   = item.first;
                 auto& input  = item.second;
-                usize offset = exists(attrs_map, name) ? attrs_map[name].offset : 0;
+                const bool has_attr = exists(attrs_map, name);
+                usize offset = has_attr ? attrs_map[name].offset : 0;
 
                 VkVertexInputAttributeDescription attr_desc {
                     .location = input.location,
@@ -798,12 +1000,9 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             VkColorComponentFlags colorMask =
                 VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
             const auto camera_name = m_desc.node != nullptr
-                ? std::string_view(m_desc.node->Camera())
-                : std::string_view {};
-            // CustomShaderPass now handles only authored image/effect nodes. First-class text
-            // bridge sources are rendered by TextPass, so alpha-write policy should come from the
-            // pass node itself instead of walking synthetic text helper parents.
-            bool alpha = ! (camera_name.empty() || sstart_with(camera_name, "global"));
+                                         ? std::string_view(m_desc.node->Camera())
+                                         : std::string_view {};
+            const bool alpha       = ShouldWriteCustomShaderAlpha(*mesh.Material(), camera_name);
 
             if (alpha) colorMask |= VK_COLOR_COMPONENT_A_BIT;
             color_blend.colorWriteMask = colorMask;
@@ -813,19 +1012,25 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             m_desc.blending = color_blend.blendEnable;
 
             SetAttachmentLoadOp(blendmode, loadOp);
+            ApplyModelPassDesc(*mesh.Material(), m_desc, loadOp);
         }
         auto opt = CreateRenderPass(device.handle(),
                                     VK_FORMAT_R8G8B8A8_UNORM,
                                     loadOp,
-                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    m_desc.model_pass,
+                                    m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                       : VK_ATTACHMENT_LOAD_OP_LOAD);
         if (! opt.has_value()) return;
         auto& pass = opt.value();
 
         descriptor_info.push_descriptor = true;
         GraphicsPipeline pipeline;
         pipeline.toDefault();
+        ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
         m_desc.pipeline.debug_name =
-            "CustomShaderPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
+            "CustomShaderPass[node=" +
+            (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
             ",output=" + m_desc.output + "]";
         pipeline.addDescriptorSetInfo(spanone { descriptor_info })
             .setColorBlendStates(spanone { color_blend })
@@ -843,7 +1048,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         // can share the same code. Keeping it as an explicit boolean check avoids routing a
         // non-VkResult helper through the `VVK_CHECK_*` macros, which only understand raw Vulkan
         // return codes.
-        if (!RecreateCustomShaderPassFramebuffer(device, m_desc)) return;
+        if (! RecreateCustomShaderPassFramebuffer(device, rr, m_desc)) return;
     }
 
     if (! ref.blocks.empty()) {
@@ -866,142 +1071,140 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             auto& force_dyn_upload = m_desc.force_dyn_upload;
             update_dyn_buf_op =
                 [&mesh, &vertex_bufs, &draw_count, &index_buf, dyn_buf, &force_dyn_upload]() {
-                const bool dirty = mesh.Dirty().load();
-                const bool needs_upload = dirty || force_dyn_upload;
-                if (needs_upload) {
-                    auto ensure_vertex_subref = [&](usize array_index,
-                                                    const wallpaper::SceneVertexArray& vertex) {
-                        if (vertex_bufs.size() <= array_index) {
-                            vertex_bufs.resize(array_index + 1);
-                        }
+                    const bool dirty        = mesh.Dirty().load();
+                    const bool needs_upload = dirty || force_dyn_upload;
+                    if (needs_upload) {
+                        auto ensure_vertex_subref = [&](usize array_index,
+                                                        const wallpaper::SceneVertexArray& vertex) {
+                            if (vertex_bufs.size() <= array_index) {
+                                vertex_bufs.resize(array_index + 1);
+                            }
 
-                        auto& buf = vertex_bufs[array_index];
-                        const auto required_live_size =
-                            static_cast<VkDeviceSize>(std::max<usize>(vertex.DataSizeOf(),
-                                                                      vertex.OneSizeOf()));
-                        if (buf && buf.size >= required_live_size) return true;
+                            auto&      buf                = vertex_bufs[array_index];
+                            const auto required_live_size = static_cast<VkDeviceSize>(
+                                std::max<usize>(vertex.DataSizeOf(), vertex.OneSizeOf()));
+                            if (buf && buf.size >= required_live_size) return true;
 
-                        // Dynamic custom-shader meshes may grow after a pass was prepared. Keep
-                        // this as a renderer-level buffer refresh mechanism for authored dynamic
-                        // meshes, while first-class text is handled by TextPass and never enters
-                        // CustomShaderPass as glyph helper nodes.
-                        const auto required_size = GrowDynamicSuballocationSize(
-                            buf ? buf.size : 0,
-                            required_live_size,
-                            static_cast<VkDeviceSize>(vertex.CapacitySizeOf()),
-                            static_cast<VkDeviceSize>(vertex.OneSizeOf()));
-                        if (required_size < required_live_size) {
-                            LOG_ERROR("DynamicVertexUpload: live data exceeds capacity node='%s' "
-                                      "live=%zu capacity=%zu",
-                                      mesh.Material() != nullptr ? mesh.Material()->name.c_str()
-                                                                 : "<unknown>",
-                                      static_cast<size_t>(required_live_size),
-                                      static_cast<size_t>(vertex.CapacitySizeOf()));
-                            return false;
-                        }
-                        if (buf) {
-                            dyn_buf->unallocateSubRef(buf);
-                            buf = {};
-                        }
-                        if (!dyn_buf->allocateSubRef(required_size, buf)) {
-                            return false;
-                        }
-                        force_dyn_upload = true;
-                        return true;
-                    };
+                            // Dynamic custom-shader meshes may grow after a pass was prepared. Keep
+                            // this as a renderer-level buffer refresh mechanism for authored
+                            // dynamic meshes, while first-class text is handled by TextPass and
+                            // never enters CustomShaderPass as glyph helper nodes.
+                            const auto required_size = GrowDynamicSuballocationSize(
+                                buf ? buf.size : 0,
+                                required_live_size,
+                                static_cast<VkDeviceSize>(vertex.CapacitySizeOf()),
+                                static_cast<VkDeviceSize>(vertex.OneSizeOf()));
+                            if (required_size < required_live_size) {
+                                LOG_ERROR(
+                                    "DynamicVertexUpload: live data exceeds capacity node='%s' "
+                                    "live=%zu capacity=%zu",
+                                    mesh.Material() != nullptr ? mesh.Material()->name.c_str()
+                                                               : "<unknown>",
+                                    static_cast<size_t>(required_live_size),
+                                    static_cast<size_t>(vertex.CapacitySizeOf()));
+                                return false;
+                            }
+                            if (buf) {
+                                dyn_buf->unallocateSubRef(buf);
+                                buf = {};
+                            }
+                            if (! dyn_buf->allocateSubRef(required_size, buf)) {
+                                return false;
+                            }
+                            force_dyn_upload = true;
+                            return true;
+                        };
 
-                    auto release_unused_vertex_subrefs = [&]() {
-                        while (vertex_bufs.size() > mesh.VertexCount()) {
-                            auto& stale_buf = vertex_bufs.back();
-                            if (stale_buf) dyn_buf->unallocateSubRef(stale_buf);
-                            vertex_bufs.pop_back();
-                        }
-                    };
+                        auto release_unused_vertex_subrefs = [&]() {
+                            while (vertex_bufs.size() > mesh.VertexCount()) {
+                                auto& stale_buf = vertex_bufs.back();
+                                if (stale_buf) dyn_buf->unallocateSubRef(stale_buf);
+                                vertex_bufs.pop_back();
+                            }
+                        };
 
-                    auto ensure_index_subref = [&](const wallpaper::SceneIndexArray& indice) {
-                        const auto required_live_size =
-                            static_cast<VkDeviceSize>(std::max<usize>(indice.DataSizeOf(),
-                                                                      kDynamicIndexQuadFloorSize));
-                        if (index_buf && index_buf.size >= required_live_size) return true;
+                        auto ensure_index_subref = [&](const wallpaper::SceneIndexArray& indice) {
+                            const auto required_live_size = static_cast<VkDeviceSize>(
+                                std::max<usize>(indice.DataSizeOf(), kDynamicIndexQuadFloorSize));
+                            if (index_buf && index_buf.size >= required_live_size) return true;
 
-                        const auto required_size = GrowDynamicSuballocationSize(
-                            index_buf ? index_buf.size : 0,
-                            required_live_size,
-                            static_cast<VkDeviceSize>(indice.CapacitySizeof()),
-                            static_cast<VkDeviceSize>(sizeof(uint32_t) * 6));
-                        if (required_size < required_live_size) {
-                            LOG_ERROR("DynamicIndexUpload: live data exceeds capacity live=%zu "
-                                      "capacity=%zu",
-                                      static_cast<size_t>(required_live_size),
-                                      static_cast<size_t>(indice.CapacitySizeof()));
-                            return false;
-                        }
-                        if (index_buf) {
-                            dyn_buf->unallocateSubRef(index_buf);
-                            index_buf = {};
-                        }
-                        if (!dyn_buf->allocateSubRef(required_size, index_buf)) {
-                            return false;
-                        }
-                        force_dyn_upload = true;
-                        return true;
-                    };
+                            const auto required_size = GrowDynamicSuballocationSize(
+                                index_buf ? index_buf.size : 0,
+                                required_live_size,
+                                static_cast<VkDeviceSize>(indice.CapacitySizeof()),
+                                static_cast<VkDeviceSize>(sizeof(uint32_t) * 6));
+                            if (required_size < required_live_size) {
+                                LOG_ERROR("DynamicIndexUpload: live data exceeds capacity live=%zu "
+                                          "capacity=%zu",
+                                          static_cast<size_t>(required_live_size),
+                                          static_cast<size_t>(indice.CapacitySizeof()));
+                                return false;
+                            }
+                            if (index_buf) {
+                                dyn_buf->unallocateSubRef(index_buf);
+                                index_buf = {};
+                            }
+                            if (! dyn_buf->allocateSubRef(required_size, index_buf)) {
+                                return false;
+                            }
+                            force_dyn_upload = true;
+                            return true;
+                        };
 
-                    release_unused_vertex_subrefs();
-                    for (usize i = 0; i < mesh.VertexCount(); i++) {
-                        const auto& vertex = mesh.GetVertexArray(i);
-                        if (!ensure_vertex_subref(i, vertex)) {
-                            mesh.SetDirty();
-                            return;
+                        release_unused_vertex_subrefs();
+                        for (usize i = 0; i < mesh.VertexCount(); i++) {
+                            const auto& vertex = mesh.GetVertexArray(i);
+                            if (! ensure_vertex_subref(i, vertex)) {
+                                mesh.SetDirty();
+                                return;
+                            }
+                            auto& buf = vertex_bufs[i];
+                            if (! dyn_buf->writeToBuf(
+                                    buf, { (uint8_t*)vertex.Data(), vertex.DataSizeOf() })) {
+                                mesh.SetDirty();
+                                return;
+                            }
                         }
-                        auto& buf = vertex_bufs[i];
-                        if (! dyn_buf->writeToBuf(buf,
-                                                  { (uint8_t*)vertex.Data(), vertex.DataSizeOf() }))
-                        {
-                            mesh.SetDirty();
-                            return;
+                        if (mesh.IndexCount() > 0) {
+                            auto& indice = mesh.GetIndexArray(0);
+                            if (! ensure_index_subref(indice)) {
+                                mesh.SetDirty();
+                                return;
+                            }
+                            u32 count  = (u32)((indice.RenderDataCount() * 2) / 3);
+                            draw_count = count * 3;
+                            auto& buf  = index_buf;
+                            if (! dyn_buf->writeToBuf(
+                                    buf, { (uint8_t*)indice.Data(), indice.DataSizeOf() })) {
+                                mesh.SetDirty();
+                                return;
+                            }
+                        } else {
+                            // Dynamic non-indexed meshes are still drawable. Text effect outputs
+                            // use a four-vertex triangle-strip card that is resized in place when
+                            // Date/Day/ Clock content changes; clearing draw_count here made the
+                            // bridge and effect passes execute successfully while submitting no
+                            // final composite geometry at all. The first vertex binding defines the
+                            // vertex count for non-indexed draws, matching the static prepare
+                            // path's draw contract.
+                            draw_count = mesh.VertexCount() > 0
+                                             ? static_cast<u32>(mesh.GetVertexArray(0).DataSize() /
+                                                                mesh.GetVertexArray(0).OneSize())
+                                             : 0;
+                            if (index_buf) {
+                                dyn_buf->unallocateSubRef(index_buf);
+                                index_buf = {};
+                            }
                         }
+                        // Clearing the pass-local bootstrap flag only after all writes succeed
+                        // keeps a freshly compiled dynamic pass from getting stuck with empty GPU
+                        // buffers if an earlier upload attempt bails out partway through due to an
+                        // allocation/write failure. Subsequent frames will keep retrying until the
+                        // first complete upload lands in the new subranges.
+                        mesh.Dirty().store(false);
+                        force_dyn_upload = false;
                     }
-                    if (mesh.IndexCount() > 0) {
-                        auto& indice = mesh.GetIndexArray(0);
-                        if (!ensure_index_subref(indice)) {
-                            mesh.SetDirty();
-                            return;
-                        }
-                        u32   count  = (u32)((indice.RenderDataCount() * 2) / 3);
-                        draw_count   = count * 3;
-                        auto& buf    = index_buf;
-                        if (! dyn_buf->writeToBuf(buf,
-                                                  { (uint8_t*)indice.Data(), indice.DataSizeOf() }))
-                        {
-                            mesh.SetDirty();
-                            return;
-                        }
-                    } else {
-                        // Dynamic non-indexed meshes are still drawable. Text effect outputs use a
-                        // four-vertex triangle-strip card that is resized in place when Date/Day/
-                        // Clock content changes; clearing draw_count here made the bridge and
-                        // effect passes execute successfully while submitting no final composite
-                        // geometry at all. The first vertex binding defines the vertex count for
-                        // non-indexed draws, matching the static prepare path's draw contract.
-                        draw_count = mesh.VertexCount() > 0
-                            ? static_cast<u32>(mesh.GetVertexArray(0).DataSize() /
-                                                mesh.GetVertexArray(0).OneSize())
-                            : 0;
-                        if (index_buf) {
-                            dyn_buf->unallocateSubRef(index_buf);
-                            index_buf = {};
-                        }
-                    }
-                    // Clearing the pass-local bootstrap flag only after all writes succeed keeps a
-                    // freshly compiled dynamic pass from getting stuck with empty GPU buffers if an
-                    // earlier upload attempt bails out partway through due to an allocation/write
-                    // failure. Subsequent frames will keep retrying until the first complete upload
-                    // lands in the new subranges.
-                    mesh.Dirty().store(false);
-                    force_dyn_upload = false;
-                }
-            };
+                };
         }
 
         auto  block  = ref.blocks.front();
@@ -1013,7 +1216,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         auto& sprites        = m_desc.sprites_map;
         auto& vk_textures    = m_desc.vk_textures;
 
-        auto* material       = mesh.Material();
+        auto* material = mesh.Material();
         if (material != nullptr) {
             LogAudioUniformBlockLayout(m_desc, *material, block);
         }
@@ -1022,30 +1225,24 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         // updates stay in execute() so Date/Clock effect composites keep their original layout
         // timing and do not shift when the upload fix is active.
         m_desc.update_dynamic_mesh_op = update_dyn_buf_op;
-        m_desc.update_op = [shader_updater,
-                            block,
-                            buf,
-                            bufref,
-                            node,
-                            material,
-                            &sprites,
-                            &vk_textures]() {
-            auto update_unf_op = [&block, buf, bufref](std::string_view       name,
-                                                       wallpaper::ShaderValue value) {
-                UpdateUniform(buf, *bufref, block, name, value);
-            };
-            if (material != nullptr) {
-                WriteMaterialUniforms(buf, *bufref, block, *material);
-            }
-            shader_updater->UpdateUniforms(node, sprites, update_unf_op);
-            // update image slot for sprites
-            {
-                for (auto& [i, sp] : sprites) {
-                    if (i >= vk_textures.size()) continue;
-                    vk_textures.at(i).active = sp.GetCurFrame().imageId;
+        m_desc.update_op =
+            [shader_updater, block, buf, bufref, node, material, &sprites, &vk_textures]() {
+                auto update_unf_op = [&block, buf, bufref](std::string_view       name,
+                                                           wallpaper::ShaderValue value) {
+                    UpdateUniform(buf, *bufref, block, name, value);
+                };
+                if (material != nullptr) {
+                    WriteMaterialUniforms(buf, *bufref, block, *material);
                 }
-            }
-        };
+                shader_updater->UpdateUniforms(node, sprites, update_unf_op);
+                // update image slot for sprites
+                {
+                    for (auto& [i, sp] : sprites) {
+                        if (i >= vk_textures.size()) continue;
+                        vk_textures.at(i).active = sp.GetCurFrame().imageId;
+                    }
+                }
+            };
 
         auto exists_unf_op = [&block](std::string_view name) {
             return exists(block.member_map, name);
@@ -1060,7 +1257,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     }
 
     {
-        auto& sc           = scene.clearColor;
+        auto& sc = scene.clearColor;
         // TextPass owns transparent clears for exact-size bridge sources. Generic custom shader
         // passes should keep the scene clear contract so image/effect behavior is no longer
         // coupled to text-specific source-pass rules.
@@ -1086,7 +1283,7 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
     // in the scene when the clock/date text changes shape.
     if (m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
         auto& mesh = *m_desc.node->Mesh();
-        if (!mesh.Dynamic() && mesh.Dirty().load()) {
+        if (! mesh.Dynamic() && mesh.Dirty().load()) {
             // Resource-only refreshes were originally written for effects whose geometry never
             // changes after graph build. Refactored text effects break that assumption: runtime
             // updates now mutate the static blur/compose quads of already-compiled effect passes.
@@ -1102,15 +1299,16 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
 
     const auto output_target_it = scene.renderTargets.find(m_desc.output);
     if (output_target_it == scene.renderTargets.end()) {
-        LOG_ERROR("CustomShaderPassRefresh: output target not found before refresh node='%s' output='%s'",
-                  m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
-                  m_desc.output.c_str());
+        LOG_ERROR(
+            "CustomShaderPassRefresh: output target not found before refresh node='%s' output='%s'",
+            m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+            m_desc.output.c_str());
         setPrepared(false);
         return;
     }
-    const auto previous_output_view = m_desc.vk_output.view;
+    const auto previous_output_view   = m_desc.vk_output.view;
     const auto previous_output_extent = m_desc.vk_output.extent;
-    const auto desired_output_key = wallpaper::vulkan::ToTexKey(output_target_it->second);
+    const auto desired_output_key     = wallpaper::vulkan::ToTexKey(output_target_it->second);
     const bool output_extent_changed =
         previous_output_extent.width != static_cast<uint32_t>(desired_output_key.width) ||
         previous_output_extent.height != static_cast<uint32_t>(desired_output_key.height);
@@ -1121,7 +1319,7 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
         // sampled input texture changes, exactly like a particle pass consuming a live source.
         m_desc.fb.reset();
     }
-    if (!RefreshCustomShaderPassTextures(scene, device, m_desc)) {
+    if (! RefreshCustomShaderPassTextures(scene, device, m_desc)) {
         LOG_ERROR("CustomShaderPassRefresh: texture refresh failed node='%s' output='%s'",
                   m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
                   m_desc.output.c_str());
@@ -1129,9 +1327,9 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
         return;
     }
     const bool output_view_changed = previous_output_view != m_desc.vk_output.view;
-    const bool framebuffer_missing = !m_desc.fb;
+    const bool framebuffer_missing = ! m_desc.fb;
     if (framebuffer_missing || output_extent_changed || output_view_changed) {
-        if (!RecreateCustomShaderPassFramebuffer(device, m_desc)) {
+        if (! RecreateCustomShaderPassFramebuffer(device, rr, m_desc)) {
             setPrepared(false);
             return;
         }
@@ -1151,18 +1349,18 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
 }
 
 void CustomShaderPass::updateBeforeUpload() {
-    if (!m_desc.update_dynamic_mesh_op) return;
+    if (! m_desc.update_dynamic_mesh_op) return;
 
-    if (m_desc.should_execute && !m_desc.should_execute()) {
+    if (m_desc.should_execute && ! m_desc.should_execute()) {
         return;
     }
 
-    if (m_desc.node != nullptr && !m_desc.node->LocalVisible()) {
+    if (m_desc.node != nullptr && ! m_desc.node->LocalVisible()) {
         return;
     }
 
     const bool node_visible = m_desc.node == nullptr ? true : m_desc.node->Visible();
-    if (m_desc.node != nullptr && ! node_visible && !m_desc.execute_when_hidden) {
+    if (m_desc.node != nullptr && ! node_visible && ! m_desc.execute_when_hidden) {
         return;
     }
 
@@ -1174,14 +1372,14 @@ void CustomShaderPass::updateBeforeUpload() {
 }
 
 void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
-    if (m_desc.should_execute && !m_desc.should_execute()) {
+    if (m_desc.should_execute && ! m_desc.should_execute()) {
         // Runtime-gated helper passes stay in the render graph so visibility flips do not rebuild
-        // framebuffer topology. Returning before uniform updates and draw submission makes the pass a
-        // true no-op on frames where its fallback branch is not active.
+        // framebuffer topology. Returning before uniform updates and draw submission makes the pass
+        // a true no-op on frames where its fallback branch is not active.
         return;
     }
 
-    if (m_desc.node != nullptr && !m_desc.node->LocalVisible()) {
+    if (m_desc.node != nullptr && ! m_desc.node->LocalVisible()) {
         // execute_when_hidden is only for layer-level invisibility, such as offscreen dependency
         // sources that must keep rendering while their authored layer is hidden in the main scene.
         // Effect-local visibility is a stricter contract: a hidden effect must not run its shader
@@ -1191,7 +1389,7 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
     }
 
     const bool node_visible = m_desc.node == nullptr ? true : m_desc.node->Visible();
-    if (m_desc.node != nullptr && ! node_visible && !m_desc.execute_when_hidden) {
+    if (m_desc.node != nullptr && ! node_visible && ! m_desc.execute_when_hidden) {
         return;
     }
 
@@ -1229,8 +1427,8 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
         cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, wset);
 
         VkImageMemoryBarrier imb {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext            = nullptr,
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
             // Render-target inputs are often produced by the immediately previous pass in the
             // same command buffer. That producer writes through the color-attachment path, not the
             // fragment-shader read path, so the consumer must wait on color attachment writes
@@ -1269,7 +1467,9 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
         cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, wset);
     }
 
-    VkRenderPassBeginInfo pass_begin_info {
+    m_desc.depth_clear_value.depthStencil = { 1.0f, 0 };
+    std::array<VkClearValue, 2> clear_values { m_desc.clear_value, m_desc.depth_clear_value };
+    VkRenderPassBeginInfo       pass_begin_info {
         .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .pNext       = nullptr,
         .renderPass  = *m_desc.pipeline.pass,
@@ -1279,8 +1479,8 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
                 .offset = { 0, 0 },
                 .extent = { outext.width, outext.height },
             },
-        .clearValueCount = 1,
-        .pClearValues    = &m_desc.clear_value,
+        .clearValueCount = m_desc.model_pass ? 2u : 1u,
+        .pClearValues    = clear_values.data(),
     };
     cmd.BeginRenderPass(pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -1315,7 +1515,7 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
 }
 
 void CustomShaderPass::destory(const Device&, RenderingResources& rr) {
-    m_desc.update_op = {};
+    m_desc.update_op              = {};
     m_desc.update_dynamic_mesh_op = {};
     {
         auto& buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;

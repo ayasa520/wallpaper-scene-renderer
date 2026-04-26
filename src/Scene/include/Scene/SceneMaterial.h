@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
@@ -16,6 +17,28 @@ struct SceneMaterialCustomShader {
     ShaderValues                 constValues;
 };
 
+enum class SceneCullMode
+{
+    None,
+    Back,
+    Front,
+};
+
+struct SceneModelRenderState {
+    // This optional state is attached only by scene-level 3D model materialization. Keeping it out
+    // of ordinary image/effect/text materials prevents the model render-policy defaults from
+    // changing the historical 2D scene path.
+    bool          preserveColor { false };
+    bool          depthTest { true };
+    bool          depthWrite { true };
+    SceneCullMode cullMode { SceneCullMode::Back };
+    // Reflection model chunks may be drawn with a negative scale on the floor normal, which changes
+    // the transform handedness and reverses triangle winding. Carry that fact as explicit model-only
+    // material state so the Vulkan pass can correct culling without changing legacy 2D materials.
+    bool          mirroredHandedness { false };
+    std::string   outputOverride;
+};
+
 struct SceneMaterial {
 public:
     SceneMaterial()                     = default;
@@ -27,7 +50,8 @@ public:
           uniformAliases(std::move(o.uniformAliases)),
           hasSprite(o.hasSprite),
           customShader(std::move(o.customShader)),
-          blenmode(o.blenmode) {};
+          blenmode(o.blenmode),
+          modelRenderState(o.modelRenderState) {};
 
     std::string              name;
     std::vector<std::string> textures;
@@ -43,5 +67,6 @@ public:
 
     SceneMaterialCustomShader customShader;
     BlendMode                 blenmode { BlendMode::Disable };
+    std::optional<SceneModelRenderState> modelRenderState;
 };
 } // namespace wallpaper

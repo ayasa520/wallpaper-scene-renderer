@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <unordered_map>
 #include <cstdint>
+#include <string>
+#include <vector>
 #include "WPJson.hpp"
 #include <nlohmann/json.hpp>
 
@@ -25,6 +27,9 @@ public:
     std::array<float, 3> center { 0.0f, 0.0f, 0.0f };
     std::array<float, 3> eye { 0.0f, 0.0f, 1.0f };
     std::array<float, 3> up { 0.0f, 1.0f, 0.0f };
+    // Authored camera path files drive only the model perspective camera. The parser intentionally
+    // keeps this data inert until WPModelObject support opts in, preserving legacy 2D camera setup.
+    std::vector<std::string> paths;
 };
 
 class WPSceneGeneral {
@@ -66,7 +71,7 @@ public:
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Orthogonalprojection, width, height);
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPSceneCamera, center, eye, up);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPSceneCamera, center, eye, up, paths);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPSceneGeneral, clearcolor, orthogonalprojection, zoom);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPScene, camera, general);
 } // namespace wpscene

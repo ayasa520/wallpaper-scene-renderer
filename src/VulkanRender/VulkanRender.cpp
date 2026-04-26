@@ -583,6 +583,32 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     gCam.Update();
     gPerCam.Update();
     scene.UpdateLinkedCamera("global");
+
+    if (!scene.modelPerspectiveCameraName.empty()) {
+        auto model_camera_it = scene.cameras.find(scene.modelPerspectiveCameraName);
+        if (model_camera_it != scene.cameras.end() && model_camera_it->second) {
+            // 3D model chunks render through a camera that is intentionally isolated from the
+            // legacy `global_perspective` camera, but its projection still has to follow the same
+            // fill-mode-adjusted framebuffer aspect. Without this, a 16:9-authored model scene keeps
+            // its native projection while Vulkan draws into a 16:10 or other non-native viewport,
+            // which changes the apparent object proportions even though the model transform itself
+            // is uniform. Only the aspect is synchronized here: the authored 3D FOV and the
+            // camera-path eye/center/up basis remain owned by the scene data and path playback.
+            model_camera_it->second->SetAspect(perspective_aspect);
+            model_camera_it->second->Update();
+            scene.UpdateLinkedCamera(scene.modelPerspectiveCameraName);
+        } else {
+            // A named model camera should exist whenever model nodes were materialized. Log this
+            // explicitly instead of silently falling back to another camera, because choosing a
+            // substitute would hide the real render-graph/parser state mismatch and make 3D aspect
+            // regressions harder to diagnose from run.log.
+            LOG_ERROR("Scene3DModelCameraAspect: missing model camera '%s' while applying "
+                      "fill-mode perspective aspect %.6f",
+                      scene.modelPerspectiveCameraName.c_str(),
+                      perspective_aspect);
+        }
+    }
+
     // Text layers with Wallpaper Engine's screen-anchor property are authored against the project
     // canvas edge, but the active orthographic camera edge moves when aspect crop/fit changes the
     // visible frame. Re-apply those anchor transforms after camera framing so HUD-style text such
@@ -600,6 +626,10 @@ void VulkanRender::Impl::clearLastRenderGraph() {
     m_passes.clear();
     m_device->tex_cache().Clear();
     m_device->video_tex_cache().Clear();
+    // Shared model depth images are tied to the compiled graph's output targets. Dropping them on
+    // full graph rebuilds keeps 3D model depth opt-in and avoids stale depth attachments surviving
+    // after scene topology or render-target ownership changes.
+    m_rendering_resources.model_depth_images.clear();
 
     m_vertex_buf->destroy();
     m_dyn_buf->destroy();

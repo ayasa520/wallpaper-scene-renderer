@@ -18,6 +18,14 @@ bool WPSceneCamera::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "center", center);
     GET_JSON_NAME_VALUE(json, "eye", eye);
     GET_JSON_NAME_VALUE(json, "up", up);
+    if (json.contains("paths") && json.at("paths").is_array()) {
+        // Camera path assets are consumed only by the 3D model camera parser. Recording the list
+        // here is inert for 2D scenes until WPSceneParser explicitly enables model camera playback.
+        paths.clear();
+        for (const auto& path : json.at("paths")) {
+            if (path.is_string()) paths.push_back(path.get<std::string>());
+        }
+    }
     return true;
 }
 

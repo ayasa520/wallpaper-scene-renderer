@@ -142,6 +142,9 @@ struct ExtraInfo {
     rg::RenderGraph*           rgraph { nullptr };
     Scene*                     scene { nullptr };
     std::unordered_map<int32_t, size_t> layer_order_index {};
+    // Model depth is shared per output target. Tracking the first model pass here lets the graph
+    // clear depth once for each target, then load it for later chunks without touching 2D passes.
+    std::unordered_set<std::string> model_depth_outputs_seen {};
     bool                       use_mipmap_framebuffer { false };
 };
 
@@ -282,13 +285,20 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
         return;
     }
     auto* material = mesh->Material();
+    const std::string output_key =
+        material->modelRenderState.has_value() && !material->modelRenderState->outputOverride.empty()
+            ? material->modelRenderState->outputOverride
+            : std::string(output);
+    const bool is_model_pass = material->modelRenderState.has_value();
+    const bool clear_model_depth = is_model_pass &&
+        extra.model_depth_outputs_seen.insert(output_key).second;
 
     std::string passName = material->name;
     rgraph.addPass<vulkan::CustomShaderPass>(
         passName,
         rg::PassNode::Type::CustomShader,
-        [material, node, &output, &imgId, &rgraph, &scene, &extra,
-         should_execute = std::move(should_execute)](
+        [material, node, output_key, imgId, &rgraph, &scene, &extra,
+         clear_model_depth, should_execute = std::move(should_execute)](
             rg::RenderGraphBuilder& builder, vulkan::CustomShaderPass::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
             // Passing the live scene into the prepared pass lets resource refreshes resolve current
@@ -296,9 +306,17 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
             // ordinary effect passes on the same stable render-graph contract.
             pdesc.scene      = &scene;
             pdesc.node       = node;
-            pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output);
+            pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
             pdesc.should_execute      = should_execute;
-            pdesc.output     = output;
+            pdesc.output     = output_key;
+            if (const auto& model_state = material->modelRenderState; model_state.has_value()) {
+                // Depth state is transported through the pass description instead of inferred from
+                // camera names, so adding model rendering cannot alter ordinary 2D custom shaders.
+                pdesc.model_pass = true;
+                pdesc.depth_test = model_state->depthTest;
+                pdesc.depth_write = model_state->depthWrite;
+                pdesc.clear_depth = clear_model_depth;
+            }
             if (IsAudioBarShaderNode(node)) {
                 LOG_INFO("SceneAudioGraphBind: pass-id=%zu source-layer=%d node-ptr=%p node-id=%d name='%s' camera='%s' output='%s' execute-when-hidden=%s gated=%s",
                          static_cast<size_t>(pass.ID()),
@@ -307,7 +325,7 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                          node->ID(),
                          node->Name().c_str(),
                          node->Camera().c_str(),
-                         output.data(),
+                         output_key.c_str(),
                          pdesc.execute_when_hidden ? "true" : "false",
                          pdesc.should_execute ? "true" : "false");
             } else if (IsSyntheticCompositeNode(node)) {
@@ -322,7 +340,7 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                          node->ID(),
                          node->Name().c_str(),
                          node->Camera().c_str(),
-                         output.data(),
+                         output_key.c_str(),
                          pdesc.execute_when_hidden ? "true" : "false",
                          pdesc.should_execute ? "true" : "false");
                 LOG_INFO("SceneAudioCompositeGraphBind: texture0='%s'", texture0);
@@ -357,7 +375,7 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                         extra.use_mipmap_framebuffer = true;
                 }
 
-                if (url == output) {
+                if (url == output_key) {
                     builder.markSelfWrite(input);
                     input = rg::addCopyPass(rgraph, input);
                 }
@@ -367,12 +385,12 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
 
             rg::TexNode* output_node { nullptr };
             output_node =
-                builder.createTexNode(rg::TexNode::Desc { .name = output.data(),
-                                                          .key  = output.data(),
+                builder.createTexNode(rg::TexNode::Desc { .name = output_key,
+                                                          .key  = output_key,
                                                           .type = rg::TexNode::TexType::Temp },
                                       true);
             builder.write(output_node);
-            if (ShouldPublishLayerLinkOutput(extra, imgId, output)) {
+            if (ShouldPublishLayerLinkOutput(extra, imgId, output_key)) {
                 extra.id_link_map[(usize)imgId] = output_node;
             }
         });

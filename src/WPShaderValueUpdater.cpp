@@ -90,6 +90,15 @@ MeshBounds2D ComputeMeshBounds2D(const SceneMesh* mesh) {
     return MeshBounds2D { .valid = true, .center = center, .halfExtent = halfExtent };
 }
 
+bool IsModelRenderNode(SceneNode* node) {
+    auto* mesh = node != nullptr ? node->Mesh() : nullptr;
+    const auto* material = mesh != nullptr ? mesh->Material() : nullptr;
+    // `g_EyePosition` updates are scoped to materials explicitly marked by WPModelObject
+    // materialization. This prevents the new 3D camera uniform support from changing any legacy 2D
+    // image, effect, text, or particle shader that happens to declare the same uniform name.
+    return material != nullptr && material->modelRenderState.has_value();
+}
+
 Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
                                         const SceneMesh* projectionMesh,
                                         const Matrix4d&  projectionModelTrans,
@@ -124,6 +133,12 @@ void WPShaderValueUpdater::FrameBegin() {
     m_modelTransformCache.clear();
     m_parallaxOffsetCache.clear();
     m_attachmentTransformCache.clear();
+    // 3D model camera paths are sampled before uniforms so the model-only camera projection,
+    // g_EyePosition, and view-basis uniforms all describe the same frame. Scenes without model
+    // camera paths return immediately inside Scene and keep the legacy 2D path untouched.
+    if (m_scene != nullptr) {
+        m_scene->UpdateModelCameraPath();
+    }
     /*
         using namespace std::chrono;
         auto nowTime = system_clock::to_time_t(system_clock::now());
@@ -173,6 +188,12 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
     info.has_SCREEN           = existsOp(G_SCREEN);
     info.has_LP               = existsOp(G_LP);
+    info.has_model_LCP        = IsModelRenderNode(pNode) && existsOp(G_LCP);
+    info.has_LCR              = IsModelRenderNode(pNode) && existsOp(G_LCR);
+    info.has_EYE_POSITION     = IsModelRenderNode(pNode) && existsOp(G_EYE_POSITION);
+    info.has_VIEWUP           = IsModelRenderNode(pNode) && existsOp(G_VIEWUP);
+    info.has_VIEWRIGHT        = IsModelRenderNode(pNode) && existsOp(G_VIEWRIGHT);
+    info.has_VIEWFORWARD      = IsModelRenderNode(pNode) && existsOp(G_VIEWFORWARD);
     for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {
         info.has_audio_spectrum_left[index] = existsOp(kAudioSpectrumLeftUniforms[index]);
         info.has_audio_spectrum_right[index] = existsOp(kAudioSpectrumRightUniforms[index]);
@@ -389,6 +410,29 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                  std::array<float, 3> {
                      m_screen_size[0], m_screen_size[1], m_screen_size[0] / m_screen_size[1] });
 
+    if (info.has_EYE_POSITION || info.has_VIEWUP || info.has_VIEWRIGHT || info.has_VIEWFORWARD) {
+        // These camera basis uniforms are gated by IsModelRenderNode() during InitUniforms. Updating
+        // them here gives 3D model shaders coherent camera-path lighting/reflection data without
+        // introducing a new uniform contract for unrelated 2D image/effect/particle shaders.
+        const auto eye = camera->GetPosition().cast<float>();
+        Vector3f forward = camera->GetDirection().cast<float>();
+        if (forward.norm() > 1e-6f) forward.normalize();
+        Vector3f up = camera->GetUp().cast<float>();
+        if (up.norm() > 1e-6f) up.normalize();
+        Vector3f right = forward.cross(up);
+        if (right.norm() > 1e-6f) right.normalize();
+
+        if (info.has_EYE_POSITION)
+            updateOp(G_EYE_POSITION, std::array<float, 3> { eye.x(), eye.y(), eye.z() });
+        if (info.has_VIEWUP)
+            updateOp(G_VIEWUP, std::array<float, 3> { up.x(), up.y(), up.z() });
+        if (info.has_VIEWRIGHT)
+            updateOp(G_VIEWRIGHT, std::array<float, 3> { right.x(), right.y(), right.z() });
+        if (info.has_VIEWFORWARD)
+            updateOp(G_VIEWFORWARD,
+                     std::array<float, 3> { forward.x(), forward.y(), forward.z() });
+    }
+
     if (info.has_PARALLAXPOSITION) {
         Vector2f para { 0.5f, 0.5f };
         if (m_parallax.enable) {
@@ -453,9 +497,10 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         updateOp(gtrans, std::array { f.x, f.y });
     }
 
-    if (info.has_LP) {
+    if (info.has_LP || info.has_model_LCP || info.has_LCR) {
         std::array<float, 16> lights { 0 };
         std::array<float, 12> lights_color { 0 };
+        std::array<float, 16> lights_color_radius { 0 };
         uint                  i = 0;
         for (auto& l : m_scene->lights) {
             if (i == 4) break;
@@ -465,14 +510,24 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             lights[i * 4 + 0]     = (float)modelTrans(0, 3);
             lights[i * 4 + 1]     = (float)modelTrans(1, 3);
             lights[i * 4 + 2]     = (float)modelTrans(2, 3);
+            // g_LightsColorRadius is distinct from g_LightsColorPremultiplied: Demon Core's
+            // core.frag feeds rgb directly into ComputeLightSpecular and keeps the falloff radius in
+            // w. Sending the radius-squared premultiplied payload here overdrives the sphere into a
+            // clipped red/white blob, while color*intensity matches the shader's authored contract.
+            const auto color_radius = l->colorIntensity();
+            lights_color_radius[i * 4 + 0] = color_radius[0];
+            lights_color_radius[i * 4 + 1] = color_radius[1];
+            lights_color_radius[i * 4 + 2] = color_radius[2];
+            lights_color_radius[i * 4 + 3] = l->radius();
             if (i < 3) {
                 const auto& color = l->premultipliedColor();
                 std::copy(color.begin(), color.end(), lights_color.begin() + i * 4);
             }
             i++;
         }
-        updateOp(G_LP, lights);
-        updateOp(G_LCP, lights_color);
+        if (info.has_LP) updateOp(G_LP, lights);
+        if (info.has_LP || info.has_model_LCP) updateOp(G_LCP, lights_color);
+        if (info.has_LCR) updateOp(G_LCR, lights_color_radius);
     }
 }
 

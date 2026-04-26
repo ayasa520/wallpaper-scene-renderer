@@ -103,6 +103,25 @@ std::string DescribeUserPropertyForLog(const UserPropertyMap& properties, std::s
     description += "]";
     return description;
 }
+
+std::string DescribeUserPropertyKeysForLog(const UserPropertyMap& properties) {
+    // Live user-property debugging must stay independent from individual wallpapers. A compact key
+    // list at the SceneWallpaper boundary proves that the native bridge delivered a payload, while
+    // the material-uniform logs prove which registered bindings consumed it.
+    std::string description = "[";
+    size_t count = 0;
+    for (const auto& [name, _] : properties) {
+        if (count != 0) description += ",";
+        description += name;
+        count++;
+        if (count >= 12 && properties.size() > count) {
+            description += ",...";
+            break;
+        }
+    }
+    description += "]";
+    return description;
+}
 } // namespace
 
 namespace wallpaper
@@ -339,6 +358,9 @@ private:
         } else {
             m_scene->userProperties.clear();
         }
+        LOG_INFO("SceneWallpaper: render thread applying live user-properties count=%zu keys=%s",
+                 m_scene->userProperties.size(),
+                 DescribeUserPropertyKeysForLog(m_scene->userProperties).c_str());
         m_scene->scriptHost->ApplyUserProperties(m_scene->userProperties, false);
     }
     MHANDLER_CMD(APPLY_MEDIA_STATE) {
@@ -638,9 +660,9 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             } else {
                 m_user_properties.clear();
             }
-            LOG_INFO("SceneWallpaper: live user-properties count=%zu hrbigb2=%s",
+            LOG_INFO("SceneWallpaper: live PROPERTY_USER_PROPERTIES count=%zu keys=%s",
                      m_user_properties.size(),
-                     DescribeUserPropertyForLog(m_user_properties, "hrbigb2").c_str());
+                     DescribeUserPropertyKeysForLog(m_user_properties).c_str());
             auto nmsg =
                 CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_APPLY_USER_PROPERTIES);
             nmsg->setObject("value", std::make_shared<UserPropertyMap>(m_user_properties));

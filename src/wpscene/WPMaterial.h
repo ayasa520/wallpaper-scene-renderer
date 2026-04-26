@@ -52,6 +52,13 @@ public:
     std::string                                         shader;
     std::string                                         depthtest { "disabled" };
     std::string                                         depthwrite { "disabled" };
+    // Authored-state bits are deliberately stored beside the parsed material. Scene-level 3D
+    // models resolve omitted render-state fields through a separate model policy, while 2D
+    // image/effect materials must keep the old default strings when the source omitted a field.
+    bool                                                blendingAuthored { false };
+    bool                                                cullmodeAuthored { false };
+    bool                                                depthtestAuthored { false };
+    bool                                                depthwriteAuthored { false };
     std::vector<std::string>                            textures;
     std::vector<WPUserTextureBinding>                   usertextures;
     std::unordered_map<std::string, int32_t>            combos;

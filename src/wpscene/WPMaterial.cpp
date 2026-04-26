@@ -195,6 +195,10 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
         LOG_ERROR("material no shader");
         return false;
     }
+    blendingAuthored = jContent.contains("blending");
+    cullmodeAuthored = jContent.contains("cullmode");
+    depthtestAuthored = jContent.contains("depthtest");
+    depthwriteAuthored = jContent.contains("depthwrite");
 	GET_JSON_NAME_VALUE(jContent, "blending", blending);
 	GET_JSON_NAME_VALUE(jContent, "cullmode", cullmode);
 	GET_JSON_NAME_VALUE(jContent, "depthtest", depthtest);

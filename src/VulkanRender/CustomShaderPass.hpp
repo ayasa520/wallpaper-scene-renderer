@@ -51,8 +51,14 @@ public:
 
         // pipeline
         VkClearValue       clear_value;
+        VkClearValue       depth_clear_value;
         bool               blending { false };
+        bool               model_pass { false };
+        bool               depth_test { false };
+        bool               depth_write { false };
+        bool               clear_depth { true };
         vvk::Framebuffer   fb;
+        VmaImageParameters* depth_image_ref { nullptr };
         PipelineParameters pipeline;
         u32                draw_count { 0 };
 

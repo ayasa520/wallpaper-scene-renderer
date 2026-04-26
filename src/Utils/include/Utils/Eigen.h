@@ -15,10 +15,13 @@ Matrix4d inline LookAt(Vector3d eye, Vector3d center, Vector3d up) noexcept {
     Vector3d yAxis = zAxis.cross(xAxis).normalized();
 
     Affine3d trans = Affine3d::Identity();
-    // base change
-    trans.linear().col(0) = xAxis;
-    trans.linear().col(1) = yAxis;
-    trans.linear().col(2) = zAxis;
+    // World-to-camera basis vectors must occupy rows for Eigen's column-vector convention:
+    // camera.x = dot(world - eye, xAxis), camera.y = dot(world - eye, yAxis),
+    // camera.z = dot(world - eye, zAxis). Columns accidentally build the transpose, which is mostly
+    // invisible for axis-aligned 2D cameras but pushes authored 3D camera paths off target.
+    trans.linear().row(0) = xAxis.transpose();
+    trans.linear().row(1) = yAxis.transpose();
+    trans.linear().row(2) = zAxis.transpose();
 
     // translate
     trans *= Translation3d(-eye);

@@ -62,6 +62,10 @@ vec4 texSample2D(sampler2D tex, vec2 uv) { return texture(tex, uv); }
 vec4 texSample2D(sampler2D tex, vec3 uv) { return texture(tex, uv.xy); }
 vec4 texSample2D(sampler2D tex, vec4 uv) { return texture(tex, uv.xy); }
 
+vec2 wpFlipSampleY(vec2 uv) { return vec2(uv.x, 1.0 - uv.y); }
+vec3 wpFlipSampleY(vec3 uv) { return vec3(uv.x, 1.0 - uv.y, uv.z); }
+vec4 wpFlipSampleY(vec4 uv) { return vec4(uv.x, 1.0 - uv.y, uv.zw); }
+
 vec4 texSample2DLod(sampler2D tex, vec2 uv, float lod) { return textureLod(tex, uv, lod); }
 vec4 texSample2DLod(sampler2D tex, vec3 uv, float lod) { return textureLod(tex, uv.xy, lod); }
 vec4 texSample2DLod(sampler2D tex, vec4 uv, float lod) { return textureLod(tex, uv.xy, lod); }
@@ -2555,6 +2559,180 @@ inline EShLanguage ToGLSL(ShaderType type) {
     }
 }
 
+inline bool TextureSlotNeedsScreenSpaceYFlip(uint slot,
+                                             std::span<const WPShaderTexInfo> texinfos) {
+    return slot < texinfos.size() && texinfos[slot].enabled &&
+        texinfos[slot].screenSpaceSampleYFlip;
+}
+
+inline bool TryParseTextureUniformSlot(std::string_view source, size_t name_pos, uint& slot) {
+    if (source.substr(name_pos, 9) != "g_Texture") return false;
+
+    const auto slot_begin = name_pos + 9;
+    auto       slot_end   = slot_begin;
+    while (slot_end < source.size() &&
+           std::isdigit(static_cast<unsigned char>(source[slot_end]))) {
+        slot_end++;
+    }
+    if (slot_end == slot_begin) return false;
+
+    auto [ptr, ec] =
+        std::from_chars(source.data() + slot_begin, source.data() + slot_end, slot);
+    return ec == std::errc() && ptr == source.data() + slot_end;
+}
+
+inline size_t FindTopLevelComma(std::string_view source, size_t begin, size_t end) {
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+    bool in_block_comment { false };
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+
+    for (size_t pos = begin; pos < end; pos++) {
+        const char ch   = source[pos];
+        const char next = pos + 1 < end ? source[pos + 1] : '\0';
+
+        if (in_block_comment) {
+            if (ch == '*' && next == '/') {
+                in_block_comment = false;
+                pos++;
+            }
+            continue;
+        }
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+        if (ch == '/' && next == '/') {
+            const auto line_end = source.find('\n', pos);
+            if (line_end == std::string_view::npos || line_end >= end) break;
+            pos = line_end;
+            continue;
+        }
+        if (ch == '/' && next == '*') {
+            in_block_comment = true;
+            pos++;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == ',' && paren_depth == 0 && bracket_depth == 0) return pos;
+    }
+    return std::string_view::npos;
+}
+
+inline std::string RewriteTextureSampleYFlipCallsForFunction(
+    const std::string& source,
+    std::string_view   function_name,
+    bool               has_lod_argument,
+    std::span<const WPShaderTexInfo> texinfos) {
+    std::string result;
+    result.reserve(source.size());
+
+    size_t cursor { 0 };
+    size_t search_pos { 0 };
+    while (true) {
+        const auto function_pos = source.find(function_name, search_pos);
+        if (function_pos == std::string::npos) break;
+
+        const bool left_boundary =
+            function_pos == 0 || !IsIdentifierContinue(source[function_pos - 1]);
+        const auto after_name = function_pos + function_name.size();
+        const bool right_boundary =
+            after_name >= source.size() || !IsIdentifierContinue(source[after_name]);
+        if (!left_boundary || !right_boundary) {
+            search_pos = after_name;
+            continue;
+        }
+
+        const auto open_pos = SkipWhitespace(source, after_name);
+        if (open_pos >= source.size() || source[open_pos] != '(') {
+            search_pos = after_name;
+            continue;
+        }
+        const auto close_after_pos = SkipBalanced(source, open_pos, '(', ')');
+        if (close_after_pos == std::string::npos || close_after_pos > source.size() ||
+            close_after_pos <= open_pos + 1) {
+            search_pos = after_name;
+            continue;
+        }
+        const auto close_pos = close_after_pos - 1;
+
+        const auto first_arg_begin = SkipWhitespace(source, open_pos + 1);
+        uint       slot { 0 };
+        if (!TryParseTextureUniformSlot(source, first_arg_begin, slot) ||
+            !TextureSlotNeedsScreenSpaceYFlip(slot, texinfos)) {
+            search_pos = close_after_pos;
+            continue;
+        }
+
+        const auto first_arg_end = SkipIdentifier(source, first_arg_begin);
+        auto       comma_pos     = SkipWhitespace(source, first_arg_end);
+        if (comma_pos >= close_pos || source[comma_pos] != ',') {
+            search_pos = close_after_pos;
+            continue;
+        }
+
+        const auto second_arg_begin = comma_pos + 1;
+        const auto second_arg_end =
+            has_lod_argument ? FindTopLevelComma(source, second_arg_begin, close_pos) : close_pos;
+        if (second_arg_end == std::string_view::npos || second_arg_end <= second_arg_begin) {
+            search_pos = close_after_pos;
+            continue;
+        }
+
+        auto value_begin = SkipWhitespace(source, second_arg_begin);
+        auto value_end   = second_arg_end;
+        while (value_end > value_begin &&
+               std::isspace(static_cast<unsigned char>(source[value_end - 1]))) {
+            value_end--;
+        }
+        if (value_begin >= value_end) {
+            search_pos = close_after_pos;
+            continue;
+        }
+
+        // This is a slot-aware shader preparation rewrite, not a shader-name workaround. Runtime
+        // render-target metadata decides which g_TextureN bindings need screen-space Y correction,
+        // while the producer pass and all unrelated 2D texture samples remain unchanged.
+        result.append(source, cursor, value_begin - cursor);
+        result.append("wpFlipSampleY(");
+        result.append(source, value_begin, value_end - value_begin);
+        result.push_back(')');
+        cursor = value_end;
+        search_pos = close_after_pos;
+    }
+
+    result.append(source, cursor, std::string::npos);
+    return result;
+}
+
+inline std::string RewriteTextureSampleYFlipCalls(
+    const std::string& source,
+    std::span<const WPShaderTexInfo> texinfos) {
+    auto result = RewriteTextureSampleYFlipCallsForFunction(
+        source, "texSample2DLod", true, texinfos);
+    result = RewriteTextureSampleYFlipCallsForFunction(
+        result, "texSample2D", false, texinfos);
+    return result;
+}
+
 inline std::string SanitizeBrokenPreprocessorDirectives(const std::string& src,
                                                         ShaderType         type) {
     std::string out;
@@ -2936,15 +3114,21 @@ inline void SaveShaderToFile(std::span<const ShaderCode> codes, fs::IBinaryStrea
     file.Write(nop, sizeof(nop));
 }
 
-inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units, const Combos& combos) {
+inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
+                                         const Combos& combos,
+                                         std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "prepared-shader-v5-float-array-index\n";
+    out << "prepared-shader-v6-slot-screen-space-sample-y-flip\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';
     }
     for (const auto& [name, value] : combos) {
         out << name << '=' << value << '\n';
+    }
+    for (const auto& texinfo : texinfos) {
+        out << static_cast<int>(texinfo.enabled)
+            << static_cast<int>(texinfo.screenSpaceSampleYFlip) << '\n';
     }
     const auto data = out.str();
     return utils::genSha1(std::span<const char>(data.data(), data.size()));
@@ -2957,6 +3141,7 @@ inline std::string GenPreShaderSha1(std::string_view expanded_src,
     out << utils::genSha1(expanded_src) << '\n';
     for (const auto& texinfo : texinfos) {
         out << static_cast<int>(texinfo.enabled);
+        out << static_cast<int>(texinfo.screenSpaceSampleYFlip);
         for (const auto component_enabled : texinfo.composEnabled) {
             out << static_cast<int>(component_enabled);
         }
@@ -3167,7 +3352,9 @@ inline void SavePreparedShaderUnits(std::span<const WPShaderUnit> units, fs::IBi
     }
 }
 
-inline void PrepareShaderUnits(std::span<WPShaderUnit> units, WPShaderInfo* shader_info) {
+inline void PrepareShaderUnits(std::span<WPShaderUnit> units,
+                               WPShaderInfo* shader_info,
+                               std::span<const WPShaderTexInfo> texinfos) {
     std::for_each(units.begin(), units.end(), [shader_info](auto& unit) {
         unit.src = Preprocessor(unit.src, unit.stage, shader_info->combos, unit.preprocess_info);
     });
@@ -3178,6 +3365,7 @@ inline void PrepareShaderUnits(std::span<WPShaderUnit> units, WPShaderInfo* shad
         WPPreprocessorInfo* post_info = i + 1 < units.size() ? &units[i + 1].preprocess_info
                                                              : nullptr;
         unit.src = Finalprocessor(unit, pre_info, post_info);
+        unit.src = RewriteTextureSampleYFlipCalls(unit.src, texinfos);
     }
 }
 
@@ -3274,8 +3462,6 @@ void WPShaderParser::FinalGlslang(std::string_view reason) {
 bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderUnit> units,
                                   std::vector<ShaderCode>& codes, fs::VFS& vfs,
                                   WPShaderInfo* shader_info, std::span<const WPShaderTexInfo> texs) {
-    (void)texs;
-
     auto compile = [](std::span<WPShaderUnit> units, std::vector<ShaderCode>& codes) {
         std::vector<vulkan::ShaderCompUnit> vunits(units.size());
         for (usize i = 0; i < units.size(); i++) {
@@ -3310,7 +3496,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
     bool has_cache_dir = vfs.IsMounted("cache");
 
     if (has_cache_dir) {
-        const std::string prepared_sha1            = GenPreparedShaderSha1(units, shader_info->combos);
+        const std::string prepared_sha1 = GenPreparedShaderSha1(units, shader_info->combos, texs);
         const std::string prepared_cache_file_path = GetPreparedShaderCachePath(scene_id, prepared_sha1);
 
         if (vfs.Contains(prepared_cache_file_path)) {
@@ -3320,7 +3506,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
                 return false;
             }
         } else {
-            PrepareShaderUnits(units, shader_info);
+            PrepareShaderUnits(units, shader_info, texs);
             if (auto cache_file = vfs.OpenW(prepared_cache_file_path); cache_file) {
                 ::SavePreparedShaderUnits(units, *cache_file);
             }
@@ -3344,7 +3530,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
         return true;
 
     } else {
-        PrepareShaderUnits(units, shader_info);
+        PrepareShaderUnits(units, shader_info, texs);
         return compile(units, codes);
     }
 }

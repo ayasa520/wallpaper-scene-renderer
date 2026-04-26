@@ -36,6 +36,22 @@ class VFS;
 }
 class Scene : NoCopy, NoMove {
 public:
+    struct CameraPathKeyframe {
+        double timestamp { 0.0 };
+        std::array<float, 3> eye { 0.0f, 0.0f, 1.0f };
+        std::array<float, 3> center { 0.0f, 0.0f, 0.0f };
+        std::array<float, 3> up { 0.0f, 1.0f, 0.0f };
+    };
+
+    struct CameraPathSegment {
+        // Wallpaper Engine 3D camera paths are scene-level timelines, not 2D camera layers. The
+        // parser stores them here but binds playback to a model-only camera name, so ordinary 2D
+        // scenes never have their `global` or `global_perspective` camera semantics changed.
+        std::string name;
+        double      duration { 0.0 };
+        std::vector<CameraPathKeyframe> keyframes;
+    };
+
     struct ImageLayerRuntimeState {
         std::array<float, 2> size { 0.0f, 0.0f };
         std::string          alignment { "center" };
@@ -95,6 +111,7 @@ public:
     bool IsLayerVisible(int32_t layer_id) const;
     void ApplyLayerVisibility(int32_t layer_id);
     void ApplyAllLayerVisibility();
+    void UpdateModelCameraPath();
     Eigen::Vector3f ResolveCameraLayerNodeTranslation(
         const std::array<float, 3>& authored_origin) const;
     void UpdateActiveCameraLayer();
@@ -188,6 +205,10 @@ public:
     std::shared_ptr<SceneNode> defaultGlobalCameraNode;
     double                     defaultGlobalCameraZoom { 1.0 };
     int32_t                    activeCameraLayerId { 0 };
+    std::string                modelPerspectiveCameraName;
+    std::vector<CameraPathSegment> modelCameraPathSegments;
+    bool                           modelCameraPathEnabled { false };
+    int32_t                        activeModelCameraPathSegment { -1 };
 
     i32                  ortho[2] { 1920, 1080 }; // w, h
     std::array<float, 3> clearColor { 1.0f, 1.0f, 1.0f };

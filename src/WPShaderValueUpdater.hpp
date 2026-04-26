@@ -39,6 +39,15 @@ struct WPUniformInfo {
     bool has_TEXELSIZEHALF { false };
     bool has_SCREEN { false };
     bool has_LP { false };
+    // These extra light payloads and the camera basis uniforms are part of the 3D model shader
+    // contract. InitUniforms enables them only on materialized model nodes so 2D shaders keep their
+    // previous uniform surface even if they happen to declare similarly named values.
+    bool has_model_LCP { false };
+    bool has_LCR { false };
+    bool has_EYE_POSITION { false };
+    bool has_VIEWUP { false };
+    bool has_VIEWRIGHT { false };
+    bool has_VIEWFORWARD { false };
     std::array<bool, 3> has_audio_spectrum_left { false, false, false };
     std::array<bool, 3> has_audio_spectrum_right { false, false, false };
 

@@ -8,6 +8,7 @@
 #include "Particle/ParticleSystem.h"
 #include "Utils/Logging.h"
 
+#include <algorithm>
 #include <cmath>
 #include <unordered_set>
 
@@ -51,6 +52,60 @@ bool IsLayerVisibleImpl(const Scene& scene, int32_t layer_id, std::unordered_set
     }
 
     return IsLayerVisibleImpl(scene, binding_it->second.parent_id, visiting);
+}
+
+Eigen::Vector3d ToVector3d(const std::array<float, 3>& value) {
+    return Eigen::Vector3d(value[0], value[1], value[2]);
+}
+
+std::array<float, 3> LerpArray3(const std::array<float, 3>& lhs,
+                                const std::array<float, 3>& rhs,
+                                double ratio) {
+    const auto t = static_cast<float>(std::clamp(ratio, 0.0, 1.0));
+    return {
+        lhs[0] + (rhs[0] - lhs[0]) * t,
+        lhs[1] + (rhs[1] - lhs[1]) * t,
+        lhs[2] + (rhs[2] - lhs[2]) * t,
+    };
+}
+
+bool ResolveCameraPathSample(const Scene::CameraPathSegment& segment,
+                             double local_time,
+                             Scene::CameraPathKeyframe& out) {
+    if (segment.keyframes.empty()) return false;
+    if (segment.keyframes.size() == 1) {
+        out = segment.keyframes.front();
+        return true;
+    }
+
+    const auto clamped_time = std::clamp(local_time, 0.0, std::max(0.0, segment.duration));
+    const auto& first = segment.keyframes.front();
+    const auto& last = segment.keyframes.back();
+    if (clamped_time <= first.timestamp) {
+        out = first;
+        return true;
+    }
+    if (clamped_time >= last.timestamp) {
+        out = last;
+        return true;
+    }
+
+    for (size_t index = 1; index < segment.keyframes.size(); index++) {
+        const auto& lhs = segment.keyframes[index - 1];
+        const auto& rhs = segment.keyframes[index];
+        if (clamped_time > rhs.timestamp) continue;
+
+        const auto span = rhs.timestamp - lhs.timestamp;
+        const auto ratio = span > 1e-9 ? (clamped_time - lhs.timestamp) / span : 0.0;
+        out.timestamp = clamped_time;
+        out.eye = LerpArray3(lhs.eye, rhs.eye, ratio);
+        out.center = LerpArray3(lhs.center, rhs.center, ratio);
+        out.up = LerpArray3(lhs.up, rhs.up, ratio);
+        return true;
+    }
+
+    out = last;
+    return true;
 }
 
 void CollectLayerEffectNodes(const Scene& scene, int32_t layer_id, std::vector<SceneNode*>& nodes) {
@@ -228,6 +283,69 @@ void Scene::ApplyAllLayerVisibility() {
         ApplyLayerVisibilityRecursive(*this, layer_id, visited);
     }
     if (!cameraLayers.empty()) UpdateActiveCameraLayer();
+}
+
+void Scene::UpdateModelCameraPath() {
+    if (!modelCameraPathEnabled || modelCameraPathSegments.empty() ||
+        modelPerspectiveCameraName.empty()) {
+        return;
+    }
+
+    auto camera_it = cameras.find(modelPerspectiveCameraName);
+    if (camera_it == cameras.end() || !camera_it->second) return;
+
+    double total_duration = 0.0;
+    for (const auto& segment : modelCameraPathSegments) {
+        total_duration += std::max(0.0, segment.duration);
+    }
+    if (total_duration <= 1e-9) return;
+
+    double path_time = std::fmod(std::max(0.0, elapsingTime), total_duration);
+    if (path_time < 0.0) path_time += total_duration;
+
+    int32_t active_segment = -1;
+    double local_time = path_time;
+    for (size_t index = 0; index < modelCameraPathSegments.size(); index++) {
+        const auto duration = std::max(0.0, modelCameraPathSegments[index].duration);
+        if (local_time <= duration || index + 1 == modelCameraPathSegments.size()) {
+            active_segment = static_cast<int32_t>(index);
+            break;
+        }
+        local_time -= duration;
+    }
+    if (active_segment < 0 ||
+        active_segment >= static_cast<int32_t>(modelCameraPathSegments.size())) {
+        return;
+    }
+
+    Scene::CameraPathKeyframe sample;
+    if (!ResolveCameraPathSample(modelCameraPathSegments[active_segment], local_time, sample)) {
+        return;
+    }
+
+    // Camera path playback is bound to the model-only camera name installed by WPModelObject
+    // parsing. This deliberately avoids `global_perspective`, which is a legacy 2D particle camera.
+    camera_it->second->SetExplicitView(ToVector3d(sample.eye),
+                                       ToVector3d(sample.center),
+                                       ToVector3d(sample.up));
+    UpdateLinkedCamera(modelPerspectiveCameraName);
+
+    if (activeModelCameraPathSegment != active_segment) {
+        const auto& segment = modelCameraPathSegments[active_segment];
+        LOG_INFO("Scene3DModelCameraPathActive: previous=%d active=%d duration=%.3f "
+                 "local-time=%.3f eye=[%.3f, %.3f, %.3f] center=[%.3f, %.3f, %.3f]",
+                 activeModelCameraPathSegment,
+                 active_segment,
+                 segment.duration,
+                 local_time,
+                 sample.eye[0],
+                 sample.eye[1],
+                 sample.eye[2],
+                 sample.center[0],
+                 sample.center[1],
+                 sample.center[2]);
+        activeModelCameraPathSegment = active_segment;
+    }
 }
 
 Eigen::Vector3f Scene::ResolveCameraLayerNodeTranslation(

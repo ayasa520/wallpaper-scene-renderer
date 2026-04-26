@@ -20,6 +20,11 @@ struct SceneRenderTarget {
     i32           mapHeight { 0 };
     bool          allowReuse { false };
     bool          withDepth { false };
+    // Model reflection buffers are sampled by authored shaders that derive UVs from clip-space
+    // screen coordinates rather than ordinary mesh texture coordinates. This opt-in sampling
+    // convention lets material-bound slots fix that Y direction at shader preparation time without
+    // changing how the producer pass renders or how legacy 2D effect targets are sampled.
+    bool          screenSpaceSampleYFlip { false };
     bool          has_mipmap { false };
     uint          mipmap_level { 1 };
     TextureSample sample { TextureWrap::CLAMP_TO_EDGE,
