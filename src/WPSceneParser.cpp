@@ -194,24 +194,78 @@ std::string DescribeUserPropertyForLog(const UserPropertyMap* properties, std::s
 
 void ExtractReferencedLayerNamesFromScript(std::string_view script,
                                            std::unordered_set<std::string>& out_names) {
-    static const std::regex kLayerRefPattern(
-        R"((?:getLayer|getLayerIndex)\(\s*['"]([^'"]+)['"]\s*\))");
-    static const std::regex kStringLiteralPattern(R"(['"]([^'"]+)['"])");
+    auto is_identifier_char = [](char ch) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        return std::isalnum(uch) != 0 || ch == '_' || ch == '$';
+    };
 
-    const std::string script_text(script);
-    for (std::sregex_iterator it(script_text.begin(), script_text.end(), kLayerRefPattern), end;
-         it != end;
-         ++it) {
-        if ((*it).size() >= 2) out_names.insert((*it)[1].str());
-    }
+    auto skip_whitespace_backward = [&script](size_t index) {
+        while (index > 0 && std::isspace(static_cast<unsigned char>(script[index - 1])) != 0) {
+            index--;
+        }
+        return index;
+    };
 
-    // Some scene scripts keep layer names in string arrays first and only call
-    // getLayer(name) later via map/forEach helpers, so plain getLayer(...)
-    // matching alone misses those runtime-controlled hidden layers.
-    for (std::sregex_iterator it(script_text.begin(), script_text.end(), kStringLiteralPattern), end;
-         it != end;
-         ++it) {
-        if ((*it).size() >= 2) out_names.insert((*it)[1].str());
+    auto is_layer_lookup_literal = [&](size_t literal_start) {
+        // Large Wallpaper Engine scripts can contain hundreds of kilobytes of text.  The previous
+        // std::regex-based scan for generic string literals could recurse deeply enough inside
+        // libstdc++ to segfault before the scene parser even finished loading.  This lightweight
+        // backwards check keeps the same "string literal immediately inside getLayer(...)" signal
+        // without entering the catastrophic regex executor path.
+        size_t cursor = skip_whitespace_backward(literal_start);
+        if (cursor == 0 || script[cursor - 1] != '(') return false;
+
+        cursor = skip_whitespace_backward(cursor - 1);
+        size_t name_end = cursor;
+        while (cursor > 0 && is_identifier_char(script[cursor - 1])) {
+            cursor--;
+        }
+
+        const std::string_view fn_name = script.substr(cursor, name_end - cursor);
+        return fn_name == "getLayer" || fn_name == "getLayerIndex";
+    };
+
+    for (size_t index = 0; index < script.size(); index++) {
+        const char quote = script[index];
+        if (quote != '\'' && quote != '"') continue;
+
+        std::string literal;
+        literal.reserve(32);
+
+        bool escaped = false;
+        size_t cursor = index + 1;
+        for (; cursor < script.size(); cursor++) {
+            const char ch = script[cursor];
+            if (escaped) {
+                // The script scanner only needs a stable best-effort string token for layer-name
+                // discovery, so keeping escaped characters as their literal payload is sufficient
+                // and avoids building a full JavaScript parser in the hot scene-load path.
+                literal.push_back(ch);
+                escaped = false;
+                continue;
+            }
+
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+
+            if (ch == quote) break;
+            literal.push_back(ch);
+        }
+
+        if (cursor >= script.size()) break;
+        if (!literal.empty()) out_names.insert(literal);
+
+        // Some scene scripts keep layer names in string arrays first and only call getLayer(name)
+        // later via map/forEach helpers, so we still collect every plain string literal.  We also
+        // preserve the explicit getLayer/getLayerIndex signal because it helps future logging and
+        // debugging distinguish direct layer lookups from unrelated strings without any regex use.
+        if (is_layer_lookup_literal(index) && !literal.empty()) {
+            out_names.insert(literal);
+        }
+
+        index = cursor;
     }
 }
 
