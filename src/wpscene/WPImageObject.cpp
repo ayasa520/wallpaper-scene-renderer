@@ -86,6 +86,10 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 		GET_JSON_NAME_VALUE(json, "origin", origin);	
 		GET_JSON_NAME_VALUE(json, "angles", angles);	
 		GET_JSON_NAME_VALUE(json, "scale", scale);	
+        // Preserve whether the field was present before parsing it. Missing parallaxDepth and an
+        // explicit "0 0" both produce the same numeric array, but they have different import
+        // semantics when a root image layer is meant to participate in scene camera parallax.
+        parallaxDepthAuthored = json.contains("parallaxDepth") && ! json.at("parallaxDepth").is_null();
 		GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
     }
     GET_JSON_NAME_VALUE_NOWARN(jImage, "nopadding", nopadding);

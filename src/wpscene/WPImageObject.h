@@ -35,6 +35,10 @@ public:
     std::array<float, 3>       angles { 0.0f, 0.0f, 0.0f };
     std::array<float, 2>       size { 2.0f, 2.0f };
     std::array<float, 2>       parallaxDepth { 0.0f, 0.0f };
+    // Scene JSON omits parallaxDepth for many ordinary image layers, while explicit "0 0" is an
+    // authored choice to pin the layer. Keeping this bit separate lets the parser repair omitted
+    // root-layer parallax without accidentally moving layers that the wallpaper author set to zero.
+    bool                       parallaxDepthAuthored { false };
     std::array<float, 3>       color { 1.0f, 1.0f, 1.0f };
     int32_t                    colorBlendMode { 0 };
     float                      alpha { 1.0f };

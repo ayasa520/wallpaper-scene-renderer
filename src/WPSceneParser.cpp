@@ -39,6 +39,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <cctype>
 #include <random>
 #include <cmath>
 #include <functional>
@@ -318,6 +319,23 @@ struct ParseContext {
     std::unordered_map<int32_t, const WPPuppet*>            object_puppets;
 };
 
+bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
+    return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
+}
+
+std::string NormalizeParallaxPeerName(std::string_view name) {
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (unsigned char ch : name) {
+        if (std::isalnum(ch)) normalized.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return normalized;
+}
+
+std::array<float, 2> ImageObjectParallaxDepth(const wpscene::WPImageObject& object) {
+    return { object.parallaxDepth[0], object.parallaxDepth[1] };
+}
+
 struct WPEmptyObject {
     int32_t              id { 0 };
     std::string          name;
@@ -462,6 +480,212 @@ using WPObjectVar = std::variant<wpscene::WPImageObject,
                                  wpscene::WPTextObject,
                                  WPShapeObject,
                                  WPEmptyObject>;
+
+std::optional<int32_t> ParallaxFallbackObjectId(const WPObjectVar& object) {
+    return std::visit(visitor::overload {
+                          [](const wpscene::WPImageObject& image) -> std::optional<int32_t> {
+                              return image.id;
+                          },
+                          [](const wpscene::WPParticleObject& particle) -> std::optional<int32_t> {
+                              return particle.id;
+                          },
+                          [](const wpscene::WPLightObject& light) -> std::optional<int32_t> {
+                              return light.id;
+                          },
+                          [](const wpscene::WPTextObject& text) -> std::optional<int32_t> {
+                              return text.id;
+                          },
+                          [](const WPShapeObject& shape) -> std::optional<int32_t> {
+                              return shape.id;
+                          },
+                          [](const WPEmptyObject& empty) -> std::optional<int32_t> {
+                              return empty.id;
+                          },
+                          [](const wpscene::WPSoundObject&) -> std::optional<int32_t> {
+                              return std::nullopt;
+                          },
+                      },
+                      object);
+}
+
+std::optional<int32_t> ParallaxFallbackParentId(const WPObjectVar& object) {
+    return std::visit(visitor::overload {
+                          [](const wpscene::WPImageObject& image) -> std::optional<int32_t> {
+                              return image.parent;
+                          },
+                          [](const wpscene::WPParticleObject& particle) -> std::optional<int32_t> {
+                              return particle.parent;
+                          },
+                          [](const wpscene::WPLightObject& light) -> std::optional<int32_t> {
+                              return light.parent;
+                          },
+                          [](const wpscene::WPTextObject& text) -> std::optional<int32_t> {
+                              return text.parent;
+                          },
+                          [](const WPShapeObject& shape) -> std::optional<int32_t> {
+                              return shape.parent;
+                          },
+                          [](const WPEmptyObject& empty) -> std::optional<int32_t> {
+                              return empty.parent;
+                          },
+                          [](const wpscene::WPSoundObject&) -> std::optional<int32_t> {
+                              return std::nullopt;
+                          },
+                      },
+                      object);
+}
+
+void ApplyNodeOwnerParallaxFallback(ParseContext&                    context,
+                                    int32_t                          owner_id,
+                                    const std::array<float, 2>&      depth,
+                                    SceneNode*                       anchor,
+                                    bool                             suppress_model_parallax = false) {
+    if (context.scene == nullptr || context.shader_updater == nullptr) return;
+
+    for (const auto& [node, node_owner_id] : context.scene->nodeOwners) {
+        if (node == nullptr || node_owner_id != owner_id) continue;
+        if (! node->Camera().empty()) continue;
+        auto* node_data = context.shader_updater->GetNodeData(node);
+        if (node_data == nullptr) continue;
+
+        // Only camera-facing/world-facing nodes should receive this repaired parallax contract.
+        // Effect source nodes render inside private effect cameras, so moving them here would bake
+        // the same mouse offset into the offscreen texture and then apply it again at composition.
+        node_data->parallaxDepth = depth;
+        node_data->parallax_anchor = anchor;
+        node_data->suppress_model_parallax = suppress_model_parallax;
+    }
+}
+
+SceneNode* FindNodeOwnerParallaxFallbackAnchor(ParseContext& context, int32_t owner_id) {
+    if (context.scene == nullptr || context.shader_updater == nullptr) return nullptr;
+
+    SceneNode* fallback_anchor = nullptr;
+    for (const auto& [node, node_owner_id] : context.scene->nodeOwners) {
+        if (node == nullptr || node_owner_id != owner_id || ! node->Camera().empty()) continue;
+        auto* node_data = context.shader_updater->GetNodeData(node);
+        if (node_data == nullptr || IsZeroParallaxDepth(node_data->parallaxDepth)) continue;
+
+        fallback_anchor = node;
+        if (node->Name().find("__hanabi_effect_final_composite") != std::string::npos) break;
+    }
+
+    return fallback_anchor;
+}
+
+void ApplyDescendantParallaxAnchorFallback(ParseContext&                    context,
+                                           const std::vector<WPObjectVar>&  objects,
+                                           int32_t                          root_id) {
+    auto* root_anchor = FindNodeOwnerParallaxFallbackAnchor(context, root_id);
+    if (root_anchor == nullptr) return;
+
+    std::unordered_map<int32_t, int32_t> parent_by_id;
+    for (const auto& object : objects) {
+        const auto id = ParallaxFallbackObjectId(object);
+        const auto parent = ParallaxFallbackParentId(object);
+        if (! id.has_value() || ! parent.has_value() || *id == 0 || *parent == 0) continue;
+        parent_by_id[*id] = *parent;
+    }
+
+    for (const auto& object : objects) {
+        const auto* empty = std::get_if<WPEmptyObject>(&object);
+        if (empty == nullptr || empty->id == root_id) continue;
+
+        auto parent_it = parent_by_id.find(empty->id);
+        if (parent_it == parent_by_id.end()) continue;
+
+        bool     descends_from_root = false;
+        int32_t  current_parent     = parent_it->second;
+        std::unordered_set<int32_t> visited;
+        while (current_parent != 0 && visited.insert(current_parent).second) {
+            if (current_parent == root_id) {
+                descends_from_root = true;
+                break;
+            }
+            auto next_it = parent_by_id.find(current_parent);
+            if (next_it == parent_by_id.end()) break;
+            current_parent = next_it->second;
+        }
+        if (! descends_from_root) continue;
+
+        // A missing-parallax root container such as a WE compose/effect group often has several
+        // empty grouping layers below it. Repair only those empty/proxy relay nodes: authored leaf
+        // image final-composites already point at their parent groups, and rewriting every leaf to
+        // the root makes puppet-attached body/hair parts evaluate different transform paths and
+        // visibly pull apart. The empty relay keeps the original hierarchy intact while providing a
+        // non-zero parallax source for the existing child anchors.
+        ApplyNodeOwnerParallaxFallback(context,
+                                       empty->id,
+                                       { 0.0f, 0.0f },
+                                       root_anchor);
+    }
+}
+
+void ApplyMissingImageParallaxFallbacks(ParseContext& context,
+                                        const std::vector<WPObjectVar>& objects) {
+    std::unordered_map<std::string, int32_t> explicit_parallax_peer_by_name;
+
+    for (const auto& object : objects) {
+        std::visit(visitor::overload {
+                       [&explicit_parallax_peer_by_name](const wpscene::WPImageObject& image) {
+                           if (! image.parallaxDepthAuthored ||
+                               IsZeroParallaxDepth(ImageObjectParallaxDepth(image))) {
+                               return;
+                           }
+                           const auto key = NormalizeParallaxPeerName(image.name);
+                           if (! key.empty()) explicit_parallax_peer_by_name.emplace(key, image.id);
+                       },
+                       [&explicit_parallax_peer_by_name](const WPEmptyObject& empty) {
+                           if (IsZeroParallaxDepth(empty.parallaxDepth)) return;
+                           const auto key = NormalizeParallaxPeerName(empty.name);
+                           if (! key.empty()) explicit_parallax_peer_by_name.emplace(key, empty.id);
+                       },
+                       [](const auto&) {},
+                   },
+                   object);
+    }
+
+    for (const auto& object : objects) {
+        const auto* image = std::get_if<wpscene::WPImageObject>(&object);
+        if (image == nullptr || image->parallaxDepthAuthored || image->parent != 0) continue;
+
+        const auto key = NormalizeParallaxPeerName(image->name);
+        auto       peer_it = explicit_parallax_peer_by_name.find(key);
+        if (peer_it != explicit_parallax_peer_by_name.end() && peer_it->second != image->id) {
+            auto peer_node_it = context.object_nodes.find(peer_it->second);
+            if (peer_node_it != context.object_nodes.end() && peer_node_it->second) {
+                // Some WE projects split a character into a static-looking root image plus an
+                // explicitly-parallaxed detail/effect group with the same normalized name. The root
+                // layer has no authored parent, but visually it must inherit the detail group's
+                // parallax offset so the pieces stay locked together.
+                ApplyNodeOwnerParallaxFallback(context,
+                                               image->id,
+                                               { 0.0f, 0.0f },
+                                               peer_node_it->second.get());
+                continue;
+            }
+        }
+
+        const bool is_compose_layer = image->image == "models/util/composelayer.json";
+        const bool has_authored_descendants = context.dependent_parent_ids.count(image->id) != 0;
+        const bool is_compose_container =
+            is_compose_layer && (! image->effects.empty() || has_authored_descendants);
+        if (is_compose_container) {
+            // Missing parallaxDepth is repaired only for WE compose containers, not for every root
+            // image that happens to own children. Compose layers are render-target aggregators, so
+            // their final quad is a stable parallax source for descendants but should not translate
+            // as visible artwork itself; ordinary image parents need an authored depth before the
+            // importer can safely infer that the parent image should participate in camera parallax.
+            ApplyNodeOwnerParallaxFallback(
+                context,
+                image->id,
+                { 1.0f, 1.0f },
+                nullptr,
+                true);
+            ApplyDescendantParallaxAnchorFallback(context, objects, image->id);
+        }
+    }
+}
 
 namespace
 {
@@ -1161,7 +1385,8 @@ const auto& f1     = texh.spriteAnim.GetCurFrame();
 
 bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer& effect_layer,
                                    std::string_view initial_source, int32_t owner_layer_id,
-                                   std::string_view owner_name) {
+                                   std::string_view owner_name,
+                                   const WPShaderValueData* final_transform_data = nullptr) {
     auto& vfs = *context.vfs;
 
     wpscene::WPMaterial composite_source;
@@ -1211,6 +1436,15 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
                   static_cast<int>(owner_name.size()),
                   owner_name.data());
         return false;
+    }
+    if (final_transform_data != nullptr) {
+        // The fallback final composite is the screen-space writer used when the last authored
+        // effect in a layer is hidden. It is not an authored child node, so copying the full parent
+        // transform binding would multiply route matrices twice; only the parallax contract is
+        // mirrored from the visible world node so hidden-effect fallbacks keep moving with their
+        // compose/text layer.
+        composite_data.parallaxDepth = final_transform_data->parallaxDepth;
+        composite_data.parallax_anchor = final_transform_data->parallax_anchor;
     }
 
     auto composite_mesh = std::make_shared<SceneMesh>();
@@ -2591,11 +2825,24 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // ping-pong target so `_rt_imageLayerComposite_<id>` samples the raw source texture
             // instead of adding an unreachable screen-space fallback node that could overwrite the
             // link-source bookkeeping.
+            WPShaderValueData finalCompositeTransformData;
+            finalCompositeTransformData.parallaxDepth = { wpimgobj.parallaxDepth[0],
+                                                          wpimgobj.parallaxDepth[1] };
+            if (needs_inherited_parent_binding) {
+                // The render graph already routes this detached final writer through the authored
+                // parent chain. Anchoring only the parallax offset to the authored parent keeps
+                // child fallbacks synchronized with zero/non-zero parallax parent groups without
+                // reapplying the parent's local transform.
+                if (auto parent = FindParentNode(context, wpimgobj.parent)) {
+                    finalCompositeTransformData.SetParallaxAnchor(parent.get());
+                }
+            }
             ConfigureEffectFinalComposite(context,
                                           *imgEffectLayer,
                                           effect_ppong_a,
                                           wpimgobj.id,
-                                          wpimgobj.name);
+                                          wpimgobj.name,
+                                          &finalCompositeTransformData);
         }
         int32_t i_eff = -1;
         for (const auto& wpeffobj : wpimgobj.effects) {
@@ -2975,11 +3222,23 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         scene.renderTargets[primitive->bridge.pingpong_b] = scene.renderTargets.at(primitive->bridge.pingpong_a);
         scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_a);
         scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_b);
+        WPShaderValueData finalCompositeTransformData;
+        finalCompositeTransformData.parallaxDepth = { text_obj.parallaxDepth[0],
+                                                      text_obj.parallaxDepth[1] };
+        if (text_obj.parent != 0 && text_obj.attachment.empty()) {
+            // Text effect fallbacks follow the same route-matrix path as image effect fallbacks:
+            // keep inherited parallax from the authored parent, but leave the transform binding
+            // empty because the resolved route matrix already contains the visual parent chain.
+            if (auto parent = FindParentNode(context, text_obj.parent)) {
+                finalCompositeTransformData.SetParallaxAnchor(parent.get());
+            }
+        }
         ConfigureEffectFinalComposite(context,
                                       *imgEffectLayer,
                                       primitive->bridge.pingpong_a,
                                       text_obj.id,
-                                      text_obj.name);
+                                      text_obj.name,
+                                      &finalCompositeTransformData);
 
         const std::string in_rt = primitive->bridge.pingpong_a;
         const std::string effect_addr = getAddr(imgEffectLayer.get());
@@ -5520,6 +5779,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view   scene_id,
                    },
                    obj);
     }
+
+    ApplyMissingImageParallaxFallbacks(context, wp_objs);
 
     RegisterSceneScripts(context, json);
 

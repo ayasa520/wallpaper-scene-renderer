@@ -82,6 +82,12 @@ struct WPShaderValueData {
     WPNodeTransformBinding transform_binding {};
     SceneNode*            effect_projection_node { nullptr };
     SceneMesh*            effect_projection_mesh { nullptr };
+    // Some repaired Wallpaper Engine container nodes must provide the canonical mouse-parallax
+    // offset for their authored children without translating their own final offscreen composite.
+    // Moving that full render-target quad exposes rectangular background seams when the target
+    // contains cleared/filtered pixels around the character, while child nodes still need to anchor
+    // to the exact same parallax source to remain synchronized.
+    bool                  suppress_model_parallax { false };
 
     void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
 
@@ -108,7 +114,9 @@ struct WPShaderValueData {
 
     bool IsBoneAttached() const { return transform_binding.IsBoneAttachment(); }
 
-    bool AppliesModelParallax() const { return ! transform_binding.IsBoneAttachment(); }
+    bool AppliesModelParallax() const {
+        return ! suppress_model_parallax && ! transform_binding.IsBoneAttachment();
+    }
 
     SceneNode* TransformParent() const { return transform_binding.parent; }
 };

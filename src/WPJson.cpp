@@ -494,9 +494,18 @@ bool TryGetUserPropertyOverride(const nlohmann::json& json, T& value) {
     const auto* property_entry = FindUserPropertyEntry(g_json_user_properties, binding->name);
     if (property == nullptr || property_entry == nullptr) return false;
 
-    if (! binding->condition.empty() &&
-        ! MatchesUserPropertyCondition(*property_entry, binding->condition)) {
-        return false;
+    if (! binding->condition.empty()) {
+        // Wallpaper Engine uses object-form `user` bindings with `condition` as a branch gate, not
+        // as a direct value source. For example, a combo value "0" can mean "Open" while the actual
+        // property value is the authored JSON `value=true`; converting that raw "0" string to bool
+        // would incorrectly disable camera parallax. When the branch matches, fall through to the
+        // authored value node. When it does not match, consume the property with an inactive zero
+        // value so the authored branch value cannot leak into the wrong selector state.
+        if (MatchesUserPropertyCondition(*property_entry, binding->condition)) {
+            return false;
+        }
+        value = T {};
+        return true;
     }
 
     const bool converted = TryConvertUserPropertyValue(*property, value);

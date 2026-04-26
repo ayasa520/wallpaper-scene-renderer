@@ -135,6 +135,41 @@ bool ParseLegacyValue(const nlohmann::json& json, WPDynamicValue::Type hint, WPD
     return false;
 }
 
+WPDynamicValue MakeInactiveConditionValue(WPDynamicValue::Type type) {
+    // Conditional user bindings represent authored selector branches. If the selector does not
+    // match, the branch should contribute a neutral value instead of falling back to the branch's
+    // authored payload; otherwise a `value=true` branch such as camera parallax would stay enabled
+    // even when the combo selects the opposite option.
+    switch (type) {
+        case WPDynamicValue::Type::Boolean:
+            return WPDynamicValue(false);
+        case WPDynamicValue::Type::Int32:
+            return WPDynamicValue(int32_t { 0 });
+        case WPDynamicValue::Type::UInt32:
+            return WPDynamicValue(uint32_t { 0 });
+        case WPDynamicValue::Type::Float:
+            return WPDynamicValue(0.0f);
+        case WPDynamicValue::Type::Double:
+            return WPDynamicValue(0.0);
+        case WPDynamicValue::Type::String:
+            return WPDynamicValue(std::string {});
+        case WPDynamicValue::Type::FloatVector:
+            return WPDynamicValue(std::vector<float> {});
+        case WPDynamicValue::Type::Int3:
+            return WPDynamicValue(std::array<int32_t, 3> {});
+        case WPDynamicValue::Type::Float2:
+            return WPDynamicValue(std::array<float, 2> {});
+        case WPDynamicValue::Type::Float3:
+            return WPDynamicValue(std::array<float, 3> {});
+        case WPDynamicValue::Type::Float4:
+            return WPDynamicValue(std::array<float, 4> {});
+        case WPDynamicValue::Type::Null:
+            return WPDynamicValue {};
+    }
+
+    return WPDynamicValue {};
+}
+
 } // namespace
 
 WPDynamicValue WPUserSetting::evaluate(const UserPropertyMap*           user_properties,
@@ -148,9 +183,18 @@ WPDynamicValue WPUserSetting::evaluate(const UserPropertyMap*           user_pro
     if (property.has_value()) {
         if (const auto* user_value = LookupUserProperty(user_properties, property->name)) {
             const auto* user_entry = FindUserPropertyEntry(user_properties, property->name);
-            if (property->condition.empty() ||
-                (user_entry != nullptr &&
-                 MatchesUserPropertyCondition(*user_entry, property->condition))) {
+            if (!property->condition.empty()) {
+                // Object-form `user` bindings with a condition are selector branches: the user
+                // property decides whether this authored branch is active, while `setting.value`
+                // remains the value to apply. This keeps combo option "0" from being converted
+                // directly into bool false for properties whose branch value is actually true.
+                if (user_entry != nullptr &&
+                    MatchesUserPropertyCondition(*user_entry, property->condition)) {
+                    resolved = value;
+                } else {
+                    resolved = MakeInactiveConditionValue(value.type());
+                }
+            } else {
                 if (const auto override_value =
                         WPDynamicValue::FromUserPropertyValue(*user_value, value.type());
                     override_value.has_value()) {
