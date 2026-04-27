@@ -370,6 +370,15 @@ void ApplyTextResolution(PangoLayout* layout) {
     pango_cairo_context_set_resolution(context, kBaseTextResolutionDpi);
 }
 
+void ApplyWallpaperEngineTextSize(PangoFontDescription* desc, double point_size) {
+    if (desc == nullptr) return;
+
+    // Wallpaper Engine stores text `pointsize` in authored canvas pixels, while Pango's regular
+    // point-size API converts through the 96/72 DPI ratio. Use an absolute Pango size so the glyph
+    // metrics stay in the same pixel-space contract as the scene JSON and the Windows renderer.
+    pango_font_description_set_absolute_size(desc, std::max(1.0, point_size) * PANGO_SCALE);
+}
+
 void ReadVisibleBinding(const nlohmann::json& json, VisibleBinding* binding) {
     if (binding == nullptr || ! json.is_object()) return;
 
@@ -886,9 +895,9 @@ std::string MakeTextGlyphCacheKey(PangoFont* font, PangoGlyph glyph, double rast
     // scale so that repeated clock/script updates can reuse the same glyph coverage without
     // re-rasterizing the whole text layout or even the same glyph more than once. The explicit
     // atlas-raster version keeps long-lived renderer processes from reusing glyph bitmaps that
-    // were generated under an older bounds contract after we tighten the atlas geometry logic.
+    // were generated under an older bounds contract or the pre-absolute-size font metric contract.
     out << description << "|glyph=" << glyph << "|scaleMilli="
-        << static_cast<int>(std::lround(raster_scale * 1000.0)) << "|atlasRasterV=3";
+        << static_cast<int>(std::lround(raster_scale * 1000.0)) << "|atlasRasterV=4";
     return out.str();
 }
 
@@ -1460,7 +1469,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
 
     pango_font_description_set_family(desc, font_family.c_str());
     const double effective_point_size = std::max(1.0, static_cast<double>(object.pointsize));
-    pango_font_description_set_size(desc, effective_point_size * PANGO_SCALE);
+    ApplyWallpaperEngineTextSize(desc, effective_point_size);
     pango_layout_set_font_description(measure_layout, desc);
 
     const int requested_max_width = std::max(0, static_cast<int>(std::lround(object.maxwidth)));
@@ -1521,7 +1530,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     ApplyTextFontRenderOptions(cr, layout);
     ApplyTextResolution(layout);
     pango_font_description_set_family(draw_desc, font_family.c_str());
-    pango_font_description_set_size(draw_desc, effective_point_size * PANGO_SCALE);
+    ApplyWallpaperEngineTextSize(draw_desc, effective_point_size);
     pango_layout_set_font_description(layout, draw_desc);
 
     const int content_width      = std::max(width - padding * 2, 1);
@@ -1571,13 +1580,9 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     const auto crop = ResolveTextSurfaceCrop(
         object, raster_width, raster_height, raster_scale, draw_x, draw_y, ink_rect);
     // `glyph_display_size` is scene/display geometry, while `raster_scale` is only the backing
-    // atlas density. The old image-backed renderer kept those two spaces separate: HiDPI
-    // render-scale growth produced more source pixels, but the visible text quad was converted
-    // back with the authored visual raster density. Dividing by the full atlas scale here made
-    // first-class text shrink by renderScale^2 whenever the scene was parsed with a HiDPI text
-    // scale, which is why 3492627662's `文本1`, `文本2`, and `早中晚英文` became much smaller than
-    // the original log. Keep the permanent primitive contract explicit: source rects live in atlas
-    // pixels; display rects live in scene units and are independent of the offscreen backing scale.
+    // atlas density. The primitive renderer already maps the text texture back into scene space, so
+    // display geometry must remove only the authored visual raster density here; including
+    // `scene_scale` again makes HiDPI text visibly too small.
     const float display_scale =
         1.0f / std::max(raster_density, kMinTextVisualScaleFactor);
     const std::array<float, 2> full_display_size {

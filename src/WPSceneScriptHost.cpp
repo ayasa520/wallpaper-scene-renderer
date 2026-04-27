@@ -7438,6 +7438,23 @@ nlohmann::json* ResolveLocalStorageBucket(WPSceneScriptHost::Opaque* opaque,
                                                     : &opaque->local_storage_screen;
 }
 
+bool ShouldKeepScriptAuthoredInitialValue(const WPSceneScriptRegistration& registration) {
+    if (registration.target_kind != WPSceneScriptTargetKind::Layer) return false;
+
+    if (registration.property_name == "visible") return true;
+
+    if (registration.property_name == "scale") {
+        // Wallpaper Engine gives property scripts their authored/user-resolved base value during
+        // init(), even when a parser-time probe has already produced a derived live layer value.
+        // Audio-response scale scripts commonly store that init() input and multiply it by their
+        // min/max envelope every update; replacing the authored base with the probed live scale
+        // applies the envelope twice and makes text-bearing layers visibly too small.
+        return true;
+    }
+
+    return false;
+}
+
 bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance) {
     if (opaque == nullptr || opaque->runtime.context == nullptr || opaque->scene == nullptr)
         return false;
@@ -7459,8 +7476,7 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
             instance.registration.setting.evaluate(&opaque->user_properties, nullptr, base_context);
     }
     const bool keep_script_base_value =
-        instance.registration.target_kind == WPSceneScriptTargetKind::Layer &&
-        instance.registration.property_name == "visible";
+        ShouldKeepScriptAuthoredInitialValue(instance.registration);
     if (! keep_script_base_value) {
         if (const auto animated_value = ReadRegistrationValue(opaque, instance.registration);
             animated_value.has_value()) {
