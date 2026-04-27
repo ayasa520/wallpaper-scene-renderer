@@ -33,7 +33,15 @@ std::optional<UserPropertyBinding> ParseUserBinding(const nlohmann::json& json) 
 
 const nlohmann::json* ResolveInitialValueNode(const nlohmann::json& json) {
     if (! json.is_object()) return &json;
-    if (json.contains("value")) return &json.at("value");
+    if (json.contains("value")) {
+        const auto& value = json.at("value");
+        // Script-property bindings can nest another conditional user binding in their authored
+        // value. Wallpaper Engine still exposes the inner authored payload during init(), then
+        // applies the actual user selection later through applyUserProperties(), so unwrap the
+        // nested "value" chain instead of treating the binding object itself as a runtime value.
+        if (value.is_object() && value.contains("value")) return ResolveInitialValueNode(value);
+        return &value;
+    }
 
     if (json.contains("animation") && json.at("animation").is_object()) {
         const auto& animation = json.at("animation");

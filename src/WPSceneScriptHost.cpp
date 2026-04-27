@@ -7468,7 +7468,14 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
         static_cast<double>(opaque->scene->ortho[1]),
     };
 
-    if (instance.registration.setting.hasUserBinding()) {
+    if (! opaque->initialized) {
+        // During the initial scene bootstrap, Wallpaper Engine exposes the authored property value
+        // to init() first and dispatches user-property overrides afterwards. Keeping that order
+        // prevents init-time script side effects from seeing inactive conditional branches too
+        // early, while ApplyUserProperties() below still installs the user's actual value before
+        // the first frame update.
+        instance.current_value = instance.registration.setting.value;
+    } else if (instance.registration.setting.hasUserBinding()) {
         instance.current_value = EvaluateRegistrationSetting(
             instance.registration, &opaque->user_properties, base_context);
     } else {
@@ -7487,8 +7494,11 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
     FreeJSValue(context, instance.script_properties);
     instance.script_properties = JS_NewObject(context);
     for (const auto& [name, setting] : instance.registration.setting.script_properties) {
-        const auto resolved = setting->evaluate(&opaque->user_properties, nullptr, base_context);
-        const auto script_value = resolved.toScriptValue();
+        // Wallpaper Engine builds scriptProperties from the authored option values before init().
+        // User overrides are delivered immediately afterwards through applyUserProperties(); doing
+        // that second phase here would let inactive conditional options poison init-time shared
+        // state, which is observable in drag scripts that seed a global flag from isMovable.
+        const auto script_value = setting->value.toScriptValue();
         if (! script_value.has_value()) continue;
         SetJSProperty(context, instance.script_properties, name.c_str(), *script_value);
     }
@@ -8297,8 +8307,10 @@ void WPSceneScriptHost::ApplyUserProperties(const UserPropertyMap& user_properti
 
     for (const auto& instance_ptr : m_impl->instances) {
         auto& instance = *instance_ptr;
-        if (instance.registration.property_name == "visible" &&
-            instance.registration.setting.hasUserBinding()) {
+        if (instance.registration.setting.hasUserBinding()) {
+            // Script init() intentionally saw the authored value during bootstrap. Apply every
+            // user-bound script property here, not only visibility, so the post-init user override
+            // phase remains complete for origin, scale, uniforms, and any future script target.
             const auto resolved = EvaluateRegistrationSetting(
                 instance.registration, &m_impl->user_properties, base_context);
             instance.current_value = resolved;
