@@ -1505,6 +1505,7 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
         // compose/text layer.
         composite_data.parallaxDepth   = final_transform_data->parallaxDepth;
         composite_data.parallax_anchor = final_transform_data->parallax_anchor;
+        composite_data.suppress_model_parallax = final_transform_data->suppress_model_parallax;
     }
 
     auto composite_mesh = std::make_shared<SceneMesh>();
@@ -3992,11 +3993,11 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                       text_obj.parallaxDepth[1] };
         if (text_obj.parent != 0 && text_obj.attachment.empty()) {
             // Text effect fallbacks follow the same route-matrix path as image effect fallbacks:
-            // keep inherited parallax from the authored parent, but leave the transform binding
-            // empty because the resolved route matrix already contains the visual parent chain.
-            if (auto parent = FindParentNode(context, text_obj.parent)) {
-                finalCompositeTransformData.SetParallaxAnchor(parent.get());
-            }
+            // leave the transform binding empty because the resolved route matrix already contains
+            // the visual parent chain. Suppress model parallax on the synthetic fallback so a routed
+            // text effect cannot add the parent parallax a second time when the final authored effect
+            // is hidden and this neutral composite becomes the visible screen writer.
+            finalCompositeTransformData.suppress_model_parallax = true;
         }
         ConfigureEffectFinalComposite(context,
                                       *imgEffectLayer,
@@ -4127,6 +4128,16 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 auto spMesh                             = std::make_shared<SceneMesh>(true);
                 effect_node_data.parallaxDepth          = { text_obj.parallaxDepth[0],
                                                             text_obj.parallaxDepth[1] };
+                if (text_obj.parent != 0 && text_obj.attachment.empty()) {
+                    // Text effect nodes start as private bridge passes, but ResolveEffect() may turn
+                    // the last authored effect node into the visible scene-space writer. Parent-routed
+                    // text already receives the visual parent chain, including parent camera parallax,
+                    // through the render-graph route matrix. Suppressing this node's own model
+                    // parallax prevents two failure modes: non-zero child text depths drifting inside
+                    // zero-parallax HUD groups, and zero-depth effect-backed date labels receiving an
+                    // extra copy of their moving parent's parallax.
+                    effect_node_data.suppress_model_parallax = true;
+                }
                 effect_node_data.effect_projection_node = &imgEffectLayer->FinalNode();
                 effect_node_data.effect_projection_mesh = &imgEffectLayer->FinalMesh();
                 spMesh->AddMaterial(std::move(effect_material));
