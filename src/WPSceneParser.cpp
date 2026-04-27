@@ -3321,8 +3321,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         return;
     }
 
-    bool hasPuppet = ! wpimgobj.puppet.empty();
-    (void)hasPuppet;
+    const bool hasAuthoredPuppet = ! wpimgobj.puppet.empty();
     // No-effect compose/project layers are logical framebuffer helpers. Drawing them as regular
     // image meshes can sample `_rt_default` and write it back through the scene camera, which
     // applies a second projection to the already-composited frame on non-authored output aspects.
@@ -3332,16 +3331,21 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     }
 
     std::unique_ptr<WPMdl> puppet;
-    if (! wpimgobj.puppet.empty()) {
+    if (hasAuthoredPuppet) {
         puppet = std::make_unique<WPMdl>();
         if (! WPMdlParser::Parse(wpimgobj.puppet, vfs, *puppet)) {
             LOG_ERROR("parse puppet failed: %s", wpimgobj.puppet.c_str());
             puppet = nullptr;
-        } else if (puppet->puppet->bones.size() == 0) {
+        } else if (puppet->kind == WPMdl::MeshKind::Puppet &&
+                   (puppet->puppet == nullptr || puppet->puppet->bones.empty())) {
             LOG_ERROR("puppet has no bones: %s", wpimgobj.puppet.c_str());
             puppet = nullptr;
         }
     }
+    const bool hasAnimatedPuppetMesh =
+        puppet != nullptr && puppet->kind == WPMdl::MeshKind::Puppet && puppet->puppet != nullptr;
+    const bool hasStaticImageMesh =
+        puppet != nullptr && puppet->kind == WPMdl::MeshKind::StaticImage;
 
     // wpimgobj.origin[1] = context.ortho_h - wpimgobj.origin[1];
     auto spWorldNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
@@ -3363,7 +3367,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     {
         if (! hasEffect) {
             svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-            if (puppet) {
+            if (hasAnimatedPuppetMesh) {
                 WPMdlParser::AddPuppetShaderInfo(shaderInfo, *puppet);
             }
         }
@@ -3429,7 +3433,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             mapRate       = { r[2] / r[0], r[3] / r[1] };
         }
 
-        if (puppet) {
+        if (hasAnimatedPuppetMesh) {
             if (hasEffect) {
                 // Keep the offscreen draw extents in scene/display units so effect
                 // composition matches the original visual size. Only the backing
@@ -3450,8 +3454,33 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 svData.puppet_layer.prepared(wpimgobj.puppet_layers);
                 WPMdlParser::GenPuppetMesh(mesh, *puppet);
             }
-        }
-        if (! puppet) {
+        } else if (hasStaticImageMesh) {
+            if (hasEffect) {
+                // Static image-puppet meshes authored in the puppet slot are final-layer shape
+                // masks, not animated sources. The effect chain still needs a normal layer-sized
+                // source card so filters sample the full media texture, then the resolved writer
+                // uses the authored mesh to clip/crop the final visible image without enabling
+                // skinning uniforms.
+                GenCardMesh(
+                    mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
+                WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
+            } else {
+                // No-effect static image puppets can draw the authored mesh directly. This keeps
+                // the exported crop geometry and UVs while avoiding any WPPuppet runtime state,
+                // which does not exist for flag-9 static image mesh files.
+                WPMdlParser::GenPuppetMesh(mesh, *puppet);
+            }
+        } else {
+            if (hasAuthoredPuppet) {
+                // Keep this diagnostic tied to the geometry fallback point. The parser error above
+                // explains why the authored puppet was unusable; this line records the rendering
+                // consequence before the rectangular card hides the real cause in visual output.
+                LOG_INFO("ImagePuppetFallback: layer=%d name='%s' puppet='%s' using rectangular "
+                         "card mesh",
+                         wpimgobj.id,
+                         wpimgobj.name.c_str(),
+                         wpimgobj.puppet.c_str());
+            }
             const auto source_mesh_size = wpimgobj.size;
             GenCardMesh(
                 mesh, { (uint16_t)source_mesh_size[0], (uint16_t)source_mesh_size[1] }, mapRate);
@@ -3470,7 +3499,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     RegisterUserShaderValueBindings(
         context, wpimgobj.material, shaderInfo, spImgNode.get(), wpimgobj.id, wpimgobj.name);
 
-    if (puppet) {
+    if (hasAnimatedPuppetMesh) {
         svData.puppet_layer = WPPuppetLayer(puppet->puppet);
         svData.puppet_layer.prepared(wpimgobj.puppet_layers);
     }
@@ -3773,7 +3802,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                 isSingleSyntheticColorBlendWriter ? "true" : "false");
                         }
                     }
-                    if (puppet && wpmat.use_puppet) {
+                    if (hasAnimatedPuppetMesh && wpmat.use_puppet) {
                         svData.puppet_layer = WPPuppetLayer(puppet->puppet);
                         svData.puppet_layer.prepared(wpimgobj.puppet_layers);
                     }
@@ -3823,7 +3852,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     };
     context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spWorldNode.get());
     context.scene->nodeOwners[spWorldNode.get()] = wpimgobj.id;
-    if (puppet) {
+    if (hasAnimatedPuppetMesh) {
         context.object_puppets[wpimgobj.id] = puppet->puppet.get();
     }
     // Effect-backed image layers usually use a detached source node plus a separate world node:

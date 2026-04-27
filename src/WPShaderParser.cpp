@@ -1696,6 +1696,136 @@ inline std::optional<size_t> FindTopLevelCompoundAssignment(std::string_view tex
     return std::nullopt;
 }
 
+inline std::string_view StripSingleOuterParens(std::string_view expression) {
+    expression = TrimWhitespace(expression);
+    if (expression.size() < 2 || expression.front() != '(' || expression.back() != ')') {
+        return expression;
+    }
+
+    const auto close_pos = SkipBalanced(expression, 0, '(', ')');
+    if (close_pos != expression.size()) return expression;
+    return TrimWhitespace(expression.substr(1, expression.size() - 2));
+}
+
+inline std::optional<size_t> FindTopLevelBinaryOperator(std::string_view text,
+                                                        std::string_view op) {
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+    int  brace_depth { 0 };
+
+    for (size_t pos = 0; pos + op.size() <= text.size(); pos++) {
+        const char ch = text[pos];
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == '{') brace_depth++;
+        else if (ch == '}' && brace_depth > 0) brace_depth--;
+        else if (paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 &&
+                 text.substr(pos, op.size()) == op) {
+            return pos;
+        }
+    }
+
+    return std::nullopt;
+}
+
+inline bool ContainsTopLevelComparisonOperator(std::string_view expression) {
+    expression = TrimWhitespace(expression);
+
+    bool in_string { false };
+    bool escaped { false };
+    char quote { '\0' };
+    int  paren_depth { 0 };
+    int  bracket_depth { 0 };
+    int  brace_depth { 0 };
+
+    for (size_t pos = 0; pos < expression.size(); pos++) {
+        const char ch   = expression[pos];
+        const char next = pos + 1 < expression.size() ? expression[pos + 1] : '\0';
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) in_string = false;
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            in_string = true;
+            quote     = ch;
+            continue;
+        }
+
+        if (ch == '(') paren_depth++;
+        else if (ch == ')' && paren_depth > 0) paren_depth--;
+        else if (ch == '[') bracket_depth++;
+        else if (ch == ']' && bracket_depth > 0) bracket_depth--;
+        else if (ch == '{') brace_depth++;
+        else if (ch == '}' && brace_depth > 0) brace_depth--;
+        else if (paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+            // Wallpaper Engine compatibility shaders often use comparison expressions as numeric
+            // masks. Detect only top-level comparisons here so nested arithmetic remains untouched
+            // unless the whole parenthesized expression was deliberately unwrapped by the caller.
+            if (ch == '<' || ch == '>') return true;
+            if ((ch == '=' || ch == '!') && next == '=') return true;
+        }
+    }
+
+    return false;
+}
+
+inline bool TryMakeFloatMaskExpression(std::string_view expression,
+                                       const std::vector<std::string>& bool_variables,
+                                       std::string& replacement) {
+    expression = TrimWhitespace(expression);
+    if (expression.empty()) return false;
+
+    const auto unwrapped = StripSingleOuterParens(expression);
+    std::string_view bool_name;
+    const bool is_bool_variable =
+        (TryParseStandaloneIdentifier(expression, bool_name) ||
+         TryParseStandaloneIdentifier(unwrapped, bool_name)) &&
+        ContainsString(bool_variables, bool_name);
+    const bool is_comparison_expression = ContainsTopLevelComparisonOperator(unwrapped);
+    if (! is_bool_variable && ! is_comparison_expression) return false;
+
+    // Wallpaper Engine treats bool masks inside scalar math as numeric 0/1 factors. Vulkan GLSL
+    // keeps booleans non-numeric, and float(boolExpr) is not portable across the glslang paths used
+    // here, so every proven boolean mask is lowered through an explicit ternary expression.
+    replacement = "((" + std::string(expression) + ") ? 1.0 : 0.0)";
+    return true;
+}
+
 inline bool TryRewriteFloatBoolMultiplyStatement(std::string_view statement,
                                                  const std::vector<std::string>& float_variables,
                                                  const std::vector<std::string>& bool_variables,
@@ -1715,22 +1845,45 @@ inline bool TryRewriteFloatBoolMultiplyStatement(std::string_view statement,
     const auto rhs = TrimWhitespace(statement.substr(*op_pos + 2));
 
     std::string_view lhs_name;
-    std::string_view rhs_name;
-    if (! TryParseStandaloneIdentifier(lhs, lhs_name) ||
-        ! TryParseStandaloneIdentifier(rhs, rhs_name)) {
+    if (! TryParseStandaloneIdentifier(lhs, lhs_name)) {
         return false;
     }
-    if (! ContainsString(float_variables, lhs_name) || ! ContainsString(bool_variables, rhs_name)) {
+    if (! ContainsString(float_variables, lhs_name)) {
         return false;
     }
 
-    // Wallpaper Engine compatibility shaders use bool values as 0/1 masks in scalar math, for
-    // example `floatMask *= boolCondition`. Desktop GLSL does not implicitly convert bool to
-    // float, so this pass makes only the proven float-times-bool compound assignment explicit
-    // instead of changing unrelated boolean logic.
-    replacement = std::string(prefix) + std::string(lhs_name) + " *= float(" +
-                  std::string(rhs_name) + ");";
-    return true;
+    std::string rhs_mask;
+    if (TryMakeFloatMaskExpression(rhs, bool_variables, rhs_mask)) {
+        replacement = std::string(prefix) + std::string(lhs_name) + " *= " + rhs_mask + ";";
+        return true;
+    }
+
+    const auto star_pos = FindTopLevelBinaryOperator(rhs, "*");
+    if (! star_pos.has_value()) return false;
+
+    const auto left  = TrimWhitespace(rhs.substr(0, *star_pos));
+    const auto right = TrimWhitespace(rhs.substr(*star_pos + 1));
+    std::string left_mask;
+    if (TryMakeFloatMaskExpression(left, bool_variables, left_mask)) {
+        // Workshop shaders commonly write `floatValue *= (comparison) * scalar;`. Preserve the
+        // authored scalar factor and lower only the boolean side so dumped prepared shaders remain
+        // readable when future workshop effects expose related compatibility cases.
+        replacement = std::string(prefix) + std::string(lhs_name) + " *= " + left_mask + " * " +
+                      std::string(right) + ";";
+        return true;
+    }
+
+    std::string right_mask;
+    if (TryMakeFloatMaskExpression(right, bool_variables, right_mask)) {
+        // Custom workshop shaders also use the reverse ordering `scalar * (comparison)`. The same
+        // compatibility rule applies because the non-boolean side is still the authored scalar
+        // factor and only the boolean mask needs a Vulkan-legal numeric lowering.
+        replacement = std::string(prefix) + std::string(lhs_name) + " *= " + std::string(left) +
+                      " * " + right_mask + ";";
+        return true;
+    }
+
+    return false;
 }
 
 inline std::string RewriteFloatBoolMultiplyAssignments(std::string_view text) {
@@ -3118,7 +3271,7 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
                                          const Combos& combos,
                                          std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "prepared-shader-v6-slot-screen-space-sample-y-flip\n";
+    out << "prepared-shader-v7-float-bool-mask-multiply\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';

@@ -27,6 +27,7 @@ struct WPMdl {
     {
         Unknown,
         Static,
+        StaticImage,
         Puppet,
     };
 

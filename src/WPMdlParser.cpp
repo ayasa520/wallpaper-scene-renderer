@@ -182,6 +182,8 @@ constexpr uint32_t mdat_attachment_data_byte_length = 64;
 // alternative consts for alternative mdl format
 constexpr uint32_t alt_singile_vertex = 4 * (3 + 4 + 4 + 2 + 7);
 constexpr uint32_t alt_format_vertex_size_herald_value = 0x0180000F;
+constexpr uint32_t static_image_vertex_size_marker      = 0x0000000F;
+constexpr uint32_t static_image_singile_vertex          = 4 * (3 + 3 + 4 + 2);
 
 constexpr uint32_t singile_bone_frame = 4 * 9;
 
@@ -244,13 +246,19 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     auto& f = memfile;
 
     mdl.mdlv = ReadMDLVesion(f);
-    mdl.kind = WPMdl::MeshKind::Puppet;
 
     int32_t mdl_flag = f.ReadInt32();
-    if (mdl_flag == 9) {
-        LOG_INFO("puppet '%s' is not complete, ignore", str_path.c_str());
-        return false;
-    };
+    const bool static_image_mesh = mdl_flag == 9;
+    if (static_image_mesh) {
+        // Flag 9 image puppet files are authored static image meshes, not broken animated
+        // puppets. They reuse the puppet slot to carry crop/shape geometry for image layers and
+        // intentionally stop before MDLS/MDLA skeleton data, so routing them through the animated
+        // puppet reader would either reject them or interpret their compact vertex stream with the
+        // wrong stride.
+        mdl.kind = WPMdl::MeshKind::StaticImage;
+    } else {
+        mdl.kind = WPMdl::MeshKind::Puppet;
+    }
     f.ReadInt32(); // unk, 1
     f.ReadInt32(); // unk, 1
 
@@ -261,40 +269,62 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     bool alt_mdl_format = false;
     uint32_t curr = f.ReadUint32();
 
-    // if the uint at the normal vertex size position is 0, then this file
-    // uses the alternative MDL format, therefore the actual vertex size is
-    // located after the herald value, and we'll need to account for other differences later on.
+    auto is_alt_vertex_marker = [&](uint32_t value) {
+        return value == alt_format_vertex_size_herald_value ||
+               (static_image_mesh && value == static_image_vertex_size_marker);
+    };
+
+    // If the uint at the normal vertex size position is 0, this file uses a marker-delimited
+    // vertex-size block. Static image puppets have their own marker value because their file
+    // family is image-layer geometry rather than animated skeleton data, but the cursor contract is
+    // the same: seek the marker, then read the byte size immediately after it.
     if(curr == 0){
         alt_mdl_format = true;
-        while (curr != alt_format_vertex_size_herald_value && f.Tell() < f.Size()){
+        while (! is_alt_vertex_marker(curr) && f.Tell() < f.Size()){
             curr = f.ReadUint32();
         }
-        if (curr != alt_format_vertex_size_herald_value) {
+        if (! is_alt_vertex_marker(curr)) {
             LOG_ERROR("failed to locate alternative vertex herald 0x%08x", alt_format_vertex_size_herald_value);
             return false;
         }
         curr = f.ReadUint32();
     }
-    else if(curr == std_format_vertex_size_herald_value){
+    else if(curr == std_format_vertex_size_herald_value ||
+            (static_image_mesh && curr == static_image_vertex_size_marker)){
         curr = f.ReadUint32();
     }
 
     uint32_t vertex_size = curr;
-    if (vertex_size % (alt_mdl_format? alt_singile_vertex : singile_vertex) != 0) {
+    const uint32_t vertex_stride =
+        static_image_mesh ? static_image_singile_vertex
+                          : (alt_mdl_format ? alt_singile_vertex : singile_vertex);
+    if (vertex_size % vertex_stride != 0) {
         LOG_ERROR("unsupport mdl vertex size %d", vertex_size);
         return false;
     }
 
-    // if using the alternative MDL format, vertexes contain 7 extra 32-bit chunks between
-    // position and blend indices
-    uint32_t vertex_num = vertex_size / (alt_mdl_format ? alt_singile_vertex : singile_vertex);
+    uint32_t vertex_num = vertex_size / vertex_stride;
     mdl.vertexs.resize(vertex_num);
     for (auto& vert : mdl.vertexs) {
-        for (auto& v : vert.position) v = f.ReadFloat();
-        if(alt_mdl_format) {for (int i = 0; i < 7; i++) f.ReadUint32();}
-        for (auto& v : vert.blend_indices) v = f.ReadUint32();
-        for (auto& v : vert.weight) v = f.ReadFloat();
-        for (auto& v : vert.texcoord) v = f.ReadFloat();
+        if (static_image_mesh) {
+            // Static image puppet meshes store position.xyz, normal.xyz, a vec4 payload, and
+            // texcoord.xy. They have no skinning attributes, so synthesize a neutral bone binding
+            // while preserving the authored shape and UV crop exactly for the final image layer.
+            for (auto& v : vert.position) v = f.ReadFloat();
+            for (int i = 0; i < 7; i++) f.ReadFloat();
+            vert.blend_indices = { 0, 0, 0, 0 };
+            vert.weight        = { 0.0f, 0.0f, 0.0f, 1.0f };
+            for (auto& v : vert.texcoord) v = f.ReadFloat();
+        } else {
+            for (auto& v : vert.position) v = f.ReadFloat();
+            // If using the alternative MDL format, vertexes contain 7 extra 32-bit chunks between
+            // position and blend indices. They are opaque payload for animated puppet meshes and
+            // must stay separate from the compact static-image path above.
+            if(alt_mdl_format) {for (int i = 0; i < 7; i++) f.ReadUint32();}
+            for (auto& v : vert.blend_indices) v = f.ReadUint32();
+            for (auto& v : vert.weight) v = f.ReadFloat();
+            for (auto& v : vert.texcoord) v = f.ReadFloat();
+        }
     }
 
     uint32_t indices_size = f.ReadUint32();
@@ -307,6 +337,17 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     mdl.indices.resize(indices_num);
     for (auto& id : mdl.indices) {
         for (auto& v : id) v = f.ReadUint16();
+    }
+
+    if (static_image_mesh) {
+        // Static image puppet meshes end after the index buffer. Returning here makes the contract
+        // explicit for callers: the mesh is valid render geometry, but there is no WPPuppet object,
+        // no bone uniforms, and no animation state to attach to the scene node.
+        LOG_INFO("read static image puppet: mdlv: %d, vertices: %u, indices: %u",
+                 mdl.mdlv,
+                 vertex_num,
+                 indices_num);
+        return true;
     }
 
     mdl.mdls = ReadMDLVesion(f);
