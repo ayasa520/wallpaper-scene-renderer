@@ -303,6 +303,9 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
     // renderer polls GStreamer. Applying them here keeps hidden authored videos from decoding
     // while prepared passes can still reuse the last uploaded frame when they are invisible.
     m_device->video_tex_cache().ApplyPlaybackStates(scene.videoTexturePaused);
+    // setCurrentTime() requests are one-shot decoder commands, so the video cache consumes and
+    // removes only the requests whose concrete GStreamer pipeline already exists.
+    m_device->video_tex_cache().ApplySeekRequests(scene.videoTextureSeekRequests);
     m_device->video_tex_cache().Poll();
 
         // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);

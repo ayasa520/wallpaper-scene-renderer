@@ -562,6 +562,39 @@ bool VideoTextureCache::setPaused(Entry& entry, bool paused) {
     return true;
 }
 
+bool VideoTextureCache::seekTo(Entry& entry, double seconds) {
+    if (entry.pipeline == nullptr) return false;
+
+    const double clamped_seconds = std::max(0.0, seconds);
+    const auto   target_time =
+        static_cast<GstClockTime>(clamped_seconds * static_cast<double>(GST_SECOND));
+
+    // SceneScript setCurrentTime() is a visible decoder command: use a flushing accurate seek so
+    // stale frames already queued in appsink are discarded before the next render poll observes the
+    // texture. This keeps one-shot intro videos deterministic when scripts stop, rewind, then wait
+    // for a later play() call.
+    if (! gst_element_seek_simple(
+            entry.pipeline,
+            GST_FORMAT_TIME,
+            static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+            target_time)) {
+        LOG_ERROR("video texture '%s': failed to seek to %.3fs",
+                  entry.key.c_str(),
+                  clamped_seconds);
+        return false;
+    }
+
+    if (entry.appsink_elem != nullptr) {
+        while (GstSample* stale =
+                   gst_app_sink_try_pull_sample(GST_APP_SINK(entry.appsink_elem), 0)) {
+            gst_sample_unref(stale);
+        }
+    }
+
+    LOG_INFO("video texture '%s': seek accepted seconds=%.3f", entry.key.c_str(), clamped_seconds);
+    return true;
+}
+
 bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSample* sample) {
     if (sample == nullptr) return false;
 
@@ -873,6 +906,24 @@ void VideoTextureCache::ApplyPlaybackStates(const std::unordered_map<std::string
         auto state_it = paused_by_key.find(entry_ptr->key);
         if (state_it == paused_by_key.end()) continue;
         setPaused(*entry_ptr, state_it->second);
+    }
+}
+
+void VideoTextureCache::ApplySeekRequests(std::unordered_map<std::string, double>& seek_seconds_by_key) {
+    for (auto iter = seek_seconds_by_key.begin(); iter != seek_seconds_by_key.end();) {
+        auto* entry = find(iter->first);
+        if (entry == nullptr) {
+            ++iter;
+            continue;
+        }
+
+        // A request is erased only after the concrete decoder accepts it. Init scripts can therefore
+        // queue setCurrentTime() before CustomShaderPass has materialized the texture, without
+        // losing the rewind on the frame where the video cache entry finally appears.
+        if (seekTo(*entry, iter->second))
+            iter = seek_seconds_by_key.erase(iter);
+        else
+            ++iter;
     }
 }
 

@@ -29,6 +29,7 @@ public:
 
     ImageSlotsRef Acquire(std::string_view key, const SceneTexture&, const Image&, bool paused = false);
     void          ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key);
+    void          ApplySeekRequests(std::unordered_map<std::string, double>& seek_seconds_by_key);
     void          Poll();
     void          RecordUploads(vvk::CommandBuffer&);
     void          Clear();
@@ -46,6 +47,7 @@ private:
     void         stopPipeline(Entry&);
     bool         restartPipeline(Entry&);
     bool         setPaused(Entry&, bool paused);
+    bool         seekTo(Entry&, double seconds);
     bool         uploadSample(Entry&, ::GstSample*);
 
     const Device& m_device;

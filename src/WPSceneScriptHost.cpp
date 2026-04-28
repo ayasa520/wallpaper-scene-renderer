@@ -1133,6 +1133,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      play() { __native.videoTextureCall(nodeId, 'play'); },\n"
         << "      pause() { __native.videoTextureCall(nodeId, 'pause'); },\n"
         << "      stop() { __native.videoTextureCall(nodeId, 'stop'); },\n"
+        << "      setCurrentTime(value) { __native.videoTextureCall(nodeId, 'setCurrentTime', "
+           "value); },\n"
         << "      isPlaying() { return !!__native.videoTextureCall(nodeId, 'isPlaying'); }\n"
         << "    };\n"
         << "  }\n"
@@ -6849,6 +6851,26 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     std::string command;
     if (! ReadJSString(context, argv[1], &command)) return JS_UNDEFINED;
 
+    const bool command_requires_video_decoder =
+        command == "play" || command == "pause" || command == "stop" ||
+        command == "setCurrentTime";
+    if (command_requires_video_decoder &&
+        opaque->scene->deferredRuntimeImageLayerIds.count(node_id) != 0) {
+        // Some Wallpaper Engine intro layers intentionally start hidden, then call
+        // getVideoTexture().stop()/setCurrentTime() during init before their first visible=true
+        // update tick. Visibility-driven materialization is too late for those scripts: the
+        // placeholder has no mesh/material, so the video command would resolve to an empty no-op
+        // controller. Materialize on the first concrete video command instead, keeping
+        // getVideoTexture() itself cheap while preserving hidden one-shot video setup.
+        if (! MaterializeDeferredImageLayerIfNeeded(opaque, node_id)) {
+            LOG_ERROR("SceneVideoTextureCall: failed to materialize deferred layer=%d command='%s'",
+                      node_id,
+                      command.c_str());
+            return JS_UNDEFINED;
+        }
+        opaque->scene->ApplyLayerVisibility(node_id);
+    }
+
     auto* node = FindNodeById(opaque, node_id);
     if (node == nullptr) {
         return command == "isPlaying" ? JS_NewBool(context, false) : JS_UNDEFINED;
@@ -6871,6 +6893,29 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
             // The Vulkan video cache owns sample timestamps, so the bridge maps stop() to the same
             // paused state as pause() while still avoiding repeated GStreamer state transitions.
             opaque->scene->videoTexturePaused[key] = paused;
+        }
+        return JS_UNDEFINED;
+    }
+
+    if (command == "setCurrentTime") {
+        double seconds = 0.0;
+        if (argc < 3 || JS_ToFloat64(context, &seconds, argv[2]) != 0 ||
+            ! std::isfinite(seconds)) {
+            LOG_ERROR("SceneVideoTextureSeekRequest: layer=%d invalid setCurrentTime argument",
+                      node_id);
+            return JS_UNDEFINED;
+        }
+
+        // Video textures may not have a Vulkan cache entry while init scripts are running. Keep the
+        // latest requested timestamp on Scene so the render thread can apply it after the pass that
+        // owns the concrete decoder has been prepared.
+        const double clamped_seconds = std::max(0.0, seconds);
+        for (const auto& key : keys) {
+            opaque->scene->videoTextureSeekRequests[key] = clamped_seconds;
+            LOG_INFO("SceneVideoTextureSeekRequest: layer=%d texture='%s' seconds=%.3f",
+                     node_id,
+                     key.c_str(),
+                     clamped_seconds);
         }
         return JS_UNDEFINED;
     }
