@@ -2163,8 +2163,10 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         return;
     }
 
-    for (const auto& [material_value_name, setting] : wpmat.constantshadervaluebindings) {
-        if (! setting.hasUserBinding()) continue;
+    for (const auto& [material_value_name, binding] : wpmat.constantshadervaluebindings) {
+        const auto& setting       = binding.setting;
+        const bool  has_animation = binding.animation != nullptr && binding.animation->valid();
+        if (! setting.hasUserBinding() && ! setting.hasScript() && ! has_animation) continue;
 
         const auto gl_uniform_name = ResolveMaterialValueUniformName(info, material_value_name);
         if (! SceneMaterialHasUniform(*node->Mesh()->Material(), gl_uniform_name)) {
@@ -2180,10 +2182,10 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         }
 
         // Effect pass constants are parsed into SceneMaterial::constValues for cold start, but
-        // authored user bindings such as workshop Bloom's `strength` slider must also be registered
-        // against the concrete pass node. The existing MaterialUniform dispatcher can then update
-        // `u_strength` on the next user-property change without rebuilding the post-process chain.
-        context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+        // dynamic constants also need a live target on the concrete pass node. User bindings and
+        // scripts both reuse the MaterialUniform dispatcher so album-art color scripts can update
+        // Gradient Color uniforms without rebuilding the post-process chain.
+        WPSceneScriptRegistration registration {
             .object_id     = object_id,
             .object_name   = std::string(object_name),
             .property_name = gl_uniform_name,
@@ -2194,17 +2196,37 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
             .value_type    = setting.value.type(),
             .base_value    = setting.value,
             .setting       = setting,
-        });
+        };
+
+        std::string registration_kind;
+        if (has_animation) {
+            // Material-uniform animations are registered against the same target descriptor as
+            // their sibling script/user binding. This keeps thisObject.getAnimation() resolvable
+            // for effect scripts that replay cover-transition timelines during media changes.
+            auto animation_registration      = registration;
+            animation_registration.animation = binding.animation;
+            context.scene->propertyAnimationRegistrations.push_back(
+                std::move(animation_registration));
+            registration_kind = "animation";
+        }
+        if (setting.hasScript()) {
+            context.scene->scriptRegistrations.push_back(registration);
+            registration_kind += registration_kind.empty() ? "script" : "+script";
+        } else if (setting.hasUserBinding()) {
+            context.scene->bindingRegistrations.push_back(registration);
+            registration_kind += registration_kind.empty() ? "user" : "+user";
+        }
 
         LOG_INFO("ConstantShaderValueRegister: layer=%d name='%.*s' effect-id=%d "
-                 "effect-index=%d material-index=%zu user-property='%s' material-value='%s' "
-                 "uniform='%s' value-type=%s",
+                 "effect-index=%d material-index=%zu kind=%s user-property='%s' "
+                 "material-value='%s' uniform='%s' value-type=%s",
                  object_id,
                  static_cast<int>(object_name.size()),
                  object_name.data(),
                  effect_id,
                  effect_index,
                  material_index,
+                 registration_kind.c_str(),
                  setting.property.has_value() ? setting.property->name.c_str() : "",
                  material_value_name.c_str(),
                  gl_uniform_name.c_str(),
@@ -4264,6 +4286,19 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                 spEffectNode.get(),
                                                 text_obj.id,
                                                 text_obj.name);
+                // Text layers build their effect materials through this separate bridge path rather
+                // than the image-layer effect parser. Register constant-shader scripts here as well
+                // so media-driven opacity fades on dynamic song-title/artist text receive playback
+                // events and can reveal the updated text layer over the authored placeholder layer.
+                RegisterConstantShaderValueBindings(context,
+                                                    material_source,
+                                                    effect_shader_info,
+                                                    spEffectNode.get(),
+                                                    text_obj.id,
+                                                    text_obj.name,
+                                                    wp_effect.id,
+                                                    effect_index,
+                                                    material_index);
                 context.shader_updater->SetNodeData(spEffectNode.get(), effect_node_data);
                 context.scene->nodeOwners[spEffectNode.get()] = text_obj.id;
                 img_effect->nodes.push_back({ material_output, spEffectNode });
@@ -5345,44 +5380,6 @@ void RegisterSceneParticleOverrideScriptBinding(ParseContext&         context,
              property_name.data());
 }
 
-void LogUnsupportedEffectMaterialScripts(const nlohmann::json& object_json,
-                                         const nlohmann::json& effect_json, int32_t object_id,
-                                         int32_t effect_id, uint32_t effect_index,
-                                         std::string_view effect_name) {
-    if (! effect_json.is_object() || ! effect_json.contains("passes") ||
-        ! effect_json.at("passes").is_array()) {
-        return;
-    }
-
-    for (std::size_t pass_index = 0; pass_index < effect_json.at("passes").size(); pass_index++) {
-        const auto& pass_json = effect_json.at("passes").at(pass_index);
-        if (! pass_json.is_object() || ! pass_json.contains("constantshadervalues") ||
-            ! pass_json.at("constantshadervalues").is_object()) {
-            continue;
-        }
-
-        for (const auto& value_entry : pass_json.at("constantshadervalues").items()) {
-            const auto& value_json = value_entry.value();
-            if (! value_json.is_object() || ! value_json.contains("script") ||
-                value_json.at("script").is_null()) {
-                continue;
-            }
-            std::string object_name;
-            GET_JSON_NAME_VALUE_NOWARN(object_json, "name", object_name);
-            LOG_INFO("SceneVisibilityEffectMaterialScriptUnsupported: layer=%d layer-name='%s' "
-                     "effect-id=%d effect-index=%u effect-name='%.*s' pass-index=%zu constant='%s'",
-                     object_id,
-                     object_name.c_str(),
-                     effect_id,
-                     effect_index,
-                     static_cast<int>(effect_name.size()),
-                     effect_name.data(),
-                     pass_index,
-                     value_entry.key().c_str());
-        }
-    }
-}
-
 void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json& object_json,
                                      const nlohmann::json& effect_json,
                                      uint32_t              authored_effect_index) {
@@ -5464,25 +5461,11 @@ void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::jso
         return;
     }
 
-    int32_t object_id { 0 };
-    GET_JSON_NAME_VALUE_NOWARN(object_json, "id", object_id);
     uint32_t effect_index = 0;
     for (const auto& effect_json : object_json.at("effects")) {
-        int32_t     effect_id { 0 };
-        std::string effect_name;
-        GET_JSON_NAME_VALUE_NOWARN(effect_json, "id", effect_id);
-        GET_JSON_NAME_VALUE_NOWARN(effect_json, "name", effect_name);
-        SceneImageEffect* effect = context.scene != nullptr && effect_id != 0
-                                       ? context.scene->FindImageEffectById(object_id, effect_id)
-                                       : nullptr;
-        if (effect != nullptr && effect_name.empty()) effect_name = effect->EffectName();
-        LogUnsupportedEffectMaterialScripts(object_json,
-                                            effect_json,
-                                            object_id,
-                                            effect_id,
-                                            effect != nullptr ? effect->EffectIndex()
-                                                              : effect_index,
-                                            effect_name);
+        // Effect material scripts are registered later while each concrete pass material is being
+        // built, because only that stage knows the resolved GLSL uniform name and pass SceneNode.
+        // Visibility bindings still stay here where the authored effect index is available.
         RegisterEffectVisibilityBinding(context, object_json, effect_json, effect_index);
         effect_index++;
     }

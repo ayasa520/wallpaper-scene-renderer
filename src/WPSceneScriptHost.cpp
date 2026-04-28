@@ -4363,7 +4363,7 @@ std::shared_ptr<Image> BuildMediaThumbnailImage(std::string_view key, int32_t wi
 }
 
 void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key, int32_t width,
-                        int32_t height, std::span<const uint8_t> rgba, const char* log_label) {
+                        int32_t height, std::span<const uint8_t> rgba) {
     if (opaque == nullptr || opaque->scene == nullptr) return;
 
     auto* synthetic_parser = AsSyntheticImageParser(opaque->scene->imageParser.get());
@@ -4392,14 +4392,12 @@ void UpdateMediaThumbnailTexture(WPSceneScriptHost::Opaque*     opaque,
                        WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE,
                        media_state.thumbnail_width,
                        media_state.thumbnail_height,
-                       media_state.thumbnail_rgba,
-                       "media thumbnail");
+                       media_state.thumbnail_rgba);
     UpdateMediaTexture(opaque,
                        WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE,
                        media_state.previous_thumbnail_width,
                        media_state.previous_thumbnail_height,
-                       media_state.previous_thumbnail_rgba,
-                       "media previous thumbnail");
+                       media_state.previous_thumbnail_rgba);
 }
 
 JSValue MakeMediaThumbnailEvent(JSContext* context, const WPSceneScriptMediaState& media_state) {
@@ -4426,6 +4424,15 @@ JSValue MakeMediaThumbnailEvent(JSContext* context, const WPSceneScriptMediaStat
                                }));
     JS_SetPropertyStr(context,
                       event,
+                      "tertiaryColor",
+                      Vec3ToJS(context,
+                               {
+                                   static_cast<double>(media_state.tertiary_color[0]),
+                                   static_cast<double>(media_state.tertiary_color[1]),
+                                   static_cast<double>(media_state.tertiary_color[2]),
+                               }));
+    JS_SetPropertyStr(context,
+                      event,
                       "textColor",
                       Vec3ToJS(context,
                                {
@@ -4433,13 +4440,34 @@ JSValue MakeMediaThumbnailEvent(JSContext* context, const WPSceneScriptMediaStat
                                    static_cast<double>(media_state.text_color[1]),
                                    static_cast<double>(media_state.text_color[2]),
                                }));
+    JS_SetPropertyStr(context,
+                      event,
+                      "highContrastColor",
+                      Vec3ToJS(context,
+                               {
+                                   static_cast<double>(media_state.high_contrast_color[0]),
+                                   static_cast<double>(media_state.high_contrast_color[1]),
+                                   static_cast<double>(media_state.high_contrast_color[2]),
+                               }));
     return event;
 }
 
 JSValue MakeMediaPropertiesEvent(JSContext* context, const WPSceneScriptMediaState& media_state) {
     JSValue event = JS_NewObject(context);
+    // Wallpaper Engine defines the extended media fields as optional, but scripts commonly compare
+    // them with an empty string before falling back. Supplying empty strings instead of leaving
+    // properties undefined keeps those fallback branches working with Linux MPRIS metadata.
     JS_SetPropertyStr(context, event, "title", JS_NewString(context, media_state.title.c_str()));
     JS_SetPropertyStr(context, event, "artist", JS_NewString(context, media_state.artist.c_str()));
+    JS_SetPropertyStr(
+        context, event, "albumTitle", JS_NewString(context, media_state.album_title.c_str()));
+    JS_SetPropertyStr(
+        context, event, "albumArtist", JS_NewString(context, media_state.album_artist.c_str()));
+    JS_SetPropertyStr(
+        context, event, "subTitle", JS_NewString(context, media_state.sub_title.c_str()));
+    JS_SetPropertyStr(context, event, "genres", JS_NewString(context, media_state.genres.c_str()));
+    JS_SetPropertyStr(
+        context, event, "contentType", JS_NewString(context, media_state.content_type.c_str()));
     return event;
 }
 
@@ -8649,7 +8677,9 @@ void WPSceneScriptHost::ApplyMediaState(const WPSceneScriptMediaState& media_sta
         m_impl->dispatched_media_state.has_thumbnail != media_state.has_thumbnail ||
         m_impl->dispatched_media_state.primary_color != media_state.primary_color ||
         m_impl->dispatched_media_state.secondary_color != media_state.secondary_color ||
+        m_impl->dispatched_media_state.tertiary_color != media_state.tertiary_color ||
         m_impl->dispatched_media_state.text_color != media_state.text_color ||
+        m_impl->dispatched_media_state.high_contrast_color != media_state.high_contrast_color ||
         m_impl->dispatched_media_state.thumbnail_width != media_state.thumbnail_width ||
         m_impl->dispatched_media_state.thumbnail_height != media_state.thumbnail_height ||
         m_impl->dispatched_media_state.thumbnail_rgba != media_state.thumbnail_rgba ||
@@ -8661,7 +8691,16 @@ void WPSceneScriptHost::ApplyMediaState(const WPSceneScriptMediaState& media_sta
             media_state.previous_thumbnail_rgba;
     const bool properties_changed = initial_dispatch ||
                                     m_impl->dispatched_media_state.title != media_state.title ||
-                                    m_impl->dispatched_media_state.artist != media_state.artist;
+                                    m_impl->dispatched_media_state.artist != media_state.artist ||
+                                    m_impl->dispatched_media_state.album_title !=
+                                        media_state.album_title ||
+                                    m_impl->dispatched_media_state.album_artist !=
+                                        media_state.album_artist ||
+                                    m_impl->dispatched_media_state.sub_title !=
+                                        media_state.sub_title ||
+                                    m_impl->dispatched_media_state.genres != media_state.genres ||
+                                    m_impl->dispatched_media_state.content_type !=
+                                        media_state.content_type;
     const bool playback_changed =
         initial_dispatch ||
         m_impl->dispatched_media_state.playback_state != media_state.playback_state;
