@@ -4454,6 +4454,70 @@ std::optional<WPDynamicValue> ReadDynamicValueFromJS(JSContext* context, JSValue
     return WPDynamicValue::FromScriptValue(*script_value, hint);
 }
 
+constexpr float kSceneScriptDegreesToRadians = 0.017453292519943295769f;
+constexpr float kSceneScriptRadiansToDegrees = 57.295779513082320877f;
+
+bool IsAngleProperty(std::string_view property_name) { return property_name == "angles"; }
+
+bool RegistrationUsesScriptAngleDegrees(const WPSceneScriptRegistration& registration) {
+    // Wallpaper Engine stores layer/camera rotations in scene JSON as radians, but SceneScript
+    // exposes the same "angles" properties as degrees. Keeping this predicate narrow prevents
+    // material uniforms, animation playback values, and other Float3 properties from being
+    // accidentally rescaled when they cross the script boundary.
+    return IsAngleProperty(registration.property_name) &&
+           (registration.target_kind == WPSceneScriptTargetKind::Layer ||
+            registration.target_kind == WPSceneScriptTargetKind::Camera);
+}
+
+WPDynamicValue ConvertFloat3Scale(const WPDynamicValue& value, float scale) {
+    std::array<float, 3> vector {};
+    if (! value.tryGet(&vector)) return value;
+    return WPDynamicValue(
+        std::array<float, 3> { vector[0] * scale, vector[1] * scale, vector[2] * scale });
+}
+
+std::array<double, 3> ConvertEulerArrayScale(const std::array<double, 3>& value, double scale) {
+    return { value[0] * scale, value[1] * scale, value[2] * scale };
+}
+
+WPDynamicValue ToScriptFacingRegistrationValue(const WPSceneScriptRegistration& registration,
+                                               const WPDynamicValue&            value) {
+    if (! RegistrationUsesScriptAngleDegrees(registration)) return value;
+
+    // SceneScript authors write formulas such as atan2(...) * 180 / PI for layer angles. Convert
+    // the renderer's internal radians to degrees before passing the update/init argument so those
+    // formulas can preserve and modify the incoming value without mixing units.
+    return ConvertFloat3Scale(value, kSceneScriptRadiansToDegrees);
+}
+
+WPDynamicValue FromScriptFacingRegistrationValue(const WPSceneScriptRegistration& registration,
+                                                 const WPDynamicValue&            value) {
+    if (! RegistrationUsesScriptAngleDegrees(registration)) return value;
+
+    // Convert script-returned degrees back to the renderer's radian storage exactly at the
+    // registration boundary. This keeps SceneNode, property animation, and JSON parsing code
+    // single-purpose: they continue to deal only in renderer-native radians.
+    return ConvertFloat3Scale(value, kSceneScriptDegreesToRadians);
+}
+
+WPDynamicValue ToScriptFacingLayerPropertyValue(std::string_view property_name,
+                                                const WPDynamicValue& value) {
+    if (! IsAngleProperty(property_name)) return value;
+
+    // Direct script property access through thisLayer.angles follows the same degree-based
+    // Wallpaper Engine contract as property update scripts, while SceneNode still stores radians.
+    return ConvertFloat3Scale(value, kSceneScriptRadiansToDegrees);
+}
+
+WPDynamicValue FromScriptFacingLayerPropertyValue(std::string_view property_name,
+                                                  const WPDynamicValue& value) {
+    if (! IsAngleProperty(property_name)) return value;
+
+    // Direct assignments like thisLayer.angles = new Vec3(...) arrive in degrees from scripts and
+    // must be converted before they are compared with, or written into, the renderer node state.
+    return ConvertFloat3Scale(value, kSceneScriptDegreesToRadians);
+}
+
 std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Opaque* opaque,
                                                      SceneNode*                       node,
                                                      std::string_view property_name) {
@@ -5496,7 +5560,8 @@ JSValue NativeGetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
 
     if (const auto text_value = ReadTextLayerPropertyValue(opaque, node_id, property_name);
         text_value.has_value()) {
-        const auto script_value = text_value->toScriptValue();
+        const auto script_value =
+            ToScriptFacingLayerPropertyValue(property_name, *text_value).toScriptValue();
         return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
     }
 
@@ -5505,7 +5570,7 @@ JSValue NativeGetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
 
     const auto value = ReadLayerPropertyValue(opaque, node, property_name);
     if (! value.has_value()) return JS_UNDEFINED;
-    const auto script_value = value->toScriptValue();
+    const auto script_value = ToScriptFacingLayerPropertyValue(property_name, *value).toScriptValue();
     return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
 }
 
@@ -5536,8 +5601,9 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
         if (! hint.supported) return JS_FALSE;
         const auto value = ReadDynamicValueFromJS(context, argv[2], hint.type);
         if (! value.has_value()) return JS_FALSE;
+        const auto runtime_value = FromScriptFacingLayerPropertyValue(property_name, *value);
         if (const auto current = ReadTextLayerPropertyValue(opaque, node_id, property_name);
-            current.has_value() && current->equals(*value)) {
+            current.has_value() && current->equals(runtime_value)) {
             // Per-frame authored scripts frequently assign the same visible/origin/text value back
             // to a layer. Treat identical writes as successful no-ops so those scripts do not force
             // transform, material, or bridge-resource work when the visual state is already
@@ -5545,7 +5611,8 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
             return JS_TRUE;
         }
         return JS_NewBool(context,
-                          ApplyTextLayerPropertyValue(opaque, node_id, property_name, *value));
+                          ApplyTextLayerPropertyValue(
+                              opaque, node_id, property_name, runtime_value));
     }
 
     auto* node = FindNodeById(opaque, node_id);
@@ -5556,15 +5623,16 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
 
     const auto value = ReadDynamicValueFromJS(context, argv[2], hint.type);
     if (! value.has_value()) return JS_FALSE;
+    const auto runtime_value = FromScriptFacingLayerPropertyValue(property_name, *value);
     if (const auto current = ReadLayerPropertyValue(opaque, node, property_name);
-        current.has_value() && current->equals(*value)) {
+        current.has_value() && current->equals(runtime_value)) {
         // Scene.on('update') scripts often drive layer visibility by assigning true/false every
         // frame. Returning early here preserves the Wallpaper Engine script contract while keeping
         // unchanged layers off the render-graph dirtiness path.
         return JS_TRUE;
     }
 
-    return JS_NewBool(context, ApplyLayerPropertyValue(opaque, node, property_name, *value));
+    return JS_NewBool(context, ApplyLayerPropertyValue(opaque, node, property_name, runtime_value));
 }
 
 JSValue NativeHasEffect(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -6427,7 +6495,12 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         if (! attachment.has_value() || attachment->attachment == nullptr) return JS_UNDEFINED;
         const auto transform = GetAttachmentWorldTransform(opaque, node, *attachment->attachment);
         if (! transform.has_value()) return JS_UNDEFINED;
-        return Vec3ToJS(context, AffineEulerAngles(Eigen::Affine3f(transform->cast<float>())));
+        // Puppet angle helpers are part of the SceneScript surface, so they expose degrees even
+        // though the underlying affine decomposition is stored and composed in radians.
+        return Vec3ToJS(
+            context,
+            ConvertEulerArrayScale(AffineEulerAngles(Eigen::Affine3f(transform->cast<float>())),
+                                   kSceneScriptRadiansToDegrees));
     }
     if (command == "getBoneCount") {
         return JS_NewInt32(context, static_cast<int32_t>(puppet->bones.size()));
@@ -6470,8 +6543,11 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         const auto bone_index = ResolveBoneReference(context, argv[2], *puppet);
         if (! bone_index.has_value()) return JS_UNDEFINED;
         const auto transform = GetBoneLocalTransform(opaque, node, *bone_index);
-        return transform.has_value() ? Vec3ToJS(context, AffineEulerAngles(*transform))
-                                     : JS_UNDEFINED;
+        return transform.has_value()
+                   ? Vec3ToJS(context,
+                              ConvertEulerArrayScale(AffineEulerAngles(*transform),
+                                                     kSceneScriptRadiansToDegrees))
+                   : JS_UNDEFINED;
     }
     if (command == "getLocalBoneOrigin") {
         if (argc < 3) return JS_UNDEFINED;
@@ -6521,8 +6597,9 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         const auto current_transform = GetBoneLocalTransform(opaque, node, *bone_index);
         if (! angles.has_value() || ! current_transform.has_value()) return JS_FALSE;
 
+        const auto runtime_angles = ConvertFloat3Scale(*angles, kSceneScriptDegreesToRadians);
         std::array<float, 3> angle_values {};
-        if (! angles->tryGet(&angle_values)) return JS_FALSE;
+        if (! runtime_angles.tryGet(&angle_values)) return JS_FALSE;
 
         Eigen::Vector3f translation {};
         Eigen::Vector3f rotation {};
@@ -7297,8 +7374,11 @@ JSValue NativeRotateLayerObjectSpace(JSContext* context, JSValueConst, int argc,
     const auto angles = ReadDynamicValueFromJS(context, argv[1], WPDynamicValue::Type::Float3);
     if (! angles.has_value()) return JS_FALSE;
 
+    // rotateObjectSpace is called from authored SceneScript, where angle deltas are degrees. The
+    // SceneNode rotation accumulator is radian-based, so convert before adding the delta.
+    const auto runtime_angles = ConvertFloat3Scale(*angles, kSceneScriptDegreesToRadians);
     std::array<float, 3> delta {};
-    if (! angles->tryGet(&delta)) return JS_FALSE;
+    if (! runtime_angles.tryGet(&delta)) return JS_FALSE;
 
     const auto& current = node->Rotation();
     node->SetRotation(
@@ -7735,8 +7815,9 @@ bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& in
     if (! JS_IsUndefined(instance.init_fn)) {
         JSValue result       = JS_UNDEFINED;
         instance.initialized = true;
-        if (const auto script_value = instance.current_value.toScriptValue();
-            script_value.has_value()) {
+        const auto script_facing_value =
+            ToScriptFacingRegistrationValue(instance.registration, instance.current_value);
+        if (const auto script_value = script_facing_value.toScriptValue(); script_value.has_value()) {
             JSValue arg = ScriptValueToJS(context, *script_value);
             result      = JS_Call(context, instance.init_fn, JS_UNDEFINED, 1, &arg);
             JS_FreeValue(context, arg);
@@ -7757,8 +7838,10 @@ bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& in
             const auto value = ReadDynamicValueFromJS(
                 context, result, hint.supported ? hint.type : instance.current_value.type());
             if (value.has_value()) {
-                instance.current_value = *value;
-                ApplyRegistrationValue(opaque, instance.registration, *value);
+                const auto runtime_value =
+                    FromScriptFacingRegistrationValue(instance.registration, *value);
+                instance.current_value = runtime_value;
+                ApplyRegistrationValue(opaque, instance.registration, runtime_value);
             }
         }
         if (! JS_IsException(result) && JS_IsUndefined(result)) {
@@ -8340,8 +8423,9 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
         }
 
         JSValue result = JS_UNDEFINED;
-        if (const auto script_value = instance.current_value.toScriptValue();
-            script_value.has_value()) {
+        const auto script_facing_value =
+            ToScriptFacingRegistrationValue(instance.registration, instance.current_value);
+        if (const auto script_value = script_facing_value.toScriptValue(); script_value.has_value()) {
             JSValue arg = ScriptValueToJS(context, *script_value);
             result      = JS_Call(context, instance.update_fn, JS_UNDEFINED, 1, &arg);
             JS_FreeValue(context, arg);
@@ -8360,17 +8444,19 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
             const auto value = ReadDynamicValueFromJS(
                 context, result, hint.supported ? hint.type : instance.current_value.type());
             if (value.has_value()) {
+                const auto runtime_value =
+                    FromScriptFacingRegistrationValue(instance.registration, *value);
                 // The Wallpaper Engine script convention is often "return the current value" from
                 // every update tick. Avoid re-entering the registration writer for identical
                 // values; the writer still performs its own guard for external callers, but
                 // skipping here removes a full property read/compare/apply round from every
                 // steady-state script.
-                if (instance.current_value.equals(*value)) {
+                if (instance.current_value.equals(runtime_value)) {
                     JS_FreeValue(context, result);
                     continue;
                 }
-                instance.current_value = *value;
-                ApplyRegistrationValue(m_impl, instance.registration, *value);
+                instance.current_value = runtime_value;
+                ApplyRegistrationValue(m_impl, instance.registration, runtime_value);
             }
         }
 
