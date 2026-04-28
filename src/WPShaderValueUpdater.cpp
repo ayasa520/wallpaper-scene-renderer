@@ -17,7 +17,6 @@
 #include <ctime>
 #include <cmath>
 #include <algorithm>
-#include <unordered_map>
 #include <limits>
 #include <numeric>
 
@@ -203,23 +202,6 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {
         info.has_audio_spectrum_left[index] = existsOp(kAudioSpectrumLeftUniforms[index]);
         info.has_audio_spectrum_right[index] = existsOp(kAudioSpectrumRightUniforms[index]);
-    }
-
-    if (std::any_of(info.has_audio_spectrum_left.begin(),
-                    info.has_audio_spectrum_left.end(),
-                    [](bool value) { return value; }) ||
-        std::any_of(info.has_audio_spectrum_right.begin(),
-                    info.has_audio_spectrum_right.end(),
-                    [](bool value) { return value; })) {
-        LOG_INFO("SceneAudioUniformInit: layer=%d name='%s' has16=(%s,%s) has32=(%s,%s) has64=(%s,%s)",
-                 pNode->ID(),
-                 pNode->Name().c_str(),
-                 info.has_audio_spectrum_left[0] ? "true" : "false",
-                 info.has_audio_spectrum_right[0] ? "true" : "false",
-                 info.has_audio_spectrum_left[1] ? "true" : "false",
-                 info.has_audio_spectrum_right[1] ? "true" : "false",
-                 info.has_audio_spectrum_left[2] ? "true" : "false",
-                 info.has_audio_spectrum_right[2] ? "true" : "false");
     }
 
     std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
@@ -480,17 +462,6 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             has_audio = !left.empty() || !right.empty() || !average.empty();
         }
         if (!has_audio) {
-            static std::unordered_map<int32_t, double> last_audio_missing_log_at;
-            const auto layer_id = pNode->ID();
-            const auto last_it = last_audio_missing_log_at.find(layer_id);
-            if (last_it == last_audio_missing_log_at.end() ||
-                m_scene->elapsingTime - last_it->second >= 5.0) {
-                last_audio_missing_log_at[layer_id] = m_scene->elapsingTime;
-                LOG_INFO("SceneAudioUniform: layer=%d name='%s' res=%u missing-audio-data",
-                         layer_id,
-                         pNode->Name().c_str(),
-                         kAudioSpectrumResolutions[index]);
-            }
             continue;
         }
 

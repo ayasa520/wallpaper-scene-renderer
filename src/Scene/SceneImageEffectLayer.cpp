@@ -7,56 +7,6 @@
 
 using namespace wallpaper;
 
-namespace
-{
-bool IsAudioBarNode(const SceneNode* node) {
-    auto* mutable_node = const_cast<SceneNode*>(node);
-    if (mutable_node == nullptr || mutable_node->Mesh() == nullptr ||
-        mutable_node->Mesh()->Material() == nullptr) {
-        return false;
-    }
-    const auto* shader = mutable_node->Mesh()->Material()->customShader.shader.get();
-    return shader != nullptr && shader->name.find("Simple_Audio_Bars") != std::string::npos;
-}
-
-bool HasAudioBarEffect(const SceneImageEffectLayer& layer) {
-    auto& mutable_layer = const_cast<SceneImageEffectLayer&>(layer);
-    for (std::size_t effect_index = 0; effect_index < mutable_layer.EffectCount(); effect_index++) {
-        auto& effect = mutable_layer.GetEffect(effect_index);
-        for (const auto& node : effect->nodes) {
-            if (IsAudioBarNode(node.sceneNode.get())) return true;
-        }
-    }
-    return false;
-}
-
-void LogNodeTransform(const char* prefix, const SceneNode* node) {
-    if (node == nullptr) {
-        LOG_INFO("%s node=<null>", prefix);
-        return;
-    }
-    const auto& t = node->Translate();
-    const auto& s = node->Scale();
-    const auto& r = node->Rotation();
-    LOG_INFO("%s layer=%d name='%s' visible=%s translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) "
-             "rotation=(%.3f,%.3f,%.3f)",
-             prefix,
-             const_cast<SceneNode*>(node)->ID(),
-             node->Name().c_str(),
-             node->Visible() ? "true" : "false",
-             t.x(),
-             t.y(),
-             t.z(),
-             s.x(),
-             s.y(),
-             s.z(),
-             r.x(),
-             r.y(),
-             r.z());
-    LOG_INFO("%s ptr=%p", prefix, static_cast<const void*>(node));
-}
-} // namespace
-
 // The width and height parameters remain in the public constructor to preserve the existing parser
 // call contract; effect geometry is copied from the resolved source/final meshes during
 // ResolveEffect(), so the constructor only records the world node and ping-pong target names.
@@ -99,13 +49,49 @@ bool SceneImageEffectLayer::HasFinalComposite() const {
     return m_final_node != nullptr && m_final_node->HasMaterial();
 }
 
-bool SceneImageEffectLayer::ShouldRunFinalCompositeFallback() const {
-    // Visible final effects must keep the historical direct-to-screen shader path because authored
-    // effects such as xray/composite shaders may rely on writing the default target themselves. The
-    // synthetic composite is therefore only allowed to run when the final authored effect is hidden
-    // and its shader pass is intentionally skipped.
-    return HasFinalComposite() && m_final_output_effect != nullptr &&
-        !m_final_output_effect->LocalVisible();
+bool SceneImageEffectLayer::HasRuntimeVisibilityContract() const {
+    for (const auto& effect : m_effects) {
+        if (effect != nullptr && effect->HasRuntimeVisibilityContract()) return true;
+    }
+    return false;
+}
+
+bool SceneImageEffectLayer::HasVisibleRuntimeVisibilityContribution() const {
+    for (const auto& effect : m_effects) {
+        if (effect != nullptr && effect->HasRuntimeVisibilityContract() &&
+            effect->LocalVisible()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SceneImageEffectLayer::HasVisibleSourceLessContribution() const {
+    if (m_final_output_effect == nullptr) return false;
+
+    if (HasRuntimeVisibilityContract()) {
+        // Source-less compose helpers often model a user-selected generator effect followed by
+        // always-visible filters such as fisheye or scroll. The filters are not valid sources on
+        // their own; when every runtime-selected source effect is hidden, publishing the final
+        // filter output would expose an empty or stale helper target as a rectangular quad.
+        return HasVisibleRuntimeVisibilityContribution();
+    }
+
+    // Static source-less helpers without runtime visibility still need to draw their authored
+    // chain normally. In that simpler contract the final effect's own visibility remains the best
+    // indication that the chain currently contributes visible pixels.
+    return m_final_output_effect->LocalVisible();
+}
+
+bool SceneImageEffectLayer::ShouldRunFinalComposite() const {
+    // The neutral final composite has two modes. Ordinary image/text layers keep their historical
+    // direct final writer while visible and use this pass only as a preserve-source hidden fallback.
+    // Source-less passthrough helpers have no meaningful base image, so this pass becomes the only
+    // screen publisher and draws only while the helper chain has a visible source contribution.
+    if (!HasFinalComposite() || m_final_output_effect == nullptr) return false;
+    if (m_publish_final_composite) return HasVisibleSourceLessContribution();
+    if (m_final_output_effect->LocalVisible()) return false;
+    return m_hidden_final_composite_policy == HiddenFinalCompositePolicy::PreserveSource;
 }
 
 void SceneImageEffectLayer::SetFinalCompositeSource(std::string source) {
@@ -114,10 +100,11 @@ void SceneImageEffectLayer::SetFinalCompositeSource(std::string source) {
     auto* material = m_final_node->Mesh()->Material();
     if (material == nullptr) return;
 
-    // The final composite is deliberately separate from every authored effect shader. ResolveEffect()
-    // keeps its source pointed at the fully resolved ping-pong chain, then restores the visible final
-    // authored effect to the historical direct output path. When that final effect is hidden, this
-    // neutral passthrough can draw the bypassed ping-pong texture without rebuilding the graph.
+    // The final composite is deliberately separate from every authored effect shader. Ordinary
+    // layers use it to draw the bypassed ping-pong texture when the final authored effect is hidden.
+    // Source-less passthrough helpers use the same neutral shader as their stable screen publisher,
+    // with the authored final effect kept private so visibility changes cannot leave stale direct
+    // framebuffer writes behind.
     if (material->textures.empty()) material->textures.resize(1);
     material->textures[0] = std::move(source);
 }
@@ -143,10 +130,10 @@ void SceneImageEffectLayer::SyncResolvedOutputMesh() {
     // vertex buffer even though the debug logs already show the updated quad geometry.
     m_resolved_output_node->Mesh()->SetDirty();
     if (HasFinalComposite() && m_final_node->Mesh() != nullptr) {
-        // The hidden-final fallback pass has its own node so the visible final shader can continue
-        // using the old direct output path. Keep that fallback mesh synchronized as well; otherwise
-        // a runtime text/image resize could fix the visible path while leaving the emergency
-        // passthrough card with stale geometry.
+        // The neutral final composite has its own node whether it is acting as a hidden fallback or
+        // as the source-less helper publisher. Keep that mesh synchronized as well; otherwise a
+        // runtime text/image resize could fix the authored path while leaving this publisher with
+        // stale geometry.
         m_final_node->Mesh()->ChangeMeshDataFrom(*m_final_mesh);
         m_final_node->Mesh()->SetDirty();
     }
@@ -205,6 +192,7 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
     m_resolved_output_node = nullptr;
     m_final_output_effect  = nullptr;
     m_resolved_output_follows_world = true;
+    m_publish_final_composite = false;
     sync_resolved_world();
 
     SceneImageEffectNode* fallback_last_output { nullptr };
@@ -281,18 +269,17 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
             material.blenmode = m_final_blend;
             m_final_node->SetCamera(std::string());
             mesh.ChangeMeshDataFrom(*m_final_mesh);
-            if (HasAudioBarEffect(*this)) {
-                LOG_INFO("SceneAudioEffectResolve: final-blend=%d output='%s'",
-                         static_cast<int>(m_final_blend),
-                         SpecTex_Default.data());
-                LogNodeTransform("SceneAudioEffectResolve: world", m_worldNode);
-                LogNodeTransform("SceneAudioEffectResolve: final", m_final_node.get());
-                LogNodeTransform("SceneAudioEffectResolve: resolved", m_final_node.get());
-            }
         }
     }
 
-    if (fallback_last_output != nullptr && !keep_final_output_private) {
+    const bool source_less_final_output =
+        m_hidden_final_composite_policy == HiddenFinalCompositePolicy::SuppressOutput &&
+        m_final_output_effect != nullptr;
+    const bool keep_authored_final_private =
+        keep_final_output_private || source_less_final_output;
+    m_publish_final_composite = source_less_final_output && !keep_final_output_private;
+
+    if (fallback_last_output != nullptr && !keep_authored_final_private) {
         // Keep the historical visible path: the final authored shader writes the screen/default
         // output directly, preserving shaders whose visual result depends on being the final
         // compositor. The synthetic final composite remains dormant unless this effect is hidden.
@@ -328,12 +315,11 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
             mesh.ChangeMeshDataFrom(*m_final_mesh);
         }
     } else if (fallback_last_output != nullptr) {
-        // Effect dependencies sampled through `_rt_imageLayerComposite_<id>` need the opposite
-        // final-output contract from visible screen layers. They are hidden source layers whose
-        // final authored effect must continue writing the private ping-pong target so the consumer
-        // samples the fully resolved source image. Rewriting that final effect to `_rt_default`
-        // would also make the pass fail the hidden-dependency execution rule and leave the linked
-        // texture with an intermediate result.
+        // Some final authored effects must remain private even when their owner is a visible screen
+        // layer. Hidden dependency sources need this because consumers sample the resolved private
+        // texture. Source-less passthrough helpers need the same topology because their base image
+        // is intentionally empty; a stable neutral composite can then publish only real visible
+        // source contributions and suppress the chain when user-selected generator effects are off.
         m_resolved_output_node = fallback_last_output->sceneNode.get();
         m_resolved_output_follows_world = false;
         sync_resolved_world();

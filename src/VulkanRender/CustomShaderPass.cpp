@@ -16,102 +16,12 @@
 #include "Core/ArrayHelper.hpp"
 
 #include <cassert>
-#include <algorithm>
 #include <array>
-#include <unordered_map>
-#include <sstream>
 
 using namespace wallpaper::vulkan;
 
 namespace
 {
-constexpr std::array<std::string_view, 6> kAudioSpectrumUniformNames {
-    "g_AudioSpectrum16Left",  "g_AudioSpectrum16Right", "g_AudioSpectrum32Left",
-    "g_AudioSpectrum32Right", "g_AudioSpectrum64Left",  "g_AudioSpectrum64Right",
-};
-
-bool HasAudioSpectrumUniforms(const ShaderReflected::Block& block) {
-    return std::any_of(kAudioSpectrumUniformNames.begin(),
-                       kAudioSpectrumUniformNames.end(),
-                       [&block](std::string_view name) {
-                           return wallpaper::exists(block.member_map, name);
-                       });
-}
-
-const wallpaper::ShaderValue* FindMaterialUniformValue(const wallpaper::SceneMaterial& material,
-                                                       std::string_view                name) {
-    if (const auto it = material.customShader.constValues.find(name);
-        it != material.customShader.constValues.end()) {
-        return &it->second;
-    }
-    if (material.customShader.shader != nullptr) {
-        if (const auto it = material.customShader.shader->default_uniforms.find(name);
-            it != material.customShader.shader->default_uniforms.end()) {
-            return &it->second;
-        }
-    }
-    return nullptr;
-}
-
-std::string DescribeMaterialUniformValue(const wallpaper::SceneMaterial& material,
-                                         std::string_view                name) {
-    const auto* value = FindMaterialUniformValue(material, name);
-    if (value == nullptr) return "<missing>";
-
-    std::ostringstream oss;
-    oss << "[";
-    for (size_t i = 0; i < value->size(); i++) {
-        if (i != 0) oss << ", ";
-        oss << (*value)[i];
-        if (i >= 3 && value->size() > 4) {
-            oss << ", ...";
-            break;
-        }
-    }
-    oss << "]";
-    return oss.str();
-}
-
-template<typename Map>
-std::string DescribeUniformMap(const Map& values) {
-    std::ostringstream oss;
-    oss << "{";
-    size_t count = 0;
-    for (const auto& [name, value] : values) {
-        if (count != 0) oss << ", ";
-        oss << name << "=";
-        oss << "[";
-        for (size_t i = 0; i < value.size(); i++) {
-            if (i != 0) oss << ", ";
-            oss << value[i];
-            if (i >= 3 && value.size() > 4) {
-                oss << ", ...";
-                break;
-            }
-        }
-        oss << "]";
-        count++;
-        if (count >= 8 && values.size() > count) {
-            oss << ", ...";
-            break;
-        }
-    }
-    oss << "}";
-    return oss.str();
-}
-
-std::string DescribeTextureList(const wallpaper::SceneMaterial& material) {
-    std::ostringstream oss;
-    oss << "[";
-    for (size_t i = 0; i < material.textures.size(); i++) {
-        if (i != 0) oss << ", ";
-        oss << i << "=";
-        oss << "'" << material.textures[i] << "'";
-    }
-    oss << "]";
-    return oss.str();
-}
-
 std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent) {
     // Model depth is allocated only for opt-in 3D model passes. The existing 2D render-target cache
     // remains color-only, while separate model chunk passes can still behave like one depth-tested
@@ -157,206 +67,6 @@ std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, Vk
     };
     VVK_CHECK_ACT(return std::nullopt, device.handle().CreateImageView(view_info, image.view));
     return image;
-}
-
-std::string DescribeDescTextureList(const std::vector<std::string>& textures) {
-    std::ostringstream oss;
-    oss << "[";
-    for (size_t i = 0; i < textures.size(); i++) {
-        if (i != 0) oss << ", ";
-        oss << i << "=";
-        oss << "'" << textures[i] << "'";
-    }
-    oss << "]";
-    return oss.str();
-}
-
-std::string DescribeBlockMemberList(const ShaderReflected::Block& block) {
-    std::ostringstream oss;
-    oss << "{";
-    size_t count = 0;
-    for (const auto& [name, uniform] : block.member_map) {
-        if (count != 0) oss << ", ";
-        oss << name << "=(offset=" << uniform.offset << ", num=" << uniform.num << ")";
-        count++;
-    }
-    oss << "}";
-    return oss.str();
-}
-
-void LogAudioUniformBlockLayout(const CustomShaderPass::Desc&   desc,
-                                const wallpaper::SceneMaterial& material,
-                                const ShaderReflected::Block&   block) {
-    if (! HasAudioSpectrumUniforms(block)) return;
-
-    const auto* node   = desc.node;
-    const auto* shader = material.customShader.shader.get();
-    LOG_INFO("SceneAudioUniformBlock: layer=%d name='%s' shader='%s' members=%s",
-             node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
-             node != nullptr ? node->Name().c_str() : "<null>",
-             shader != nullptr ? shader->name.c_str() : "<null>",
-             DescribeBlockMemberList(block).c_str());
-}
-
-void LogAudioReactivePassConfig(const CustomShaderPass::Desc&   desc,
-                                const wallpaper::SceneMaterial& material,
-                                const ShaderReflected::Block&   block) {
-    if (! HasAudioSpectrumUniforms(block)) return;
-
-    const auto* node   = desc.node;
-    const auto* shader = material.customShader.shader.get();
-    LOG_INFO("SceneAudioPass: layer=%d name='%s' shader='%s' output='%s' visible=%s textures=%zu "
-             "barCount=%s volumeFactor=%s barBounds=%s barOpacity=%s barSpacing=%s barColor=%s "
-             "hideTs=%s dynamicHide=%s radius=%s segmentSpacing=%s segmentCount=%s "
-             "segmentThreshold=%s textureList=%s",
-             node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
-             node != nullptr ? node->Name().c_str() : "<null>",
-             shader != nullptr ? shader->name.c_str() : "<null>",
-             desc.output.c_str(),
-             node != nullptr && node->Visible() ? "true" : "false",
-             desc.textures.size(),
-             DescribeMaterialUniformValue(material, "u_BarCount").c_str(),
-             DescribeMaterialUniformValue(material, "u_VolumeFactor").c_str(),
-             DescribeMaterialUniformValue(material, "u_BarBounds").c_str(),
-             DescribeMaterialUniformValue(material, "u_BarOpacity").c_str(),
-             DescribeMaterialUniformValue(material, "u_BarSpacing").c_str(),
-             DescribeMaterialUniformValue(material, "u_BarColor").c_str(),
-             DescribeMaterialUniformValue(material, "u_TsOfHiding").c_str(),
-             DescribeMaterialUniformValue(material, "u_DynamicHiding").c_str(),
-             DescribeMaterialUniformValue(material, "u_Radius").c_str(),
-             DescribeMaterialUniformValue(material, "u_SegmentSpacing").c_str(),
-             DescribeMaterialUniformValue(material, "u_SegmentCount").c_str(),
-             DescribeMaterialUniformValue(material, "u_SegmentThreshold").c_str(),
-             DescribeTextureList(material).c_str());
-}
-
-void LogAudioCompositePassConfig(const CustomShaderPass::Desc&   desc,
-                                 const wallpaper::SceneMaterial& material) {
-    const auto* node   = desc.node;
-    const auto* shader = material.customShader.shader.get();
-    if (shader == nullptr || shader->name != "genericimage3") return;
-
-    LOG_INFO("SceneAudioCompositeConfig: layer=%d name='%s' ptr=%p shader='%s' output='%s' "
-             "visible=%s textures=%zu texture0='%s' blendMode=%d color4=%s alpha=%s userAlpha=%s "
-             "brightness=%s textureList=%s",
-             node != nullptr ? const_cast<wallpaper::SceneNode*>(node)->ID() : -1,
-             node != nullptr ? node->Name().c_str() : "<null>",
-             static_cast<const void*>(node),
-             shader->name.c_str(),
-             desc.output.c_str(),
-             node != nullptr && node->Visible() ? "true" : "false",
-             material.textures.size(),
-             ! material.textures.empty() ? material.textures[0].c_str() : "<none>",
-             static_cast<int>(material.blenmode),
-             DescribeMaterialUniformValue(material, "g_Color4").c_str(),
-             DescribeMaterialUniformValue(material, "g_Alpha").c_str(),
-             DescribeMaterialUniformValue(material, "g_UserAlpha").c_str(),
-             DescribeMaterialUniformValue(material, "g_Brightness").c_str(),
-             DescribeTextureList(material).c_str());
-    LOG_INFO("SceneAudioCompositeConfig: constValues=%s",
-             DescribeUniformMap(material.customShader.constValues).c_str());
-    if (shader != nullptr) {
-        LOG_INFO("SceneAudioCompositeConfig: defaultUniforms=%s",
-                 DescribeUniformMap(shader->default_uniforms).c_str());
-    }
-}
-
-void LogAudioReactivePassExecute(const CustomShaderPass::Desc& desc) {
-    const auto* node         = desc.node;
-    auto*       mutable_node = const_cast<wallpaper::SceneNode*>(node);
-    if (mutable_node == nullptr || mutable_node->Mesh() == nullptr ||
-        mutable_node->Mesh()->Material() == nullptr) {
-        return;
-    }
-
-    const auto& material = *mutable_node->Mesh()->Material();
-    const auto* shader   = material.customShader.shader.get();
-    if (shader == nullptr) return;
-    const bool is_audio_bar_shader = shader->name.find("Simple_Audio_Bars") != std::string::npos;
-    if (! is_audio_bar_shader) return;
-
-    static std::unordered_map<int32_t, size_t> s_log_counts;
-    const auto                                 layer_id = mutable_node->ID();
-    const auto                                 count    = ++s_log_counts[layer_id];
-    if (count != 1 && (count % 300) != 0) return;
-
-    const auto& t = node->Translate();
-    const auto& s = node->Scale();
-    const auto& r = node->Rotation();
-    LOG_INFO(
-        "SceneAudioPassExecute: layer=%d name='%s' output='%s' visible=%s drawCount=%u indexed=%s "
-        "rt=%ux%u translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) rotation=(%.3f,%.3f,%.3f)",
-        layer_id,
-        node->Name().c_str(),
-        desc.output.c_str(),
-        node->Visible() ? "true" : "false",
-        desc.draw_count,
-        desc.index_buf ? "true" : "false",
-        desc.vk_output.extent.width,
-        desc.vk_output.extent.height,
-        t.x(),
-        t.y(),
-        t.z(),
-        s.x(),
-        s.y(),
-        s.z(),
-        r.x(),
-        r.y(),
-        r.z());
-    LOG_INFO("SceneAudioPassExecute: textures=%s", DescribeTextureList(material).c_str());
-    LOG_INFO("SceneAudioPassExecute: desc-textures=%s",
-             DescribeDescTextureList(desc.textures).c_str());
-}
-
-void LogAudioCompositePassExecute(const CustomShaderPass::Desc& desc) {
-    const auto* node         = desc.node;
-    auto*       mutable_node = const_cast<wallpaper::SceneNode*>(node);
-    if (mutable_node == nullptr || mutable_node->Mesh() == nullptr ||
-        mutable_node->Mesh()->Material() == nullptr) {
-        return;
-    }
-
-    const auto* shader   = mutable_node->Mesh()->Material()->customShader.shader.get();
-    const auto* material = mutable_node->Mesh()->Material();
-    if (shader == nullptr || material == nullptr) return;
-    if (shader->name != "genericimage3") {
-        return;
-    }
-
-    static std::unordered_map<int32_t, size_t> s_log_counts;
-    const auto                                 layer_id = mutable_node->ID();
-    const auto                                 count    = ++s_log_counts[layer_id];
-    if (count != 1 && (count % 300) != 0) return;
-
-    const auto& t = node->Translate();
-    const auto& s = node->Scale();
-    const auto& r = node->Rotation();
-    LOG_INFO("SceneAudioCompositePassExecute: layer=%d name='%s' ptr=%p output='%s' visible=%s "
-             "drawCount=%u indexed=%s rt=%ux%u translate=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) "
-             "rotation=(%.3f,%.3f,%.3f)",
-             layer_id,
-             node->Name().c_str(),
-             static_cast<const void*>(node),
-             desc.output.c_str(),
-             node->Visible() ? "true" : "false",
-             desc.draw_count,
-             desc.index_buf ? "true" : "false",
-             desc.vk_output.extent.width,
-             desc.vk_output.extent.height,
-             t.x(),
-             t.y(),
-             t.z(),
-             s.x(),
-             s.y(),
-             s.z(),
-             r.x(),
-             r.y(),
-             r.z());
-    LOG_INFO("SceneAudioCompositePassExecute: texture0='%s'",
-             ! material->textures.empty() ? material->textures[0].c_str() : "<none>");
-    LOG_INFO("SceneAudioCompositePassExecute: textures=%s", DescribeTextureList(*material).c_str());
-    LOG_INFO("SceneAudioCompositePassExecute: desc-textures=%s",
-             DescribeDescTextureList(desc.textures).c_str());
 }
 
 } // namespace
@@ -909,11 +619,6 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         }
     }
 
-    if (! ref.blocks.empty() && mesh.Material() != nullptr) {
-        LogAudioReactivePassConfig(m_desc, *mesh.Material(), ref.blocks.front());
-        LogAudioCompositePassConfig(m_desc, *mesh.Material());
-    }
-
     m_desc.draw_count = 0;
     std::vector<VkVertexInputBindingDescription>   bind_descriptions;
     std::vector<VkVertexInputAttributeDescription> attr_descriptions;
@@ -1215,11 +920,11 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         auto* shader_updater = scene.shaderValueUpdater.get();
         auto& sprites        = m_desc.sprites_map;
         auto& vk_textures    = m_desc.vk_textures;
+        // The update lambda still needs the live material pointer to write authored uniforms after
+        // the one-off audio diagnostics are removed; keep that dependency explicit in the capture
+        // list instead of rediscovering the material through the scene node at execution time.
+        auto* material       = mesh.Material();
 
-        auto* material = mesh.Material();
-        if (material != nullptr) {
-            LogAudioUniformBlockLayout(m_desc, *material, block);
-        }
         // Keep Star-River-style dynamic mesh uploads separate from general pass updates. Only the
         // vertex/index bytes need to move before m_dyn_buf->recordUpload(); uniform and sprite
         // updates stay in execute() so Date/Clock effect composites keep their original layout
@@ -1394,8 +1099,6 @@ void CustomShaderPass::execute(const Device& device, RenderingResources& rr) {
     }
 
     if (m_desc.update_op) m_desc.update_op();
-    LogAudioReactivePassExecute(m_desc);
-    LogAudioCompositePassExecute(m_desc);
 
     auto&                   cmd    = rr.command;
     auto&                   outext = m_desc.vk_output.extent;
