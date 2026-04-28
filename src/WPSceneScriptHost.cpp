@@ -7707,18 +7707,22 @@ nlohmann::json* ResolveLocalStorageBucket(WPSceneScriptHost::Opaque* opaque,
 bool ShouldKeepScriptAuthoredInitialValue(const WPSceneScriptRegistration& registration) {
     if (registration.target_kind != WPSceneScriptTargetKind::Layer) return false;
 
-    if (registration.property_name == "visible") return true;
+    constexpr std::array<std::string_view, 3> kAuthoredBaseLayerProperties {
+        "visible",
+        "origin",
+        "scale",
+    };
 
-    if (registration.property_name == "scale") {
-        // Wallpaper Engine gives property scripts their authored/user-resolved base value during
-        // init(), even when a parser-time probe has already produced a derived live layer value.
-        // Audio-response scale scripts commonly store that init() input and multiply it by their
-        // min/max envelope every update; replacing the authored base with the probed live scale
-        // applies the envelope twice and makes text-bearing layers visibly too small.
-        return true;
-    }
-
-    return false;
+    // Wallpaper Engine gives property scripts their authored/user-resolved base value during
+    // init(), even when a parser-time probe has already produced a derived live layer value.
+    // Transform scripts commonly keep this init() input as their base for applyUserProperties()
+    // formulas, so replacing origin/scale with renderer-resolved values makes later user-property
+    // deltas accumulate from the wrong coordinate space.
+    return std::any_of(kAuthoredBaseLayerProperties.begin(),
+                       kAuthoredBaseLayerProperties.end(),
+                       [&](std::string_view property_name) {
+                           return registration.property_name == property_name;
+                       });
 }
 
 bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance) {
