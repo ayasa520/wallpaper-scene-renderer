@@ -2846,6 +2846,22 @@ std::string ResolveModelMaterialPath(const std::string&    material_path,
     return remapped;
 }
 
+std::string ResolveStaticChunkMaterialPath(const WPMdl::StaticChunk& chunk, int32_t skin) {
+    if (chunk.material_json_variants.empty()) return chunk.material_json_file;
+    if (skin >= 0 && static_cast<size_t>(skin) < chunk.material_json_variants.size()) {
+        // MDLV0004 static models can carry several material paths for one geometry payload. The
+        // scene object owns the skin index, so material selection belongs here rather than in the
+        // low-level binary parser that only knows the model file bytes.
+        return chunk.material_json_variants[skin];
+    }
+
+    LOG_ERROR("ModelMaterialSkin: skin=%d out of range variants=%zu fallback='%s'",
+              skin,
+              chunk.material_json_variants.size(),
+              chunk.material_json_file.c_str());
+    return chunk.material_json_file;
+}
+
 std::optional<nlohmann::json> LoadModelSidecarJson(fs::VFS& vfs, std::string_view model_path) {
     auto path = std::string(model_path);
     if (path.size() >= 4 && path.substr(path.size() - 4) == ".mdl") {
@@ -3048,7 +3064,8 @@ public:
     bool LoadChunkMaterial(const WPMdl::StaticChunk& chunk, SceneNode* chunk_node,
                            SceneMaterial& material, WPShaderValueData& node_data,
                            wpscene::WPMaterial& resolved_wp_material,
-                           WPShaderInfo& resolved_shader_info, bool preserve_color,
+                           WPShaderInfo& resolved_shader_info,
+                           SceneModelColorLoadMode color_load_mode,
                            bool mirrored_handedness, std::string output_override) const {
         const auto source = LoadSource(chunk);
         if (! source.has_value()) {
@@ -3080,7 +3097,7 @@ public:
         LoadConstvalue(material, source->material, shader_info);
         LoadUserShaderValue(material, source->material, shader_info, context_.user_properties);
         const auto render_state =
-            BuildRenderState(preserve_color,
+            BuildRenderState(color_load_mode,
                              mirrored_handedness,
                              std::move(output_override),
                              source->renderPolicy);
@@ -3094,14 +3111,15 @@ public:
     }
 
 private:
-    SceneModelRenderState BuildRenderState(bool preserve_color, bool mirrored_handedness,
-                                           std::string                output_override,
+    SceneModelRenderState BuildRenderState(SceneModelColorLoadMode color_load_mode,
+                                           bool                    mirrored_handedness,
+                                           std::string             output_override,
                                            const ModelMaterialRenderPolicy& policy) const {
         // The renderer-facing model state is derived from the same validated policy used to build
         // the effective WPMaterial, keeping shader loading, depth rules, culling, and reflection
         // output routing on one explicit model-material contract.
         return SceneModelRenderState {
-            .preserveColor      = preserve_color,
+            .colorLoadMode      = color_load_mode,
             .depthTest          = policy.depthTest,
             .depthWrite         = policy.depthWrite,
             .cullMode           = policy.cullMode,
@@ -3145,7 +3163,8 @@ private:
     }
 
     std::string ResolvePath(const WPMdl::StaticChunk& chunk) const {
-        return ResolveModelMaterialPath(chunk.material_json_file, sidecar_json_, model_obj_.skin);
+        return ResolveModelMaterialPath(
+            ResolveStaticChunkMaterialPath(chunk, model_obj_.skin), sidecar_json_, model_obj_.skin);
     }
 
     ParseContext&         context_;
@@ -3226,7 +3245,7 @@ struct ModelChunkOrder {
 struct ModelChunkNodeRequest {
     std::string name;
     std::string output_override;
-    bool        preserve_color { false };
+    SceneModelColorLoadMode color_load_mode { SceneModelColorLoadMode::DontCare };
     bool        mirrored_handedness { false };
 };
 
@@ -3299,7 +3318,7 @@ private:
                 .name                = model_obj_.name + "::__hanabi_model_reflection_chunk_" +
                                        std::to_string(chunk_index),
                 .output_override     = std::string(kModelReflectionTargetName),
-                .preserve_color      = ShouldPreserveOutputColor(kModelReflectionTargetName),
+                .color_load_mode     = NextModelOutputColorLoadMode(kModelReflectionTargetName),
                 .mirrored_handedness = true,
             });
         if (reflection_node == nullptr) return;
@@ -3317,7 +3336,7 @@ private:
             chunk,
             ModelChunkNodeRequest {
                 .name = model_obj_.name + "::__hanabi_model_chunk_" + std::to_string(chunk_index),
-                .preserve_color = ShouldPreserveOutputColor(SpecTex_Default),
+                .color_load_mode = NextModelOutputColorLoadMode(SpecTex_Default),
             });
         if (node != nullptr) root_->AppendChild(node);
     }
@@ -3344,7 +3363,7 @@ private:
                                                  node_data,
                                                  wp_material,
                                                  shader_info,
-                                                 request.preserve_color,
+                                                 request.color_load_mode,
                                                  request.mirrored_handedness,
                                                  std::move(request.output_override))) {
             return nullptr;
@@ -3360,10 +3379,17 @@ private:
         return node;
     }
 
-    bool ShouldPreserveOutputColor(std::string_view output) {
+    SceneModelColorLoadMode NextModelOutputColorLoadMode(std::string_view output) {
         auto  key   = output.empty() ? std::string(SpecTex_Default) : std::string(output);
         auto& count = context_.model_pass_count_by_output[key];
-        return count++ > 0;
+        if (count++ > 0) return SceneModelColorLoadMode::Load;
+
+        // The default scene target is already owned by the renderer pre-pass, while private model
+        // render targets have no standalone clear pass. Clearing the first model writer to an
+        // offscreen target prevents transparent pixels from loading the previous frame, and later
+        // writers still load so multi-chunk models compose into the same target.
+        return key == SpecTex_Default ? SceneModelColorLoadMode::DontCare
+                                      : SceneModelColorLoadMode::Clear;
     }
 
     ParseContext&                 context_;

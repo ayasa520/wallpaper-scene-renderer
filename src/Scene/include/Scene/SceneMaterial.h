@@ -24,11 +24,23 @@ enum class SceneCullMode
     Front,
 };
 
+enum class SceneModelColorLoadMode
+{
+    DontCare,
+    Load,
+    Clear,
+};
+
 struct SceneModelRenderState {
     // This optional state is attached only by scene-level 3D model materialization. Keeping it out
     // of ordinary image/effect/text materials prevents the model render-policy defaults from
     // changing the historical 2D scene path.
-    bool          preserveColor { false };
+    // Model passes can target either the main scene buffer, which already has the ordinary pre-pass
+    // clear contract, or private offscreen buffers that are sampled later by another material. The
+    // color load mode makes that ownership explicit: the first offscreen producer clears to
+    // transparent, later producers load and composite, and legacy main-target first passes can keep
+    // the historical custom-shader load behavior.
+    SceneModelColorLoadMode colorLoadMode { SceneModelColorLoadMode::DontCare };
     bool          depthTest { true };
     bool          depthWrite { true };
     SceneCullMode cullMode { SceneCullMode::Back };

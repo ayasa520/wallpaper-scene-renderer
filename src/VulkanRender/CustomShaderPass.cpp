@@ -353,9 +353,51 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     desc.depth_test  = model_state->depthTest;
     desc.depth_write = model_state->depthWrite;
     // Model passes are the only custom-shader passes allowed to override the historical load/cull
-    // defaults. `preserveColor` lets consecutive opaque model chunks compose into the same render
-    // target without making ordinary 2D image/effect passes load stale framebuffer contents.
-    if (model_state->preserveColor) load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    // defaults. The parser chooses a color-load mode per output target, so offscreen model buffers
+    // can be cleared once per frame before later chunks load and composite into the same image.
+    switch (model_state->colorLoadMode) {
+    case wallpaper::SceneModelColorLoadMode::DontCare:
+        break;
+    case wallpaper::SceneModelColorLoadMode::Load:
+        load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+        break;
+    case wallpaper::SceneModelColorLoadMode::Clear:
+        load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        break;
+    }
+}
+
+std::string_view ModelColorLoadModeName(wallpaper::SceneModelColorLoadMode mode) {
+    switch (mode) {
+    case wallpaper::SceneModelColorLoadMode::DontCare:
+        return "dont-care";
+    case wallpaper::SceneModelColorLoadMode::Load:
+        return "load";
+    case wallpaper::SceneModelColorLoadMode::Clear:
+        return "clear";
+    }
+    return "unknown";
+}
+
+VkClearValue BuildCustomShaderClearValue(const wallpaper::Scene&         scene,
+                                         const wallpaper::SceneMaterial& material) {
+    if (material.modelRenderState.has_value() &&
+        material.modelRenderState->colorLoadMode == wallpaper::SceneModelColorLoadMode::Clear) {
+        // Model-only offscreen targets are sampled as textures by later passes. Transparent black is
+        // the neutral clear value for those buffers: uncovered pixels contribute no stale color, no
+        // alpha, and no previous-frame reflection when the current model geometry shrinks.
+        return VkClearValue {
+            .color = { 0.0f, 0.0f, 0.0f, 0.0f },
+        };
+    }
+
+    auto& sc = scene.clearColor;
+    // Non-model and main-target custom shader passes retain the existing scene clear color contract.
+    // Keeping this branch shared avoids changing ordinary image/effect behavior while still letting
+    // model state opt into transparent offscreen clears explicitly.
+    return VkClearValue {
+        .color = { sc[0], sc[1], sc[2], 1.0f },
+    };
 }
 
 void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  material,
@@ -375,13 +417,13 @@ void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  ma
     const auto effective_cull_mode =
         ResolveModelCullMode(model_state->cullMode, model_state->mirroredHandedness);
     pipeline.raster.cullMode = ToVkCullMode(effective_cull_mode);
-    LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' preserve-color=%s "
+    LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' color-load=%s "
              "mirrored-handedness=%s depth-test=%s depth-write=%s depth-clear=%s cull=%u",
              desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
              material.customShader.shader != nullptr ? material.customShader.shader->name.c_str()
                                                      : "<null>",
              desc.output.c_str(),
-             model_state->preserveColor ? "true" : "false",
+             ModelColorLoadModeName(model_state->colorLoadMode).data(),
              model_state->mirroredHandedness ? "true" : "false",
              desc.depth_test ? "true" : "false",
              desc.depth_write ? "true" : "false",
@@ -962,13 +1004,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     }
 
     {
-        auto& sc = scene.clearColor;
-        // TextPass owns transparent clears for exact-size bridge sources. Generic custom shader
-        // passes should keep the scene clear contract so image/effect behavior is no longer
-        // coupled to text-specific source-pass rules.
-        m_desc.clear_value = VkClearValue {
-            .color = { sc[0], sc[1], sc[2], 1.0f },
-        };
+        m_desc.clear_value = BuildCustomShaderClearValue(scene, *mesh.Material());
     }
     setPrepared();
 }
