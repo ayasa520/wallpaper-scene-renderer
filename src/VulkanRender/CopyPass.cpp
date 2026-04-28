@@ -53,10 +53,6 @@ void CopyPass::prepare(Scene& scene, const Device& device, RenderingResources& r
         *vk_textures[i] = img;
     }
 
-    for (auto& tex : releaseTexs()) {
-        device.tex_cache().MarkShareReady(tex);
-    }
-
     setPrepared();
 };
 
@@ -91,6 +87,7 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
         // The render graph still declares this copy as an ordering edge, but runtime visibility can
         // make the actual transfer unnecessary for the current frame. Returning here is what keeps
         // visible toggles cheap and avoids rebuilding the graph just to skip one effect branch.
+        releaseFinalReadTexs(device);
         return;
     }
 
@@ -99,6 +96,10 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
     auto& dst = m_desc.vk_dst;
 
     if (! (src.handle && dst.handle)) {
+        // A prepared copy with missing image handles cannot record a GPU read, but the frame has
+        // still reached this pass's final-reader boundary. Release the graph-owned keys before the
+        // diagnostic assert so non-assert builds do not pin reusable render targets indefinitely.
+        releaseFinalReadTexs(device);
         assert(src.handle && dst.handle);
         return;
     }
@@ -195,6 +196,11 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
     if (dst.mipmap_level > 1) {
         device.tex_cache().RecGenerateMipmaps(cmd, dst);
     }
+
+    // CopyPass participates in the same temporary-resource lifetime contract as shader passes:
+    // a key becomes reusable only after the command buffer has recorded the transfer that reads it.
+    // Preparing copy handles is just binding metadata and must not free cache ownership.
+    releaseFinalReadTexs(device);
 };
 void CopyPass::destory(const Device&, RenderingResources&) {
     // Copy passes also keep their pass objects across resource-only refreshes. Resetting the

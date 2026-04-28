@@ -76,7 +76,13 @@ constexpr std::string_view G_VIEWFORWARD { "g_ViewForward" };
 
 constexpr std::string_view G_TIME { "g_Time" };
 constexpr std::string_view G_DAYTIME { "g_DayTime" };
+// Wallpaper Engine feedback effects integrate their simulations with the current frame delta and
+// cursor history. Keep these global uniform names centralized so the parser and updater share the
+// same authored runtime contract instead of relying on ad-hoc string literals in effect fixes.
+constexpr std::string_view G_FRAMETIME { "g_Frametime" };
 constexpr std::string_view G_POINTERPOSITION { "g_PointerPosition" };
+constexpr std::string_view G_POINTERPOSITIONLAST { "g_PointerPositionLast" };
+constexpr std::string_view G_POINTERSTATE { "g_PointerState" };
 constexpr std::string_view G_TEXELSIZE { "g_TexelSize" };
 constexpr std::string_view G_TEXELSIZEHALF { "g_TexelSizeHalf" };
 constexpr std::string_view G_BONES { "g_Bones" };

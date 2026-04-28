@@ -8,6 +8,7 @@ FinPass.cpp
 PrePass.cpp
 SceneToRenderGraph.cpp
 TextPass.cpp
+VulkanPass.cpp
 VulkanRender.cpp
 )
 

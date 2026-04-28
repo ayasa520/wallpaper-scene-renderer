@@ -297,8 +297,12 @@ bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
                             const WPSceneScriptRegistration& registration,
                             const WPDynamicValue&            value);
 void RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque, int32_t layer_id, SceneNode* node);
+bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
+bool MaterializeDeferredVisibleLayerTreeIfNeeded(WPSceneScriptHost::Opaque* opaque,
+                                                 int32_t                    root_layer_id);
+bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, SceneNode* node);
 bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance);
 void ResortLayerTree(SceneNode* parent, const WPSceneScriptHost::Opaque* opaque);
@@ -1072,8 +1076,35 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    });\n"
         << "    return builder;\n"
         << "  }\n"
+        << "  function createDeferredTextureAnimation() {\n"
+        << "    // Deferred runtime layer placeholders intentionally have no mesh/material yet, "
+           "but\n"
+        << "    // authored wallpaper scripts may still drive their texture animation every "
+           "frame.\n"
+        << "    // Keep that script contract stable with a cheap no-op object so hidden "
+           "multilingual\n"
+        << "    // branches stay logical-only until visibility materialization is actually "
+           "required.\n"
+        << "    return {\n"
+        << "      get frameCount() { return 0; },\n"
+        << "      get duration() { return 0; },\n"
+        << "      get rate() { return 1; },\n"
+        << "      set rate(_value) {},\n"
+        << "      play() {},\n"
+        << "      stop() {},\n"
+        << "      pause() {},\n"
+        << "      isPlaying() { return false; },\n"
+        << "      getFrame() { return 0; },\n"
+        << "      setFrame(_frame) {},\n"
+        << "      join() {}\n"
+        << "    };\n"
+        << "  }\n"
         << "  function createTextureAnimation(slot = 0, nodeId = __nodeId) {\n"
-        << "    if (!__native.hasTextureAnimation(nodeId, slot)) return undefined;\n"
+        << "    if (!__native.hasTextureAnimation(nodeId, slot)) {\n"
+        << "      if (__native.isDeferredRuntimeLayer(nodeId)) return "
+           "createDeferredTextureAnimation();\n"
+        << "      return undefined;\n"
+        << "    }\n"
         << "    return {\n"
         << "      get frameCount() { return __native.textureAnimationGet(nodeId, slot, "
            "'frameCount'); },\n"
@@ -2444,6 +2475,32 @@ bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque,
     return true;
 }
 
+bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
+    if (opaque == nullptr || opaque->scene == nullptr) return false;
+    if (opaque->scene->deferredRuntimeImageLayerIds.count(layer_id) == 0) return true;
+
+    if (! wallpaper::MaterializeDeferredImageLayer(
+            *opaque->scene, layer_id, &opaque->user_properties)) {
+        LOG_ERROR("DeferredRuntimeImageRealize: failed for layer=%d", layer_id);
+        return false;
+    }
+
+    auto* node = FindNodeById(opaque, layer_id);
+    if (node == nullptr) {
+        LOG_ERROR("DeferredRuntimeImageRealize: missing realized node for layer=%d", layer_id);
+        return false;
+    }
+
+    RebindLayerRegistrations(opaque, layer_id, node);
+    EnsureTextureAnimationStatesForNode(opaque, node);
+    // Deferred image layers are the expensive case for multilingual scenes: the hidden placeholder
+    // had no material/effect passes, so turning it visible changes graph topology and must rebuild
+    // before any newly-created render targets or pipelines can contribute to the frame.
+    opaque->scene->MarkRenderGraphTopologyDirty();
+    LOG_INFO("DeferredRuntimeImageRealize: materialized layer=%d topology-dirty=true", layer_id);
+    return true;
+}
+
 bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
     if (opaque->scene->deferredRuntimeTextLayerIds.count(layer_id) == 0) return true;
@@ -2468,6 +2525,36 @@ bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int
     // refresh.
     opaque->scene->MarkRenderGraphTopologyDirty();
     LOG_INFO("DeferredRuntimeTextRealize: materialized layer=%d topology-dirty=true", layer_id);
+    return true;
+}
+
+bool MaterializeDeferredVisibleLayerTreeIfNeeded(WPSceneScriptHost::Opaque* opaque,
+                                                 int32_t                    root_layer_id) {
+    if (opaque == nullptr || opaque->scene == nullptr || root_layer_id == 0) return false;
+
+    std::vector<int32_t>        stack { root_layer_id };
+    std::unordered_set<int32_t> visited;
+    while (! stack.empty()) {
+        const int32_t layer_id = stack.back();
+        stack.pop_back();
+        if (layer_id == 0 || ! visited.insert(layer_id).second) continue;
+
+        if (! opaque->scene->IsLayerVisible(layer_id)) {
+            // Deferred descendants inherit effective visibility from their parent chain. If this
+            // layer is still effectively hidden after the current local-visible write, none of its
+            // children can be visible either, so keep that branch logical and cheap.
+            continue;
+        }
+
+        if (! MaterializeDeferredImageLayerIfNeeded(opaque, layer_id)) return false;
+        if (! MaterializeDeferredParticleLayerIfNeeded(opaque, layer_id)) return false;
+        if (! MaterializeDeferredTextLayerIfNeeded(opaque, layer_id)) return false;
+
+        for (const auto child_id : opaque->scene->GetLayerChildren(layer_id)) {
+            stack.push_back(child_id);
+        }
+    }
+
     return true;
 }
 
@@ -2627,6 +2714,17 @@ int32_t FindOwningLayerId(const WPSceneScriptHost::Opaque* opaque, const SceneNo
     if (opaque == nullptr || opaque->scene == nullptr || node == nullptr) return 0;
     auto it = opaque->scene->nodeOwners.find(const_cast<SceneNode*>(node));
     return it == opaque->scene->nodeOwners.end() ? 0 : it->second;
+}
+
+bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
+    if (opaque == nullptr || opaque->scene == nullptr || layer_id == 0) return false;
+
+    // The script API is intentionally asked about the logical layer id instead of probing render
+    // resources. Deferred image/text/particle placeholders all preserve their layer identity while
+    // skipping heavy runtime nodes, which keeps this predicate independent from material layout.
+    return opaque->scene->deferredRuntimeImageLayerIds.count(layer_id) != 0 ||
+           opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) != 0 ||
+           opaque->scene->deferredRuntimeTextLayerIds.count(layer_id) != 0;
 }
 
 void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, SceneNode* node) {
@@ -3279,7 +3377,12 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             opaque->scene->textLayers.erase(text_it);
         }
         opaque->scene->imageLayers.erase(layer_id);
+        // Deferred runtime sets are lightweight ownership records for hidden placeholder layers.
+        // Delete must clear every deferred kind together with the regular registries so a later
+        // dynamic layer that reuses this authored id cannot inherit a stale materialization state.
+        opaque->scene->deferredRuntimeImageLayerIds.erase(layer_id);
         opaque->scene->deferredRuntimeParticleLayerIds.erase(layer_id);
+        opaque->scene->deferredRuntimeTextLayerIds.erase(layer_id);
         opaque->scene->layerNodes.erase(layer_id);
         opaque->scene->initialLayerConfigJson.erase(layer_id);
         opaque->scene->scriptRegistrations.erase(
@@ -4498,13 +4601,10 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
         if (opaque != nullptr && opaque->scene != nullptr) {
             const auto layer_id = FindNodeId(opaque, node);
             if (layer_id != 0) {
-                if (visible && ! MaterializeDeferredParticleLayerIfNeeded(opaque, layer_id)) {
-                    return false;
-                }
-                if (visible && ! MaterializeDeferredTextLayerIfNeeded(opaque, layer_id)) {
-                    return false;
-                }
                 opaque->scene->SetLayerLocalVisibility(layer_id, visible);
+                if (visible && ! MaterializeDeferredVisibleLayerTreeIfNeeded(opaque, layer_id)) {
+                    return false;
+                }
                 opaque->scene->ApplyLayerVisibility(layer_id);
                 return true;
             }
@@ -6728,6 +6828,28 @@ JSValue NativeHasTextureAnimation(JSContext* context, JSValueConst, int argc, JS
         context, ResolveTextureAnimationNode(opaque, node, static_cast<usize>(slot)) != nullptr);
 }
 
+JSValue NativeIsDeferredRuntimeLayer(JSContext* context, JSValueConst, int argc,
+                                     JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || argc < 1) return JS_FALSE;
+
+    int32_t node_id = 0;
+    if (JS_ToInt32(context, &node_id, argv[0]) != 0) return JS_FALSE;
+
+    auto* node = FindNodeById(opaque, node_id);
+    if (node == nullptr) return JS_FALSE;
+
+    int32_t layer_id = FindOwningLayerId(opaque, node);
+    if (layer_id == 0) {
+        // Layer proxies pass their logical layer id as the node id. A deferred placeholder may be
+        // the only scene node for that layer, so the bridge must fall back to the proxy id when no
+        // owner record is available yet.
+        layer_id = node_id;
+    }
+
+    return JS_NewBool(context, IsDeferredRuntimeLayer(opaque, layer_id));
+}
+
 JSValue NativeGetAnimationLayerCount(JSContext* context, JSValueConst, int argc,
                                      JSValueConst* argv) {
     auto* opaque = GetOpaque(context);
@@ -7864,6 +7986,11 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
         m_impl->native_bridge,
         "hasTextureAnimation",
         JS_NewCFunction(context, NativeHasTextureAnimation, "hasTextureAnimation", 2));
+    JS_SetPropertyStr(context,
+                      m_impl->native_bridge,
+                      "isDeferredRuntimeLayer",
+                      JS_NewCFunction(
+                          context, NativeIsDeferredRuntimeLayer, "isDeferredRuntimeLayer", 1));
     JS_SetPropertyStr(
         context,
         m_impl->native_bridge,

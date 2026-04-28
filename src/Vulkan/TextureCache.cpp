@@ -161,6 +161,78 @@ VkResult TransImgLayout(const vvk::Queue& queue, vvk::CommandBuffer& cmd,
     return result;
 }
 
+VkResult ClearNewRenderTargetToTransparentBlack(const vvk::Queue& queue, vvk::CommandBuffer& cmd,
+                                                const ImageParameters& image) {
+    VkResult result;
+    do {
+        result = cmd.Begin(VkCommandBufferBeginInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        });
+        if (result != VK_SUCCESS) break;
+
+        VkImageSubresourceRange subresourceRange {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+        };
+        {
+            VkImageMemoryBarrier to_transfer {
+                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext            = nullptr,
+                .srcAccessMask    = 0,
+                .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .image            = image.handle,
+                .subresourceRange = subresourceRange,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                to_transfer);
+        }
+
+        const VkClearColorValue transparent_black { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
+        cmd.ClearColorImage(image.handle,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            &transparent_black,
+                            subresourceRange);
+
+        {
+            VkImageMemoryBarrier to_shader_read {
+                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext            = nullptr,
+                .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .image            = image.handle,
+                .subresourceRange = subresourceRange,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                to_shader_read);
+        }
+
+        result = cmd.End();
+        if (result != VK_SUCCESS) break;
+
+        VkSubmitInfo sub_info {
+            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext              = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers    = cmd.address(),
+        };
+        result = queue.Submit(sub_info);
+    } while (false);
+    return result;
+}
+
 std::size_t ImageAllocationBytes(const VmaImageParameters& image) {
     return image.handle ? static_cast<std::size_t>(image.handle.AllocationSize()) : 0u;
 }
@@ -726,10 +798,22 @@ std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
             break;
 
         if (! m_tex_cmd) allocateCmd();
-        TransImgLayout(m_device.graphics_queue().handle,
-                       m_tex_cmd,
-                       image_paras,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        // Newly allocated render targets can be sampled before any pass has written them when an
+        // authored effect implements feedback. Initialize them to the neutral transparent-black
+        // value so first-frame feedback reads are deterministic, while normal writer passes still
+        // overwrite the whole target before later consumers observe their output.
+        const VkResult clear_result =
+            ClearNewRenderTargetToTransparentBlack(m_device.graphics_queue().handle,
+                                                   m_tex_cmd,
+                                                   image_paras);
+        if (clear_result != VK_SUCCESS) {
+            VVK_CHECK(clear_result);
+            break;
+        }
+        LOG_INFO("TextureCacheInitialClear: render-target=%dx%d mip-levels=%u transparent-black=true",
+                 tex_key.width,
+                 tex_key.height,
+                 tex_key.mipmap_level);
 
         VVK_CHECK_ACT(break, m_device.handle().WaitIdle());
         return image_paras;

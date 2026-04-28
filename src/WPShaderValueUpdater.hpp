@@ -33,7 +33,13 @@ struct WPUniformInfo {
     bool has_BONES { false };
     bool has_TIME { false };
     bool has_DAYTIME { false };
+    // Cursor feedback shaders need these values as a coherent per-frame set. Tracking them beside
+    // the older pointer position bit keeps UpdateUniforms data-driven: ordinary materials do not pay
+    // for cursor state writes, while effects like cursorripple receive every uniform they declare.
+    bool has_FRAMETIME { false };
     bool has_POINTERPOSITION { false };
+    bool has_POINTERPOSITIONLAST { false };
+    bool has_POINTERSTATE { false };
     bool has_PARALLAXPOSITION { false };
     bool has_TEXELSIZE { false };
     bool has_TEXELSIZEHALF { false };
@@ -173,6 +179,9 @@ private:
     std::array<float, 2> m_texelSize { 1.0f / 1920.0f, 1.0f / 1080.0f };
 
     std::array<float, 2> m_mousePos { 0.5f, 0.5f };
+    // Stores the position published on the previous FrameBegin. Feedback effects compare this with
+    // g_PointerPosition to decide whether to inject a new cursor impulse into their simulation FBOs.
+    std::array<float, 2> m_mousePosLast { 0.5f, 0.5f };
     std::array<float, 2> m_mousePosInput { 0.5f, 0.5f };
 
     std::array<float, 2> m_screen_size { 1920, 1080 };

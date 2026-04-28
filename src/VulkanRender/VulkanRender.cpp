@@ -739,6 +739,10 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                        auto* pass = rg.getPass(id);
                        assert(pass != nullptr);
                        VulkanPass* vpass = static_cast<VulkanPass*>(pass);
+                       // Release ownership is compiled from the current render graph topology, not
+                       // from pass construction. Clear stale metadata before assigning this graph's
+                       // final-reader keys so reused pass objects keep an exact lifecycle contract.
+                       vpass->clearReleaseTexs();
                        // LOG_INFO("----release tex");
                        for (auto& tex : texs) {
                            vpass->addReleaseTexs(spanone<const std::string_view> { tex->key() });

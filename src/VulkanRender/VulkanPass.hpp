@@ -63,10 +63,18 @@ public:
     }
 
     void addReleaseTexs(std::span<const std::string_view> texs) {
-        m_release_texs.clear();
-        std::transform(texs.begin(), texs.end(), std::back_inserter(m_release_texs), [](auto& sv) {
-            return std::string(sv);
-        });
+        for (const auto tex : texs) {
+            if (tex.empty()) continue;
+
+            // Render-graph compilation owns the release list as declarative lifecycle metadata. Keep
+            // this append operation idempotent so repeated graph assignment or duplicate final-read
+            // edges cannot make one pass call TextureCache::MarkShareReady() more than once for the
+            // same logical key.
+            if (std::find(m_release_texs.begin(), m_release_texs.end(), tex) != m_release_texs.end()) {
+                continue;
+            }
+            m_release_texs.emplace_back(tex);
+        }
     }
     bool                         prepared() const { return m_prepared; }
     std::span<const std::string> releaseTexs() const { return m_release_texs; }
@@ -74,6 +82,7 @@ public:
 
 protected:
     void setPrepared(bool v = true) { m_prepared = v; }
+    void releaseFinalReadTexs(const Device& device) const;
 
 private:
     bool                     m_prepared { false };
