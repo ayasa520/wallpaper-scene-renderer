@@ -494,8 +494,11 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
                  nullptr);
     gst_caps_unref(caps);
 
-    GstCaps* sink_caps =
-        gst_caps_from_string("video/x-raw,format=(string)NV12;video/x-raw,format=(string)RGBA");
+    // Force RGBA so GStreamer owns the YUV colorimetry and chroma reconstruction path. Offering
+    // NV12 as a second caps structure still lets negotiation keep the decoder-native NV12 frames,
+    // which routes high-contrast anime edges through Hanabi's fixed shader conversion and can make
+    // source antialiasing look jagged compared with a normal video player.
+    GstCaps* sink_caps = gst_caps_from_string("video/x-raw,format=(string)RGBA");
     g_object_set(entry.appsink_elem, "caps", sink_caps, nullptr);
     gst_caps_unref(sink_caps);
 
