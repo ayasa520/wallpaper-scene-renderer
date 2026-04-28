@@ -14,12 +14,23 @@ Matrix4d SceneNode::GetLocalTrans() const {
     trans.prerotate(AngleAxis<double>(m_rotation.z(), Vector3d::UnitZ())); // z
 
     trans.pretranslate(m_translate.cast<double>());
+    // Alignment offset is appended in local quad space so it is still affected by the node's scale
+    // and rotation. That keeps the authored translation as the pivot while moving the image mesh to
+    // the visual position requested by top/left/right/bottom alignment.
+    trans.translate(m_alignmentOffset.cast<double>());
 
     return trans.matrix();
 }
 
 void SceneNode::SetLocalAffine(const Affine3f& affine) {
-    Matrix3f linear = affine.linear();
+    // Callers often round-trip GetLocalTrans() through SetLocalAffine() while rebinding parents or
+    // synchronizing effect output nodes. Strip the local alignment placement before decomposing the
+    // authored transform; otherwise the offset would be baked into m_translate and then applied a
+    // second time by GetLocalTrans().
+    Affine3f authored_affine = affine;
+    authored_affine.translate(-m_alignmentOffset);
+
+    Matrix3f linear = authored_affine.linear();
     Vector3f scale(linear.col(0).norm(), linear.col(1).norm(), linear.col(2).norm());
     for (int i = 0; i < 3; ++i) {
         if (scale[i] > 1e-6f) {
@@ -34,7 +45,7 @@ void SceneNode::SetLocalAffine(const Affine3f& affine) {
     const auto zyx = linear.eulerAngles(2, 1, 0);
     SetScale(scale);
     SetRotation(Vector3f(zyx[2], zyx[1], zyx[0]));
-    SetTranslate(affine.translation());
+    SetTranslate(authored_affine.translation());
 }
 
 void SceneNode::UpdateTrans() {

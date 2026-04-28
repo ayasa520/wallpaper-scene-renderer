@@ -31,6 +31,7 @@
 #include "Utils/Logging.h"
 #include "WPJson.hpp"
 #include "WPDynamicValue.hpp"
+#include "WPImageAlignment.hpp"
 #include "WPSceneParser.hpp"
 #include "WPSceneScriptMedia.hpp"
 #include "WPSyntheticImageParser.hpp"
@@ -4102,23 +4103,14 @@ bool IsCameraLinkedFromScene(const Scene& scene, std::string_view camera_name) {
         });
 }
 
-void AdjustAlignedLayerTranslation(SceneNode* node, std::string_view alignment,
-                                   const std::array<float, 2>& old_size,
-                                   const std::array<float, 2>& new_size) {
+void RefreshAlignedLayerPivot(SceneNode* node, std::string_view alignment,
+                              const std::array<float, 2>& new_size) {
     if (node == nullptr) return;
 
-    auto        translation  = node->Translate();
-    const float delta_width  = (new_size[0] - old_size[0]) * 0.5f;
-    const float delta_height = (new_size[1] - old_size[1]) * 0.5f;
-    const auto  contains     = [&](std::string_view value) {
-        return alignment.find(value) != std::string_view::npos;
-    };
-
-    if (contains("top")) translation.y() -= delta_height;
-    if (contains("left")) translation.x() += delta_width;
-    if (contains("right")) translation.x() -= delta_width;
-    if (contains("bottom")) translation.y() += delta_height;
-    node->SetTranslate(translation);
+    // Runtime `thisLayer.size` updates must follow the same contract as cold parsing: the authored
+    // origin remains the script-visible pivot, and only the mesh-local alignment offset changes to
+    // reflect the new quad dimensions.
+    node->SetAlignmentOffset(ResolveImageAlignmentOffset(alignment, new_size));
 }
 
 bool UpdateQuadMeshSize(SceneMesh* mesh, const std::array<float, 2>& size) {
@@ -4737,8 +4729,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
 
             auto layer_node_it = opaque->scene->layerNodes.find(layer_id);
             if (layer_node_it != opaque->scene->layerNodes.end()) {
-                AdjustAlignedLayerTranslation(
-                    layer_node_it->second, image_layer->alignment, old_size, new_size);
+                RefreshAlignedLayerPivot(layer_node_it->second, image_layer->alignment, new_size);
             }
 
             if (auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);

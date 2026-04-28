@@ -69,6 +69,7 @@ public:
     const auto& Translate() const { return m_translate; }
     const auto& Rotation() const { return m_rotation; }
     const auto& Scale() const { return m_scale; }
+    const auto& AlignmentOffset() const { return m_alignmentOffset; }
     void        SetRotation(Eigen::Vector3f v) {
         m_rotation = v;
         MarkTransDirty();
@@ -81,12 +82,17 @@ public:
         m_translate = v;
         MarkTransDirty();
     }
+    void        SetAlignmentOffset(Eigen::Vector3f v) {
+        m_alignmentOffset = v;
+        MarkTransDirty();
+    }
     void        SetLocalAffine(const Eigen::Affine3f& affine);
 
     void CopyTrans(const SceneNode& node) {
         m_translate = node.m_translate;
         m_scale     = node.m_scale;
         m_rotation  = node.m_rotation;
+        m_alignmentOffset = node.m_alignmentOffset;
         MarkTransDirty();
     }
 
@@ -142,6 +148,10 @@ private:
     Eigen::Vector3f m_translate { 0.0f, 0.0f, 0.0f };
     Eigen::Vector3f m_scale { 1.0f, 1.0f, 1.0f };
     Eigen::Vector3f m_rotation { 0.0f, 0.0f, 0.0f };
+    // Image alignment is part of the quad's local placement, not the authored layer origin.
+    // Keeping it separate preserves Wallpaper Engine pivot semantics when scripts later animate
+    // rotation, scale, parent attachment, or effect-composite synchronization for the same layer.
+    Eigen::Vector3f m_alignmentOffset { 0.0f, 0.0f, 0.0f };
 
     std::shared_ptr<SceneMesh> m_mesh;
     // The text primitive holds canonical text geometry, atlas resources, and optional bridge
