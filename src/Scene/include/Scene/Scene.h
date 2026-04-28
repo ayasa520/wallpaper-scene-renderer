@@ -150,6 +150,7 @@ public:
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeRenderTargets;
     std::unordered_map<int32_t, std::vector<SceneLight*>> objectRuntimeLights;
     std::unordered_map<int32_t, std::vector<ParticleSubSystem*>> objectRuntimeParticleSubsystems;
+    std::unordered_set<int32_t>                          deferredRuntimeImageLayerIds;
     std::unordered_set<int32_t>                          deferredRuntimeParticleLayerIds;
     std::unordered_set<int32_t>                          deferredRuntimeTextLayerIds;
     std::unordered_map<int32_t, uint32_t>                 objectRuntimeSoundHandles;

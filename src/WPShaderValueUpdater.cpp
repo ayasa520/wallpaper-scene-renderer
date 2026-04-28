@@ -147,7 +147,9 @@ void WPShaderValueUpdater::FrameBegin() {
             (((cTime->tm_hour * 60) + cTime->tm_min) * 60 + cTime->tm_sec) / (24.0f * 60.0f
        * 60.0f);
     */
+    const std::array<float, 2> previousMousePos = m_mousePos;
     if (!(m_parallax.delay > 0.0f) || !std::isfinite(m_parallax.delay)) {
+        m_mousePosLast     = previousMousePos;
         m_mousePos         = m_mousePosInput;
         return;
     }
@@ -155,6 +157,7 @@ void WPShaderValueUpdater::FrameBegin() {
     const double frameTime = std::max(m_scene->frameTime, 0.0);
     const double t =
         1.0 - std::exp(-(frameTime * kParallaxSettleRatio) / static_cast<double>(m_parallax.delay));
+    m_mousePosLast     = previousMousePos;
     m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
                                       (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
 }
@@ -182,7 +185,10 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_BONES            = existsOp(G_BONES);
     info.has_TIME             = existsOp(G_TIME);
     info.has_DAYTIME          = existsOp(G_DAYTIME);
+    info.has_FRAMETIME        = existsOp(G_FRAMETIME);
     info.has_POINTERPOSITION  = existsOp(G_POINTERPOSITION);
+    info.has_POINTERPOSITIONLAST = existsOp(G_POINTERPOSITIONLAST);
+    info.has_POINTERSTATE     = existsOp(G_POINTERSTATE);
     info.has_PARALLAXPOSITION = existsOp(G_PARALLAXPOSITION);
     info.has_TEXELSIZE        = existsOp(G_TEXELSIZE);
     info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
@@ -399,6 +405,20 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_DAYTIME) updateOp(G_DAYTIME, (float)m_dayTime);
 
     if (info.has_POINTERPOSITION) updateOp(G_POINTERPOSITION, m_mousePos);
+    if (info.has_POINTERPOSITIONLAST) updateOp(G_POINTERPOSITIONLAST, m_mousePosLast);
+    if (info.has_POINTERSTATE) {
+        // Wallpaper Engine cursor ripple shaders treat `.z` as the left-button impulse term. Keep
+        // the other lanes neutral because their exact editor-side meanings are effect-specific, and
+        // writing arbitrary non-zero values would inject force into authored feedback buffers.
+        updateOp(G_POINTERSTATE,
+                 std::array<float, 4> { 0.0f, 0.0f, m_scene->cursorLeftDown ? 1.0f : 0.0f, 0.0f });
+    }
+    if (info.has_FRAMETIME) {
+        // Feedback effects such as cursor ripple integrate per-frame decay from this uniform. The
+        // parser already exposes the authored default, but runtime updates must overwrite it so the
+        // simulation sees the same frame delta that drives timers and scripts.
+        updateOp(G_FRAMETIME, static_cast<float>(std::max(m_scene->frameTime, 0.0)));
+    }
 
     if (info.has_TEXELSIZE) updateOp(G_TEXELSIZE, m_texelSize);
 

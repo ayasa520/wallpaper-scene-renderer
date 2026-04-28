@@ -1650,6 +1650,71 @@ inline bool TryParseScalarDeclarationStatement(std::string_view statement, std::
     return pos == lhs.size();
 }
 
+inline bool TryRewriteStepMaskIntDeclarationStatement(std::string_view statement,
+                                                      std::string&     replacement) {
+    const auto leading = statement.find_first_not_of(" \t\r\n");
+    const auto prefix = leading == std::string_view::npos ? std::string_view {} :
+        statement.substr(0, leading);
+
+    statement = TrimWhitespace(statement);
+    if (statement.empty() || statement.back() != ';') return false;
+    statement.remove_suffix(1);
+
+    const auto assignment_pos = FindTopLevelAssignmentOperator(statement);
+    if (! assignment_pos.has_value()) return false;
+
+    const auto lhs = TrimWhitespace(statement.substr(0, *assignment_pos));
+    const auto rhs = TrimWhitespace(statement.substr(*assignment_pos + 1));
+    if (! StartsWithToken(lhs, "int")) return false;
+
+    auto pos = SkipWhitespace(lhs, 3);
+    if (pos >= lhs.size() || ! IsIdentifierStart(lhs[pos])) return false;
+
+    const auto name_end = SkipIdentifier(lhs, pos);
+    const auto name     = lhs.substr(pos, name_end - pos);
+    pos                 = SkipWhitespace(lhs, name_end);
+    if (pos != lhs.size()) return false;
+
+    std::string_view function_name;
+    std::string_view call_args_source;
+    if (! TryParseConstructorCall(rhs, function_name, call_args_source) ||
+        function_name != "step") {
+        return false;
+    }
+
+    // Wallpaper Engine compatibility shaders often use GLSL `step()` as a numeric 0/1 mask but
+    // declare the temporary as `int`. Vulkan GLSL keeps `step()` as a float result, and leaving the
+    // mask as `int` also prevents the later bool-mask lowering from seeing float arithmetic.
+    replacement = std::string(prefix) + "float " + std::string(name) + " = step(" +
+                  std::string(call_args_source) + ");";
+    return true;
+}
+
+inline std::string RewriteStepMaskIntDeclarations(std::string_view text) {
+    std::string result;
+    result.reserve(text.size() + 64);
+
+    size_t cursor { 0 };
+    size_t pos { 0 };
+    while (pos < text.size()) {
+        const auto stmt_end = FindStatementTerminator(text, pos);
+        if (stmt_end == std::string::npos) break;
+
+        std::string replacement;
+        if (TryRewriteStepMaskIntDeclarationStatement(
+                text.substr(pos, stmt_end - pos + 1), replacement)) {
+            result.append(text.substr(cursor, pos - cursor));
+            result.append(replacement);
+            cursor = stmt_end + 1;
+        }
+
+        pos = stmt_end + 1;
+    }
+
+    result.append(text.substr(cursor));
+    return result;
+}
+
 inline std::optional<size_t> FindTopLevelCompoundAssignment(std::string_view text,
                                                             std::string_view op) {
     bool in_string { false };
@@ -3172,6 +3237,7 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
     // Wallpaper Engine sometimes stores integer loop bounds in float uniforms or expressions.
     result = RewriteIntegerForLoops(result);
     result = RewriteUintModuloAssignments(result);
+    result = RewriteStepMaskIntDeclarations(result);
     result = RewriteFloatBoolMultiplyAssignments(result);
     result = RewriteFloatArrayIndices(result);
     result = TrimOverlongVectorConstructors(result);
@@ -3271,7 +3337,7 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
                                          const Combos& combos,
                                          std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "prepared-shader-v7-float-bool-mask-multiply\n";
+    out << "prepared-shader-v8-step-mask-float-declarations\n";
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';

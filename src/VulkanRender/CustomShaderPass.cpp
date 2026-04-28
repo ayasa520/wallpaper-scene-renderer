@@ -1265,9 +1265,6 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             .color = { sc[0], sc[1], sc[2], 1.0f },
         };
     }
-    for (auto& tex : releaseTexs()) {
-        device.tex_cache().MarkShareReady(tex);
-    }
     setPrepared();
 }
 
@@ -1343,9 +1340,6 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
         // post-refresh draw, instead of binding a fresh suballocation that still contains old data.
         m_desc.update_dynamic_mesh_op();
     }
-    for (auto& tex : releaseTexs()) {
-        device.tex_cache().MarkShareReady(tex);
-    }
 }
 
 void CustomShaderPass::updateBeforeUpload() {
@@ -1371,11 +1365,12 @@ void CustomShaderPass::updateBeforeUpload() {
     m_desc.update_dynamic_mesh_op();
 }
 
-void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
+void CustomShaderPass::execute(const Device& device, RenderingResources& rr) {
     if (m_desc.should_execute && ! m_desc.should_execute()) {
         // Runtime-gated helper passes stay in the render graph so visibility flips do not rebuild
         // framebuffer topology. Returning before uniform updates and draw submission makes the pass
         // a true no-op on frames where its fallback branch is not active.
+        releaseFinalReadTexs(device);
         return;
     }
 
@@ -1385,11 +1380,16 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
         // Effect-local visibility is a stricter contract: a hidden effect must not run its shader
         // pass, otherwise the hidden branch would still overwrite the ping-pong output that the
         // bypass copy is responsible for preserving.
+        releaseFinalReadTexs(device);
         return;
     }
 
     const bool node_visible = m_desc.node == nullptr ? true : m_desc.node->Visible();
     if (m_desc.node != nullptr && ! node_visible && ! m_desc.execute_when_hidden) {
+        // The render graph has still reached this pass's ordering point even when authored
+        // visibility turns the shader into a no-op for the frame. Releasing final-read keys here
+        // prevents temporary render targets from staying pinned only because no draw was recorded.
+        releaseFinalReadTexs(device);
         return;
     }
 
@@ -1512,6 +1512,11 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
     }
 
     cmd.EndRenderPass();
+    // Temporary render targets may only be returned to TextureCache after the pass has actually
+    // consumed them in the recorded frame. Releasing during prepare/resource-refresh is unsafe:
+    // all passes are prepared before any pass executes, so a later pass can accidentally bind a
+    // same-sized but unrelated physical image for a still-live logical key.
+    releaseFinalReadTexs(device);
 }
 
 void CustomShaderPass::destory(const Device&, RenderingResources& rr) {

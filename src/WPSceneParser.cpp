@@ -305,6 +305,7 @@ void LogTextLayerRegistration(const char* event_name, int32_t object_id,
 enum class LazyMaterializeKind
 {
     None,
+    Image,
     Particle,
     Text,
 };
@@ -336,6 +337,7 @@ struct ParseContext {
     std::shared_ptr<SceneNode>                              global_perspective_camera_node;
     std::unordered_set<int32_t>                             dependent_parent_ids;
     std::unordered_map<int32_t, VisibilityContract>         layer_visibility_contracts;
+    std::unordered_map<int32_t, int32_t>                    initial_parent_by_layer_id;
     std::unordered_map<int32_t, std::shared_ptr<SceneNode>> object_nodes;
     std::unordered_map<int32_t, const WPPuppet*>            object_puppets;
     // Model chunk passes share the main scene target. Tracking their parse order here lets the
@@ -905,6 +907,59 @@ const VisibilityContract* FindLayerVisibilityContract(const ParseContext& contex
     return it == context.layer_visibility_contracts.end() ? nullptr : &it->second;
 }
 
+int32_t FindInitialParentLayerId(const ParseContext& context, int32_t layer_id) {
+    const auto it = context.initial_parent_by_layer_id.find(layer_id);
+    return it == context.initial_parent_by_layer_id.end() ? 0 : it->second;
+}
+
+bool LayerHasRuntimeVisibilityInInitialAncestry(const ParseContext& context, int32_t layer_id) {
+    std::unordered_set<int32_t> visited;
+    int32_t current = layer_id;
+    while (current != 0 && visited.insert(current).second) {
+        if (const auto* contract = FindLayerVisibilityContract(context, current);
+            contract != nullptr && contract->requires_runtime_contract) {
+            return true;
+        }
+        current = FindInitialParentLayerId(context, current);
+    }
+    return false;
+}
+
+bool LayerInitiallyVisibleThroughInitialAncestry(const ParseContext& context, int32_t layer_id,
+                                                bool local_initial_visible) {
+    if (! local_initial_visible) return false;
+
+    std::unordered_set<int32_t> visited;
+    int32_t current = layer_id;
+    while (current != 0 && visited.insert(current).second) {
+        if (const auto* contract = FindLayerVisibilityContract(context, current);
+            contract != nullptr && ! contract->initial_visible) {
+            return false;
+        }
+        current = FindInitialParentLayerId(context, current);
+    }
+    return true;
+}
+
+bool ShouldDeferRuntimeLayerMaterialization(const ParseContext& context, int32_t layer_id,
+                                            bool local_initial_visible,
+                                            const VisibilityContract* contract,
+                                            bool force_runtime_materialization) {
+    if (force_runtime_materialization) return false;
+    if (contract != nullptr && contract->dependency_source) return false;
+    if (LayerInitiallyVisibleThroughInitialAncestry(context, layer_id, local_initial_visible)) {
+        return false;
+    }
+
+    // A multilingual branch often keeps each child layer locally visible and hides the branch at an
+    // ancestor controlled by user settings or scripts. Looking only at the child authored flag
+    // materializes every hidden language subtree. The initial parent map lets parser-side lazy
+    // materialization follow the same effective-visibility contract that Scene later applies to
+    // runtime nodes, while dependency-source layers still stay concrete for consumers that sample
+    // their render targets.
+    return LayerHasRuntimeVisibilityInInitialAncestry(context, layer_id);
+}
+
 class ScopedGlslangSession {
 public:
     explicit ScopedGlslangSession(std::string_view reason): m_reason(reason) {
@@ -1154,7 +1209,7 @@ BlendMode ParseBlendMode(std::string_view str) {
     return bm;
 }
 
-void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
+void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const Scene* scene,
                       const WPShaderInfo& sinfo) {
     if (IsSpecTex(name)) {
         if (name == "_rt_FullFrameBuffer") {
@@ -1185,6 +1240,11 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat,
             // first-party grid materials may reference the sampler while their own model is not
             // reflected. Accept the name here as a model/runtime target instead of treating it as a
             // missing 2D texture.
+        } else if (scene != nullptr && scene->renderTargets.count(name) != 0) {
+            // Effect-local feedback buffers such as `_rt_EightBuffer1_<effect-layer-address>` are
+            // registered dynamically from the authored FBO table. They still use Wallpaper Engine's
+            // `_rt_` prefix, so the generic special-texture parser sees them, but the scene render
+            // target table is the authoritative contract for whether they are valid runtime FBOs.
         } else {
             LOG_ERROR("unknown tex \"%s\"", name.c_str());
         }
@@ -1339,7 +1399,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     for (usize i = 0; i < textures.size(); i++) {
         std::string name = textures.at(i);
         if (name == "_alias_lightCookie") name = "cookie/flashlight1";
-        ParseSpecTexName(name, wpmat, *pWPShaderInfo);
+        ParseSpecTexName(name, wpmat, pScene, *pWPShaderInfo);
         material.textures.push_back(name);
         material.defines.push_back("g_Texture" + std::to_string(i));
         if (name.empty()) {
@@ -1636,6 +1696,40 @@ void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
     }
 }
 
+void RestoreRenderOrderProxyChildrenForLayer(Scene& scene, int32_t parent_layer_id,
+                                             SceneNode* parent_node) {
+    if (parent_layer_id == 0 || parent_node == nullptr) return;
+
+    auto& routed_children = scene.renderOrderProxyChildren[parent_node];
+    for (const auto child_layer_id : scene.GetLayerChildren(parent_layer_id)) {
+        const auto binding = scene.GetLayerParentBinding(child_layer_id);
+        if (binding.parent_id != parent_layer_id || ! binding.attachment.empty()) continue;
+
+        const auto child_node_it = scene.layerNodes.find(child_layer_id);
+        if (child_node_it == scene.layerNodes.end() || child_node_it->second == nullptr) continue;
+
+        // Deferred parent materialization replaces the placeholder node that owned the authored
+        // render-order proxy bucket. Existing children may be lightweight containers that are not
+        // materialized themselves, so rebuild the parent->child route from layer bindings instead
+        // of waiting for every child parser to run again.
+        if (std::find(routed_children.begin(), routed_children.end(), child_node_it->second) ==
+            routed_children.end()) {
+            routed_children.push_back(child_node_it->second);
+        }
+        scene.renderOrderProxyNodes.insert(child_node_it->second);
+        LOG_INFO("SceneRenderOrderProxyRestore: parent-layer=%d proxy-layer=%d parent-name='%s' "
+                 "proxy-name='%s'",
+                 parent_layer_id,
+                 child_layer_id,
+                 parent_node->Name().c_str(),
+                 child_node_it->second->Name().c_str());
+    }
+
+    if (routed_children.empty()) {
+        scene.renderOrderProxyChildren.erase(parent_node);
+    }
+}
+
 struct AttachmentBinding {
     uint32_t        bone_index { 0xFFFFFFFFu };
     Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
@@ -1730,6 +1824,70 @@ void RegisterLayerSceneState(ParseContext& context, int32_t layer_id, int32_t pa
     if (context.scene == nullptr || layer_id == 0) return;
     context.scene->SetLayerParentBinding(layer_id, parent_id, std::string(attachment));
     context.scene->SetLayerLocalVisibility(layer_id, visible);
+}
+
+void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObject& wpimgobj,
+                               bool defer_runtime_materialization) {
+    auto node = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
+                                            Vector3f(wpimgobj.scale.data()),
+                                            Vector3f(wpimgobj.angles.data()),
+                                            wpimgobj.name);
+    LoadAlignment(*node, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+    node->ID() = wpimgobj.id;
+
+    WPShaderValueData node_data;
+    node_data.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+    ConfigureBoneAttachment(context,
+                            wpimgobj.parent,
+                            wpimgobj.attachment,
+                            Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
+                            "image layer",
+                            wpimgobj.name,
+                            node_data);
+
+    if (wpimgobj.parent != 0 && wpimgobj.attachment.empty()) {
+        ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
+        context.scene->sceneGraph->AppendChild(node);
+        RegisterRenderOrderProxyChild(context, wpimgobj.parent, node, wpimgobj.id);
+    } else {
+        AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
+    }
+
+    context.object_nodes[wpimgobj.id]       = node;
+    context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
+        .size      = wpimgobj.size,
+        .alignment = wpimgobj.alignment,
+    };
+    context.scene->objectRuntimeNodes[wpimgobj.id].push_back(node.get());
+    context.scene->nodeOwners[node.get()] = wpimgobj.id;
+    context.shader_updater->SetNodeData(node.get(), node_data);
+    RegisterLayerSceneState(
+        context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
+    context.scene->ApplyLayerVisibility(wpimgobj.id);
+
+    if (defer_runtime_materialization) {
+        // Hidden user/script-controlled image layers can be very expensive: materializing their
+        // complete effect chains creates render targets, pipelines, and descriptors even though no
+        // pass can execute while the layer is invisible. Keep only the transform/runtime contract
+        // until the visibility property first turns true, then rebuild the graph with real passes.
+        context.scene->deferredRuntimeImageLayerIds.insert(wpimgobj.id);
+    }
+
+    LOG_INFO("SceneObjectMaterialize: mode=image-logical-only id=%d name='%s' image='%s' "
+             "fullscreen=%s autosize=%s projectlayer=%s effects=%zu dependency-source=%s "
+             "deferred-runtime=%s",
+             wpimgobj.id,
+             wpimgobj.name.c_str(),
+             wpimgobj.image.c_str(),
+             wpimgobj.fullscreen ? "true" : "false",
+             wpimgobj.autosize ? "true" : "false",
+             wpimgobj.projectlayer ? "true" : "false",
+             wpimgobj.effects.size(),
+             context.scene != nullptr &&
+                     context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0
+                 ? "true"
+                 : "false",
+             defer_runtime_materialization ? "true" : "false");
 }
 
 void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObject& wppartobj) {
@@ -3209,63 +3367,19 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
 void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                    bool force_runtime_materialization = false) {
     auto& wpimgobj = img_obj;
+    const auto* visibility_contract = FindLayerVisibilityContract(context, wpimgobj.id);
+    const bool  can_defer_hidden_runtime_image = ShouldDeferRuntimeLayerMaterialization(
+        context, wpimgobj.id, wpimgobj.visible, visibility_contract, force_runtime_materialization);
+    if (can_defer_hidden_runtime_image) {
+        RegisterLogicalImageLayer(context, wpimgobj, true);
+        return;
+    }
     if (! wpimgobj.visible && ! force_runtime_materialization) return;
 
     auto& vfs = *context.vfs;
 
     const auto register_logical_only_layer = [&]() {
-        auto node = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
-                                                Vector3f(wpimgobj.scale.data()),
-                                                Vector3f(wpimgobj.angles.data()),
-                                                wpimgobj.name);
-        LoadAlignment(*node, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
-        node->ID() = wpimgobj.id;
-
-        WPShaderValueData node_data;
-        node_data.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-        ConfigureBoneAttachment(context,
-                                wpimgobj.parent,
-                                wpimgobj.attachment,
-                                Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
-                                "image layer",
-                                wpimgobj.name,
-                                node_data);
-
-        if (wpimgobj.parent != 0 && wpimgobj.attachment.empty()) {
-            ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
-            context.scene->sceneGraph->AppendChild(node);
-            RegisterRenderOrderProxyChild(context, wpimgobj.parent, node, wpimgobj.id);
-        } else {
-            AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
-        }
-
-        context.object_nodes[wpimgobj.id]       = node;
-        context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
-            .size      = wpimgobj.size,
-            .alignment = wpimgobj.alignment,
-        };
-        context.scene->objectRuntimeNodes[wpimgobj.id].push_back(node.get());
-        context.scene->nodeOwners[node.get()] = wpimgobj.id;
-        context.shader_updater->SetNodeData(node.get(), node_data);
-        RegisterLayerSceneState(
-            context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
-        // Logical-only image layers are deliberately still registered as scene/runtime layers.
-        // The log records the image path and project-layer flag so a run log can prove that a
-        // framebuffer helper stayed logical instead of being materialized into a drawable pass.
-        LOG_INFO("SceneObjectMaterialize: mode=image-logical-only id=%d name='%s' image='%s' "
-                 "fullscreen=%s autosize=%s projectlayer=%s effects=%zu dependency-source=%s",
-                 wpimgobj.id,
-                 wpimgobj.name.c_str(),
-                 wpimgobj.image.c_str(),
-                 wpimgobj.fullscreen ? "true" : "false",
-                 wpimgobj.autosize ? "true" : "false",
-                 wpimgobj.projectlayer ? "true" : "false",
-                 wpimgobj.effects.size(),
-                 context.scene != nullptr &&
-                         context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0
-                     ? "true"
-                     : "false");
-        context.scene->ApplyLayerVisibility(wpimgobj.id);
+        RegisterLogicalImageLayer(context, wpimgobj, false);
     };
 
     // coloBlendMode load passthrough manaully
@@ -3882,10 +3996,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     const auto* visibility_contract = FindLayerVisibilityContract(context, text_obj.id);
     const bool  has_runtime_visibility_contract =
         visibility_contract != nullptr && visibility_contract->requires_runtime_contract;
-    if (! text_obj.visible && has_runtime_visibility_contract) {
-        // Hidden dynamic text stays as a lightweight logical layer until first visible. This keeps
-        // startup cheap while preserving the same runtime target that scripts and user bindings
-        // will materialize later through MaterializeDeferredTextLayer().
+    if (ShouldDeferRuntimeLayerMaterialization(
+            context, text_obj.id, text_obj.visible, visibility_contract, false)) {
+        // Hidden dynamic text, including text hidden only by a runtime-controlled parent branch,
+        // stays as a lightweight logical layer until first effective visibility. This keeps startup
+        // cheap while preserving the same runtime target that scripts and user bindings will
+        // materialize later through MaterializeDeferredTextLayer().
         RegisterLogicalTextLayer(context, text_obj);
         return;
     }
@@ -4233,12 +4349,13 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     bool        is_child            = child_ptr.child != nullptr;
     const auto* visibility_contract = FindLayerVisibilityContract(context, wppartobj.id);
-    const bool  has_runtime_visibility_contract =
-        visibility_contract != nullptr && visibility_contract->requires_runtime_contract;
-    if (! is_child && ! wppartobj.visible && has_runtime_visibility_contract) {
-        // Hidden dynamic particles keep only their logical registration at parse time. The heavy
-        // particle system allocation is deferred until runtime visibility turns true, matching the
-        // text lazy path while still keeping static hidden particles prunable.
+    if (! is_child &&
+        ShouldDeferRuntimeLayerMaterialization(
+            context, wppartobj.id, wppartobj.visible, visibility_contract, false)) {
+        // Hidden dynamic particles keep only their logical registration at parse time. The check
+        // uses effective initial visibility through the parent chain, so language branches hidden
+        // by a runtime-controlled container do not allocate particle systems until that branch is
+        // actually shown.
         RegisterLogicalParticleLayer(context, wppartobj);
         return;
     }
@@ -6005,7 +6122,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
     if (object_json.contains("image") && ! object_json.at("image").is_null()) {
         wpscene::WPImageObject object;
         if (! object.FromJson(object_json, *context.vfs)) return false;
-        register_visibility_contract(object.id, LazyMaterializeKind::None);
+        register_visibility_contract(object.id, LazyMaterializeKind::Image);
         resolve_visibility(object);
 
         const bool requested_visible = object.visible;
@@ -6088,6 +6205,91 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
     return context.object_nodes.count(object.id) != 0;
 }
 } // namespace
+
+bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
+                                              const UserPropertyMap* user_properties) {
+    if (scene.deferredRuntimeImageLayerIds.count(layer_id) == 0) return false;
+
+    const auto config_it = scene.initialLayerConfigJson.find(layer_id);
+    if (config_it == scene.initialLayerConfigJson.end()) return false;
+
+    nlohmann::json object_json;
+    if (! PARSE_JSON(config_it->second, object_json)) return false;
+
+    ParseContext context {};
+    if (! InitDynamicParseContext(context, scene, user_properties)) return false;
+    ScopedGlslangSession glslang_scope("deferred-image-parse");
+
+    std::shared_ptr<SceneNode> placeholder_node;
+    if (auto node_it = context.object_nodes.find(layer_id); node_it != context.object_nodes.end()) {
+        placeholder_node = node_it->second;
+    }
+
+    const auto binding = scene.GetLayerParentBinding(layer_id);
+    const auto apply_placeholder_transform = [layer_id, &binding, &placeholder_node](auto& object) {
+        object.id         = layer_id;
+        object.visible    = true;
+        object.parent     = binding.parent_id;
+        object.attachment = binding.attachment;
+        if (placeholder_node == nullptr) return;
+
+        // Runtime materialization must preserve the script-mutated logical transform carried by
+        // the placeholder. Reusing the initial JSON transform would make late-visible multilingual
+        // branches snap back to authored values after user/script updates.
+        object.name           = placeholder_node->Name();
+        const auto& translate = placeholder_node->Translate();
+        const auto& scale     = placeholder_node->Scale();
+        const auto& rotation  = placeholder_node->Rotation();
+        object.origin         = { translate.x(), translate.y(), translate.z() };
+        object.scale          = { scale.x(), scale.y(), scale.z() };
+        object.angles         = { rotation.x(), rotation.y(), rotation.z() };
+    };
+
+    if (placeholder_node != nullptr && scene.sceneGraph != nullptr) {
+        // The placeholder exists only to preserve script/user-property addressing while the layer is
+        // hidden. Remove every render-order reference before materializing the real image/effect
+        // nodes, otherwise the rebuilt graph would see both the placeholder and the drawable layer.
+        RemoveRenderOrderNodeReferences(scene, placeholder_node.get());
+        (void)DetachNodeFromTree(scene.sceneGraph, placeholder_node.get());
+        scene.nodeOwners.erase(placeholder_node.get());
+    }
+    scene.objectRuntimeNodes.erase(layer_id);
+    scene.imageLayers.erase(layer_id);
+    scene.layerNodes[layer_id] = nullptr;
+
+    if (object_json.contains("shape") && ! object_json.at("shape").is_null()) {
+        WPShapeObject object;
+        if (! object.FromJson(object_json, *context.vfs)) return false;
+        apply_placeholder_transform(object);
+        // Direct-draw shapes are stored in the same deferred image set because their runtime path
+        // deliberately reuses image-effect materialization. On wake-up they still need to be parsed
+        // from the authored shape JSON first, otherwise WPImageObject would try to load an empty
+        // image path and abort the visible subtree before clock text can materialize.
+        ParseShapeObj(context, object, true);
+    } else {
+        wpscene::WPImageObject object;
+        if (! object.FromJson(object_json, *context.vfs)) return false;
+        apply_placeholder_transform(object);
+        ParseImageObj(context, object, true);
+    }
+    auto node_it = context.object_nodes.find(layer_id);
+    if (node_it == context.object_nodes.end() || ! node_it->second) return false;
+
+    scene.layerNodes[layer_id] = node_it->second.get();
+    RestoreRenderOrderProxyChildrenForLayer(scene, layer_id, node_it->second.get());
+    for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
+        if (it->second == layer_id) {
+            it = scene.layerNameToId.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (! node_it->second->Name().empty()) {
+        scene.layerNameToId[node_it->second->Name()] = layer_id;
+    }
+    scene.deferredRuntimeImageLayerIds.erase(layer_id);
+    return true;
+}
 
 bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
                                                  const UserPropertyMap* user_properties) {
@@ -6338,7 +6540,9 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             script_referenced_layer_names.count(object_name) != 0;
 
         LazyMaterializeKind lazy_kind = LazyMaterializeKind::None;
-        if (obj.contains("particle") && ! obj.at("particle").is_null()) {
+        if (obj.contains("image") && ! obj.at("image").is_null()) {
+            lazy_kind = LazyMaterializeKind::Image;
+        } else if (obj.contains("particle") && ! obj.at("particle").is_null()) {
             lazy_kind = LazyMaterializeKind::Particle;
         } else if (obj.contains("text") && ! obj.at("text").is_null()) {
             lazy_kind = LazyMaterializeKind::Text;
@@ -6382,9 +6586,11 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                          binding.value ? "true" : "false",
                          visibility_contract.initial_visible ? "true" : "false",
                          visibility_contract.requires_runtime_contract ? "true" : "false",
-                         lazy_kind == LazyMaterializeKind::Particle
-                             ? "particle"
-                             : (lazy_kind == LazyMaterializeKind::Text ? "text" : "none"));
+                         lazy_kind == LazyMaterializeKind::Image
+                             ? "image"
+                             : (lazy_kind == LazyMaterializeKind::Particle
+                                    ? "particle"
+                                    : (lazy_kind == LazyMaterializeKind::Text ? "text" : "none")));
             }
         }
 
@@ -6411,6 +6617,16 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         } else {
             AddWPObject<WPEmptyObject>(wp_objs, obj, vfs, user_properties);
         }
+    }
+
+    context.initial_parent_by_layer_id.clear();
+    for (const auto& obj : wp_objs) {
+        const auto id = GetObjectId(obj);
+        if (! id.has_value() || *id == 0) continue;
+        // Effective visibility is a parent-chain property, not just a layer-local property. Keep
+        // the authored parse-time parent table before any pruning/materialization so lazy layer
+        // decisions can mirror Scene::IsLayerVisible() without needing concrete runtime nodes.
+        context.initial_parent_by_layer_id[*id] = GetObjectParentId(obj);
     }
 
     std::unordered_set<int32_t> hidden_object_ids;
@@ -6573,13 +6789,12 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                                FindLayerVisibilityContract(context, obj.id);
                            const bool force_runtime_materialization =
                                visibility_contract != nullptr &&
-                               visibility_contract->requires_runtime_contract;
+                               visibility_contract->dependency_source;
 
                            // Image layers now keep the authored initial visibility intact while
-                           // still materializing runtime-controlled hidden nodes.
-                           // RegisterLayerSceneState() applies that initial local visibility after
-                           // the node exists, so scripts can later flip visibility without the
-                           // parser pretending the layer was authored visible.
+                           // deferring runtime-controlled hidden nodes. Dependency sources remain
+                           // concrete because another visible layer may sample their render target
+                           // even while their own visibility contract begins false.
                            ParseImageObj(context, obj, force_runtime_materialization);
                        },
                        [&context](wpscene::WPParticleObject& obj) {
@@ -6603,11 +6818,11 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                                FindLayerVisibilityContract(context, obj.id);
                            const bool force_runtime_materialization =
                                visibility_contract != nullptr &&
-                               visibility_contract->requires_runtime_contract;
+                               visibility_contract->dependency_source;
 
                            // Shape direct-draw effects mirror image-layer visibility behavior:
-                           // materialize runtime-controlled hidden layers, then let the shared
-                           // layer visibility state apply the authored initial value.
+                           // dependency-source shapes stay materialized for consumers, while
+                           // hidden runtime branches can stay logical until effective visibility.
                            ParseShapeObj(context, obj, force_runtime_materialization);
                        },
                        [&context](WPEmptyObject& obj) {

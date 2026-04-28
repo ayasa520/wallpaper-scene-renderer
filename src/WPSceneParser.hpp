@@ -36,4 +36,6 @@ bool MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
                                       const UserPropertyMap* user_properties);
 bool MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
                                   const UserPropertyMap* user_properties);
+bool MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
+                                   const UserPropertyMap* user_properties);
 } // namespace wallpaper
