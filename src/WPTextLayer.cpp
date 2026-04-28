@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -128,6 +129,19 @@ std::string NormalizeSystemFontAlias(std::string font) {
     std::replace(font.begin(), font.end(), '_', ' ');
     if (font == "default") return "Sans";
     return font.empty() ? std::string("Sans") : font;
+}
+
+std::string LowercaseAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+bool IsSupportedFontAssetPath(std::string_view path) {
+    const auto extension =
+        LowercaseAscii(std::filesystem::path(std::string(path)).extension().string());
+    return extension == ".ttf" || extension == ".otf";
 }
 
 struct AssetFontCacheEntry {
@@ -589,7 +603,7 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
     if (font.empty()) {
         return std::string("Sans");
     }
-    if (! font.ends_with(".ttf") && ! font.ends_with(".otf")) {
+    if (! IsSupportedFontAssetPath(font)) {
         return NormalizeSystemFontAlias(font);
     }
 
