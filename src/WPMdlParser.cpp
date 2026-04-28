@@ -24,6 +24,54 @@ constexpr uint32_t kStaticTangentSpaceFloats     = 12;
 constexpr uint32_t kStaticTangentSpaceSecondUvFloats = 14;
 constexpr uint32_t kStaticTriangleIndexBytes     = 2 * 3;
 
+enum class StaticHeaderFieldRole
+{
+    Reserved,
+    MaterialPathCount,
+    GeometryChunkCount,
+    GeometryAndMaterialPathCount,
+};
+
+enum class StaticMaterialPathLayout
+{
+    InterleavedPerChunk,
+    PrefixedSkinVariantTable,
+};
+
+struct StaticMdlFormat {
+    int32_t                  version { 0 };
+    StaticHeaderFieldRole    second_field { StaticHeaderFieldRole::Reserved };
+    StaticHeaderFieldRole    third_field { StaticHeaderFieldRole::GeometryChunkCount };
+    StaticMaterialPathLayout material_layout { StaticMaterialPathLayout::InterleavedPerChunk };
+};
+
+struct StaticMdlHeader {
+    uint32_t mdl_flag { 0 };
+    uint32_t reserved { 0 };
+    uint32_t material_path_count { 0 };
+    uint32_t geometry_chunk_count { 0 };
+    StaticMaterialPathLayout material_layout { StaticMaterialPathLayout::InterleavedPerChunk };
+
+    bool HasPrefixedMaterialTable() const {
+        return material_layout == StaticMaterialPathLayout::PrefixedSkinVariantTable;
+    }
+
+    bool UsesSkinVariantMaterials() const {
+        return material_layout == StaticMaterialPathLayout::PrefixedSkinVariantTable;
+    }
+};
+
+constexpr std::array<StaticMdlFormat, 2> kStaticMdlFormats {{
+    { 4,
+      StaticHeaderFieldRole::MaterialPathCount,
+      StaticHeaderFieldRole::GeometryChunkCount,
+      StaticMaterialPathLayout::PrefixedSkinVariantTable },
+    { 14,
+      StaticHeaderFieldRole::Reserved,
+      StaticHeaderFieldRole::GeometryAndMaterialPathCount,
+      StaticMaterialPathLayout::InterleavedPerChunk },
+}};
+
 WPPuppet::PlayMode ToPlayMode(std::string_view m) {
     if (m == "loop" || m.empty()) return WPPuppet::PlayMode::Loop;
     if (m == "mirror") return WPPuppet::PlayMode::Mirror;
@@ -89,6 +137,114 @@ bool StaticVertexHasTangentSpace(uint32_t mdl_flag) {
 
 bool StaticVertexHasSecondUv(uint32_t mdl_flag) {
     return mdl_flag == kStaticTangentSpaceSecondUvFlag;
+}
+
+const StaticMdlFormat* FindStaticMdlFormat(int32_t mdl_version) {
+    const auto it = std::find_if(kStaticMdlFormats.begin(),
+                                 kStaticMdlFormats.end(),
+                                 [mdl_version](const StaticMdlFormat& format) {
+                                     return format.version == mdl_version;
+                                 });
+    return it != kStaticMdlFormats.end() ? &*it : nullptr;
+}
+
+void ApplyStaticHeaderField(StaticMdlHeader& header,
+                            StaticHeaderFieldRole role,
+                            uint32_t value) {
+    switch (role) {
+    case StaticHeaderFieldRole::Reserved:
+        header.reserved = value;
+        break;
+    case StaticHeaderFieldRole::MaterialPathCount:
+        header.material_path_count = value;
+        break;
+    case StaticHeaderFieldRole::GeometryChunkCount:
+        header.geometry_chunk_count = value;
+        break;
+    case StaticHeaderFieldRole::GeometryAndMaterialPathCount:
+        header.geometry_chunk_count = value;
+        header.material_path_count  = value;
+        break;
+    }
+}
+
+std::string_view StaticMaterialLayoutName(StaticMaterialPathLayout layout) {
+    switch (layout) {
+    case StaticMaterialPathLayout::InterleavedPerChunk:
+        return "interleaved-per-chunk";
+    case StaticMaterialPathLayout::PrefixedSkinVariantTable:
+        return "prefixed-skin-variant-table";
+    }
+    return "unknown";
+}
+
+bool ReadStaticMdlHeader(fs::IBinaryStream& f,
+                         int32_t            mdl_version,
+                         std::string_view   path,
+                         StaticMdlHeader&   header) {
+    header.mdl_flag = f.ReadUint32();
+    const uint32_t second_header_field = f.ReadUint32();
+    const uint32_t third_header_field  = f.ReadUint32();
+
+    const auto* format = FindStaticMdlFormat(mdl_version);
+    if (format == nullptr) {
+        LOG_ERROR("static mdl unsupported header version path='%.*s' version=%d flag=%u raw-field-1=%u "
+                  "raw-field-2=%u",
+                  static_cast<int>(path.size()),
+                  path.data(),
+                  mdl_version,
+                  header.mdl_flag,
+                  second_header_field,
+                  third_header_field);
+        return false;
+    }
+
+    // The static MDL header has only two numeric slots after the vertex flag, but those slots have
+    // different meanings across format versions. A small format descriptor keeps the parse policy
+    // data-driven and prevents version-specific branches from leaking into the chunk reader.
+    header.material_layout = format->material_layout;
+    ApplyStaticHeaderField(header, format->second_field, second_header_field);
+    ApplyStaticHeaderField(header, format->third_field, third_header_field);
+
+    LOG_INFO("StaticMdlHeader: path='%.*s' version=%d flag=%u reserved=%u material-count=%u "
+             "geometry-chunks=%u material-layout=%s",
+             static_cast<int>(path.size()),
+             path.data(),
+             mdl_version,
+             header.mdl_flag,
+             header.reserved,
+             header.material_path_count,
+             header.geometry_chunk_count,
+             StaticMaterialLayoutName(header.material_layout).data());
+    return true;
+}
+
+std::vector<std::string> ReadPrefixedStaticMaterialPaths(fs::IBinaryStream& f,
+                                                         const StaticMdlHeader& header) {
+    std::vector<std::string> material_paths;
+    if (! header.HasPrefixedMaterialTable()) return material_paths;
+
+    material_paths.reserve(header.material_path_count);
+    for (uint32_t material_index = 0; material_index < header.material_path_count;
+         material_index++) {
+        // Prefixed material tables belong to the model header, not to individual chunk byte blocks.
+        // Reading the whole table up front lets the chunk reader stay focused on geometry bytes and
+        // lets the scene material resolver apply the skin index later.
+        material_paths.push_back(f.ReadStr());
+    }
+    return material_paths;
+}
+
+std::string ReadStaticChunkMaterialPath(fs::IBinaryStream& f,
+                                        const StaticMdlHeader& header,
+                                        const std::vector<std::string>& prefixed_material_paths,
+                                        uint32_t chunk_index) {
+    if (! header.HasPrefixedMaterialTable()) return f.ReadStr();
+
+    // For prefixed material tables, the first entries are valid fallback materials for geometry
+    // chunks, while the full table is retained as skin variants on the chunk. The invariant below
+    // is validated before parsing begins so this index is stable and version-agnostic.
+    return prefixed_material_paths[chunk_index];
 }
 
 void UpdateStaticBounds(WPMdl::StaticChunk& chunk) {
@@ -205,11 +361,24 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
         return false;
     }
 
-    const uint32_t mdl_flag = f.ReadUint32();
-    f.ReadUint32(); // Reserved field observed as 1 in MDLV0014 static model assets.
-    const uint32_t chunk_count = f.ReadUint32();
+    StaticMdlHeader header;
+    if (! ReadStaticMdlHeader(f, mdl.mdlv, str_path, header)) return false;
+
+    const uint32_t mdl_flag = header.mdl_flag;
+    const uint32_t chunk_count = header.geometry_chunk_count;
     if (chunk_count == 0) {
         LOG_ERROR("static mdl has no chunks: %s", str_path.c_str());
+        return false;
+    }
+    if (header.material_path_count == 0) {
+        LOG_ERROR("static mdl has no material paths: %s", str_path.c_str());
+        return false;
+    }
+    if (header.HasPrefixedMaterialTable() && header.material_path_count < chunk_count) {
+        LOG_ERROR("static mdl has fewer prefixed material paths than chunks: %s materials=%u chunks=%u",
+                  str_path.c_str(),
+                  header.material_path_count,
+                  chunk_count);
         return false;
     }
 
@@ -217,8 +386,11 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
     mdl.static_chunks.clear();
     mdl.static_chunks.reserve(chunk_count);
 
-    std::string material_json_file = f.ReadStr();
+    const auto prefixed_material_paths = ReadPrefixedStaticMaterialPaths(f, header);
+
     for (uint32_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+        std::string material_json_file =
+            ReadStaticChunkMaterialPath(f, header, prefixed_material_paths, chunk_index);
         if (material_json_file.empty()) {
             LOG_ERROR("static mdl chunk %u has empty material path: %s",
                       chunk_index,
@@ -228,11 +400,13 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
 
         WPMdl::StaticChunk chunk;
         if (! ReadStaticChunk(f, mdl_flag, material_json_file, chunk)) return false;
-        mdl.static_chunks.push_back(std::move(chunk));
-
-        if (chunk_index + 1 < chunk_count) {
-            material_json_file = f.ReadStr();
+        if (header.UsesSkinVariantMaterials()) {
+            // Keep the variant table on the parsed chunk so WPSceneParser can apply the model
+            // object's skin index after sidecar material remapping. This keeps binary parsing
+            // independent from scene-object policy while still preserving the authored skin choice.
+            chunk.material_json_variants = prefixed_material_paths;
         }
+        mdl.static_chunks.push_back(std::move(chunk));
     }
 
     return true;
