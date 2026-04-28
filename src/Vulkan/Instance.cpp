@@ -152,6 +152,16 @@ bool Instance::supportLayer(std::string_view name) const { return exists(m_layer
 
 void Instance::Destroy() {}
 
+void Instance::Abandon() {
+    // Device-lost recovery may intentionally leak the Vulkan instance and its
+    // child surface/debug handles.  Destroying an instance while a faulted device
+    // is being abandoned would force the NVIDIA driver back through teardown code
+    // that has already been observed in crash stacks.
+    m_surface.abandon();
+    m_debug_utils.abandon();
+    m_vinst.abandon();
+}
+
 bool Instance::Create(Instance& inst, std::span<const Extension> instExts,
                       std::span<const InstanceLayer> instLayers) {
     vvk::LoadLibrary(inst.m_vklib, inst.m_dld);

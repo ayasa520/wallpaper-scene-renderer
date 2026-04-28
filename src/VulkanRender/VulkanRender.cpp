@@ -75,6 +75,9 @@ struct VulkanRender::Impl {
     void drawFrameSwapchain();
     void drawFrameOffscreen();
     void setRenderTargetSize(Scene&, rg::RenderGraph&);
+    bool isDeviceFaultResult(VkResult) const;
+    bool checkVkResult(VkResult, const char* operation);
+    void abandonDeviceOwnedResourcesAfterFault();
 
     Instance                m_instance;
     std::unique_ptr<Device> m_device;
@@ -95,6 +98,8 @@ struct VulkanRender::Impl {
     bool m_with_surface { false };
     bool m_inited { false };
     bool m_pass_loaded { false };
+    bool m_device_faulted { false };
+    bool m_device_fault_log_emitted { false };
 
     std::unique_ptr<VulkanExSwapchain> m_ex_swapchain;
     RenderingResources                 m_rendering_resources;
@@ -207,6 +212,34 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
     return m_inited;
 }
 
+bool VulkanRender::Impl::isDeviceFaultResult(VkResult result) const {
+    return result == VK_ERROR_DEVICE_LOST || result == VK_TIMEOUT;
+}
+
+bool VulkanRender::Impl::checkVkResult(VkResult result, const char* operation) {
+    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) return true;
+
+    const char* operation_name = operation ? operation : "unknown operation";
+    if (isDeviceFaultResult(result)) {
+        m_device_faulted = true;
+        m_pass_loaded = false;
+        if (!m_device_fault_log_emitted) {
+            // Device loss is terminal for this VulkanRender instance.  Continuing to submit frames
+            // only repeats VK_ERROR_DEVICE_LOST, and destroying every pipeline after an NVIDIA Xid
+            // can enter driver teardown paths that have appeared in the Arsenal crash stacks.
+            LOG_ERROR("HanabiScene Vulkan: device became unhealthy during %s (%s); "
+                      "suppressing future frame submissions and abandoning deep Vulkan teardown",
+                      operation_name,
+                      vvk::ToString(result));
+            m_device_fault_log_emitted = true;
+        }
+        return false;
+    }
+
+    LOG_ERROR("HanabiScene Vulkan: %s failed with %s", operation_name, vvk::ToString(result));
+    return false;
+}
+
 bool VulkanRender::Impl::initRes() {
     m_prepass = std::make_unique<PrePass>(PrePass::Desc {});
     m_finpass = std::make_unique<FinPass>(FinPass::Desc {});
@@ -251,10 +284,51 @@ bool VulkanRender::Impl::initRes() {
     return true;
 }
 
+void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
+    // Once the GPU has reported timeout/device-lost, Vulkan object destruction is no longer a safe
+    // cleanup mechanism on the observed NVIDIA path.  This routine intentionally abandons wrapper
+    // ownership so process shutdown or backend replacement does not call back into driver destroy
+    // functions with a broken device.  The leaked objects are bounded to this renderer instance and
+    // are preferable to a SIGSEGV while switching away from the failed scene.
+    m_rendering_resources.sem_swap_wait_image.abandon();
+    m_rendering_resources.sem_swap_finish.abandon();
+    m_rendering_resources.fence_frame.abandon();
+    m_rendering_resources.command.abandon();
+    for (auto& [_, image] : m_rendering_resources.model_depth_images) {
+        image.sampler.abandon();
+        image.view.abandon();
+        image.handle.abandon();
+    }
+    m_rendering_resources.model_depth_images.clear();
+    m_rendering_resources.vertex_buf = nullptr;
+    m_rendering_resources.dyn_buf = nullptr;
+
+    m_upload_cmd.abandon();
+    m_render_cmd.abandon();
+    m_passes.clear();
+    (void)m_prepass.release();
+    (void)m_finpass.release();
+    (void)m_testpass.release();
+    (void)m_vertex_buf.release();
+    (void)m_dyn_buf.release();
+    (void)m_ex_swapchain.release();
+    (void)m_device.release();
+    m_instance.Abandon();
+    m_inited = false;
+    m_pass_loaded = false;
+}
+
 void VulkanRender::Impl::destroy() {
-    if (! m_inited) return;
+    if (! m_inited && !m_device_faulted) return;
+    if (m_device_faulted) {
+        abandonDeviceOwnedResourcesAfterFault();
+        return;
+    }
     if (m_device && m_device->handle()) {
-        VVK_CHECK(m_device->handle().WaitIdle());
+        if (!checkVkResult(m_device->handle().WaitIdle(), "device wait idle before destroy")) {
+            abandonDeviceOwnedResourcesAfterFault();
+            return;
+        }
 
         // res
         for (auto& p : m_passes) {
@@ -297,6 +371,7 @@ void VulkanRender::Impl::DestroyRenderingResource(RenderingResources& rr) {}
 // VulkanExSwapchain* VulkanRender::exSwapchain() const { return m_ex_swapchain.get(); }
 
 void VulkanRender::Impl::drawFrame(Scene& scene) {
+    if (m_device_faulted) return;
     if (! (m_inited && m_pass_loaded)) return;
 
     // The QuickJS host records getVideoTexture().play()/pause() decisions on Scene before the
@@ -349,11 +424,13 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     resource_index         = (resource_index + 1) % 3;
     uint32_t image_index   = 0;
     {
-        VVK_CHECK_VOID_RE(m_device->handle().AcquireNextImageKHR(*m_device->swapchain().handle(),
-                                                                 vk_wait_time,
-                                                                 *rr.sem_swap_wait_image,
-                                                                 {},
-                                                                 &image_index));
+        if (!checkVkResult(m_device->handle().AcquireNextImageKHR(*m_device->swapchain().handle(),
+                                                                  vk_wait_time,
+                                                                  *rr.sem_swap_wait_image,
+                                                                  {},
+                                                                  &image_index),
+                           "acquire swapchain image"))
+            return;
     }
     const auto& image = m_device->swapchain().images()[image_index];
 
@@ -368,11 +445,12 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         }
     }
 
-    (void)rr.command.Begin(VkCommandBufferBeginInfo {
+    if (!checkVkResult(rr.command.Begin(VkCommandBufferBeginInfo {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    });
+    }), "begin swapchain frame command buffer"))
+        return;
     m_dyn_buf->recordUpload(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
     for (auto* p : m_passes) {
@@ -380,7 +458,8 @@ void VulkanRender::Impl::drawFrameSwapchain() {
             p->execute(*m_device, rr);
         }
     }
-    (void)rr.command.End();
+    if (!checkVkResult(rr.command.End(), "end swapchain frame command buffer"))
+        return;
 
     VkPipelineStageFlags wait_dst_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo         sub_info {
@@ -395,7 +474,9 @@ void VulkanRender::Impl::drawFrameSwapchain() {
                 .pSignalSemaphores    = rr.sem_swap_finish.address(),
     };
 
-    VVK_CHECK_VOID_RE(m_device->present_queue().handle.Submit(sub_info, *rr.fence_frame));
+    if (!checkVkResult(m_device->present_queue().handle.Submit(sub_info, *rr.fence_frame),
+                       "submit swapchain frame"))
+        return;
     VkPresentInfoKHR present_info {
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext              = nullptr,
@@ -405,10 +486,14 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .pSwapchains        = m_device->swapchain().handle().address(),
         .pImageIndices      = &image_index,
     };
-    VVK_CHECK_VOID_RE(m_device->present_queue().handle.Present(present_info));
+    if (!checkVkResult(m_device->present_queue().handle.Present(present_info),
+                       "present swapchain frame"))
+        return;
 
-    VVK_CHECK_VOID_RE(rr.fence_frame.Wait(vk_wait_time));
-    VVK_CHECK_VOID_RE(rr.fence_frame.Reset());
+    if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait swapchain frame fence"))
+        return;
+    if (!checkVkResult(rr.fence_frame.Reset(), "reset swapchain frame fence"))
+        return;
 }
 void VulkanRender::Impl::drawFrameOffscreen() {
     RenderingResources& rr    = m_rendering_resources;
@@ -425,11 +510,12 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         }
     }
 
-    (void)rr.command.Begin(VkCommandBufferBeginInfo {
+    if (!checkVkResult(rr.command.Begin(VkCommandBufferBeginInfo {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    });
+    }), "begin offscreen frame command buffer"))
+        return;
     m_dyn_buf->recordUpload(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
 
@@ -439,7 +525,8 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         }
     }
 
-    (void)rr.command.End();
+    if (!checkVkResult(rr.command.End(), "end offscreen frame command buffer"))
+        return;
 
     VkSubmitInfo sub_info {
         .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -447,10 +534,14 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         .commandBufferCount = 1,
         .pCommandBuffers    = rr.command.address(),
     };
-    VVK_CHECK_VOID_RE(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame));
+    if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
+                       "submit offscreen frame"))
+        return;
 
-    VVK_CHECK_VOID_RE(rr.fence_frame.Wait(vk_wait_time));
-    VVK_CHECK_VOID_RE(rr.fence_frame.Reset());
+    if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
+        return;
+    if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
+        return;
     m_ex_swapchain->renderFrame();
 }
 
@@ -620,6 +711,13 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
 }
 
 void VulkanRender::Impl::clearLastRenderGraph() {
+    if (m_device_faulted) {
+        // After device loss, pass destruction can call vkDestroyPipeline and friends on a driver
+        // context that already timed out.  Leave the bounded stale graph abandoned with the renderer
+        // instead of turning a recoverable backend replacement into a process crash.
+        return;
+    }
+
     // A topology rebuild invalidates the compiled pass list and the backing mesh buffers that were
     // uploaded for the previous graph. Reallocating those buffers keeps the full rebuild path
     // conservative and mirrors the historical behavior used when nodes were added or removed.
@@ -651,30 +749,35 @@ void VulkanRender::Impl::clearRenderGraphResources() {
 
 void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                                             bool refresh_resources_only) {
+    if (m_device_faulted) return;
     if (! m_inited) return;
     m_pass_loaded = false;
 
     auto submit_pending_uploads = [&]() -> bool {
-        VVK_CHECK_BOOL_RE(m_upload_cmd.Begin(VkCommandBufferBeginInfo {
+        if (!checkVkResult(m_upload_cmd.Begin(VkCommandBufferBeginInfo {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             .pNext = nullptr,
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        }));
+        }), "begin upload command buffer"))
+            return false;
         m_vertex_buf->recordUpload(m_upload_cmd);
         // Resource refresh can now update dynamic text meshes and text-backed effect quads before
         // the first post-refresh frame is recorded. Uploading the dynamic buffer here makes those
         // writes visible immediately, instead of waiting for the next frame and briefly drawing
         // resized text bridge passes with stale or uninitialized GPU subranges.
         m_dyn_buf->recordUpload(m_upload_cmd);
-        VVK_CHECK_BOOL_RE(m_upload_cmd.End());
+        if (!checkVkResult(m_upload_cmd.End(), "end upload command buffer"))
+            return false;
         VkSubmitInfo sub_info {
             .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .pNext              = nullptr,
             .commandBufferCount = 1,
             .pCommandBuffers    = m_upload_cmd.address(),
         };
-        VVK_CHECK_BOOL_RE(m_device->graphics_queue().handle.Submit(sub_info, {}));
-        VVK_CHECK_BOOL_RE(m_device->handle().WaitIdle());
+        if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, {}), "submit render graph uploads"))
+            return false;
+        if (!checkVkResult(m_device->handle().WaitIdle(), "wait idle after render graph uploads"))
+            return false;
         return true;
     };
 

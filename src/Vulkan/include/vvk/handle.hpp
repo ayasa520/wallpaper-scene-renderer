@@ -39,6 +39,13 @@ public:
         handle = nullptr;
     }
 
+    /// Drops ownership without calling the Vulkan destroy function.
+    /// This is only for device-lost recovery paths where the driver has already
+    /// reported that the device is unusable; calling more destroy entry points in
+    /// that state can recurse into the same crashed driver context we are trying
+    /// to leave behind.
+    void abandon() noexcept { handle = nullptr; }
+
     /// Returns the address of the held object.
     /// Intended for Vulkan structures that expect a pointer to an array.
     const Type* address() const noexcept { return std::addressof(handle); }
@@ -95,6 +102,12 @@ public:
         handle = nullptr;
     }
 
+    /// Drops ownership without calling the Vulkan destroy function.
+    /// Device-lost teardown may intentionally leak process-local Vulkan objects
+    /// so the renderer can stop submitting frames without entering unsafe driver
+    /// destruction paths.
+    void abandon() noexcept { handle = nullptr; }
+
     /// Returns the address of the held object.
     /// Intended for Vulkan structures that expect a pointer to an array.
     const Type* address() const noexcept { return std::addressof(handle); }
@@ -135,6 +148,11 @@ public:
 
     /// Destroys any held object.
     void reset() noexcept { handle = nullptr; }
+
+    /// Matches the owning-handle API even though this specialization never
+    /// destroys the wrapped handle; callers can uniformly abandon nested Vulkan
+    /// state during device-loss cleanup.
+    void abandon() noexcept { handle = nullptr; }
 
     /// Returns the address of the held object.
     /// Intended for Vulkan structures that expect a pointer to an array.
