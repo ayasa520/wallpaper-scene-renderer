@@ -190,6 +190,12 @@ public:
     // during the QuickJS tick while the Vulkan video cache consumes the same state on the render
     // thread before polling GStreamer.
     std::unordered_map<std::string, bool> videoTexturePaused;
+    // Wallpaper Engine exposes getVideoTexture().setCurrentTime() as an imperative decoder
+    // command rather than a persistent property. Store pending seeks separately from pause state so
+    // scripts can queue a seek during init before the render graph has created the video cache
+    // entry, and let the Vulkan render thread erase each request only after the matching decoder
+    // has accepted it.
+    std::unordered_map<std::string, double> videoTextureSeekRequests;
 
     std::string scene_id { "unknown_id" };
 
