@@ -39,8 +39,17 @@ struct SceneImageEffect {
     // visibility or being pruned while parsing.
     void SetIdentity(int32_t owner_layer_id, int32_t effect_id, uint32_t effect_index,
                      std::string effect_name);
+    void SetRuntimeVisibilityContract(bool runtime_visibility_contract) {
+        // Runtime-driven effect visibility is a render-topology contract, not only a property
+        // value. A final effect that can disappear while the graph stays alive must not be the
+        // persistent `_rt_default` writer, because skipping that pass can leave the previous frame
+        // inside feedback copies. SceneImageEffectLayer uses this flag to publish such final
+        // effects through the neutral final composite instead.
+        m_runtime_visibility_contract = runtime_visibility_contract;
+    }
     void SetLocalVisible(bool visible);
     bool LocalVisible() const { return m_local_visible; }
+    bool HasRuntimeVisibilityContract() const { return m_runtime_visibility_contract; }
 
     int32_t            OwnerLayerId() const { return m_owner_layer_id; }
     int32_t            EffectId() const { return m_effect_id; }
@@ -60,6 +69,7 @@ private:
     int32_t     m_effect_id { 0 };
     uint32_t    m_effect_index { 0 };
     std::string m_effect_name;
+    bool        m_runtime_visibility_contract { false };
     bool        m_local_visible { true };
     std::string m_bypass_src;
     std::string m_bypass_dst;
@@ -67,6 +77,12 @@ private:
 
 class SceneImageEffectLayer {
 public:
+    enum class HiddenFinalCompositePolicy
+    {
+        PreserveSource,
+        SuppressOutput,
+    };
+
     SceneImageEffectLayer(SceneNode* node, float w, float h, std::string_view pingpong_a,
                           std::string_view pingpong_b);
 
@@ -77,9 +93,16 @@ public:
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
     SceneNode&  FinalNode() const { return *m_final_node; }
     bool        HasFinalComposite() const;
-    bool        ShouldRunFinalCompositeFallback() const;
+    bool        ShouldRunFinalComposite() const;
     void        SetFinalCompositeSource(std::string source);
     void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
+    void        SetHiddenFinalCompositePolicy(HiddenFinalCompositePolicy policy) {
+        // Hidden final effects have two valid source contracts. Ordinary images/text preserve the
+        // pre-effect source when an effect is disabled. Source-less passthrough/compose helpers must
+        // instead contribute nothing, because preserving their uninitialized helper target can draw
+        // stale framebuffer-sized quads while the authored effect is hidden.
+        m_hidden_final_composite_policy = policy;
+    }
     SceneNode*  WorldNode() const { return m_worldNode; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
     void        SyncResolvedOutputMesh();
@@ -109,12 +132,24 @@ private:
     // resolve into a private offscreen texture instead; their final pass must stay in the effect
     // camera's local fullscreen space or `_rt_imageLayerComposite_<id>` samples a shifted source.
     bool                       m_resolved_output_follows_world { true };
-    // The synthetic final composite is a narrow fallback, not the normal output path. Keep the
-    // authored final effect as the resolved screen writer while it is visible, and only enable the
-    // passthrough composite when that exact final effect becomes runtime-hidden.
+    // The neutral final composite is policy-driven. Ordinary image/text layers use it as a narrow
+    // hidden-final fallback, while source-less passthrough helpers use it as the single stable
+    // screen publisher so their authored effect passes never become persistent framebuffer writers.
     SceneImageEffect* m_final_output_effect { nullptr };
+    // This flag means the neutral final composite owns the visible `_rt_default` write for the
+    // chain. Source-less helpers set it because their own image source is intentionally empty; the
+    // publisher can then suppress output when the runtime-selected source effect is hidden instead
+    // of preserving whatever a downstream filter wrote into a private helper target.
+    bool                       m_publish_final_composite { false };
+    HiddenFinalCompositePolicy m_hidden_final_composite_policy {
+        HiddenFinalCompositePolicy::PreserveSource
+    };
     BlendMode                  m_final_blend;
 
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
+
+    bool HasRuntimeVisibilityContract() const;
+    bool HasVisibleRuntimeVisibilityContribution() const;
+    bool HasVisibleSourceLessContribution() const;
 };
 } // namespace wallpaper

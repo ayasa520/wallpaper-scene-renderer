@@ -1586,6 +1586,18 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
     return true;
 }
 
+SceneImageEffectLayer::HiddenFinalCompositePolicy
+ResolveHiddenFinalCompositePolicy(const wpscene::WPImageObject& image) {
+    // This is a source-contract decision rather than a shader or layer-name decision. Normal image
+    // layers have a meaningful pre-effect source, so disabling the final effect should reveal that
+    // source. Passthrough compose helpers are source-less routing layers; when their final effect is
+    // hidden they should publish nothing instead of preserving a helper render target that may only
+    // contain previous framebuffer contents.
+    return image.config.passthrough
+        ? SceneImageEffectLayer::HiddenFinalCompositePolicy::SuppressOutput
+        : SceneImageEffectLayer::HiddenFinalCompositePolicy::PreserveSource;
+}
+
 void LoadAlignment(SceneNode& node, std::string_view align, Vector2f size) {
     // Alignment changes where the centered quad is drawn relative to the authored origin. Store it
     // as a local mesh offset instead of mutating translation, because translation is the pivot that
@@ -3686,6 +3698,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // active scene camera.
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalBlend(imgBlendMode);
+            imgEffectLayer->SetHiddenFinalCompositePolicy(
+                ResolveHiddenFinalCompositePolicy(wpimgobj));
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
             imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
                                                                                  : *spImgNode);
@@ -3747,6 +3761,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             std::shared_ptr<SceneImageEffect> imgEffect = std::make_shared<SceneImageEffect>();
             imgEffect->SetIdentity(
                 wpimgobj.id, wpeffobj.id, static_cast<uint32_t>(i_eff), wpeffobj.name);
+            imgEffect->SetRuntimeVisibilityContract(effect_visibility.requires_runtime_contract);
             if (effect_visibility.requires_runtime_contract) {
                 LOG_INFO("SceneVisibilityEffectMaterialize: layer=%d effect-id=%d effect-index=%d "
                          "name='%s' initial-visible=%s authored-visible=%s",
@@ -4148,6 +4163,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             std::shared_ptr<SceneImageEffect> img_effect = std::make_shared<SceneImageEffect>();
             img_effect->SetIdentity(
                 text_obj.id, wp_effect.id, static_cast<uint32_t>(effect_index), wp_effect.name);
+            img_effect->SetRuntimeVisibilityContract(effect_visibility.requires_runtime_contract);
             if (effect_visibility.requires_runtime_contract) {
                 LOG_INFO("SceneVisibilityEffectMaterialize: layer=%d effect-id=%d effect-index=%d "
                          "name='%s' initial-visible=%s authored-visible=%s",

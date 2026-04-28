@@ -102,22 +102,6 @@ static void CheckAndSetSprite(Scene& scene, vulkan::CustomShaderPass::Desc& desc
     }
 }
 
-static bool IsAudioBarShaderNode(SceneNode* node) {
-    if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr) {
-        return false;
-    }
-    const auto* shader = node->Mesh()->Material()->customShader.shader.get();
-    return shader != nullptr && shader->name.find("Simple_Audio_Bars") != std::string::npos;
-}
-
-static bool IsSyntheticCompositeNode(SceneNode* node) {
-    if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr) {
-        return false;
-    }
-    const auto* shader   = node->Mesh()->Material()->customShader.shader.get();
-    return shader != nullptr && shader->name == "genericimage3";
-}
-
 static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::string_view output) {
     const auto owner_it = scene.nodeOwners.find(node);
     if (owner_it == scene.nodeOwners.end()) return false;
@@ -316,34 +300,6 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                 pdesc.depth_test = model_state->depthTest;
                 pdesc.depth_write = model_state->depthWrite;
                 pdesc.clear_depth = clear_model_depth;
-            }
-            if (IsAudioBarShaderNode(node)) {
-                LOG_INFO("SceneAudioGraphBind: pass-id=%zu source-layer=%d node-ptr=%p node-id=%d name='%s' camera='%s' output='%s' execute-when-hidden=%s gated=%s",
-                         static_cast<size_t>(pass.ID()),
-                         imgId,
-                         static_cast<void*>(node),
-                         node->ID(),
-                         node->Name().c_str(),
-                         node->Camera().c_str(),
-                         output_key.c_str(),
-                         pdesc.execute_when_hidden ? "true" : "false",
-                         pdesc.should_execute ? "true" : "false");
-            } else if (IsSyntheticCompositeNode(node)) {
-                const auto* bind_material = node->Mesh()->Material();
-                const auto texture0 = bind_material != nullptr && !bind_material->textures.empty()
-                    ? bind_material->textures[0].c_str()
-                    : "<none>";
-                LOG_INFO("SceneAudioCompositeGraphBind: pass-id=%zu source-layer=%d node-ptr=%p node-id=%d name='%s' camera='%s' output='%s' execute-when-hidden=%s gated=%s",
-                         static_cast<size_t>(pass.ID()),
-                         imgId,
-                         static_cast<void*>(node),
-                         node->ID(),
-                         node->Name().c_str(),
-                         node->Camera().c_str(),
-                         output_key.c_str(),
-                         pdesc.execute_when_hidden ? "true" : "false",
-                         pdesc.should_execute ? "true" : "false");
-                LOG_INFO("SceneAudioCompositeGraphBind: texture0='%s'", texture0);
             }
             CheckAndSetSprite(scene, pdesc, material->textures);
             for (usize i = 0; i < material->textures.size(); i++) {
@@ -626,17 +582,18 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         }
 
         if (imgeff->HasFinalComposite()) {
-            // The final composite is deliberately a runtime fallback, not a replacement for visible
-            // authored final effects. It only draws when the final effect is hidden; otherwise the
-            // historical direct-to-output shader path remains the only screen writer for this chain.
-            auto hidden_final_fallback_gate = [imgeff]() {
-                return imgeff != nullptr && imgeff->ShouldRunFinalCompositeFallback();
+            // The image-effect layer decides whether the neutral final composite is acting as the
+            // ordinary stable publisher or only as a hidden-effect bypass fallback. Keeping that
+            // policy inside SceneImageEffectLayer avoids shader/name special cases in the graph
+            // traversal while still preserving direct authored final writers for static chains.
+            auto final_composite_gate = [imgeff]() {
+                return imgeff != nullptr && imgeff->ShouldRunFinalComposite();
             };
             ToGraphPass(&imgeff->FinalNode(),
                         inherited_output,
                         imgId,
                         extra,
-                        hidden_final_fallback_gate,
+                        final_composite_gate,
                         false,
                         // The synthetic fallback is another detached final writer for the same
                         // image effect, so it must share the resolved route matrix used by the
