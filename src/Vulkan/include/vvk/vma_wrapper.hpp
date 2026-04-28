@@ -52,6 +52,12 @@ public:
 
     const auto& operator*() const noexcept { return m_allocator; }
 
+    /// Drops allocator ownership without calling VMA destruction.
+    /// Device-lost cleanup uses this as a last-resort escape hatch because VMA
+    /// destruction ultimately calls Vulkan device functions that may crash after
+    /// the driver has reported VK_ERROR_DEVICE_LOST.
+    void abandon() noexcept { m_allocator = nullptr; }
+
 private:
     void Release() {
         if (m_allocator) Destroy(m_allocator, 0);

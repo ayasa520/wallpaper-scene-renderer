@@ -39,6 +39,7 @@ public:
     ~Instance() = default;
 
     void Destroy();
+    void Abandon();
 
     static bool Create(Instance&, std::span<const Extension>, std::span<const InstanceLayer>);
     bool ChoosePhysicalDevice(const CheckGpuOp& checkgpu, std::span<const std::uint8_t> uuid = {});
