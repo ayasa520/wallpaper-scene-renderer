@@ -1394,15 +1394,32 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      }\n"
         << "    });\n"
         << "  }\n"
+        << "  function createLayerAssetHandle(file) {\n"
+        << "    const handle = { file };\n"
+        << "    // Imported workshop scene scripts keep their namespace in __workshopId while "
+           "their\n"
+        << "    // runtime createLayer() calls often use compact asset paths. Carry that "
+           "namespace to\n"
+        << "    // native code so the VFS-backed resolver can choose between the project-local "
+           "asset and\n"
+        << "    // the imported workshop asset without embedding resource-type knowledge in the "
+           "JS shim.\n"
+        << "    if (typeof __workshopId === 'string' && __workshopId.length > 0) {\n"
+        << "      handle.workshopId = __workshopId;\n"
+        << "    }\n"
+        << "    return handle;\n"
+        << "  }\n"
         << "  function normalizeCreateLayerConfig(value, topLevel = false) {\n"
         << "    if (value === null || value === undefined) return value;\n"
+        << "    if (topLevel && typeof value === 'string') return "
+           "createLayerAssetHandle(value);\n"
         << "    if (typeof value !== 'object') return value;\n"
         << "    if ('__nodeId' in value) return value.__nodeId;\n"
         << "    if (Array.isArray(value)) return value.map((item) => "
            "normalizeCreateLayerConfig(item, false));\n"
         << "    const keys = Object.keys(value);\n"
         << "    if (keys.length === 1 && keys[0] === 'file' && typeof value.file === 'string') {\n"
-        << "      return topLevel ? { file: value.file } : value.file;\n"
+        << "      return topLevel ? createLayerAssetHandle(value.file) : value.file;\n"
         << "    }\n"
         << "    const normalized = {};\n"
         << "    for (const [key, entry] of Object.entries(value)) {\n"
@@ -1710,8 +1727,144 @@ std::optional<nlohmann::json> JsonFromJS(JSContext* context, JSValueConst value)
 }
 
 bool IsAssetHandleJson(const nlohmann::json& json) {
-    return json.is_object() && json.size() == 1 && json.contains("file") &&
-           json.at("file").is_string();
+    if (! json.is_object() || ! json.contains("file") || ! json.at("file").is_string()) {
+        return false;
+    }
+
+    // Script-side createLayer() may attach the stripped module's __workshopId to a file handle.
+    // Keep the accepted shape intentionally tiny so arbitrary layer configuration objects cannot
+    // be mistaken for asset handles just because they happen to contain a "file" property.
+    for (const auto& [key, value] : json.items()) {
+        (void)value;
+        if (key != "file" && key != "workshopId") return false;
+    }
+    return true;
+}
+
+struct ScriptAssetHandle {
+    std::string file;
+    std::string workshop_id;
+};
+
+struct AssetPathParts {
+    std::string_view root;
+    std::string_view relative_path;
+};
+
+constexpr std::string_view kAssetMountPrefix { "/assets/" };
+constexpr std::string_view kWorkshopNamespaceSegment { "workshop" };
+
+std::optional<ScriptAssetHandle> ReadScriptAssetHandle(const nlohmann::json& json) {
+    if (json.is_string()) {
+        return ScriptAssetHandle {
+            .file = json.get<std::string>(),
+        };
+    }
+
+    if (! IsAssetHandleJson(json)) return std::nullopt;
+
+    ScriptAssetHandle handle {
+        .file = json.at("file").get<std::string>(),
+    };
+    if (const auto workshop_it = json.find("workshopId");
+        workshop_it != json.end() && workshop_it->is_string()) {
+        handle.workshop_id = workshop_it->get<std::string>();
+    }
+    return handle;
+}
+
+std::string AssetVfsPath(std::string_view file) {
+    std::string path;
+    path.reserve(kAssetMountPrefix.size() + file.size());
+    path.append(kAssetMountPrefix);
+    path.append(file);
+    return path;
+}
+
+std::optional<AssetPathParts> SplitAssetPath(std::string_view file) {
+    const auto separator = file.find('/');
+    if (separator == std::string_view::npos || separator == 0 || separator + 1 >= file.size()) {
+        return std::nullopt;
+    }
+
+    return AssetPathParts {
+        .root          = file.substr(0, separator),
+        .relative_path = file.substr(separator + 1),
+    };
+}
+
+bool IsWorkshopScopedAssetPath(const AssetPathParts& parts) {
+    return parts.relative_path == kWorkshopNamespaceSegment ||
+           (parts.relative_path.starts_with(kWorkshopNamespaceSegment) &&
+            parts.relative_path.size() > kWorkshopNamespaceSegment.size() &&
+            parts.relative_path[kWorkshopNamespaceSegment.size()] == '/');
+}
+
+std::optional<std::string> BuildWorkshopScopedAssetFile(const ScriptAssetHandle& handle) {
+    const auto parts = SplitAssetPath(handle.file);
+    if (! parts.has_value() || IsWorkshopScopedAssetPath(*parts) || handle.workshop_id.empty()) {
+        return std::nullopt;
+    }
+
+    // Imported Wallpaper Engine scripts commonly preserve only the first asset directory and the
+    // leaf path. Rebuilding `<root>/workshop/<id>/<relative>` from path structure keeps the rule
+    // open to new asset roots while VFS validation remains the authority for whether it is real.
+    std::string resolved;
+    resolved.reserve(parts->root.size() + 1 + kWorkshopNamespaceSegment.size() + 1 +
+                     handle.workshop_id.size() + 1 + parts->relative_path.size());
+    resolved.append(parts->root);
+    resolved.push_back('/');
+    resolved.append(kWorkshopNamespaceSegment);
+    resolved.push_back('/');
+    resolved.append(handle.workshop_id);
+    resolved.push_back('/');
+    resolved.append(parts->relative_path);
+    return resolved;
+}
+
+std::string ResolveWorkshopRelativeAssetFile(const Scene* scene, const ScriptAssetHandle& handle) {
+    if (handle.file.empty() || scene == nullptr || scene->vfs == nullptr) {
+        return handle.file;
+    }
+
+    if (scene->vfs->Contains(AssetVfsPath(handle.file))) return handle.file;
+
+    const auto scoped_file = BuildWorkshopScopedAssetFile(handle);
+    if (! scoped_file.has_value() || ! scene->vfs->Contains(AssetVfsPath(*scoped_file))) {
+        LOG_INFO("SceneScriptCreateLayer: no workshop asset fallback found file='%s' "
+                 "workshop-id='%s'",
+                 handle.file.c_str(),
+                 handle.workshop_id.c_str());
+        return handle.file;
+    }
+
+    LOG_INFO("SceneScriptCreateLayer: resolved workshop asset file='%s' workshop-id='%s' "
+             "resolved='%s'",
+             handle.file.c_str(),
+             handle.workshop_id.c_str(),
+             scoped_file->c_str());
+    return *scoped_file;
+}
+
+bool IsWorkshopFallbackEligible(const ScriptAssetHandle& handle) {
+    const std::string_view file { handle.file };
+    // Keep path-shape screening separate from VFS lookup. The resolver should only rewrite
+    // ordinary relative asset paths; malformed or absolute strings stay untouched so the existing
+    // materializer reports the same unsupported-asset diagnostics it would have reported before.
+    const bool malformed_asset_path = file.starts_with('/') ||
+                                      file.find('\\') != std::string_view::npos ||
+                                      file.find("//") != std::string_view::npos ||
+                                      file.find("..") != std::string_view::npos;
+    return ! handle.workshop_id.empty() && SplitAssetPath(file).has_value() &&
+           ! malformed_asset_path;
+}
+
+std::string ResolveScriptAssetFile(const Scene* scene, const ScriptAssetHandle& handle) {
+    // Asset resolution is intentionally isolated from dynamic layer materialization: this helper
+    // only decides which registered asset path exists, while the caller remains responsible for
+    // inferring whether that asset is an image, particle, sound, or unsupported dynamic layer.
+    return IsWorkshopFallbackEligible(handle) ? ResolveWorkshopRelativeAssetFile(scene, handle)
+                                              : handle.file;
 }
 
 nlohmann::json NormalizeCreateLayerJson(const nlohmann::json& json) {
@@ -1735,14 +1888,10 @@ nlohmann::json NormalizeCreateLayerJson(const nlohmann::json& json) {
 
 std::optional<nlohmann::json> MaterializeAssetHandleConfig(const Scene*          scene,
                                                            const nlohmann::json& json) {
-    std::string file;
-    if (! json.is_string()) {
-        if (! IsAssetHandleJson(json)) return std::nullopt;
-        file = json.at("file").get<std::string>();
-    } else {
-        file = json.get<std::string>();
-    }
+    const auto asset_handle = ReadScriptAssetHandle(json);
+    if (! asset_handle.has_value()) return std::nullopt;
 
+    std::string file = ResolveScriptAssetFile(scene, *asset_handle);
     if (file.empty()) return std::nullopt;
 
     if (file.ends_with(".png") || file.ends_with(".jpg") || file.ends_with(".jpeg") ||
