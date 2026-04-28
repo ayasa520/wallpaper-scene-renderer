@@ -76,6 +76,43 @@ bool MediaThumbnailChanged(const std::shared_ptr<WPSceneScriptMediaState>& previ
            previous->previous_thumbnail_rgba != next->previous_thumbnail_rgba;
 }
 
+void PopulatePreviousMediaThumbnail(const std::shared_ptr<WPSceneScriptMediaState>& previous,
+                                    const std::shared_ptr<WPSceneScriptMediaState>& next) {
+    if (!next) return;
+
+    if (!next->has_thumbnail) {
+        next->previous_thumbnail_width  = 0;
+        next->previous_thumbnail_height = 0;
+        next->previous_thumbnail_rgba.clear();
+        return;
+    }
+
+    const bool previous_has_current_thumbnail =
+        previous != nullptr && previous->has_thumbnail && previous->thumbnail_width > 0 &&
+        previous->thumbnail_height > 0 && !previous->thumbnail_rgba.empty();
+    const bool current_thumbnail_changed =
+        previous == nullptr || previous->thumbnail_width != next->thumbnail_width ||
+        previous->thumbnail_height != next->thumbnail_height ||
+        previous->thumbnail_rgba != next->thumbnail_rgba;
+
+    if (previous_has_current_thumbnail && current_thumbnail_changed) {
+        // Wallpaper Engine's `$mediaPreviousThumbnail` is derived from the last committed current
+        // thumbnail, not from an authored JSON field. Supplying it here gives blend-gradient
+        // transition passes real old-cover pixels while keeping JavaScript payloads focused on the
+        // active track metadata.
+        next->previous_thumbnail_width  = previous->thumbnail_width;
+        next->previous_thumbnail_height = previous->thumbnail_height;
+        next->previous_thumbnail_rgba   = previous->thumbnail_rgba;
+    } else if (previous != nullptr) {
+        // Metadata-only updates should keep the old previous texture stable so a later thumbnail
+        // change still transitions from the last visible cover instead of an empty transparent
+        // placeholder.
+        next->previous_thumbnail_width  = previous->previous_thumbnail_width;
+        next->previous_thumbnail_height = previous->previous_thumbnail_height;
+        next->previous_thumbnail_rgba   = previous->previous_thumbnail_rgba;
+    }
+}
+
 std::string DescribeUserPropertyForLog(const UserPropertyMap& properties, std::string_view name) {
     // Reused scene switches are sensitive to the exact user-property snapshot
     // that MainHandler holds when PROPERTY_SOURCE triggers parsing.  This compact
@@ -668,7 +705,10 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             nmsg->setObject("value", std::make_shared<UserPropertyMap>(m_user_properties));
             nmsg->post();
         } else if (property == PROPERTY_MEDIA_STATE) {
-            msg->findObject("value", &m_media_state);
+            std::shared_ptr<WPSceneScriptMediaState> next_media_state;
+            msg->findObject("value", &next_media_state);
+            PopulatePreviousMediaThumbnail(m_media_state, next_media_state);
+            m_media_state = std::move(next_media_state);
             auto nmsg =
                 CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_APPLY_MEDIA_STATE);
             nmsg->setObject("value", m_media_state);

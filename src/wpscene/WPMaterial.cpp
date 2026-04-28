@@ -1,4 +1,5 @@
 #include "WPMaterial.h"
+#include "WPPropertyAnimation.hpp"
 
 using namespace wallpaper::wpscene;
 
@@ -21,23 +22,36 @@ wallpaper::WPDynamicValue::Type ShaderValueTypeForConstantVector(const std::vect
 }
 
 void StoreDynamicConstantShaderValue(
-    std::unordered_map<std::string, wallpaper::WPUserSetting>& bindings,
-    const std::string&                                         name,
-    const nlohmann::json&                                      value_json,
-    const std::vector<float>&                                  resolved_value) {
+    std::unordered_map<std::string, WPConstantShaderValueBinding>& bindings,
+    const std::string&                                             name,
+    const nlohmann::json&                                          value_json,
+    const std::vector<float>&                                      resolved_value) {
     if (! value_json.is_object()) return;
 
+    const auto value_type = ShaderValueTypeForConstantVector(resolved_value);
+
     wallpaper::WPUserSetting setting;
-    if (! wallpaper::ParseUserSetting(
-            value_json, setting, ShaderValueTypeForConstantVector(resolved_value))) {
+    if (! wallpaper::ParseUserSetting(value_json, setting, value_type)) {
         return;
     }
-    if (! setting.hasUserBinding()) return;
 
-    // Constant shader values can be authored as plain numbers, arrays, or objects with user
-    // bindings. The resolved numeric value is already stored in `constantshadervalues`; keeping this
-    // sidecar setting records the live binding contract that would otherwise disappear after parse.
-    bindings[name] = std::move(setting);
+    wallpaper::WPPropertyAnimationDefinition animation_definition;
+    const bool has_animation =
+        wallpaper::ParsePropertyAnimationDefinition(value_json, value_type, animation_definition);
+    if (! setting.hasUserBinding() && ! setting.hasScript() && ! has_animation) return;
+
+    // Constant shader values can be authored as plain numbers, arrays, user bindings, or scripts.
+    // The resolved numeric value is already stored in `constantshadervalues`; keeping this sidecar
+    // binding records the live runtime contract that would otherwise disappear after parse. That
+    // includes property animations because media-thumbnail transition scripts call
+    // thisObject.getAnimation().play() on the same material-uniform proxy.
+    WPConstantShaderValueBinding binding;
+    binding.setting = std::move(setting);
+    if (has_animation) {
+        binding.animation =
+            std::make_shared<wallpaper::WPPropertyAnimationDefinition>(std::move(animation_definition));
+    }
+    bindings[name] = std::move(binding);
 }
 
 } // namespace

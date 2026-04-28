@@ -18,9 +18,16 @@ struct WPSceneScriptMediaState {
     int32_t              playback_state { 0 };
     std::array<float, 3> primary_color { 0.0f, 0.0f, 0.0f };
     std::array<float, 3> secondary_color { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3> tertiary_color { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> text_color { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3> high_contrast_color { 1.0f, 1.0f, 1.0f };
     std::string          title;
     std::string          artist;
+    std::string          album_title;
+    std::string          album_artist;
+    std::string          sub_title;
+    std::string          genres;
+    std::string          content_type;
     int32_t              thumbnail_width { 0 };
     int32_t              thumbnail_height { 0 };
     std::vector<uint8_t> thumbnail_rgba;
