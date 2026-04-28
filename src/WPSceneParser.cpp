@@ -21,6 +21,7 @@
 #include "WPSceneScriptMedia.hpp"
 #include "WPTextLayer.hpp"
 #include "WPUserSetting.hpp"
+#include "WPImageAlignment.hpp"
 
 #include "Particle/WPParticleRawGener.h"
 #include "Particle/ParticleSystem.h"
@@ -1586,21 +1587,10 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
 }
 
 void LoadAlignment(SceneNode& node, std::string_view align, Vector2f size) {
-    Vector3f trans = node.Translate();
-    size *= 0.5f;
-    size.y() *= 1.0f;
-
-    auto contains = [&](std::string_view s) {
-        return align.find(s) != std::string::npos;
-    };
-
-    // topleft top center ...
-    if (contains("top")) trans.y() -= size.y();
-    if (contains("left")) trans.x() += size.x();
-    if (contains("right")) trans.x() -= size.x();
-    if (contains("bottom")) trans.y() += size.y();
-
-    node.SetTranslate(trans);
+    // Alignment changes where the centered quad is drawn relative to the authored origin. Store it
+    // as a local mesh offset instead of mutating translation, because translation is the pivot that
+    // Wallpaper Engine scripts read and rotate around.
+    node.SetAlignmentOffset(ResolveImageAlignmentOffset(align, size));
 }
 
 std::shared_ptr<SceneNode> FindParentNode(ParseContext& context, int32_t parent_id) {
