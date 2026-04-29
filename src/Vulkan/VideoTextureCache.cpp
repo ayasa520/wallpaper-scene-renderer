@@ -213,6 +213,7 @@ struct VideoTextureCache::Entry {
     bool     warned_unexpected_format { false };
     bool     pipeline_failed { false };
     bool     paused { false };
+    bool     stopped { false };
     bool     eos_loop_waiting_for_sample { false };
     bool     eos_loop_rebuild_attempted { false };
     uint64_t eos_loop_count { 0 };
@@ -282,6 +283,7 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
     stopPipeline(entry);
     entry.eos_loop_waiting_for_sample = false;
     entry.eos_loop_rebuild_attempted = false;
+    entry.pipeline_failed = false;
 
     GError* error = nullptr;
     const auto pipeline_desc = BuildVideoOnlyPipelineDescription();
@@ -345,12 +347,14 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
         }
     }
 
-    if (gst_element_set_state(entry.pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    const auto target_state = m_globally_paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+    if (gst_element_set_state(entry.pipeline, target_state) == GST_STATE_CHANGE_FAILURE) {
         LOG_ERROR("start video pipeline playback for '%s' failed", entry.key.c_str());
         stopPipeline(entry);
         return false;
     }
     entry.paused = false;
+    entry.stopped = false;
     return true;
 }
 
@@ -366,7 +370,7 @@ bool VideoTextureCache::restartPipeline(Entry& entry) {
 }
 
 bool VideoTextureCache::loopPipeline(Entry& entry) {
-    if (entry.pipeline == nullptr) return false;
+    if (entry.pipeline == nullptr || entry.stopped) return false;
 
     if (entry.eos_loop_waiting_for_sample) {
         if (entry.eos_loop_rebuild_attempted) {
@@ -422,8 +426,9 @@ bool VideoTextureCache::loopPipeline(Entry& entry) {
         return restartPipeline(entry);
     }
 
-    entry.eos_loop_waiting_for_sample = !entry.paused;
-    const auto target_state = entry.paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+    entry.eos_loop_waiting_for_sample = ! entry.paused && ! m_globally_paused;
+    const auto target_state =
+        (entry.paused || m_globally_paused) ? GST_STATE_PAUSED : GST_STATE_PLAYING;
     if (gst_element_set_state(entry.pipeline, target_state) == GST_STATE_CHANGE_FAILURE) {
         LOG_ERROR("video texture '%s': failed to resume pipeline after EOS loop seek",
                   entry.key.c_str());
@@ -440,25 +445,51 @@ bool VideoTextureCache::loopPipeline(Entry& entry) {
     return true;
 }
 
-bool VideoTextureCache::setPaused(Entry& entry, bool paused) {
-    if (entry.paused == paused) return true;
-    if (entry.pipeline == nullptr) {
-        entry.paused = paused;
-        return true;
-    }
+bool VideoTextureCache::applyPipelinePlaybackState(Entry& entry) {
+    if (entry.pipeline == nullptr || entry.stopped) return true;
 
-    // getVideoTexture().pause() is often called every scene tick by authored Wallpaper Engine
-    // scripts. Make the cache transition the GStreamer pipeline only when the desired state
-    // changes so hidden videos stop decoding without turning repeated script calls into stalls.
-    const auto target_state = paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+    const auto target_state =
+        (entry.paused || m_globally_paused) ? GST_STATE_PAUSED : GST_STATE_PLAYING;
     if (gst_element_set_state(entry.pipeline, target_state) == GST_STATE_CHANGE_FAILURE) {
-        LOG_ERROR("video texture '%s': failed to %s playback",
+        LOG_ERROR("video texture '%s': failed to switch playback state paused=%s global_paused=%s",
                   entry.key.c_str(),
-                  paused ? "pause" : "resume");
+                  entry.paused ? "true" : "false",
+                  m_globally_paused ? "true" : "false");
         entry.pipeline_failed = true;
         return false;
     }
+    return true;
+}
+
+bool VideoTextureCache::setPaused(Entry& entry, bool paused) {
+    if (! paused && entry.pipeline == nullptr) {
+        return startPipeline(entry);
+    }
+    if (entry.paused == paused) return true;
+    if (entry.pipeline == nullptr) {
+        entry.paused = paused;
+        entry.stopped = false;
+        return true;
+    }
+
     entry.paused = paused;
+    entry.stopped = false;
+    return applyPipelinePlaybackState(entry);
+}
+
+bool VideoTextureCache::stopPlayback(Entry& entry) {
+    if (entry.stopped && entry.pipeline == nullptr) return true;
+
+    // stop() is intentionally stronger than pause(): authored intro videos call it after their
+    // fade-out and expect decoder, colorspace conversion, appsink polling, and Vulkan upload work
+    // to end. Keep the already-created Vulkan image alive for descriptor stability, but release the
+    // GStreamer graph so future frames are not decoded until play() rebuilds the pipeline.
+    stopPipeline(entry);
+    entry.paused = true;
+    entry.stopped = true;
+    entry.pipeline_failed = false;
+    entry.eos_loop_waiting_for_sample = false;
+    entry.eos_loop_rebuild_attempted = false;
     return true;
 }
 
@@ -583,10 +614,15 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
     return true;
 }
 
-ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTexture& texture,
-                                         const Image& image, bool paused) {
+ImageSlotsRef VideoTextureCache::Acquire(std::string_view key,
+                                         const SceneTexture& texture,
+                                         const Image& image,
+                                         VideoTexturePlaybackState initial_state) {
     if (auto* entry = find(key)) {
-        setPaused(*entry, paused);
+        if (initial_state == VideoTexturePlaybackState::Stopped)
+            stopPlayback(*entry);
+        else
+            setPaused(*entry, initial_state == VideoTexturePlaybackState::Paused);
         ImageSlotsRef ref;
         ref.slots.push_back(ImageParameters(entry->image));
         return ref;
@@ -653,10 +689,15 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
     }
     VVK_CHECK(m_device.handle().WaitIdle());
 
-    if (!startPipeline(*entry)) {
-        return {};
+    if (initial_state == VideoTexturePlaybackState::Stopped) {
+        entry->paused = true;
+        entry->stopped = true;
+    } else {
+        if (!startPipeline(*entry)) {
+            return {};
+        }
+        if (initial_state == VideoTexturePlaybackState::Paused) setPaused(*entry, true);
     }
-    if (paused) setPaused(*entry, true);
 
     m_entries.emplace_back(std::move(entry));
     ImageSlotsRef ref;
@@ -664,12 +705,31 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
     return ref;
 }
 
-void VideoTextureCache::ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key) {
+void VideoTextureCache::ApplyPlaybackStates(
+    const std::unordered_map<std::string, bool>& paused_by_key,
+    const std::unordered_set<std::string>& stopped_keys) {
     for (auto& entry_ptr : m_entries) {
         if (entry_ptr == nullptr) continue;
+        if (stopped_keys.count(entry_ptr->key) != 0) {
+            stopPlayback(*entry_ptr);
+            continue;
+        }
         auto state_it = paused_by_key.find(entry_ptr->key);
         if (state_it == paused_by_key.end()) continue;
         setPaused(*entry_ptr, state_it->second);
+    }
+}
+
+void VideoTextureCache::SetGlobalPaused(bool paused) {
+    if (m_globally_paused == paused) return;
+    m_globally_paused = paused;
+
+    // Shell-level pause stops the render timer, but GStreamer keeps decoding on its own threads
+    // unless the pipeline is told to pause. Apply this immediately so video-texture wallpapers do
+    // not burn CPU while the visible scene is frozen by GJS playback controls.
+    for (auto& entry_ptr : m_entries) {
+        if (entry_ptr == nullptr) continue;
+        (void)applyPipelinePlaybackState(*entry_ptr);
     }
 }
 
@@ -695,6 +755,8 @@ void VideoTextureCache::Poll() {
     for (auto& entry_ptr : m_entries) {
         auto& entry = *entry_ptr;
         if (entry.pipeline_failed) continue;
+        if (entry.stopped || entry.pipeline == nullptr) continue;
+        if (m_globally_paused) continue;
 
         bool should_loop = false;
         while (entry.bus != nullptr) {

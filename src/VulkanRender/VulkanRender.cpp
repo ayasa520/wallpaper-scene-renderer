@@ -61,6 +61,7 @@ struct VulkanRender::Impl {
     void destroy();
 
     void drawFrame(Scene&);
+    void setPaused(bool paused);
 
     bool CreateRenderingResource(RenderingResources&);
     void DestroyRenderingResource(RenderingResources&);
@@ -116,6 +117,7 @@ bool VulkanRender::inited() const { return pImpl->m_inited; }
 bool VulkanRender::init(RenderInitInfo info) { return pImpl->init(info); }
 void VulkanRender::destroy() { pImpl->destroy(); }
 void VulkanRender::drawFrame(Scene& scene) { pImpl->drawFrame(scene); };
+void VulkanRender::setPaused(bool paused) { pImpl->setPaused(paused); };
 void VulkanRender::clearLastRenderGraph() { pImpl->clearLastRenderGraph(); };
 void VulkanRender::clearRenderGraphResources() { pImpl->clearRenderGraphResources(); };
 void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg, bool refresh_resources_only) {
@@ -377,7 +379,8 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
     // The QuickJS host records getVideoTexture().play()/pause() decisions on Scene before the
     // renderer polls GStreamer. Applying them here keeps hidden authored videos from decoding
     // while prepared passes can still reuse the last uploaded frame when they are invisible.
-    m_device->video_tex_cache().ApplyPlaybackStates(scene.videoTexturePaused);
+    m_device->video_tex_cache().ApplyPlaybackStates(scene.videoTexturePaused,
+                                                    scene.videoTextureStopped);
     // setCurrentTime() requests are one-shot decoder commands, so the video cache consumes and
     // removes only the requests whose concrete GStreamer pipeline already exists.
     m_device->video_tex_cache().ApplySeekRequests(scene.videoTextureSeekRequests);
@@ -404,6 +407,11 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
         rdoc_api->EndFrameCapture(
             RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE((VkInstance)m_instance.inst()), NULL);
 #endif
+}
+
+void VulkanRender::Impl::setPaused(bool paused) {
+    if (m_device == nullptr) return;
+    m_device->video_tex_cache().SetGlobalPaused(paused);
 }
 
 void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {

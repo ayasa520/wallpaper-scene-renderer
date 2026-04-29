@@ -190,6 +190,10 @@ public:
     // during the QuickJS tick while the Vulkan video cache consumes the same state on the render
     // thread before polling GStreamer.
     std::unordered_map<std::string, bool> videoTexturePaused;
+    // stop() is stronger than pause(): authors use it for finished intro videos that should stop
+    // consuming decoder/upload work entirely. Keep it separate from pause so play() can clear the
+    // stopped state while pause() can still preserve the current decoded frame.
+    std::unordered_set<std::string>        videoTextureStopped;
     // Wallpaper Engine exposes getVideoTexture().setCurrentTime() as an imperative decoder
     // command rather than a persistent property. Store pending seeks separately from pause state so
     // scripts can queue a seek during init before the render graph has created the video cache

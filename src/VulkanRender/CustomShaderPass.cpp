@@ -500,6 +500,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
             if (image) {
                 if (scene.textures.count(tex_name) != 0 && scene.textures.at(tex_name).isVideo) {
                     const auto paused_it = scene.videoTexturePaused.find(tex_name);
+                    const bool stopped = scene.videoTextureStopped.count(tex_name) != 0;
                     // Hidden video passes are kept prepared so visibility flips are cheap, but the
                     // backing decoder should still start paused unless a scene script explicitly
                     // requested playback for this texture.
@@ -507,8 +508,13 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                         paused_it != scene.videoTexturePaused.end()
                             ? paused_it->second
                             : (desc.node != nullptr && ! desc.node->Visible());
+                    const auto initial_state =
+                        stopped ? wallpaper::VideoTexturePlaybackState::Stopped
+                                : (initially_paused
+                                       ? wallpaper::VideoTexturePlaybackState::Paused
+                                       : wallpaper::VideoTexturePlaybackState::Playing);
                     img_slots = device.video_tex_cache().Acquire(
-                        tex_name, scene.textures.at(tex_name), *image, initially_paused);
+                        tex_name, scene.textures.at(tex_name), *image, initial_state);
                 } else {
                     img_slots = device.tex_cache().CreateTex(*image);
                 }
