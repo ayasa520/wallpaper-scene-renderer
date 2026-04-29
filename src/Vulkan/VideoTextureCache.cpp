@@ -1,16 +1,13 @@
 #include "VideoTextureCache.hpp"
 
-#include "Core/ArrayHelper.hpp"
 #include "Device.hpp"
 #include "Image.hpp"
 #include "Scene/SceneTexture.h"
-#include "Shader.hpp"
 #include "TextureCache.hpp"
 #include "Util.hpp"
 #include "Utils/Logging.h"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -29,46 +26,6 @@ namespace
 {
 
 constexpr guint kAppSrcChunkSize = 256 * 1024;
-
-constexpr std::string_view kNv12ConvertVert = R"(#version 320 es
-layout(location = 0) out vec2 v_Texcoord;
-
-void main() {
-    const vec2 positions[3] = vec2[](
-        vec2(-1.0, -1.0),
-        vec2(-1.0, 3.0),
-        vec2(3.0, -1.0)
-    );
-    const vec2 texcoords[3] = vec2[](
-        vec2(0.0, 0.0),
-        vec2(0.0, 2.0),
-        vec2(2.0, 0.0)
-    );
-    v_Texcoord = texcoords[gl_VertexIndex];
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-}
-)";
-
-constexpr std::string_view kNv12ConvertFrag = R"(#version 320 es
-layout(location = 0) in vec2 v_Texcoord;
-layout(location = 0) out vec4 out_FragColor;
-
-layout(binding = 0) uniform sampler2D u_YTexture;
-layout(binding = 1) uniform sampler2D u_UVTexture;
-
-void main() {
-    vec2 sample_uv = vec2(v_Texcoord.x, 1.0 - v_Texcoord.y);
-    float y = texture(u_YTexture, sample_uv).r;
-    vec2 uv = texture(u_UVTexture, sample_uv).rg - vec2(0.5, 0.5);
-
-    float luma = 1.16438356 * max(y - 0.0625, 0.0);
-    float r = luma + 1.79274107 * uv.y;
-    float g = luma - 0.21324861 * uv.x - 0.53290933 * uv.y;
-    float b = luma + 2.11240179 * uv.x;
-
-    out_FragColor = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
-}
-)";
 
 bool EndsWith(std::string_view value, std::string_view suffix) {
     return value.size() >= suffix.size() &&
@@ -182,57 +139,6 @@ CreateVideoImage(const Device& device, uint32_t width, uint32_t height, const Te
     return std::nullopt;
 }
 
-TextureSample MakePlaneSample() {
-    return TextureSample {
-        .wrapS = TextureWrap::CLAMP_TO_EDGE,
-        .wrapT = TextureWrap::CLAMP_TO_EDGE,
-        .magFilter = TextureFilter::LINEAR,
-        .minFilter = TextureFilter::LINEAR,
-    };
-}
-
-std::optional<vvk::RenderPass> CreateNv12ConvertRenderPass(const vvk::Device& device, VkFormat format) {
-    VkAttachmentDescription attachment {
-        .format         = format,
-        .samples        = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout  = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    };
-    VkAttachmentReference attachment_ref {
-        .attachment = 0,
-        .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    };
-    VkSubpassDescription subpass {
-        .pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .colorAttachmentCount = 1,
-        .pColorAttachments    = &attachment_ref,
-    };
-    VkSubpassDependency dependency {
-        .srcSubpass    = VK_SUBPASS_EXTERNAL,
-        .dstSubpass    = 0,
-        .srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-    };
-    VkRenderPassCreateInfo info {
-        .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &attachment,
-        .subpassCount    = 1,
-        .pSubpasses      = &subpass,
-        .dependencyCount = 1,
-        .pDependencies   = &dependency,
-    };
-    vvk::RenderPass pass;
-    if (device.CreateRenderPass(info, pass) != VK_SUCCESS) return std::nullopt;
-    return pass;
-}
-
 VkResult TransitionImageLayout(const vvk::Queue& queue, vvk::CommandBuffer& cmd,
                                const ImageParameters& image, VkImageLayout old_layout,
                                VkImageLayout new_layout) {
@@ -291,32 +197,19 @@ VkResult TransitionImageLayout(const vvk::Queue& queue, vvk::CommandBuffer& cmd,
 } // namespace
 
 struct VideoTextureCache::Entry {
-    enum class UploadMode {
-        RGBA,
-        NV12,
-    };
-
     std::string key;
     std::vector<uint8_t> encoded;
     VmaImageParameters image;
-    VmaImageParameters plane_y_image;
-    VmaImageParameters plane_uv_image;
     VmaBufferParameters staging;
-    VmaBufferParameters plane_y_staging;
-    VmaBufferParameters plane_uv_staging;
     uint8_t* staging_mapped { nullptr };
-    uint8_t* plane_y_staging_mapped { nullptr };
-    uint8_t* plane_uv_staging_mapped { nullptr };
     uint32_t width { 0 };
     uint32_t height { 0 };
     bool     dirty { false };
-    bool     plane_dirty { false };
     bool     warned_size_mismatch { false };
+    bool     warned_unexpected_format { false };
     bool     pipeline_failed { false };
     bool     paused { false };
     size_t   read_offset { 0 };
-    UploadMode upload_mode { UploadMode::RGBA };
-    vvk::Framebuffer convert_framebuffer;
 
     GstElement* pipeline { nullptr };
     GstElement* appsrc_elem { nullptr };
@@ -356,8 +249,6 @@ struct VideoTextureCache::Entry {
 
     ~Entry() {
         if (staging_mapped != nullptr) staging.handle.UnMapMemory();
-        if (plane_y_staging_mapped != nullptr) plane_y_staging.handle.UnMapMemory();
-        if (plane_uv_staging_mapped != nullptr) plane_uv_staging.handle.UnMapMemory();
         if (pipeline != nullptr) (void)gst_element_set_state(pipeline, GST_STATE_NULL);
         if (bus != nullptr) gst_object_unref(bus);
         if (appsink_elem != nullptr) gst_object_unref(appsink_elem);
@@ -393,54 +284,6 @@ void VideoTextureCache::allocateCmd() {
     const auto& pool = m_device.cmd_pool();
     VVK_CHECK(pool.Allocate(1, VK_COMMAND_BUFFER_LEVEL_PRIMARY, m_cmds));
     m_cmd = vvk::CommandBuffer(m_cmds[0], m_device.handle().Dispatch());
-}
-
-bool VideoTextureCache::ensureNv12Pipeline() {
-    if (m_nv12_pipeline_ready) return true;
-
-    auto pass = CreateNv12ConvertRenderPass(m_device.handle(), VK_FORMAT_R8G8B8A8_UNORM);
-    if (!pass.has_value()) return false;
-
-    std::vector<Uni_ShaderSpv> spvs;
-    ShaderCompOpt opt;
-    opt.client_ver             = glslang::EShTargetVulkan_1_1;
-    opt.relaxed_errors_glsl    = true;
-    opt.relaxed_rules_vulkan   = true;
-    opt.suppress_warnings_glsl = true;
-
-    std::array<ShaderCompUnit, 2> units;
-    units[0] = ShaderCompUnit { .stage = EShLangVertex, .src = std::string(kNv12ConvertVert) };
-    units[1] = ShaderCompUnit { .stage = EShLangFragment, .src = std::string(kNv12ConvertFrag) };
-    if (! CompileAndLinkShaderUnits(units, opt, spvs)) return false;
-
-    DescriptorSetInfo descriptor_info;
-    descriptor_info.push_descriptor = true;
-    descriptor_info.bindings = {
-        VkDescriptorSetLayoutBinding {
-            .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-        VkDescriptorSetLayoutBinding {
-            .binding = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-    };
-
-    GraphicsPipeline pipeline;
-    pipeline.toDefault();
-    m_nv12_pipeline.debug_name = "VideoTextureCache::NV12";
-    pipeline.setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-        .addDescriptorSetInfo(spanone { descriptor_info });
-    for (auto& spv : spvs) pipeline.addStage(std::move(spv));
-
-    auto render_pass = std::move(pass.value());
-    if (! pipeline.create(m_device, render_pass, m_nv12_pipeline)) return false;
-    m_nv12_pipeline_ready = true;
-    return true;
 }
 
 void VideoTextureCache::stopPipeline(Entry& entry) {
@@ -494,10 +337,8 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
                  nullptr);
     gst_caps_unref(caps);
 
-    // Force RGBA so GStreamer owns the YUV colorimetry and chroma reconstruction path. Offering
-    // NV12 as a second caps structure still lets negotiation keep the decoder-native NV12 frames,
-    // which routes high-contrast anime edges through Hanabi's fixed shader conversion and can make
-    // source antialiasing look jagged compared with a normal video player.
+    // Keep YUV colorimetry and chroma reconstruction in GStreamer; Vulkan only uploads the final
+    // RGBA frame so video textures match the quality of the normal playback path.
     GstCaps* sink_caps = gst_caps_from_string("video/x-raw,format=(string)RGBA");
     g_object_set(entry.appsink_elem, "caps", sink_caps, nullptr);
     gst_caps_unref(sink_caps);
@@ -626,68 +467,15 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
         entry.warned_size_mismatch = true;
     }
 
-    if (GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_NV12) {
-        const auto chroma_width = (copy_width + 1u) / 2u;
-        const auto chroma_height = (copy_height + 1u) / 2u;
-        auto* y_dst = entry.plane_y_staging_mapped;
-        auto* uv_dst = entry.plane_uv_staging_mapped;
-        if (y_dst == nullptr || uv_dst == nullptr) {
-            gst_video_frame_unmap(&frame);
-            return false;
+    if (GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_RGBA) {
+        if (! entry.warned_unexpected_format) {
+            LOG_ERROR("video texture '%s' negotiated unexpected format %d; expected RGBA",
+                      entry.key.c_str(),
+                      GST_VIDEO_INFO_FORMAT(&info));
+            entry.warned_unexpected_format = true;
         }
-
-        const auto* y_src = static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&frame, 0));
-        const auto* uv_src = static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&frame, 1));
-        const auto y_src_stride = static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0));
-        const auto uv_src_stride = static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 1));
-        const auto y_dst_stride = static_cast<size_t>(entry.width);
-        const auto uv_dst_stride = static_cast<size_t>((entry.width + 1u) / 2u) * 2u;
-
-        for (uint32_t y = 0; y < copy_height; y++) {
-            std::memcpy(y_dst + static_cast<size_t>(y) * y_dst_stride,
-                        y_src + static_cast<size_t>(y) * y_src_stride,
-                        copy_width);
-            if (copy_width < entry.width) {
-                std::memset(y_dst + static_cast<size_t>(y) * y_dst_stride + copy_width,
-                            0,
-                            y_dst_stride - copy_width);
-            }
-        }
-        if (copy_height < entry.height) {
-            std::memset(y_dst + static_cast<size_t>(copy_height) * y_dst_stride,
-                        0,
-                        (static_cast<size_t>(entry.height) - copy_height) * y_dst_stride);
-        }
-
-        for (uint32_t y = 0; y < chroma_height; y++) {
-            std::memcpy(uv_dst + static_cast<size_t>(y) * uv_dst_stride,
-                        uv_src + static_cast<size_t>(y) * uv_src_stride,
-                        chroma_width * 2u);
-            if (chroma_width * 2u < uv_dst_stride) {
-                std::memset(uv_dst + static_cast<size_t>(y) * uv_dst_stride + chroma_width * 2u,
-                            0,
-                            uv_dst_stride - chroma_width * 2u);
-            }
-        }
-        const auto plane_uv_height = (entry.height + 1u) / 2u;
-        if (chroma_height < plane_uv_height) {
-            std::memset(uv_dst + static_cast<size_t>(chroma_height) * uv_dst_stride,
-                        0,
-                        (static_cast<size_t>(plane_uv_height) - chroma_height) * uv_dst_stride);
-        }
-
-        (void)vmaFlushAllocation(m_device.vma_allocator(),
-                                 entry.plane_y_staging.handle.Allocation(),
-                                 0,
-                                 entry.plane_y_staging.req_size);
-        (void)vmaFlushAllocation(m_device.vma_allocator(),
-                                 entry.plane_uv_staging.handle.Allocation(),
-                                 0,
-                                 entry.plane_uv_staging.req_size);
-        entry.upload_mode = Entry::UploadMode::NV12;
-        entry.plane_dirty = true;
         gst_video_frame_unmap(&frame);
-        return true;
+        return false;
     }
 
     uint8_t* mapped = entry.staging_mapped;
@@ -721,7 +509,6 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
                                  entry.staging.handle.Allocation(),
                                  0,
                                  entry.staging.req_size);
-        entry.upload_mode = Entry::UploadMode::RGBA;
         entry.dirty = true;
     }
 
@@ -762,9 +549,7 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
                                     entry->height,
                                     texture.sample,
                                     VK_FORMAT_R8G8B8A8_UNORM,
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                        VK_IMAGE_USAGE_SAMPLED_BIT |
-                                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         opt.has_value()) {
         entry->image = std::move(opt.value());
     } else {
@@ -772,50 +557,10 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
         return {};
     }
 
-    const auto plane_sample = MakePlaneSample();
-    if (auto opt = CreateVideoImage(m_device,
-                                    entry->width,
-                                    entry->height,
-                                    plane_sample,
-                                    VK_FORMAT_R8_UNORM,
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        opt.has_value()) {
-        entry->plane_y_image = std::move(opt.value());
-    } else {
-        LOG_ERROR("create video texture Y plane for '%s' failed", entry->key.c_str());
-        return {};
-    }
-
-    if (auto opt = CreateVideoImage(m_device,
-                                    (entry->width + 1u) / 2u,
-                                    (entry->height + 1u) / 2u,
-                                    plane_sample,
-                                    VK_FORMAT_R8G8_UNORM,
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        opt.has_value()) {
-        entry->plane_uv_image = std::move(opt.value());
-    } else {
-        LOG_ERROR("create video texture UV plane for '%s' failed", entry->key.c_str());
-        return {};
-    }
-
     if (! CreateStagingBuffer(m_device.vma_allocator(),
                               static_cast<size_t>(entry->width) * entry->height * 4u,
                               entry->staging)) {
         LOG_ERROR("create video staging buffer for '%s' failed", entry->key.c_str());
-        return {};
-    }
-    if (! CreateStagingBuffer(m_device.vma_allocator(),
-                              static_cast<size_t>(entry->width) * entry->height,
-                              entry->plane_y_staging)) {
-        LOG_ERROR("create video Y staging buffer for '%s' failed", entry->key.c_str());
-        return {};
-    }
-    if (! CreateStagingBuffer(m_device.vma_allocator(),
-                              static_cast<size_t>((entry->width + 1u) / 2u) *
-                                  ((entry->height + 1u) / 2u) * 2u,
-                              entry->plane_uv_staging)) {
-        LOG_ERROR("create video UV staging buffer for '%s' failed", entry->key.c_str());
         return {};
     }
     {
@@ -828,22 +573,6 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
                                      0,
                                      entry->staging.req_size);
         }
-        if (entry->plane_y_staging.handle.MapMemory(&mapped) == VK_SUCCESS) {
-            entry->plane_y_staging_mapped = static_cast<uint8_t*>(mapped);
-            std::memset(entry->plane_y_staging_mapped, 0, entry->plane_y_staging.req_size);
-            (void)vmaFlushAllocation(m_device.vma_allocator(),
-                                     entry->plane_y_staging.handle.Allocation(),
-                                     0,
-                                     entry->plane_y_staging.req_size);
-        }
-        if (entry->plane_uv_staging.handle.MapMemory(&mapped) == VK_SUCCESS) {
-            entry->plane_uv_staging_mapped = static_cast<uint8_t*>(mapped);
-            std::memset(entry->plane_uv_staging_mapped, 0, entry->plane_uv_staging.req_size);
-            (void)vmaFlushAllocation(m_device.vma_allocator(),
-                                     entry->plane_uv_staging.handle.Allocation(),
-                                     0,
-                                     entry->plane_uv_staging.req_size);
-        }
     }
 
     if (! m_cmd) allocateCmd();
@@ -855,42 +584,7 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key, const SceneTextur
         LOG_ERROR("transition video texture '%s' image layout failed", entry->key.c_str());
         return {};
     }
-    if (TransitionImageLayout(m_device.graphics_queue().handle,
-                              m_cmd,
-                              ImageParameters(entry->plane_y_image),
-                              VK_IMAGE_LAYOUT_UNDEFINED,
-                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) != VK_SUCCESS) {
-        LOG_ERROR("transition video texture '%s' Y plane layout failed", entry->key.c_str());
-        return {};
-    }
-    if (TransitionImageLayout(m_device.graphics_queue().handle,
-                              m_cmd,
-                              ImageParameters(entry->plane_uv_image),
-                              VK_IMAGE_LAYOUT_UNDEFINED,
-                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) != VK_SUCCESS) {
-        LOG_ERROR("transition video texture '%s' UV plane layout failed", entry->key.c_str());
-        return {};
-    }
     VVK_CHECK(m_device.handle().WaitIdle());
-
-    if (! ensureNv12Pipeline()) {
-        LOG_ERROR("create video texture conversion pipeline for '%s' failed", entry->key.c_str());
-        return {};
-    }
-    VkFramebufferCreateInfo framebuffer_info {
-        .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .pNext           = nullptr,
-        .renderPass      = *m_nv12_pipeline.pass,
-        .attachmentCount = 1,
-        .pAttachments    = entry->image.view.address(),
-        .width           = entry->width,
-        .height          = entry->height,
-        .layers          = 1,
-    };
-    if (m_device.handle().CreateFramebuffer(framebuffer_info, entry->convert_framebuffer) != VK_SUCCESS) {
-        LOG_ERROR("create video texture conversion framebuffer for '%s' failed", entry->key.c_str());
-        return {};
-    }
 
     if (!startPipeline(*entry)) {
         return {};
@@ -985,180 +679,7 @@ void VideoTextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
         auto& entry = *entry_ptr;
         if (entry.pipeline_failed) continue;
 
-        auto image_range = VkImageSubresourceRange {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = 1,
-            .baseArrayLayer = 0,
-            .layerCount     = 1,
-        };
-
-        if (entry.plane_dirty && entry.upload_mode == Entry::UploadMode::NV12) {
-            const auto upload_plane = [&](const VmaBufferParameters& staging, const VmaImageParameters& image,
-                                          uint32_t width, uint32_t height, VkImageMemoryBarrier& to_transfer,
-                                          VkImageMemoryBarrier& to_shader) {
-                to_transfer = VkImageMemoryBarrier {
-                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .pNext            = nullptr,
-                    .srcAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-                    .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    .image            = *image.handle,
-                    .subresourceRange = image_range,
-                };
-                cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_DEPENDENCY_BY_REGION_BIT,
-                                    to_transfer);
-
-                const VkBufferImageCopy copy {
-                    .bufferOffset = 0,
-                    .bufferRowLength = 0,
-                    .bufferImageHeight = 0,
-                    .imageSubresource =
-                        VkImageSubresourceLayers {
-                            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .mipLevel       = 0,
-                            .baseArrayLayer = 0,
-                            .layerCount     = 1,
-                        },
-                    .imageOffset = VkOffset3D { 0, 0, 0 },
-                    .imageExtent = VkExtent3D { width, height, 1 },
-                };
-                VkBufferImageCopy copy_regions[] { copy };
-                cmd.CopyBufferToImage(*staging.handle,
-                                      *image.handle,
-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      copy_regions);
-
-                to_shader = VkImageMemoryBarrier {
-                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .pNext            = nullptr,
-                    .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-                    .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    .image            = *image.handle,
-                    .subresourceRange = image_range,
-                };
-                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                    VK_DEPENDENCY_BY_REGION_BIT,
-                                    to_shader);
-            };
-
-            VkImageMemoryBarrier y_to_transfer {}, y_to_shader {};
-            VkImageMemoryBarrier uv_to_transfer {}, uv_to_shader {};
-            upload_plane(entry.plane_y_staging,
-                         entry.plane_y_image,
-                         entry.width,
-                         entry.height,
-                         y_to_transfer,
-                         y_to_shader);
-            upload_plane(entry.plane_uv_staging,
-                         entry.plane_uv_image,
-                         (entry.width + 1u) / 2u,
-                         (entry.height + 1u) / 2u,
-                         uv_to_transfer,
-                         uv_to_shader);
-
-            const VkImageMemoryBarrier to_color {
-                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext            = nullptr,
-                .srcAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-                .dstAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .newLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .image            = *entry.image.handle,
-                .subresourceRange = image_range,
-            };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                to_color);
-
-            const std::array descriptor_writes {
-                VkWriteDescriptorSet {
-                    .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext           = nullptr,
-                    .dstSet          = {},
-                    .dstBinding      = 0,
-                    .descriptorCount = 1,
-                    .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                },
-                VkWriteDescriptorSet {
-                    .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext           = nullptr,
-                    .dstSet          = {},
-                    .dstBinding      = 1,
-                    .descriptorCount = 1,
-                    .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                },
-            };
-            const std::array descriptor_images {
-                VkDescriptorImageInfo {
-                    .sampler     = *entry.plane_y_image.sampler,
-                    .imageView   = *entry.plane_y_image.view,
-                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                },
-                VkDescriptorImageInfo {
-                    .sampler     = *entry.plane_uv_image.sampler,
-                    .imageView   = *entry.plane_uv_image.view,
-                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                },
-            };
-            auto writes = descriptor_writes;
-            writes[0].pImageInfo = &descriptor_images[0];
-            writes[1].pImageInfo = &descriptor_images[1];
-
-            const VkClearValue clear_value { .color = { 0.0f, 0.0f, 0.0f, 1.0f } };
-            const VkRenderPassBeginInfo render_pass_info {
-                .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                .pNext = nullptr,
-                .renderPass = *m_nv12_pipeline.pass,
-                .framebuffer = *entry.convert_framebuffer,
-                .renderArea = VkRect2D { { 0, 0 }, { entry.width, entry.height } },
-                .clearValueCount = 1,
-                .pClearValues = &clear_value,
-            };
-            cmd.BeginRenderPass(render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
-            cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_nv12_pipeline.handle);
-            cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_nv12_pipeline.layout, 0, writes);
-            const VkViewport viewport {
-                .x        = 0.0f,
-                .y        = static_cast<float>(entry.height),
-                .width    = static_cast<float>(entry.width),
-                .height   = -static_cast<float>(entry.height),
-                .minDepth = 0.0f,
-                .maxDepth = 1.0f,
-            };
-            const VkRect2D scissor { { 0, 0 }, { entry.width, entry.height } };
-            VkViewport viewports[] { viewport };
-            VkRect2D   scissors[] { scissor };
-            cmd.SetViewport(0, viewports);
-            cmd.SetScissor(0, scissors);
-            cmd.Draw(3, 1, 0, 0);
-            cmd.EndRenderPass();
-
-            const VkImageMemoryBarrier to_shader {
-                .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext            = nullptr,
-                .srcAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-                .oldLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .image            = *entry.image.handle,
-                .subresourceRange = image_range,
-            };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                to_shader);
-            entry.plane_dirty = false;
-        }
-
-        if (! entry.dirty || entry.upload_mode != Entry::UploadMode::RGBA) continue;
+        if (! entry.dirty) continue;
 
         VkImageMemoryBarrier to_transfer {
             .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1229,19 +750,7 @@ std::size_t VideoTextureCache::GetTrackedBytes() const {
     for (const auto& entry : m_entries) {
         if (! entry) continue;
         if (entry->image.handle) total += static_cast<std::size_t>(entry->image.handle.AllocationSize());
-        if (entry->plane_y_image.handle) {
-            total += static_cast<std::size_t>(entry->plane_y_image.handle.AllocationSize());
-        }
-        if (entry->plane_uv_image.handle) {
-            total += static_cast<std::size_t>(entry->plane_uv_image.handle.AllocationSize());
-        }
         if (entry->staging.handle) total += static_cast<std::size_t>(entry->staging.handle.AllocationSize());
-        if (entry->plane_y_staging.handle) {
-            total += static_cast<std::size_t>(entry->plane_y_staging.handle.AllocationSize());
-        }
-        if (entry->plane_uv_staging.handle) {
-            total += static_cast<std::size_t>(entry->plane_uv_staging.handle.AllocationSize());
-        }
     }
     return total;
 }
