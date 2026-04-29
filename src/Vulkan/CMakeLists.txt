@@ -1,7 +1,7 @@
 set(LIB_NAME wpVulkan)
 
 find_package(Vulkan REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gio-2.0)
 
 add_library(${LIB_NAME}
 STATIC

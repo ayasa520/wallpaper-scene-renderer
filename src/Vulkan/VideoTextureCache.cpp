@@ -8,13 +8,14 @@
 #include "Utils/Logging.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include <gst/app/gstappsrc.h>
+#include <gio/gio.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
@@ -24,8 +25,6 @@ using namespace wallpaper::vulkan;
 
 namespace
 {
-
-constexpr guint kAppSrcChunkSize = 256 * 1024;
 
 bool EndsWith(std::string_view value, std::string_view suffix) {
     return value.size() >= suffix.size() &&
@@ -64,13 +63,18 @@ void ConfigureDecoderRanks() {
 }
 
 std::string BuildVideoOnlyPipelineDescription() {
-    return "appsrc name=src block=true format=bytes stream-type=random-access "
+    return "giostreamsrc name=src "
            "! qtdemux name=demux "
            "demux.video_0 ! queue "
            "! h264parse "
            "! decodebin "
            "! videoconvert "
            "! appsink name=sink sync=true max-buffers=1 drop=true";
+}
+
+long long ElapsedMillis(std::chrono::steady_clock::time_point start,
+                        std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 }
 
 std::optional<VmaImageParameters>
@@ -209,51 +213,25 @@ struct VideoTextureCache::Entry {
     bool     warned_unexpected_format { false };
     bool     pipeline_failed { false };
     bool     paused { false };
-    size_t   read_offset { 0 };
+    bool     eos_loop_waiting_for_sample { false };
+    bool     eos_loop_rebuild_attempted { false };
+    uint64_t eos_loop_count { 0 };
+    uint64_t uploaded_sample_count { 0 };
 
     GstElement* pipeline { nullptr };
-    GstElement* appsrc_elem { nullptr };
+    GstElement* source_elem { nullptr };
     GstElement* appsink_elem { nullptr };
     GstBus*     bus { nullptr };
-
-    static void NeedData(GstAppSrc* src, guint length, gpointer user_data) {
-        auto* self = static_cast<Entry*>(user_data);
-        if (self == nullptr || self->pipeline_failed) return;
-        if (self->read_offset >= self->encoded.size()) {
-            (void)gst_app_src_end_of_stream(src);
-            return;
-        }
-
-        const auto chunk_size =
-            std::min<size_t>(length > 0 ? static_cast<size_t>(length) : kAppSrcChunkSize,
-                             self->encoded.size() - self->read_offset);
-        GstBuffer* buffer = gst_buffer_new_allocate(nullptr, chunk_size, nullptr);
-        if (buffer == nullptr) return;
-
-        (void)gst_buffer_fill(buffer, 0, self->encoded.data() + self->read_offset, chunk_size);
-        self->read_offset += chunk_size;
-
-        const auto flow = gst_app_src_push_buffer(src, buffer);
-        if (flow != GST_FLOW_OK && flow != GST_FLOW_EOS) {
-            LOG_ERROR("video texture '%s' appsrc push failed: %d", self->key.c_str(), flow);
-            self->pipeline_failed = true;
-        }
-    }
-
-    static gboolean SeekData(GstAppSrc*, guint64 offset, gpointer user_data) {
-        auto* self = static_cast<Entry*>(user_data);
-        if (self == nullptr) return FALSE;
-        self->read_offset = std::min<size_t>(static_cast<size_t>(offset), self->encoded.size());
-        return TRUE;
-    }
+    GInputStream* memory_stream { nullptr };
 
     ~Entry() {
         if (staging_mapped != nullptr) staging.handle.UnMapMemory();
         if (pipeline != nullptr) (void)gst_element_set_state(pipeline, GST_STATE_NULL);
         if (bus != nullptr) gst_object_unref(bus);
         if (appsink_elem != nullptr) gst_object_unref(appsink_elem);
-        if (appsrc_elem != nullptr) gst_object_unref(appsrc_elem);
+        if (source_elem != nullptr) gst_object_unref(source_elem);
         if (pipeline != nullptr) gst_object_unref(pipeline);
+        if (memory_stream != nullptr) g_object_unref(memory_stream);
     }
 };
 
@@ -290,17 +268,20 @@ void VideoTextureCache::stopPipeline(Entry& entry) {
     if (entry.pipeline != nullptr) (void)gst_element_set_state(entry.pipeline, GST_STATE_NULL);
     if (entry.bus != nullptr) gst_object_unref(entry.bus);
     if (entry.appsink_elem != nullptr) gst_object_unref(entry.appsink_elem);
-    if (entry.appsrc_elem != nullptr) gst_object_unref(entry.appsrc_elem);
+    if (entry.source_elem != nullptr) gst_object_unref(entry.source_elem);
     if (entry.pipeline != nullptr) gst_object_unref(entry.pipeline);
+    if (entry.memory_stream != nullptr) g_object_unref(entry.memory_stream);
     entry.bus = nullptr;
     entry.appsink_elem = nullptr;
-    entry.appsrc_elem = nullptr;
+    entry.source_elem = nullptr;
     entry.pipeline = nullptr;
+    entry.memory_stream = nullptr;
 }
 
 bool VideoTextureCache::startPipeline(Entry& entry) {
     stopPipeline(entry);
-    entry.read_offset = 0;
+    entry.eos_loop_waiting_for_sample = false;
+    entry.eos_loop_rebuild_attempted = false;
 
     GError* error = nullptr;
     const auto pipeline_desc = BuildVideoOnlyPipelineDescription();
@@ -319,36 +300,36 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
         return false;
     }
 
-    entry.appsrc_elem = gst_bin_get_by_name(GST_BIN(entry.pipeline), "src");
-    entry.appsink_elem = gst_bin_get_by_name(GST_BIN(entry.pipeline), "sink");
-    entry.bus = gst_element_get_bus(entry.pipeline);
-    if (entry.appsrc_elem == nullptr || entry.appsink_elem == nullptr || entry.bus == nullptr) {
-        LOG_ERROR("video texture '%s' pipeline is missing appsrc/appsink", entry.key.c_str());
+    entry.memory_stream =
+        G_INPUT_STREAM(g_memory_input_stream_new_from_data(entry.encoded.data(),
+                                                           static_cast<gssize>(entry.encoded.size()),
+                                                           nullptr));
+    if (entry.memory_stream == nullptr) {
+        LOG_ERROR("create video memory stream for '%s' failed", entry.key.c_str());
         stopPipeline(entry);
         return false;
     }
 
-    GstCaps* caps = gst_caps_from_string("video/quicktime, variant=(string)iso");
-    g_object_set(entry.appsrc_elem,
-                 "caps",
-                 caps,
-                 "size",
-                 static_cast<gint64>(entry.encoded.size()),
-                 nullptr);
-    gst_caps_unref(caps);
+    entry.source_elem = gst_bin_get_by_name(GST_BIN(entry.pipeline), "src");
+    entry.appsink_elem = gst_bin_get_by_name(GST_BIN(entry.pipeline), "sink");
+    entry.bus = gst_element_get_bus(entry.pipeline);
+    if (entry.source_elem == nullptr || entry.appsink_elem == nullptr || entry.bus == nullptr) {
+        LOG_ERROR("video texture '%s' pipeline is missing giostreamsrc/appsink", entry.key.c_str());
+        stopPipeline(entry);
+        return false;
+    }
+
+    g_object_set(entry.source_elem, "stream", entry.memory_stream, nullptr);
+    LOG_INFO("VideoTexturePipeline key='%s' source=giostreamsrc bytes=%zu desc='%s'",
+             entry.key.c_str(),
+             entry.encoded.size(),
+             pipeline_desc.c_str());
 
     // Keep YUV colorimetry and chroma reconstruction in GStreamer; Vulkan only uploads the final
     // RGBA frame so video textures match the quality of the normal playback path.
     GstCaps* sink_caps = gst_caps_from_string("video/x-raw,format=(string)RGBA");
     g_object_set(entry.appsink_elem, "caps", sink_caps, nullptr);
     gst_caps_unref(sink_caps);
-
-    static GstAppSrcCallbacks callbacks {
-        .need_data = &Entry::NeedData,
-        .enough_data = nullptr,
-        .seek_data = &Entry::SeekData,
-    };
-    gst_app_src_set_callbacks(GST_APP_SRC(entry.appsrc_elem), &callbacks, &entry, nullptr);
 
     if (gst_element_set_state(entry.pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE) {
         LOG_ERROR("start video pipeline preroll for '%s' failed", entry.key.c_str());
@@ -384,6 +365,81 @@ bool VideoTextureCache::restartPipeline(Entry& entry) {
     return true;
 }
 
+bool VideoTextureCache::loopPipeline(Entry& entry) {
+    if (entry.pipeline == nullptr) return false;
+
+    if (entry.eos_loop_waiting_for_sample) {
+        if (entry.eos_loop_rebuild_attempted) {
+            LOG_ERROR("video texture '%s': EOS loop seek still produced no sample after rebuild",
+                      entry.key.c_str());
+            entry.pipeline_failed = true;
+            return false;
+        }
+
+        // If EOS arrives again before a decoded frame proves that the flush seek worked, keep the
+        // render resource stable but rebuild the decoder graph once. Repeating this indefinitely
+        // would hide the real failure behind an EOS storm and could stall future texture updates.
+        LOG_ERROR("video texture '%s': EOS loop seek produced no sample; restarting pipeline once",
+                  entry.key.c_str());
+        const uint64_t uploaded_before_restart = entry.uploaded_sample_count;
+        if (!restartPipeline(entry)) return false;
+        if (entry.uploaded_sample_count == uploaded_before_restart) {
+            entry.eos_loop_waiting_for_sample = true;
+            entry.eos_loop_rebuild_attempted = true;
+        }
+        return true;
+    }
+
+    entry.eos_loop_count++;
+    const auto start = std::chrono::steady_clock::now();
+    if (gst_element_set_state(entry.pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE) {
+        LOG_ERROR("video texture '%s': failed to pause pipeline for EOS loop seek",
+                  entry.key.c_str());
+        entry.pipeline_failed = true;
+        return false;
+    }
+    const auto paused = std::chrono::steady_clock::now();
+
+    // Looping by seek keeps decoder state, negotiated caps, appsink ownership, and Vulkan texture
+    // bindings stable. Rebuilding here can force shader/resource refresh at the exact frame where
+    // a wallpaper loop is most noticeable.
+    const gboolean seek_ok = gst_element_seek(
+        entry.pipeline,
+        1.0,
+        GST_FORMAT_TIME,
+        static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+        GST_SEEK_TYPE_SET,
+        0,
+        GST_SEEK_TYPE_NONE,
+        -1);
+    const auto seeked = std::chrono::steady_clock::now();
+    if (! seek_ok) {
+        LOG_ERROR("VideoTexturePerf eos-loop-seek-failed key='%s' loop=%llu paused_ms=%lld seek_ms=%lld",
+                  entry.key.c_str(),
+                  static_cast<unsigned long long>(entry.eos_loop_count),
+                  ElapsedMillis(start, paused),
+                  ElapsedMillis(paused, seeked));
+        return restartPipeline(entry);
+    }
+
+    entry.eos_loop_waiting_for_sample = !entry.paused;
+    const auto target_state = entry.paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+    if (gst_element_set_state(entry.pipeline, target_state) == GST_STATE_CHANGE_FAILURE) {
+        LOG_ERROR("video texture '%s': failed to resume pipeline after EOS loop seek",
+                  entry.key.c_str());
+        entry.pipeline_failed = true;
+        return false;
+    }
+    const auto playing = std::chrono::steady_clock::now();
+    LOG_INFO("VideoTexturePerf eos-loop-seek key='%s' loop=%llu paused_ms=%lld seek_ms=%lld play_ms=%lld",
+             entry.key.c_str(),
+             static_cast<unsigned long long>(entry.eos_loop_count),
+             ElapsedMillis(start, paused),
+             ElapsedMillis(paused, seeked),
+             ElapsedMillis(seeked, playing));
+    return true;
+}
+
 bool VideoTextureCache::setPaused(Entry& entry, bool paused) {
     if (entry.paused == paused) return true;
     if (entry.pipeline == nullptr) {
@@ -411,7 +467,7 @@ bool VideoTextureCache::seekTo(Entry& entry, double seconds) {
 
     const double clamped_seconds = std::max(0.0, seconds);
     const auto   target_time =
-        static_cast<GstClockTime>(clamped_seconds * static_cast<double>(GST_SECOND));
+        static_cast<gint64>(clamped_seconds * static_cast<double>(GST_SECOND));
 
     // SceneScript setCurrentTime() is a visible decoder command: use a flushing accurate seek so
     // stale frames already queued in appsink are discarded before the next render poll observes the
@@ -435,6 +491,8 @@ bool VideoTextureCache::seekTo(Entry& entry, double seconds) {
         }
     }
 
+    entry.eos_loop_waiting_for_sample = false;
+    entry.eos_loop_rebuild_attempted = false;
     LOG_INFO("video texture '%s': seek accepted seconds=%.3f", entry.key.c_str(), clamped_seconds);
     return true;
 }
@@ -513,6 +571,15 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
     }
 
     gst_video_frame_unmap(&frame);
+    entry.uploaded_sample_count++;
+    if (entry.eos_loop_waiting_for_sample) {
+        LOG_INFO("VideoTexturePerf eos-loop-sample key='%s' loop=%llu uploaded=%llu",
+                 entry.key.c_str(),
+                 static_cast<unsigned long long>(entry.eos_loop_count),
+                 static_cast<unsigned long long>(entry.uploaded_sample_count));
+    }
+    entry.eos_loop_waiting_for_sample = false;
+    entry.eos_loop_rebuild_attempted = false;
     return true;
 }
 
@@ -629,7 +696,7 @@ void VideoTextureCache::Poll() {
         auto& entry = *entry_ptr;
         if (entry.pipeline_failed) continue;
 
-        bool should_restart = false;
+        bool should_loop = false;
         while (entry.bus != nullptr) {
             GstMessage* message = gst_bus_pop(entry.bus);
             if (message == nullptr) break;
@@ -647,15 +714,15 @@ void VideoTextureCache::Poll() {
                 entry.pipeline_failed = true;
                 break;
             }
-            case GST_MESSAGE_EOS: should_restart = true; break;
+            case GST_MESSAGE_EOS: should_loop = true; break;
             default: break;
             }
 
             gst_message_unref(message);
         }
 
-        if (should_restart && !entry.pipeline_failed) {
-            if (!restartPipeline(entry)) continue;
+        if (should_loop && !entry.pipeline_failed) {
+            if (!loopPipeline(entry)) continue;
         }
 
         if (entry.paused) continue;

@@ -44,6 +44,7 @@ private:
     bool         startPipeline(Entry&);
     void         stopPipeline(Entry&);
     bool         restartPipeline(Entry&);
+    bool         loopPipeline(Entry&);
     bool         setPaused(Entry&, bool paused);
     bool         seekTo(Entry&, double seconds);
     bool         uploadSample(Entry&, ::GstSample*);
