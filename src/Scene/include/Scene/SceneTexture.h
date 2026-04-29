@@ -7,6 +7,12 @@
 namespace wallpaper
 {
 
+enum class VideoTexturePlaybackState {
+    Playing,
+    Paused,
+    Stopped,
+};
+
 struct SceneTexture {
     std::string     url;
     TextureSample   sample;

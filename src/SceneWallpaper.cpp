@@ -379,6 +379,9 @@ private:
     MHANDLER_CMD(STOP) {
         bool stop { false };
         if (msg->findBool("value", &stop)) {
+            if (m_render) {
+                m_render->setPaused(stop);
+            }
             if (stop)
                 frame_timer.Stop();
             else

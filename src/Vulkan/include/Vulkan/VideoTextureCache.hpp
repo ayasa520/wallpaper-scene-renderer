@@ -2,10 +2,12 @@
 
 #include "Core/NoCopyMove.hpp"
 #include "Parameters.hpp"
+#include "Scene/SceneTexture.h"
 
 #include <memory>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 typedef struct _GstSample GstSample;
@@ -26,8 +28,14 @@ public:
     VideoTextureCache(const Device&);
     ~VideoTextureCache();
 
-    ImageSlotsRef Acquire(std::string_view key, const SceneTexture&, const Image&, bool paused = false);
-    void          ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key);
+    ImageSlotsRef Acquire(std::string_view key,
+                          const SceneTexture&,
+                          const Image&,
+                          VideoTexturePlaybackState initial_state =
+                              VideoTexturePlaybackState::Playing);
+    void          ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key,
+                                      const std::unordered_set<std::string>& stopped_keys);
+    void          SetGlobalPaused(bool paused);
     void          ApplySeekRequests(std::unordered_map<std::string, double>& seek_seconds_by_key);
     void          Poll();
     void          RecordUploads(vvk::CommandBuffer&);
@@ -45,7 +53,9 @@ private:
     void         stopPipeline(Entry&);
     bool         restartPipeline(Entry&);
     bool         loopPipeline(Entry&);
+    bool         applyPipelinePlaybackState(Entry&);
     bool         setPaused(Entry&, bool paused);
+    bool         stopPlayback(Entry&);
     bool         seekTo(Entry&, double seconds);
     bool         uploadSample(Entry&, ::GstSample*);
 
@@ -53,6 +63,7 @@ private:
     vvk::CommandBuffers m_cmds;
     vvk::CommandBuffer  m_cmd;
     std::vector<std::unique_ptr<Entry>> m_entries;
+    bool m_globally_paused { false };
 };
 
 } // namespace vulkan

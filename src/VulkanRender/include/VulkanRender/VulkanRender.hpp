@@ -26,6 +26,7 @@ public:
     void destroy();
 
     void drawFrame(Scene&);
+    void setPaused(bool paused);
 
     void clearLastRenderGraph();
     void clearRenderGraphResources();

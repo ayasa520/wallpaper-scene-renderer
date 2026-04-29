@@ -7028,17 +7028,23 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     }
 
     if (command == "play" || command == "pause" || command == "stop") {
-        const bool paused = command != "play";
         for (const auto& key : keys) {
-            const auto current_it = opaque->scene->videoTexturePaused.find(key);
-            if (current_it != opaque->scene->videoTexturePaused.end() &&
-                current_it->second == paused) {
-                continue;
+            if (command == "stop") {
+                // Wallpaper Engine stop() is a terminal decoder command, not just pause().
+                // Finished intro layers rely on this to release playback work after they fade out.
+                opaque->scene->videoTexturePaused[key] = true;
+                opaque->scene->videoTextureStopped.insert(key);
+            } else {
+                const bool paused = command == "pause";
+                const auto current_it = opaque->scene->videoTexturePaused.find(key);
+                if (current_it != opaque->scene->videoTexturePaused.end() &&
+                    current_it->second == paused &&
+                    opaque->scene->videoTextureStopped.count(key) == 0) {
+                    continue;
+                }
+                opaque->scene->videoTextureStopped.erase(key);
+                opaque->scene->videoTexturePaused[key] = paused;
             }
-            // Wallpaper Engine scripts use stop() as a decoder control for ordinary scene videos.
-            // The Vulkan video cache owns sample timestamps, so the bridge maps stop() to the same
-            // paused state as pause() while still avoiding repeated GStreamer state transitions.
-            opaque->scene->videoTexturePaused[key] = paused;
         }
         return JS_UNDEFINED;
     }
@@ -7069,6 +7075,7 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     if (command == "isPlaying") {
         bool any_playing = false;
         for (const auto& key : keys) {
+            if (opaque->scene->videoTextureStopped.count(key) != 0) continue;
             const auto paused_it = opaque->scene->videoTexturePaused.find(key);
             const bool paused =
                 paused_it != opaque->scene->videoTexturePaused.end() ? paused_it->second : false;
