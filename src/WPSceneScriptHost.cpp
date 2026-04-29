@@ -2822,19 +2822,7 @@ bool ApplyTextLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t laye
         wallpaper::ResolveTextLayerPropertyUpdateStrategy(*state, property_name);
     if (update_strategy == TextLayerPropertyUpdateStrategy::MaterialOnly) {
         if (auto* node = FindNodeById(opaque, layer_id); node != nullptr) {
-            const bool synced = SyncTextLayerSceneMaterials(*opaque->scene, layer_id);
-            if (synced) {
-                // Text color/alpha updates are consumed directly by the dedicated TextPass from the
-                // scene-owned primitive. Log the material-only path so live user-property tests can
-                // distinguish "binding was not registered" from "the primitive updated but a later
-                // render path failed to sample the new visual state".
-                LOG_INFO("SceneTextMaterialApply: layer=%d property='%.*s' value=%s",
-                         layer_id,
-                         static_cast<int>(property_name.size()),
-                         property_name.data(),
-                         value.describe().c_str());
-            }
-            return synced;
+            return SyncTextLayerSceneMaterials(*opaque->scene, layer_id);
         }
         return true;
     }
@@ -5663,17 +5651,7 @@ void FreeJSValue(JSContext* context, JSValue& value) {
     }
 }
 
-JSValue NativeConsoleLog(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-    std::string message;
-    for (int i = 0; i < argc; i++) {
-        if (i != 0) message.push_back(' ');
-        const char* text = JS_ToCString(context, argv[i]);
-        if (text != nullptr) {
-            message += text;
-            JS_FreeCString(context, text);
-        }
-    }
-    LOG_INFO("SceneScript: %s", message.c_str());
+JSValue NativeConsoleLog(JSContext*, JSValueConst, int, JSValueConst*) {
     return JS_UNDEFINED;
 }
 
