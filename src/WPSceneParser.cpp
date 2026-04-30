@@ -1813,11 +1813,45 @@ void AttachNodeToScene(ParseContext& context, const std::shared_ptr<SceneNode>& 
     }
 }
 
+bool ShouldInheritParentParallax(ParseContext& context, int32_t parent_id,
+                                 const WPShaderValueData& node_data) {
+    if (parent_id == 0 || context.shader_updater == nullptr) return true;
+    if (IsZeroParallaxDepth(node_data.parallaxDepth)) return true;
+
+    auto parent = FindParentNode(context, parent_id);
+    if (! parent) return true;
+
+    const auto* parent_data = context.shader_updater->GetNodeData(parent.get());
+    if (parent_data == nullptr) return true;
+
+    // Inherited transform and inherited camera-parallax are separate contracts in Wallpaper
+    // Engine. Authored relay layers can be positioned relative to a parent while still carrying
+    // their own parallaxDepth. Keep the old parent-anchor behavior for repaired/suppressed
+    // containers and zero-depth parents, but let explicit child depth survive when both sides
+    // authored their own non-zero parallax values.
+    if (parent_data->suppress_model_parallax || parent_data->IsBoneAttached()) return true;
+    if (parent_data->parallax_anchor != nullptr) return true;
+    if (IsZeroParallaxDepth(parent_data->parallaxDepth)) return true;
+
+    return false;
+}
+
 void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
                                      WPShaderValueData& node_data) {
     if (parent_id == 0) return;
     if (auto parent = FindParentNode(context, parent_id)) {
-        node_data.InheritParentTransform(parent.get());
+        const bool inherit_parent_parallax =
+            ShouldInheritParentParallax(context, parent_id, node_data);
+        node_data.InheritParentTransform(parent.get(), inherit_parent_parallax);
+    }
+}
+
+void ConfigureInheritedParentParallaxAnchor(ParseContext& context, int32_t parent_id,
+                                            WPShaderValueData& node_data) {
+    if (parent_id == 0) return;
+    if (! ShouldInheritParentParallax(context, parent_id, node_data)) return;
+    if (auto parent = FindParentNode(context, parent_id)) {
+        node_data.SetParallaxAnchor(parent.get());
     }
 }
 
@@ -1976,6 +2010,96 @@ bool DetachNodeFromTree(const std::shared_ptr<SceneNode>& parent, SceneNode* tar
         if (DetachNodeFromTree(child, target)) return true;
     }
     return false;
+}
+
+std::vector<std::shared_ptr<SceneNode>> ExtractDirectChildren(SceneNode* node) {
+    std::vector<std::shared_ptr<SceneNode>> children;
+    if (node == nullptr) return children;
+
+    while (! node->GetChildren().empty()) {
+        auto child = node->GetChildren().front();
+        if (! node->RemoveChild(child.get())) break;
+        children.push_back(std::move(child));
+    }
+
+    return children;
+}
+
+int32_t ResolveLayerIdForRuntimeNode(const Scene& scene, SceneNode* node) {
+    if (node == nullptr) return 0;
+    if (auto owner_it = scene.nodeOwners.find(node);
+        owner_it != scene.nodeOwners.end()) {
+        return owner_it->second;
+    }
+    return node->ID();
+}
+
+void RebindAdoptedAttachmentChildren(ParseContext& context, int32_t parent_layer_id,
+                                     SceneNode* parent_node,
+                                     const std::vector<std::shared_ptr<SceneNode>>& children) {
+    if (context.scene == nullptr || context.shader_updater == nullptr || parent_layer_id == 0 ||
+        parent_node == nullptr) {
+        return;
+    }
+
+    for (const auto& child : children) {
+        if (! child) continue;
+
+        const int32_t child_layer_id = ResolveLayerIdForRuntimeNode(*context.scene, child.get());
+        if (child_layer_id == 0) continue;
+
+        const auto binding = context.scene->GetLayerParentBinding(child_layer_id);
+        if (binding.parent_id != parent_layer_id || binding.attachment.empty()) continue;
+
+        auto attachment_binding =
+            ResolveAttachmentBinding(context, parent_layer_id, binding.attachment);
+        if (! attachment_binding.has_value()) continue;
+
+        auto* child_data = context.shader_updater->GetNodeData(child.get());
+        if (child_data == nullptr) continue;
+
+        // Attachment children can be parsed while their hidden parent is still only a lightweight
+        // placeholder, so the original bone lookup may fail and the child is temporarily kept as a
+        // normal scene child. Once the parent is materialized and its puppet is available, promote
+        // that child back to the authored bone-attachment contract before the old placeholder is
+        // destroyed.
+        child_data->AttachToBone(parent_node,
+                                 attachment_binding->bone_index,
+                                 attachment_binding->transform,
+                                 Eigen::Affine3f(child->GetLocalTrans().cast<float>()));
+    }
+}
+
+void ReplaceDeferredPlaceholderNode(ParseContext& context, int32_t layer_id,
+                                    const std::shared_ptr<SceneNode>& placeholder_node,
+                                    const std::shared_ptr<SceneNode>& replacement_node) {
+    if (context.scene == nullptr || ! placeholder_node || ! replacement_node ||
+        placeholder_node.get() == replacement_node.get()) {
+        return;
+    }
+
+    // Hidden runtime layers are first represented by lightweight placeholder nodes so scripts and
+    // user bindings have a stable layer identity. Some authored attachment children are real
+    // SceneNode children of that placeholder. Destroying the placeholder without first adopting
+    // those children leaves scene.layerNodes, objectRuntimeNodes, and shader-data parent pointers
+    // aimed at freed memory; later allocations can reuse the same address and create recursive or
+    // dangling transform chains during uniform updates.
+    auto adopted_children = ExtractDirectChildren(placeholder_node.get());
+    RemoveRenderOrderNodeReferences(*context.scene, placeholder_node.get());
+    if (context.scene->sceneGraph != nullptr) {
+        (void)DetachNodeFromTree(context.scene->sceneGraph, placeholder_node.get());
+    }
+    context.scene->nodeOwners.erase(placeholder_node.get());
+    if (context.shader_updater != nullptr) {
+        context.shader_updater->ReplaceNodeReferences(placeholder_node.get(), replacement_node.get());
+    }
+
+    RebindAdoptedAttachmentChildren(
+        context, layer_id, replacement_node.get(), adopted_children);
+    for (auto& child : adopted_children) {
+        if (! child) continue;
+        replacement_node->AppendChild(child);
+    }
 }
 
 void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
@@ -3764,9 +3888,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 // parent chain. Anchoring only the parallax offset to the authored parent keeps
                 // child fallbacks synchronized with zero/non-zero parallax parent groups without
                 // reapplying the parent's local transform.
-                if (auto parent = FindParentNode(context, wpimgobj.parent)) {
-                    finalCompositeTransformData.SetParallaxAnchor(parent.get());
-                }
+                ConfigureInheritedParentParallaxAnchor(
+                    context, wpimgobj.parent, finalCompositeTransformData);
             }
             ConfigureEffectFinalComposite(context,
                                           *imgEffectLayer,
@@ -6260,14 +6383,6 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
         object.angles         = { rotation.x(), rotation.y(), rotation.z() };
     };
 
-    if (placeholder_node != nullptr && scene.sceneGraph != nullptr) {
-        // The placeholder exists only to preserve script/user-property addressing while the layer is
-        // hidden. Remove every render-order reference before materializing the real image/effect
-        // nodes, otherwise the rebuilt graph would see both the placeholder and the drawable layer.
-        RemoveRenderOrderNodeReferences(scene, placeholder_node.get());
-        (void)DetachNodeFromTree(scene.sceneGraph, placeholder_node.get());
-        scene.nodeOwners.erase(placeholder_node.get());
-    }
     scene.objectRuntimeNodes.erase(layer_id);
     scene.imageLayers.erase(layer_id);
     scene.layerNodes[layer_id] = nullptr;
@@ -6290,6 +6405,7 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     auto node_it = context.object_nodes.find(layer_id);
     if (node_it == context.object_nodes.end() || ! node_it->second) return false;
 
+    ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
     scene.layerNodes[layer_id] = node_it->second.get();
     RestoreRenderOrderProxyChildrenForLayer(scene, layer_id, node_it->second.get());
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
@@ -6343,11 +6459,6 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
         object.angles         = { rotation.x(), rotation.y(), rotation.z() };
     }
 
-    if (placeholder_node != nullptr && scene.sceneGraph != nullptr) {
-        RemoveRenderOrderNodeReferences(scene, placeholder_node.get());
-        (void)DetachNodeFromTree(scene.sceneGraph, placeholder_node.get());
-        scene.nodeOwners.erase(placeholder_node.get());
-    }
     scene.objectRuntimeNodes.erase(layer_id);
     scene.layerNodes[layer_id] = nullptr;
 
@@ -6355,6 +6466,7 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
     auto node_it = context.object_nodes.find(layer_id);
     if (node_it == context.object_nodes.end() || ! node_it->second) return false;
 
+    ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
     scene.layerNodes[layer_id] = node_it->second.get();
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
         if (it->second == layer_id) {
@@ -6410,11 +6522,6 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
         object.angles         = { rotation.x(), rotation.y(), rotation.z() };
     }
 
-    if (placeholder_node != nullptr && scene.sceneGraph != nullptr) {
-        RemoveRenderOrderNodeReferences(scene, placeholder_node.get());
-        (void)DetachNodeFromTree(scene.sceneGraph, placeholder_node.get());
-        scene.nodeOwners.erase(placeholder_node.get());
-    }
     scene.objectRuntimeNodes.erase(layer_id);
     scene.layerNodes[layer_id] = nullptr;
 
@@ -6422,6 +6529,7 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     auto node_it = context.object_nodes.find(layer_id);
     if (node_it == context.object_nodes.end() || ! node_it->second) return false;
 
+    ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
     scene.layerNodes[layer_id] = node_it->second.get();
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
         if (it->second == layer_id) {

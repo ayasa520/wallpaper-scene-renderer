@@ -106,8 +106,8 @@ struct WPShaderValueData {
 
     void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
 
-    void InheritParentTransform(SceneNode* parent) {
-        parallax_anchor        = parent;
+    void InheritParentTransform(SceneNode* parent, bool inherit_parent_parallax = true) {
+        parallax_anchor        = inherit_parent_parallax ? parent : nullptr;
         transform_binding.mode = WPNodeTransformBindingMode::InheritParent;
         transform_binding.parent = parent;
     }
@@ -159,6 +159,7 @@ public:
     void SetNodeData(void*, const WPShaderValueData&);
     const WPShaderValueData* GetNodeData(const void* node_addr) const;
     WPShaderValueData*       GetNodeData(const void* node_addr);
+    void ReplaceNodeReferences(SceneNode* old_node, SceneNode* new_node);
     void SetCameraParallax(const WPCameraParallax& value) {
         m_parallax = value;
         // Camera parallax changes alter the derived model transforms even when the authored layer
