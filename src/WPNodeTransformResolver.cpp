@@ -156,6 +156,16 @@ void WPNodeTransformResolver::ApplyParentParallaxToAttachment(SceneNode* parent_
                                                               const WPShaderValueData& parent_data,
                                                               Affine3f& local_transform) {
     if (parent_node == nullptr || m_parallax_camera == nullptr || ! m_parallax.enable) return;
+    if (parent_data.IsBoneAttached()) {
+        // Nested attachments resolve their parent SceneNode local transform before the child is
+        // evaluated. That resolved parent local transform already carries the inherited camera
+        // parallax needed to keep the attached artwork locked to the parent puppet. Injecting the
+        // same parent parallax again here makes the offset accumulate once per attachment depth
+        // (body -> leg -> shoe), which pulls shoe overlays away from the base foot artwork. Direct
+        // attachments to normal puppet layers still fall through because their parent parallax is
+        // shader-only and must be converted into the attachment's local space.
+        return;
+    }
 
     const auto parent_parallax = ComputeParallaxOffset(parent_node, parent_data, m_parallax_camera);
     const auto parent_model    = ResolveModelTransform(parent_node, &parent_data);
