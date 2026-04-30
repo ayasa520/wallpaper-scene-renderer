@@ -1,4 +1,5 @@
 # Wallpaper Engine Scene Renderer
+
 Open source scene renderer, mostly for linux.  
 Made this for fun.
 
@@ -12,47 +13,51 @@ Wallpaper Engine editor/runtime clone. -->
 - Pango/Cairo text rasterization for first-class text layers
 
 ## Supported
+
 - [x] Layer
-	- [x] Image
-	- [x] Composition / Fullscreen
-	- [x] Text
-	- [x] Sound
-	- [x] Particle
+  - [x] Image
+  - [x] Composition / Fullscreen
+  - [x] Text
+  - [x] Sound
+  - [x] Particle
+  - [x] Light
+  - [x] Shape direct draw
 - [x] Effect
-    - [x] Basic
-	- [x] Mouse position with delay
-	- [x] Parallax
+  - [x] Basic
+  - [x] Mouse position with delay
+  - [x] Parallax
     - [x] Depth Parallax
-	- [x] ColorBlendMode
-	- [x] PBR light
-	- [ ] Global bloom
+  - [x] ColorBlendMode
+  - [x] PBR light
+  - [x] Global bloom
 - [x] Camera
-	- [x] Zoom
-	- [ ] Shake
-	- [ ] Fade / Path
+  - [x] Zoom
+  - [x] Path
+  - [ ] Shake
+  - [ ] Fade
 - [x] Audio
-	- [x] Loop
-	- [ ] Random
-	- [x] SceneScript audio buffers from host-provided spectrum data
+  - [x] Loop
+  - [x] Random
+  - [x] SceneScript audio buffers from host-provided spectrum data
 - [x] Particle System
-	- [x] Renderers
-	- [x] Emitters
-		- [ ] Duration 
-	- [x] Initializers
-	- [x] Operators
-	- [x] Control Points
-        - [x] Control point force / attract / repel
-        - [ ] Full editor mouse-follow feature set
-	- [x] Children
+  - [x] Renderers
+  - [x] Emitters
+    - [ ] Duration
+  - [x] Initializers
+  - [x] Operators
+  - [x] Control Points
+    - [x] Control point force / attract / repel
+    - [ ] Full editor mouse-follow feature set
+  - [x] Children
     - [ ] Audio Response
 - [x] Puppet warp
-- [ ] 3D model
+- [x] 3D model
 - [x] Property / timeline animations
 - [x] SceneScript compatibility subset
-    - [x] `init`, `update`, `destroy`, timers, and property scripts
-    - [x] `applyUserProperties` and `applyGeneralSettings`
-    - [x] Cursor enter/leave/move/down/up/click events
-    - [x] Media thumbnail/properties/playback events
-    - [x] Texture animation and video texture control helpers
-    - [ ] Complete Wallpaper Engine API surface
+  - [x] `init`, `update`, `destroy`, timers, and property scripts
+  - [x] `applyUserProperties` and `applyGeneralSettings`
+  - [x] Cursor enter/leave/move/down/up/click events
+  - [x] Media thumbnail/properties/playback events
+  - [x] Texture animation and video texture control helpers
+  - [ ] Complete Wallpaper Engine API surface
 - [x] User Properties
