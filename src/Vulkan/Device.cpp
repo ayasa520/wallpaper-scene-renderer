@@ -126,7 +126,11 @@ std::vector<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surf
     return queues;
 }
 
-bool Device::Create(Instance& inst, std::span<const Extension> exts, VkExtent2D extent, Device& device) {
+bool Device::Create(Instance& inst,
+                    std::span<const Extension> exts,
+                    VkExtent2D extent,
+                    Device& device,
+                    VideoTexturePipelineSettings video_texture_settings) {
     device.dld      = vvk::DeviceDispatch { inst.inst().Dispatch() };
     device.m_gpu    = inst.gpu();
     device.m_limits = inst.gpu().GetProperties().limits;
@@ -207,7 +211,7 @@ bool Device::Create(Instance& inst, std::span<const Extension> exts, VkExtent2D 
         VVK_CHECK_BOOL_RE(vvk::CreateVmaAllocator(allocatorInfo, device.m_allocator));
     }
     device.m_tex_cache       = std::make_unique<TextureCache>(device);
-    device.m_video_tex_cache = std::make_unique<VideoTextureCache>(device);
+    device.m_video_tex_cache = std::make_unique<VideoTextureCache>(device, video_texture_settings);
     return true;
 }
 
@@ -227,9 +231,7 @@ VkDeviceSize Device::GetUsage() const {
 
 void Device::Destroy() { VVK_CHECK(m_device.WaitIdle()); }
 
-Device::Device()
-    : m_tex_cache(std::make_unique<TextureCache>(*this)),
-      m_video_tex_cache(std::make_unique<VideoTextureCache>(*this)) {}
+Device::Device() = default;
 Device::~Device() {};
 
 bool Device::supportExt(std::string_view name) const { return exists(m_extensions, name); }

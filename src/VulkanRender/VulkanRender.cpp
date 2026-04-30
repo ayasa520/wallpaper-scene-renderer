@@ -183,12 +183,26 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
         auto check_gpu = [&device_exts, surface](const vvk::PhysicalDevice& gpu) {
             return Device::CheckGPU(gpu, device_exts, surface);
         };
-        if (! m_instance.ChoosePhysicalDevice(check_gpu, info.uuid)) return false;
+        const auto preference =
+            info.device_preference == wallpaper::VulkanDevicePreference::PreferIntegrated
+                ? PhysicalDevicePreference::PreferIntegrated
+                : (info.device_preference == wallpaper::VulkanDevicePreference::PreferDiscrete
+                       ? PhysicalDevicePreference::PreferDiscrete
+                       : PhysicalDevicePreference::Default);
+        if (! m_instance.ChoosePhysicalDevice(check_gpu, info.uuid, preference)) return false;
     }
 
     {
         m_device = std::make_unique<Device>();
-        if (! Device::Create(m_instance, device_exts, extent, *m_device)) {
+        const VideoTexturePipelineSettings video_texture_settings {
+            .gpu_pipeline =
+                info.gpu_pipeline_preference == wallpaper::GpuPipelinePreference::Va
+                    ? VideoTextureGpuPipeline::Va
+                    : (info.gpu_pipeline_preference == wallpaper::GpuPipelinePreference::NvidiaStateless
+                           ? VideoTextureGpuPipeline::NvidiaStateless
+                           : VideoTextureGpuPipeline::Nvidia),
+        };
+        if (! Device::Create(m_instance, device_exts, extent, *m_device, video_texture_settings)) {
             LOG_ERROR("init vulkan device failed");
             return false;
         }

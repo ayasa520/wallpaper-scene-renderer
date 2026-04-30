@@ -12,6 +12,18 @@ namespace wallpaper
 {
 using ReDrawCB = std::function<void()>;
 
+enum class VulkanDevicePreference {
+    Default,
+    PreferIntegrated,
+    PreferDiscrete,
+};
+
+enum class GpuPipelinePreference {
+    Nvidia,
+    NvidiaStateless,
+    Va,
+};
+
 struct VulkanSurfaceInfo {
     std::function<VkResult(VkInstance, VkSurfaceKHR*)> createSurfaceOp;
     std::vector<std::string>                           instanceExts;
@@ -23,6 +35,8 @@ struct RenderInitInfo {
     ExternalFrameExportMode export_mode { ExternalFrameExportMode::OPAQUE_FD };
 
     std::span<const std::uint8_t> uuid;
+    VulkanDevicePreference        device_preference { VulkanDevicePreference::Default };
+    GpuPipelinePreference         gpu_pipeline_preference { GpuPipelinePreference::Nvidia };
     TexTiling                     offscreen_tiling { TexTiling::OPTIMAL };
     uint32_t                      export_drm_fourcc { 0 };
     std::vector<uint64_t>         export_drm_modifiers;

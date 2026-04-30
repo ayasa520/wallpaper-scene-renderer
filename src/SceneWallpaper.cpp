@@ -32,10 +32,8 @@
 
 using namespace wallpaper;
 
-#define CASE_CMD(cmd)      \
-    case CMD::CMD_##cmd:   \
-        handle_##cmd(msg); \
-        break;
+#define CASE_CMD(cmd) \
+    case CMD::CMD_##cmd: handle_##cmd(msg); break;
 #define MHANDLER_CMD(cmd) void handle_##cmd(const std::shared_ptr<looper::Message>& msg)
 #define MHANDLER_CMD_IMPL(cl, cmd) \
     void impl_##cl::handle_##cmd(const std::shared_ptr<looper::Message>& msg)
@@ -43,12 +41,10 @@ using namespace wallpaper;
 
 namespace
 {
-constexpr int64_t SCENE_MEDIA_APPLY_SLOW_THRESHOLD_US         = 16000;
-constexpr int64_t SCENE_RENDER_GRAPH_SLOW_THRESHOLD_US        = 16000;
+constexpr int64_t SCENE_MEDIA_APPLY_SLOW_THRESHOLD_US  = 16000;
+constexpr int64_t SCENE_RENDER_GRAPH_SLOW_THRESHOLD_US = 16000;
 
-void TrimHeap() {
-    malloc_trim(0);
-}
+void TrimHeap() { malloc_trim(0); }
 
 template<typename T>
 void AddMsgCmd(looper::Message& msg, T cmd) {
@@ -65,7 +61,7 @@ std::shared_ptr<looper::Message> CreateMsgWithCmd(const std::shared_ptr<looper::
 bool MediaThumbnailChanged(const std::shared_ptr<WPSceneScriptMediaState>& previous,
                            const std::shared_ptr<WPSceneScriptMediaState>& next) {
     if (previous == next) return false;
-    if (!previous || !next) return true;
+    if (! previous || ! next) return true;
 
     return previous->has_thumbnail != next->has_thumbnail ||
            previous->thumbnail_width != next->thumbnail_width ||
@@ -78,9 +74,9 @@ bool MediaThumbnailChanged(const std::shared_ptr<WPSceneScriptMediaState>& previ
 
 void PopulatePreviousMediaThumbnail(const std::shared_ptr<WPSceneScriptMediaState>& previous,
                                     const std::shared_ptr<WPSceneScriptMediaState>& next) {
-    if (!next) return;
+    if (! next) return;
 
-    if (!next->has_thumbnail) {
+    if (! next->has_thumbnail) {
         next->previous_thumbnail_width  = 0;
         next->previous_thumbnail_height = 0;
         next->previous_thumbnail_rgba.clear();
@@ -89,11 +85,11 @@ void PopulatePreviousMediaThumbnail(const std::shared_ptr<WPSceneScriptMediaStat
 
     const bool previous_has_current_thumbnail =
         previous != nullptr && previous->has_thumbnail && previous->thumbnail_width > 0 &&
-        previous->thumbnail_height > 0 && !previous->thumbnail_rgba.empty();
-    const bool current_thumbnail_changed =
-        previous == nullptr || previous->thumbnail_width != next->thumbnail_width ||
-        previous->thumbnail_height != next->thumbnail_height ||
-        previous->thumbnail_rgba != next->thumbnail_rgba;
+        previous->thumbnail_height > 0 && ! previous->thumbnail_rgba.empty();
+    const bool current_thumbnail_changed = previous == nullptr ||
+                                           previous->thumbnail_width != next->thumbnail_width ||
+                                           previous->thumbnail_height != next->thumbnail_height ||
+                                           previous->thumbnail_rgba != next->thumbnail_rgba;
 
     if (previous_has_current_thumbnail && current_thumbnail_changed) {
         // Wallpaper Engine's `$mediaPreviousThumbnail` is derived from the last committed current
@@ -146,7 +142,7 @@ std::string DescribeUserPropertyKeysForLog(const UserPropertyMap& properties) {
     // list at the SceneWallpaper boundary proves that the native bridge delivered a payload, while
     // the material-uniform logs prove which registered bindings consumed it.
     std::string description = "[";
-    size_t count = 0;
+    size_t      count       = 0;
     for (const auto& [name, _] : properties) {
         if (count != 0) description += ",";
         description += name;
@@ -200,9 +196,9 @@ public:
         }
     }
 
-    void sendCmdLoadScene();
-    void sendFirstFrameOk();
-    bool isGenGraphviz() const { return m_gen_graphviz; }
+    void        sendCmdLoadScene();
+    void        sendFirstFrameOk();
+    bool        isGenGraphviz() const { return m_gen_graphviz; }
     const auto& mediaState() const { return m_media_state; }
     const auto& audioSamples() const { return m_audio_samples; }
 
@@ -217,13 +213,13 @@ private:
 private:
     bool m_inited { false };
 
-    std::string m_assets;
-    std::string m_source;
-    std::string m_cache_path;
-    UserPropertyMap m_user_properties;
+    std::string                              m_assets;
+    std::string                              m_source;
+    std::string                              m_cache_path;
+    UserPropertyMap                          m_user_properties;
     std::shared_ptr<WPSceneScriptMediaState> m_media_state;
-    std::shared_ptr<std::vector<float>> m_audio_samples;
-    bool        m_gen_graphviz { false };
+    std::shared_ptr<std::vector<float>>      m_audio_samples;
+    bool                                     m_gen_graphviz { false };
 
     WPSceneParser                        m_scene_parser;
     std::unique_ptr<audio::SoundManager> m_sound_manager;
@@ -307,18 +303,18 @@ public:
 
 private:
     void RefreshRenderGraphIfNeeded() {
-        if (!m_scene || !m_scene->renderGraphDirty) return;
+        if (! m_scene || ! m_scene->renderGraphDirty) return;
 
-        const auto started_at = std::chrono::steady_clock::now();
+        const auto started_at                = std::chrono::steady_clock::now();
         const bool requires_topology_rebuild = m_rg == nullptr || m_scene->renderGraphTopologyDirty;
         if (m_rg) {
             if (requires_topology_rebuild) {
                 m_render->clearLastRenderGraph();
             } else {
-                // Minute-level effect text updates only resize existing offscreen resources. Reusing
-                // the compiled graph topology while recreating pass-owned GPU resources avoids the
-                // old "full graph rebuild" hitch where every static mesh buffer in the scene was
-                // torn down even though the pass list itself had not changed.
+                // Minute-level effect text updates only resize existing offscreen resources.
+                // Reusing the compiled graph topology while recreating pass-owned GPU resources
+                // avoids the old "full graph rebuild" hitch where every static mesh buffer in the
+                // scene was torn down even though the pass list itself had not changed.
                 m_render->clearRenderGraphResources();
             }
         }
@@ -326,11 +322,11 @@ private:
             m_rg = sceneToRenderGraph(*m_scene);
         }
         // Custom shader uniforms are written during pass preparation and uploaded before the first
-        // draw after a graph rebuild. Keep the framebuffer-relative camera dimensions current before
-        // preparing passes, otherwise the first uploaded UBO can still contain the project's native
-        // orthographic aspect and only correct itself on the following frame.
+        // draw after a graph rebuild. Keep the framebuffer-relative camera dimensions current
+        // before preparing passes, otherwise the first uploaded UBO can still contain the project's
+        // native orthographic aspect and only correct itself on the following frame.
         m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
-        m_render->compileRenderGraph(*m_scene, *m_rg, !requires_topology_rebuild);
+        m_render->compileRenderGraph(*m_scene, *m_rg, ! requires_topology_rebuild);
         m_scene->ClearRenderGraphDirty();
         const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - started_at)
@@ -359,10 +355,10 @@ private:
     }
     MHANDLER_CMD(MOUSE_LEFT_BUTTON) {
         bool down { false };
-        if (!msg->findBool("down", &down)) return;
+        if (! msg->findBool("down", &down)) return;
 
         m_cursor_left_down.store(down);
-        if (!m_scene) return;
+        if (! m_scene) return;
 
         m_scene->cursorLeftDown = down;
         if (m_scene->scriptHost) {
@@ -371,7 +367,8 @@ private:
     }
     MHANDLER_CMD(APPLY_AUDIO_SAMPLES) {
         std::shared_ptr<std::vector<float>> audio_samples;
-        if (!msg->findObject("value", &audio_samples) || !m_scene || !m_scene->scriptHost || !audio_samples)
+        if (! msg->findObject("value", &audio_samples) || ! m_scene || ! m_scene->scriptHost ||
+            ! audio_samples)
             return;
 
         m_scene->scriptHost->ApplyAudioSamples(*audio_samples);
@@ -390,8 +387,8 @@ private:
     }
     MHANDLER_CMD(APPLY_USER_PROPERTIES) {
         std::shared_ptr<UserPropertyMap> user_properties;
-        if (!msg->findObject("value", &user_properties)) return;
-        if (!m_scene || !m_scene->scriptHost) return;
+        if (! msg->findObject("value", &user_properties)) return;
+        if (! m_scene || ! m_scene->scriptHost) return;
 
         if (user_properties) {
             m_scene->userProperties = *user_properties;
@@ -405,22 +402,22 @@ private:
     }
     MHANDLER_CMD(APPLY_MEDIA_STATE) {
         std::shared_ptr<WPSceneScriptMediaState> media_state;
-        if (!msg->findObject("value", &media_state)) return;
-        if (!m_scene || !m_scene->scriptHost || !media_state) return;
+        if (! msg->findObject("value", &media_state)) return;
+        if (! m_scene || ! m_scene->scriptHost || ! media_state) return;
 
         const bool thumbnail_changed = MediaThumbnailChanged(m_applied_media_state, media_state);
         const bool render_graph_dirty_before = m_scene->renderGraphDirty;
-        const auto started_at = std::chrono::steady_clock::now();
+        const auto started_at                = std::chrono::steady_clock::now();
         m_scene->scriptHost->ApplyMediaState(*media_state);
         const bool render_graph_dirty_after = m_scene->renderGraphDirty;
-        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - started_at)
-                                    .count();
-        m_applied_media_state = media_state;
+        const auto elapsed_us               = std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - started_at)
+                                                  .count();
+        m_applied_media_state               = media_state;
 
-        if (thumbnail_changed && !render_graph_dirty_after) {
+        if (thumbnail_changed && ! render_graph_dirty_after) {
             LOG_INFO("SceneScript: media state applied without render graph rebuild");
-        } else if (!render_graph_dirty_before && render_graph_dirty_after) {
+        } else if (! render_graph_dirty_before && render_graph_dirty_after) {
             LOG_INFO("SceneScript: media state requested render graph rebuild");
         }
 
@@ -490,7 +487,7 @@ private:
                 std::abs(parsed_text_render_scale - requested_text_render_scale) > 0.001;
             for (const auto& [layer_id, _] : m_scene->textLayers) {
                 if (m_scene->deferredRuntimeTextLayerIds.count(layer_id) != 0) continue;
-                if (!requires_initial_text_rerender) continue;
+                if (! requires_initial_text_rerender) continue;
 
                 // Startup only needs to rebuild text when the scene was parsed at a different
                 // device scale than the active renderer. The canonical text geometry contract is
@@ -521,15 +518,16 @@ private:
 
             if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
             // The initial render graph compile performs the first uniform write and immediately
-            // submits the dynamic-buffer upload. Apply fill mode first so scene switches do not show a
-            // one-frame native-aspect projection before draw-time uniform refreshes catch up.
+            // submits the dynamic-buffer upload. Apply fill mode first so scene switches do not
+            // show a one-frame native-aspect projection before draw-time uniform refreshes catch
+            // up.
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
             m_render->compileRenderGraph(*m_scene, *m_rg, false);
             m_scene->ClearRenderGraphDirty();
 
-            auto pos = m_mouse_pos.load();
+            auto pos                         = m_mouse_pos.load();
             m_scene->mousePositionNormalized = pos;
-            m_scene->cursorLeftDown = m_cursor_left_down.load();
+            m_scene->cursorLeftDown          = m_cursor_left_down.load();
             m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
             m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
             m_scene->scriptHost->HandleCursorMove();
@@ -552,11 +550,11 @@ public:
     FpsCounter fps_counter;
 
 private:
-    std::shared_ptr<Scene> m_scene { nullptr };
+    std::shared_ptr<Scene>                   m_scene { nullptr };
     std::shared_ptr<WPSceneScriptMediaState> m_applied_media_state;
-    float                  m_speed { 1.0f };
-    double                 m_render_scale { 1.0 };
-    std::atomic<bool>      m_cursor_left_down { false };
+    float                                    m_speed { 1.0f };
+    double                                   m_render_scale { 1.0 };
+    std::atomic<bool>                        m_cursor_left_down { false };
 
     std::unique_ptr<vulkan::VulkanRender> m_render;
     std::unique_ptr<rg::RenderGraph>      m_rg { nullptr };
@@ -595,15 +593,16 @@ void SceneWallpaper::pause() {
 }
 
 void SceneWallpaper::mouseInput(double x, double y) {
-    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_MOUSE_INPUT);
+    auto msg =
+        CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_MOUSE_INPUT);
     msg->setFloat("x", (float)x);
     msg->setFloat("y", (float)y);
     msg->post();
 }
 
 void SceneWallpaper::mouseLeftButton(bool down) {
-    auto msg =
-        CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_MOUSE_LEFT_BUTTON);
+    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(),
+                                RenderHandler::CMD::CMD_MOUSE_LEFT_BUTTON);
     msg->setBool("down", down);
     msg->post();
 }
@@ -845,14 +844,14 @@ void MainHandler::loadScene() {
 }
 void MainHandler::sendCmdLoadScene() {
     auto self = weak_from_this().lock();
-    if (!self) return;
+    if (! self) return;
 
     auto msg = CreateMsgWithCmd(self, MainHandler::CMD::CMD_LOAD_SCENE);
     msg->post();
 }
 void MainHandler::sendFirstFrameOk() {
     auto self = weak_from_this().lock();
-    if (!self) return;
+    if (! self) return;
 
     auto msg = CreateMsgWithCmd(self, MainHandler::CMD::CMD_FIRST_FRAME);
     msg->post();

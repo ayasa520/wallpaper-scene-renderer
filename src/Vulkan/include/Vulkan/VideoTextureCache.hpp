@@ -23,9 +23,19 @@ namespace vulkan
 
 class Device;
 
+enum class VideoTextureGpuPipeline {
+    Nvidia,
+    NvidiaStateless,
+    Va,
+};
+
+struct VideoTexturePipelineSettings {
+    VideoTextureGpuPipeline gpu_pipeline { VideoTextureGpuPipeline::Nvidia };
+};
+
 class VideoTextureCache : NoCopy, NoMove {
 public:
-    VideoTextureCache(const Device&);
+    VideoTextureCache(const Device&, VideoTexturePipelineSettings settings = {});
     ~VideoTextureCache();
 
     ImageSlotsRef Acquire(std::string_view key,
@@ -60,6 +70,7 @@ private:
     bool         uploadSample(Entry&, ::GstSample*);
 
     const Device& m_device;
+    VideoTexturePipelineSettings m_settings;
     vvk::CommandBuffers m_cmds;
     vvk::CommandBuffer  m_cmd;
     std::vector<std::unique_ptr<Entry>> m_entries;
