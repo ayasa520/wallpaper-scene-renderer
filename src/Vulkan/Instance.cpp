@@ -2,6 +2,9 @@
 #include "Device.hpp"
 
 #include <cstdio>
+#include <algorithm>
+#include <utility>
+#include <vector>
 #include "Utils/Logging.h"
 
 using namespace wallpaper::vulkan;
@@ -86,7 +89,8 @@ void EnumateLayers(wallpaper::Set<std::string>& set, const vvk::InstanceDispatch
 } // namespace
 
 bool Instance::ChoosePhysicalDevice(const CheckGpuOp&             checkgpu,
-                                    std::span<const std::uint8_t> uuid) {
+                                    std::span<const std::uint8_t> uuid,
+                                    PhysicalDevicePreference      preference) {
     auto deviceList = m_vinst.EnumeratePhysicalDevices();
 
     VkInstanceCreateInfo crea;
@@ -97,7 +101,19 @@ bool Instance::ChoosePhysicalDevice(const CheckGpuOp&             checkgpu,
     vvk::PhysicalDevice        final_gpu;
     VkPhysicalDeviceProperties final_props;
 
-    // choose deiscrete device
+    auto preferenceMatches = [](VkPhysicalDeviceType type, PhysicalDevicePreference preference) {
+        switch (preference) {
+        case PhysicalDevicePreference::PreferIntegrated:
+            return type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        case PhysicalDevicePreference::PreferDiscrete:
+            return type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        case PhysicalDevicePreference::Default:
+            return true;
+        }
+        return true;
+    };
+
+    std::vector<std::pair<vvk::PhysicalDevice, VkPhysicalDeviceProperties>> candidates;
     for (const auto& d : deviceList) {
         VkPhysicalDeviceIDProperties device_id_props {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, .pNext = NULL
@@ -121,11 +137,19 @@ bool Instance::ChoosePhysicalDevice(const CheckGpuOp&             checkgpu,
             }
         } else {
             if (checkgpu(d)) {
-                final_props = props;
-                final_gpu   = d;
-                break;
+                candidates.emplace_back(d, props);
             }
         }
+    }
+    if (! final_gpu && ! candidates.empty()) {
+        auto preferred =
+            std::find_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+                return preferenceMatches(candidate.second.deviceType, preference);
+            });
+        if (preferred == candidates.end())
+            preferred = candidates.begin();
+        final_gpu = preferred->first;
+        final_props = preferred->second;
     }
     if (final_gpu) {
         logGpu(final_props);

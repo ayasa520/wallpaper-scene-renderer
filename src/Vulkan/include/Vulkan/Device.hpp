@@ -4,6 +4,7 @@
 #include "vk_mem_alloc.h"
 #include "Parameters.hpp"
 #include "TextureCache.hpp"
+#include "VideoTextureCache.hpp"
 
 namespace wallpaper
 {
@@ -11,14 +12,16 @@ namespace vulkan
 {
 
 class PipelineParameters;
-class VideoTextureCache;
-
 class Device : NoCopy, NoMove {
 public:
     Device();
     ~Device();
 
-    static bool Create(Instance&, std::span<const Extension> exts, VkExtent2D extent, Device&);
+    static bool Create(Instance&,
+                       std::span<const Extension> exts,
+                       VkExtent2D extent,
+                       Device&,
+                       VideoTexturePipelineSettings video_texture_settings = {});
     static bool CheckGPU(vvk::PhysicalDevice gpu, std::span<const Extension> exts, VkSurfaceKHR surface);
 
     void Destroy();
