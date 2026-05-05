@@ -1460,19 +1460,30 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     if (out_image == nullptr) return false;
 
     const auto   font_family    = ResolveFontFamily(vfs, object.font).value_or("Sans");
-    const int    padding        = ResolvePadding(object);
+    const int    authored_padding = ResolvePadding(object);
     const double scene_scale    = std::max(1.0, render_scale);
     const float  raster_density = ResolveTextRasterDensityFactor(object);
-    // Keep the current display/camera sizing semantics intact while avoiding the
-    // extra HiDPI blur introduced when render_scale > 1. The backing text raster
-    // tracks the scene scale twice, so every cropped display-space metric must be
-    // converted back from raster pixels with the full raster scale. If we only
-    // divide by the authored visual downscale, the runtime will treat texture
-    // pixels as scene units and inflate the text quad/effect bounds by the HiDPI
-    // backing factor.
+    // Text layout has two deliberately different scale contracts. Glyphs are still shaped at the
+    // authored `pointsize` and then rasterized into a denser backing atlas, because that preserves
+    // the Wallpaper Engine font size that users see. The authored text box (`size`, `maxwidth`,
+    // and `padding`) is different: it is a display-space rectangle, so it must be converted down to
+    // the Pango layout coordinate space before wrapping is computed. Keeping these paths separate
+    // fixes HiDPI/effect text wrapping without shrinking the glyph quads themselves.
     const double raster_scale =
         std::max(static_cast<double>(kMinTextVisualScaleFactor),
                  scene_scale * scene_scale * static_cast<double>(raster_density));
+    const double display_scale =
+        1.0 / static_cast<double>(std::max(raster_density, kMinTextVisualScaleFactor));
+    const double display_units_per_layout_unit = raster_scale * display_scale;
+    auto scale_display_metric_to_layout_pixels = [&](double value, int minimum) {
+        if (value <= 0.0) return minimum;
+        return std::max(minimum,
+                        static_cast<int>(
+                            std::lround(value / std::max(display_units_per_layout_unit,
+                                                          static_cast<double>(kMinTextVisualScaleFactor)))));
+    };
+    const int padding = scale_display_metric_to_layout_pixels(
+        static_cast<double>(authored_padding), authored_padding > 0 ? 1 : 0);
 
     auto* measure_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 4, 4);
     auto* measure_cr      = cairo_create(measure_surface);
@@ -1486,7 +1497,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     ApplyWallpaperEngineTextSize(desc, effective_point_size);
     pango_layout_set_font_description(measure_layout, desc);
 
-    const int requested_max_width = std::max(0, static_cast<int>(std::lround(object.maxwidth)));
+    const int requested_max_width =
+        scale_display_metric_to_layout_pixels(static_cast<double>(object.maxwidth), 0);
     const int measure_width =
         object.limitwidth ? std::max(0, requested_max_width - padding * 2) : -1;
     ConfigureLayout(measure_layout, object, measure_width);
@@ -1504,15 +1516,19 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     const int bounds_width  = std::max(layout_width + ink_overhang_left + ink_overhang_right, 1);
     const int bounds_height = std::max(layout_height + ink_overhang_top + ink_overhang_bottom, 1);
 
-    int resolved_width  = std::max(1, static_cast<int>(std::lround(object.size[0])));
-    int resolved_height = std::max(1, static_cast<int>(std::lround(object.size[1])));
+    int resolved_width =
+        scale_display_metric_to_layout_pixels(static_cast<double>(object.size[0]), 1);
+    int resolved_height =
+        scale_display_metric_to_layout_pixels(static_cast<double>(object.size[1]), 1);
     if (! object.size_explicit || object.size[0] <= 0.0f || object.size[1] <= 0.0f) {
         resolved_width =
             requested_max_width > 0 ? requested_max_width : std::max(bounds_width + padding * 2, 1);
         resolved_height = std::max(bounds_height + padding * 2, 1);
         object.size     = {
-            static_cast<float>(resolved_width),
-            static_cast<float>(resolved_height),
+            static_cast<float>(static_cast<double>(resolved_width) *
+                               display_units_per_layout_unit),
+            static_cast<float>(static_cast<double>(resolved_height) *
+                               display_units_per_layout_unit),
         };
     } else if (! object.limitwidth) {
         // Non-width-limited text should never be clipped just because Linux font
@@ -1520,8 +1536,10 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         resolved_width  = std::max(resolved_width, bounds_width + padding * 2);
         resolved_height = std::max(resolved_height, bounds_height + padding * 2);
         object.size     = {
-            static_cast<float>(resolved_width),
-            static_cast<float>(resolved_height),
+            static_cast<float>(static_cast<double>(resolved_width) *
+                               display_units_per_layout_unit),
+            static_cast<float>(static_cast<double>(resolved_height) *
+                               display_units_per_layout_unit),
         };
     }
 
@@ -1593,12 +1611,6 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
 
     const auto crop = ResolveTextSurfaceCrop(
         object, raster_width, raster_height, raster_scale, draw_x, draw_y, ink_rect);
-    // `glyph_display_size` is scene/display geometry, while `raster_scale` is only the backing
-    // atlas density. The primitive renderer already maps the text texture back into scene space, so
-    // display geometry must remove only the authored visual raster density here; including
-    // `scene_scale` again makes HiDPI text visibly too small.
-    const float display_scale =
-        1.0f / std::max(raster_density, kMinTextVisualScaleFactor);
     const std::array<float, 2> full_display_size {
         static_cast<float>(static_cast<double>(raster_width) * static_cast<double>(display_scale)),
         static_cast<float>(static_cast<double>(raster_height) * static_cast<double>(display_scale)),
@@ -1635,10 +1647,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         return false;
     }
 
-    out_image->logical_size = {
-        static_cast<float>(width),
-        static_cast<float>(height),
-    };
+    out_image->logical_size = full_display_size;
     out_image->logical_source_size = {
         static_cast<float>(raster_width),
         static_cast<float>(raster_height),
@@ -2165,16 +2174,11 @@ bool wallpaper::ApplyTextLayerDisplaySize(TextLayerRuntimeState& state,
     display_size[0] = std::max(display_size[0], 1.0f);
     display_size[1] = std::max(display_size[1], 1.0f);
 
-    const float logical_scale            = static_cast<float>(std::max(1.0, render_scale));
-    const float display_to_logical_scale = logical_scale * logical_scale;
-    state.object.size                    = {
-        display_size[0] / display_to_logical_scale,
-        display_size[1] / display_to_logical_scale,
-    };
+    state.object.size = display_size;
     // Size writes now only mutate authored state. The live primitive keeps the previously applied
-    // geometry until the caller chooses one of the explicit runtime actions (layout rebuild or
-    // bridge-resource resize), which prevents the registry from carrying a second copy of layout
-    // metrics alongside the canonical primitive.
+    // geometry until the caller chooses one of the explicit runtime actions. The rasterizer owns
+    // the display-space to Pango-layout conversion, so runtime scripts can round-trip
+    // `thisLayer.size` without receiving or storing hidden HiDPI layout units.
     (void)render_scale;
     state.object.size_explicit = true;
     return true;
@@ -2614,9 +2618,8 @@ bool wallpaper::RasterizeTextPrimitiveLayout(fs::VFS& vfs,
                                              double render_scale,
                                              TextRasterLayoutResult* out_image,
                                              std::string* out_error) {
-    // Production text rasterization is deliberately silent. Earlier diagnostics logged every
-    // parse/runtime reraster and made minute updates compete with filesystem log I/O; failures are
-    // still reported through `out_error` so callers can decide how to surface them.
+    // Production text rasterization is deliberately silent; failures travel through `out_error`
+    // so callers can decide how to surface hard rasterization errors.
     return GenerateTextLayoutImage(vfs, object, texture_key, render_scale, out_image, out_error);
 }
 
