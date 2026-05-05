@@ -106,6 +106,25 @@ struct WPShaderValueData {
 
     void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
 
+    void SetParallaxContract(const std::array<float, 2>& depth, SceneNode* anchor = nullptr,
+                             bool suppress_own_model_parallax = false) {
+        parallaxDepth           = depth;
+        parallax_anchor         = anchor;
+        suppress_model_parallax = suppress_own_model_parallax;
+    }
+
+    void SetEffectProjection(SceneNode* projection_node, SceneMesh* projection_mesh) {
+        effect_projection_node = projection_node;
+        effect_projection_mesh = projection_mesh;
+    }
+
+    void SuppressOwnModelParallax() { suppress_model_parallax = true; }
+
+    void CopyParallaxContractFrom(const WPShaderValueData& source) {
+        SetParallaxContract(
+            source.parallaxDepth, source.parallax_anchor, source.suppress_model_parallax);
+    }
+
     void InheritParentTransform(SceneNode* parent, bool inherit_parent_parallax = true) {
         parallax_anchor        = inherit_parent_parallax ? parent : nullptr;
         transform_binding.mode = WPNodeTransformBindingMode::InheritParent;

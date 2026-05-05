@@ -364,6 +364,14 @@ std::array<float, 2> ImageObjectParallaxDepth(const wpscene::WPImageObject& obje
     return { object.parallaxDepth[0], object.parallaxDepth[1] };
 }
 
+std::array<float, 2> TextObjectParallaxDepth(const wpscene::WPTextObject& object) {
+    return { object.parallaxDepth[0], object.parallaxDepth[1] };
+}
+
+bool LayerUsesRoutedParent(int32_t parent_id, std::string_view attachment) {
+    return parent_id != 0 && attachment.empty();
+}
+
 struct WPEmptyObject {
     int32_t              id { 0 };
     std::string          name;
@@ -625,9 +633,7 @@ void ApplyNodeOwnerParallaxFallback(ParseContext& context, int32_t owner_id,
         // Only camera-facing/world-facing nodes should receive this repaired parallax contract.
         // Effect source nodes render inside private effect cameras, so moving them here would bake
         // the same mouse offset into the offscreen texture and then apply it again at composition.
-        node_data->parallaxDepth           = depth;
-        node_data->parallax_anchor         = anchor;
-        node_data->suppress_model_parallax = suppress_model_parallax;
+        node_data->SetParallaxContract(depth, anchor, suppress_model_parallax);
     }
 }
 
@@ -1564,9 +1570,7 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
         // transform binding would multiply route matrices twice; only the parallax contract is
         // mirrored from the visible world node so hidden-effect fallbacks keep moving with their
         // compose/text layer.
-        composite_data.parallaxDepth   = final_transform_data->parallaxDepth;
-        composite_data.parallax_anchor = final_transform_data->parallax_anchor;
-        composite_data.suppress_model_parallax = final_transform_data->suppress_model_parallax;
+        composite_data.CopyParallaxContractFrom(*final_transform_data);
     }
 
     auto composite_mesh = std::make_shared<SceneMesh>();
@@ -1813,15 +1817,12 @@ void AttachNodeToScene(ParseContext& context, const std::shared_ptr<SceneNode>& 
     }
 }
 
-bool ShouldInheritParentParallax(ParseContext& context, int32_t parent_id,
+bool ShouldInheritParentParallax(ParseContext& context, const SceneNode& parent,
                                  const WPShaderValueData& node_data) {
-    if (parent_id == 0 || context.shader_updater == nullptr) return true;
+    if (context.shader_updater == nullptr) return true;
     if (IsZeroParallaxDepth(node_data.parallaxDepth)) return true;
 
-    auto parent = FindParentNode(context, parent_id);
-    if (! parent) return true;
-
-    const auto* parent_data = context.shader_updater->GetNodeData(parent.get());
+    const auto* parent_data = context.shader_updater->GetNodeData(&parent);
     if (parent_data == nullptr) return true;
 
     // Inherited transform and inherited camera-parallax are separate contracts in Wallpaper
@@ -1836,23 +1837,218 @@ bool ShouldInheritParentParallax(ParseContext& context, int32_t parent_id,
     return false;
 }
 
-void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
-                                     WPShaderValueData& node_data) {
-    if (parent_id == 0) return;
-    if (auto parent = FindParentNode(context, parent_id)) {
-        const bool inherit_parent_parallax =
-            ShouldInheritParentParallax(context, parent_id, node_data);
+enum class ParentTransformBindingContract
+{
+    None,
+    InheritAuthoredParent,
+};
+
+enum class ParentParallaxAnchorContract
+{
+    None,
+    InheritWhenCompatible,
+    ForceAuthoredParent,
+};
+
+struct ParentTransformContract {
+    int32_t                         parent_id { 0 };
+    ParentTransformBindingContract  transform_binding {
+        ParentTransformBindingContract::None
+    };
+    ParentParallaxAnchorContract    parallax_anchor {
+        ParentParallaxAnchorContract::None
+    };
+
+    static ParentTransformContract InheritAuthoredParentTransform(int32_t parent_id) {
+        return { .parent_id         = parent_id,
+                 .transform_binding = ParentTransformBindingContract::InheritAuthoredParent,
+                 .parallax_anchor   = ParentParallaxAnchorContract::InheritWhenCompatible };
+    }
+
+    static ParentTransformContract RoutedEffectWorldTransform(int32_t parent_id) {
+        return { .parent_id         = parent_id,
+                 .transform_binding = ParentTransformBindingContract::InheritAuthoredParent,
+                 .parallax_anchor   = ParentParallaxAnchorContract::ForceAuthoredParent };
+    }
+
+    static ParentTransformContract ParallaxAnchorWhenCompatible(int32_t parent_id) {
+        return { .parent_id       = parent_id,
+                 .parallax_anchor = ParentParallaxAnchorContract::InheritWhenCompatible };
+    }
+
+    static ParentTransformContract ForceParallaxAnchor(int32_t parent_id) {
+        return { .parent_id       = parent_id,
+                 .parallax_anchor = ParentParallaxAnchorContract::ForceAuthoredParent };
+    }
+};
+
+void ApplyParentTransformContract(ParseContext& context, const ParentTransformContract& contract,
+                                  WPShaderValueData& node_data) {
+    if (contract.parent_id == 0) return;
+    auto parent = FindParentNode(context, contract.parent_id);
+    if (! parent) return;
+
+    const bool inherit_parent_parallax =
+        contract.parallax_anchor == ParentParallaxAnchorContract::ForceAuthoredParent ||
+        (contract.parallax_anchor == ParentParallaxAnchorContract::InheritWhenCompatible &&
+         ShouldInheritParentParallax(context, *parent, node_data));
+
+    if (contract.transform_binding ==
+        ParentTransformBindingContract::InheritAuthoredParent) {
         node_data.InheritParentTransform(parent.get(), inherit_parent_parallax);
+        return;
+    }
+
+    if (inherit_parent_parallax) {
+        node_data.SetParallaxAnchor(parent.get());
     }
 }
 
-void ConfigureInheritedParentParallaxAnchor(ParseContext& context, int32_t parent_id,
-                                            WPShaderValueData& node_data) {
-    if (parent_id == 0) return;
-    if (! ShouldInheritParentParallax(context, parent_id, node_data)) return;
-    if (auto parent = FindParentNode(context, parent_id)) {
-        node_data.SetParallaxAnchor(parent.get());
+void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
+                                     WPShaderValueData& node_data) {
+    ApplyParentTransformContract(
+        context, ParentTransformContract::InheritAuthoredParentTransform(parent_id), node_data);
+}
+
+void ConfigureRoutedEffectWorldParentBinding(ParseContext& context, int32_t parent_id,
+                                             WPShaderValueData& node_data) {
+    // Effect-backed image layers split into a routed world node and private effect nodes. The world
+    // node is the scene-space writer that ResolveEffect()/UpdateUniforms use to synchronize the
+    // final output, so it must keep the authored parent as its camera-parallax anchor even when both
+    // parent and child authored non-zero parallaxDepth. Authored effect materials still keep their
+    // own child parallax contract; this binding only preserves the parent component that would
+    // otherwise be lost before the final writer is synchronized.
+    ApplyParentTransformContract(
+        context, ParentTransformContract::RoutedEffectWorldTransform(parent_id), node_data);
+}
+
+struct EffectWriterTransformContract {
+    std::array<float, 2>       parallax_depth { 0.0f, 0.0f };
+    SceneImageEffectLayer*     projection_layer { nullptr };
+    ParentTransformContract    parent_transform {};
+    bool suppress_own_model_parallax { false };
+};
+
+void ApplyEffectWriterTransformContract(ParseContext& context,
+                                        const EffectWriterTransformContract& contract,
+                                        WPShaderValueData& data) {
+    data.SetParallaxContract(contract.parallax_depth);
+
+    if (contract.projection_layer != nullptr) {
+        data.SetEffectProjection(&contract.projection_layer->FinalNode(),
+                                 &contract.projection_layer->FinalMesh());
     }
+
+    ApplyParentTransformContract(context, contract.parent_transform, data);
+
+    if (contract.suppress_own_model_parallax) {
+        data.SuppressOwnModelParallax();
+    }
+}
+
+WPShaderValueData BuildEffectWriterTransformData(ParseContext& context,
+                                                 const EffectWriterTransformContract& contract) {
+    WPShaderValueData data;
+    ApplyEffectWriterTransformContract(context, contract, data);
+    return data;
+}
+
+EffectWriterTransformContract BuildImageEffectFinalCompositeContract(
+    const wpscene::WPImageObject& image, bool uses_routed_parent) {
+    EffectWriterTransformContract contract;
+    contract.parallax_depth = ImageObjectParallaxDepth(image);
+    if (uses_routed_parent) {
+        // Image final composites are detached screen writers. The render graph supplies the routed
+        // parent transform, while this parallax anchor supplies only the parent mouse-parallax
+        // component needed by hidden authored-effect fallbacks.
+        contract.parent_transform =
+            ParentTransformContract::ParallaxAnchorWhenCompatible(image.parent);
+    }
+    return contract;
+}
+
+enum class ImageEffectWriterRole
+{
+    AuthoredEffectProjection,
+    LayerSurfaceProxy,
+};
+
+struct ImageEffectMaterialTopology {
+    bool                  uses_routed_parent { false };
+    ImageEffectWriterRole writer_role { ImageEffectWriterRole::AuthoredEffectProjection };
+
+    bool NeedsLayerSurfaceParentParallax() const {
+        return uses_routed_parent && writer_role == ImageEffectWriterRole::LayerSurfaceProxy;
+    }
+};
+
+ImageEffectWriterRole ResolveImageEffectWriterRole(bool is_compose_layer,
+                                                   const wpscene::WPImageEffect& effect,
+                                                   int32_t materialized_effect_count) {
+    if (is_compose_layer) return ImageEffectWriterRole::LayerSurfaceProxy;
+
+    const bool is_single_synthetic_color_blend_writer =
+        effect.name == kSyntheticColorBlendEffectName && materialized_effect_count == 1;
+    return is_single_synthetic_color_blend_writer
+               ? ImageEffectWriterRole::LayerSurfaceProxy
+               : ImageEffectWriterRole::AuthoredEffectProjection;
+}
+
+EffectWriterTransformContract BuildTextEffectFinalCompositeContract(
+    const wpscene::WPTextObject& text) {
+    EffectWriterTransformContract contract;
+    contract.parallax_depth = TextObjectParallaxDepth(text);
+    if (LayerUsesRoutedParent(text.parent, text.attachment)) {
+        // Text final composites also receive the routed parent transform from the render graph, but
+        // parent-routed text effect nodes already carry that parent camera-parallax through the
+        // route matrix path. This writer keeps the authored child depth while suppressing another
+        // model-parallax pass on itself.
+        contract.suppress_own_model_parallax = true;
+    }
+    return contract;
+}
+
+EffectWriterTransformContract BuildImageEffectMaterialContract(
+    const wpscene::WPImageObject& image, SceneImageEffectLayer& effect_layer,
+    const ImageEffectMaterialTopology& topology) {
+    EffectWriterTransformContract contract;
+    contract.parallax_depth   = ImageObjectParallaxDepth(image);
+    contract.projection_layer = &effect_layer;
+
+    if (topology.NeedsLayerSurfaceParentParallax()) {
+        // This decision is based on render topology, not on authored parallax values. Compose
+        // layers and image layers whose only effect is Hanabi's synthetic color-blend pass have no
+        // authored effect projection that should own a separate child-space parallax result; their
+        // resolved screen writer is the layer image itself, merely routed through the image-effect
+        // path. Match the no-effect image-layer contract by inheriting the authored parent's
+        // parallax anchor, so virtual render-order parents such as the 3521337568 Earth container
+        // keep the visible compose and atmosphere pixels locked together.
+        //
+        // Detached chains with real authored effects intentionally do not enter this branch. Their
+        // final writer belongs to the effect pipeline, and the world route matrix already supplies
+        // the parent transform. Re-anchoring that authored final writer to the parent changes the
+        // effect-chain projection contract and moves layers such as the lantern media cover and
+        // audio rings away from their authored local center.
+        contract.parent_transform = ParentTransformContract::ForceParallaxAnchor(image.parent);
+    }
+    return contract;
+}
+
+EffectWriterTransformContract BuildTextEffectMaterialContract(
+    const wpscene::WPTextObject& text, SceneImageEffectLayer& effect_layer) {
+    EffectWriterTransformContract contract;
+    contract.parallax_depth   = TextObjectParallaxDepth(text);
+    contract.projection_layer = &effect_layer;
+    if (LayerUsesRoutedParent(text.parent, text.attachment)) {
+        // Text effect nodes start as private bridge passes, but ResolveEffect() may turn the last
+        // authored effect node into the visible scene-space writer. Parent-routed text already
+        // receives the visual parent chain, including parent camera parallax, through the render
+        // graph route matrix. Suppressing this node's own model parallax prevents two failure modes:
+        // non-zero child text depths drifting inside zero-parallax HUD groups, and zero-depth
+        // effect-backed date labels receiving an extra copy of their moving parent's parallax.
+        contract.suppress_own_model_parallax = true;
+    }
+    return contract;
 }
 
 void RegisterLayerSceneState(ParseContext& context, int32_t layer_id, int32_t parent_id,
@@ -1881,7 +2077,7 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
                             wpimgobj.name,
                             node_data);
 
-    if (wpimgobj.parent != 0 && wpimgobj.attachment.empty()) {
+    if (LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment)) {
         ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, wpimgobj.parent, node, wpimgobj.id);
@@ -1944,7 +2140,7 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
                             wppartobj.name,
                             node_data);
 
-    if (wppartobj.parent != 0 && wppartobj.attachment.empty()) {
+    if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
         ConfigureInheritedParentBinding(context, wppartobj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, wppartobj.parent, node, wppartobj.id);
@@ -1980,7 +2176,7 @@ void RegisterLogicalTextLayer(ParseContext& context, wpscene::WPTextObject& text
                             text_obj.name,
                             node_data);
 
-    if (text_obj.parent != 0 && text_obj.attachment.empty()) {
+    if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
         ConfigureInheritedParentBinding(context, text_obj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, text_obj.parent, node, text_obj.id);
@@ -3598,7 +3794,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     // also needs a dedicated logical/world node for image layers with effects, otherwise runtime
     // transform updates move the offscreen source quad out of its effect camera and the final
     // output turns blank.
-    bool needs_inherited_parent_binding = wpimgobj.parent != 0 && wpimgobj.attachment.empty();
+    const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
     bool use_detached_effect_world_node = hasEffect && ! isCompose;
     const std::array<float, 2> effect_source_size =
         wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
@@ -3880,17 +4076,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // ping-pong target so `_rt_imageLayerComposite_<id>` samples the raw source texture
             // instead of adding an unreachable screen-space fallback node that could overwrite the
             // link-source bookkeeping.
-            WPShaderValueData finalCompositeTransformData;
-            finalCompositeTransformData.parallaxDepth = { wpimgobj.parallaxDepth[0],
-                                                          wpimgobj.parallaxDepth[1] };
-            if (needs_inherited_parent_binding) {
-                // The render graph already routes this detached final writer through the authored
-                // parent chain. Anchoring only the parallax offset to the authored parent keeps
-                // child fallbacks synchronized with zero/non-zero parallax parent groups without
-                // reapplying the parent's local transform.
-                ConfigureInheritedParentParallaxAnchor(
-                    context, wpimgobj.parent, finalCompositeTransformData);
-            }
+            const auto finalCompositeTransformData = BuildEffectWriterTransformData(
+                context,
+                BuildImageEffectFinalCompositeContract(wpimgobj,
+                                                       uses_routed_parent));
             ConfigureEffectFinalComposite(context,
                                           *imgEffectLayer,
                                           effect_ppong_a,
@@ -3921,6 +4110,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                          effect_visibility.initial_visible ? "true" : "false",
                          effect_visibility.authored_visible ? "true" : "false");
             }
+            const bool isSyntheticColorBlendEffect =
+                wpeffobj.name == kSyntheticColorBlendEffectName;
+            const ImageEffectMaterialTopology effect_material_topology {
+                .uses_routed_parent = uses_routed_parent,
+                .writer_role        = ResolveImageEffectWriterRole(isCompose, wpeffobj, count_eff),
+            };
 
             // this will be replace when resolve, use here to get rt info
             const std::string inRT { effect_ppong_a };
@@ -4011,12 +4206,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 if (wpmat.textures.at(0).empty()) {
                     wpmat.textures[0] = inRT;
                 }
-                auto        spEffNode  = std::make_shared<SceneNode>();
-                std::string effmataddr = getAddr(spEffNode.get());
-                const bool  isSyntheticColorBlendEffect =
-                    wpeffobj.name == kSyntheticColorBlendEffectName;
-                const bool isSingleSyntheticColorBlendWriter =
-                    isSyntheticColorBlendEffect && count_eff == 1;
+                auto spEffNode = std::make_shared<SceneNode>();
                 ShaderValueMap effectBaseConstSvs = baseConstSvs;
                 if (isSyntheticColorBlendEffect) {
                     // The passthrough blend pass should preserve the source render target's alpha,
@@ -4055,44 +4245,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 LoadUserShaderValue(material, wpmat, wpEffShaderInfo, context.user_properties);
                 auto spMesh = std::make_shared<SceneMesh>();
                 {
-                    svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-                    svData.effect_projection_node = &imgEffectLayer->FinalNode();
-                    svData.effect_projection_mesh = &imgEffectLayer->FinalMesh();
-                    if (needs_inherited_parent_binding &&
-                        (isCompose || isSingleSyntheticColorBlendWriter)) {
-                        // This decision is based on render topology, not on authored parallax
-                        // values. Compose layers and image layers whose only effect is Hanabi's
-                        // synthetic color-blend pass have no authored effect projection that should
-                        // own a separate child-space parallax result; their resolved screen writer
-                        // is the layer image itself, merely routed through the image-effect path.
-                        // Match the no-effect image-layer contract by inheriting the authored
-                        // parent's parallax anchor, so virtual render-order parents such as the
-                        // 3521337568 Earth container keep the visible compose and atmosphere pixels
-                        // locked together.
-                        //
-                        // Detached chains with real authored effects intentionally do not enter
-                        // this branch. Their final writer belongs to the effect pipeline, and the
-                        // world route matrix already supplies the parent transform. Re-anchoring
-                        // that authored final writer to the parent changes the effect-chain
-                        // projection contract and moves layers such as the lantern media cover and
-                        // audio rings away from their authored local center.
-                        if (auto parent = FindParentNode(context, wpimgobj.parent)) {
-                            svData.SetParallaxAnchor(parent.get());
-                            LOG_INFO(
-                                "SceneEffectParallaxAnchor: layer=%d name='%s' effect-id=%d "
-                                "effect-index=%d effect='%s' material-index=%zu parent-layer=%d "
-                                "compose=%s synthetic-color-blend-only=%s",
-                                wpimgobj.id,
-                                wpimgobj.name.c_str(),
-                                wpeffobj.id,
-                                i_eff,
-                                wpeffobj.name.c_str(),
-                                i_mat,
-                                wpimgobj.parent,
-                                isCompose ? "true" : "false",
-                                isSingleSyntheticColorBlendWriter ? "true" : "false");
-                        }
-                    }
+                    ApplyEffectWriterTransformContract(
+                        context,
+                        BuildImageEffectMaterialContract(wpimgobj,
+                                                         *imgEffectLayer,
+                                                         effect_material_topology),
+                        svData);
                     if (hasAnimatedPuppetMesh && wpmat.use_puppet) {
                         svData.puppet_layer = WPPuppetLayer(puppet->puppet);
                         svData.puppet_layer.prepared(wpimgobj.puppet_layers);
@@ -4125,9 +4283,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             }
         }
     }
-    if (needs_inherited_parent_binding) {
+    if (uses_routed_parent) {
         if (hasEffect) {
-            ConfigureInheritedParentBinding(context, wpimgobj.parent, worldNodeData);
+            ConfigureRoutedEffectWorldParentBinding(context, wpimgobj.parent, worldNodeData);
         } else {
             ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
         }
@@ -4280,17 +4438,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             scene.renderTargets.at(primitive->bridge.pingpong_a);
         scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_a);
         scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_b);
-        WPShaderValueData finalCompositeTransformData;
-        finalCompositeTransformData.parallaxDepth = { text_obj.parallaxDepth[0],
-                                                      text_obj.parallaxDepth[1] };
-        if (text_obj.parent != 0 && text_obj.attachment.empty()) {
-            // Text effect fallbacks follow the same route-matrix path as image effect fallbacks:
-            // leave the transform binding empty because the resolved route matrix already contains
-            // the visual parent chain. Suppress model parallax on the synthetic fallback so a routed
-            // text effect cannot add the parent parallax a second time when the final authored effect
-            // is hidden and this neutral composite becomes the visible screen writer.
-            finalCompositeTransformData.suppress_model_parallax = true;
-        }
+        const auto finalCompositeTransformData = BuildEffectWriterTransformData(
+            context, BuildTextEffectFinalCompositeContract(text_obj));
         ConfigureEffectFinalComposite(context,
                                       *imgEffectLayer,
                                       primitive->bridge.pingpong_a,
@@ -4419,20 +4568,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 // same dynamic-buffer path used by particle-like geometry, instead of destroying
                 // and rebuilding the shader pass for every text size change.
                 auto spMesh                             = std::make_shared<SceneMesh>(true);
-                effect_node_data.parallaxDepth          = { text_obj.parallaxDepth[0],
-                                                            text_obj.parallaxDepth[1] };
-                if (text_obj.parent != 0 && text_obj.attachment.empty()) {
-                    // Text effect nodes start as private bridge passes, but ResolveEffect() may turn
-                    // the last authored effect node into the visible scene-space writer. Parent-routed
-                    // text already receives the visual parent chain, including parent camera parallax,
-                    // through the render-graph route matrix. Suppressing this node's own model
-                    // parallax prevents two failure modes: non-zero child text depths drifting inside
-                    // zero-parallax HUD groups, and zero-depth effect-backed date labels receiving an
-                    // extra copy of their moving parent's parallax.
-                    effect_node_data.suppress_model_parallax = true;
-                }
-                effect_node_data.effect_projection_node = &imgEffectLayer->FinalNode();
-                effect_node_data.effect_projection_mesh = &imgEffectLayer->FinalMesh();
+                ApplyEffectWriterTransformContract(
+                    context,
+                    BuildTextEffectMaterialContract(text_obj, *imgEffectLayer),
+                    effect_node_data);
                 spMesh->AddMaterial(std::move(effect_material));
                 spEffectNode->AddMesh(spMesh);
                 RegisterUserShaderValueBindings(context,
@@ -4466,7 +4605,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         }
     }
 
-    if (text_obj.parent != 0 && text_obj.attachment.empty()) {
+    if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
         ConfigureInheritedParentBinding(context, text_obj.parent, worldNodeData);
         context.scene->sceneGraph->AppendChild(spWorldNode);
         RegisterRenderOrderProxyChild(context, text_obj.parent, spWorldNode, text_obj.id);
@@ -4788,7 +4927,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     if (is_child)
         child_ptr.node_parent->AppendChild(spNode);
     else {
-        if (wppartobj.parent != 0 && wppartobj.attachment.empty()) {
+        if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
             ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
             RegisterRenderOrderProxyChild(context, wppartobj.parent, spNode, wppartobj.id);
@@ -4847,7 +4986,7 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
                             empty_obj.name,
                             svData);
 
-    if (empty_obj.parent != 0 && empty_obj.attachment.empty()) {
+    if (LayerUsesRoutedParent(empty_obj.parent, empty_obj.attachment)) {
         ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, empty_obj.parent, node, empty_obj.id);
