@@ -6502,6 +6502,10 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
         placeholder_node = node_it->second;
     }
 
+    // Deferred materialization may now run as a residency warm-up while the authored layer is still
+    // hidden. The parser entry points still require `visible=true` to build the full runtime node,
+    // so preserve the logical visibility first and restore it after the placeholder swap.
+    const bool local_visible = scene.GetLayerLocalVisibility(layer_id);
     const auto binding = scene.GetLayerParentBinding(layer_id);
     const auto apply_placeholder_transform = [layer_id, &binding, &placeholder_node](auto& object) {
         object.id         = layer_id;
@@ -6557,6 +6561,8 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     if (! node_it->second->Name().empty()) {
         scene.layerNameToId[node_it->second->Name()] = layer_id;
     }
+    scene.SetLayerLocalVisibility(layer_id, local_visible);
+    scene.ApplyLayerVisibility(layer_id);
     scene.deferredRuntimeImageLayerIds.erase(layer_id);
     return true;
 }
@@ -6583,6 +6589,9 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
     wpscene::WPParticleObject object;
     if (! object.FromJson(object_json, *context.vfs)) return false;
 
+    // See image deferred materialization above: build the concrete runtime object with parser-local
+    // visibility enabled, then restore the Scene-owned logical visibility contract.
+    const bool local_visible = scene.GetLayerLocalVisibility(layer_id);
     object.id          = layer_id;
     object.visible     = true;
     const auto binding = scene.GetLayerParentBinding(layer_id);
@@ -6617,6 +6626,8 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
     if (! node_it->second->Name().empty()) {
         scene.layerNameToId[node_it->second->Name()] = layer_id;
     }
+    scene.SetLayerLocalVisibility(layer_id, local_visible);
+    scene.ApplyLayerVisibility(layer_id);
     scene.deferredRuntimeParticleLayerIds.erase(layer_id);
     return true;
 }
@@ -6646,8 +6657,11 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
         if (! object.FromJson(object_json, *context.vfs)) return false;
     }
 
+    // Text parsing uses `visible` as an early materialization gate, so residency warm-up must keep
+    // the parser visible while preserving the Scene-visible state externally.
     object.id          = layer_id;
     object.visible     = true;
+    const bool local_visible = scene.GetLayerLocalVisibility(layer_id);
     const auto binding = scene.GetLayerParentBinding(layer_id);
     object.parent      = binding.parent_id;
     object.attachment  = binding.attachment;
@@ -6680,6 +6694,8 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     if (! node_it->second->Name().empty()) {
         scene.layerNameToId[node_it->second->Name()] = layer_id;
     }
+    scene.SetLayerLocalVisibility(layer_id, local_visible);
+    scene.ApplyLayerVisibility(layer_id);
     scene.deferredRuntimeTextLayerIds.erase(layer_id);
     if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
     } else {

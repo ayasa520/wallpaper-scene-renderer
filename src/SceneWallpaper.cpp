@@ -257,7 +257,7 @@ public:
     virtual ~RenderHandler() {
         frame_timer.Stop();
         if (m_render && m_rg) {
-            m_render->clearLastRenderGraph();
+            m_render->clearLastRenderGraph(true);
         }
         m_rg.reset();
         m_scene.reset();
@@ -309,7 +309,12 @@ private:
         const bool requires_topology_rebuild = m_rg == nullptr || m_scene->renderGraphTopologyDirty;
         if (m_rg) {
             if (requires_topology_rebuild) {
-                m_render->clearLastRenderGraph();
+                // Runtime visibility changes can alter graph topology, but treating that as a
+                // scene switch destroys every prepared pass and recreates hundreds of pipelines on
+                // the next frame. Mature game renderers diff the new graph against the resident one:
+                // unchanged passes keep their PSO/descriptors, removed hidden branches are retired,
+                // and the queued per-layer resource releases drain only after those old passes have
+                // dropped their references. VulkanRender::compileRenderGraph owns that handoff.
             } else {
                 // Minute-level effect text updates only resize existing offscreen resources.
                 // Reusing the compiled graph topology while recreating pass-owned GPU resources
@@ -512,8 +517,13 @@ private:
             if (main_handler.audioSamples()) {
                 m_scene->scriptHost->ApplyAudioSamples(*main_handler.audioSamples());
             }
+            m_scene->scriptHost->MaterializeDeferredRuntimeLayersForResidency();
 
-            if (m_rg) m_render->clearLastRenderGraph();
+            if (m_rg) m_render->clearLastRenderGraph(true);
+            {
+                auto warmup_rg = sceneToPipelineWarmupRenderGraph(*m_scene);
+                m_render->warmupRenderGraphPipelines(*m_scene, *warmup_rg);
+            }
             m_rg = sceneToRenderGraph(*m_scene);
 
             if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");

@@ -27,13 +27,19 @@ size_t EstimateImageBytes(const std::shared_ptr<Image>& image) {
 WPSyntheticImageParser::~WPSyntheticImageParser() = default;
 
 std::shared_ptr<Image> WPSyntheticImageParser::Parse(const std::string& name) {
-    if (const auto it = m_images.find(name); it != m_images.end()) return it->second;
+    {
+        std::lock_guard lock(m_mutex);
+        if (const auto it = m_images.find(name); it != m_images.end()) return it->second;
+    }
     return m_fallback ? m_fallback->Parse(name) : nullptr;
 }
 
 ImageHeader WPSyntheticImageParser::ParseHeader(const std::string& name) {
-    if (const auto it = m_images.find(name); it != m_images.end() && it->second != nullptr) {
-        return it->second->header;
+    {
+        std::lock_guard lock(m_mutex);
+        if (const auto it = m_images.find(name); it != m_images.end() && it->second != nullptr) {
+            return it->second->header;
+        }
     }
     return m_fallback ? m_fallback->ParseHeader(name) : ImageHeader {};
 }
@@ -41,17 +47,23 @@ ImageHeader WPSyntheticImageParser::ParseHeader(const std::string& name) {
 void WPSyntheticImageParser::RegisterImage(std::string key, std::shared_ptr<Image> image) {
     if (key.empty() || image == nullptr) return;
     image->key = key;
+    std::lock_guard lock(m_mutex);
     m_images[std::move(key)] = std::move(image);
 }
 
 void WPSyntheticImageParser::UnregisterImage(const std::string& key) {
     if (key.empty()) return;
+    std::lock_guard lock(m_mutex);
     m_images.erase(key);
 }
 
-size_t WPSyntheticImageParser::TrackedImageCount() const { return m_images.size(); }
+size_t WPSyntheticImageParser::TrackedImageCount() const {
+    std::lock_guard lock(m_mutex);
+    return m_images.size();
+}
 
 size_t WPSyntheticImageParser::TrackedBytes() const {
+    std::lock_guard lock(m_mutex);
     size_t total_bytes = 0;
     for (const auto& [key, image] : m_images) {
         (void)key;

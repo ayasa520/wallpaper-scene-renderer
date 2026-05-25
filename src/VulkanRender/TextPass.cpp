@@ -11,12 +11,22 @@
 #include "WPSceneScriptMedia.hpp"
 
 #include <Eigen/Dense>
+#include <cstdint>
 
 using namespace wallpaper::vulkan;
 
 namespace
 {
 constexpr std::string_view kTextBackgroundTextureKey { "__text_layer_background_white" };
+
+std::string TextPipelineCompatibilityKey(bool offscreen_output) {
+    // Text PSOs are shared by render-pass compatibility plus the full GraphicsPipeline descriptor,
+    // not by the layer that first requested them. This keeps visibility toggles on the same model
+    // as engine-level PSO caches while still letting hidden text release atlas/framebuffer memory.
+    return "TextPass|format=rgba8|final=shader-read|load=" +
+           std::to_string(static_cast<int>(offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                            : VK_ATTACHMENT_LOAD_OP_LOAD));
+}
 
 struct TextPassUniforms {
     float model_view_projection[16] {};
@@ -218,6 +228,64 @@ bool LoadTextPassTexture(const Device&                        device,
     return !out_slots->slots.empty();
 }
 
+bool CreateTextPipelineForPrimitive(const Device&                         device,
+                                    RenderingResources&                   rr,
+                                    const wallpaper::SceneTextPrimitive&  primitive,
+                                    bool                                  offscreen_output,
+                                    std::string                           debug_name,
+                                    PipelineParameters&                   pipeline_parameters) {
+    auto render_pass =
+        CreateTextRenderPass(device.handle(),
+                             VK_FORMAT_R8G8B8A8_UNORM,
+                             offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
+    if (!render_pass.has_value()) return false;
+
+    const auto compiled_shaders = CompileTextShaders();
+    if (!compiled_shaders.has_value()) return false;
+
+    DescriptorSetInfo descriptor_info;
+    descriptor_info.push_descriptor = true;
+    descriptor_info.bindings = {
+        VkDescriptorSetLayoutBinding {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        VkDescriptorSetLayoutBinding {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+    };
+
+    const auto vertex_layout = ResolveTextVertexInputLayout(primitive);
+    if (!vertex_layout.has_value()) return false;
+
+    VkPipelineColorBlendAttachmentState blend_state {};
+    blend_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    SetBlend(wallpaper::BlendMode::Translucent, blend_state);
+
+    GraphicsPipeline pipeline;
+    pipeline.toDefault();
+    pipeline_parameters.debug_name = std::move(debug_name);
+    pipeline_parameters.cache_key  = TextPipelineCompatibilityKey(offscreen_output);
+    pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
+        .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
+        .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+        .addInputBindingDescription(
+            std::span<const VkVertexInputBindingDescription>(&vertex_layout->binding, 1))
+        .addInputAttributeDescription(vertex_layout->attributes);
+    for (const auto& stage : compiled_shaders->stages) {
+        if (!stage) continue;
+        pipeline.addStage(Uni_ShaderSpv(new ShaderSpv(*stage)));
+    }
+
+    return pipeline.create(device, *render_pass, pipeline_parameters, rr.pipeline_cache.get());
+}
+
 std::array<float, 4> ResolveTextColor(const wallpaper::SceneTextPrimitive& primitive,
                                       bool                                 background) {
     if (background) {
@@ -249,6 +317,31 @@ TextPass::TextPass(const Desc& desc) {
     m_desc.output              = desc.output;
 }
 TextPass::~TextPass() = default;
+
+std::string TextPass::residencyKey() const {
+    return "TextPass|node=" + std::to_string(reinterpret_cast<std::uintptr_t>(m_desc.node)) +
+           "|layer=" + std::to_string(m_desc.layer_id) + "|output=" + m_desc.output;
+}
+
+bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
+    const auto* next = dynamic_cast<const TextPass*>(&next_pass);
+    if (next == nullptr) return false;
+    // The text pipeline depends on the text primitive's vertex layout and output target, both
+    // represented by the stable node/layer/output residency key. Visibility gates and the live
+    // scene pointer are safe to absorb without recreating shader modules or descriptor layouts.
+    return residencyKey() == next->residencyKey() &&
+           m_desc.execute_when_hidden == next->m_desc.execute_when_hidden;
+}
+
+void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
+    const auto* next = dynamic_cast<const TextPass*>(&next_pass);
+    if (next == nullptr) return;
+    m_desc.scene               = next->m_desc.scene;
+    m_desc.node                = next->m_desc.node;
+    m_desc.layer_id            = next->m_desc.layer_id;
+    m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
+    m_desc.output              = next->m_desc.output;
+}
 
 bool TextPass::referencesRenderTarget(std::string_view render_target) const {
     // A text pass only owns its bridge output. Glyph atlas pages are imported texture-cache entries,
@@ -400,56 +493,13 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
 
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
     m_desc.clear_output = offscreen_output;
-    auto render_pass =
-        CreateTextRenderPass(device.handle(),
-                             VK_FORMAT_R8G8B8A8_UNORM,
-                             offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
-    if (!render_pass.has_value()) return;
-
-    const auto compiled_shaders = CompileTextShaders();
-    if (!compiled_shaders.has_value()) return;
-
-    DescriptorSetInfo descriptor_info;
-    descriptor_info.push_descriptor = true;
-    descriptor_info.bindings = {
-        VkDescriptorSetLayoutBinding {
-            .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-        VkDescriptorSetLayoutBinding {
-            .binding = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-    };
-
-    const auto vertex_layout = ResolveTextVertexInputLayout(*primitive);
-    if (!vertex_layout.has_value()) return;
-
-    VkPipelineColorBlendAttachmentState blend_state {};
-    blend_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    SetBlend(BlendMode::Translucent, blend_state);
-
-    GraphicsPipeline pipeline;
-    pipeline.toDefault();
-    m_desc.pipeline.debug_name =
+    const auto debug_name =
         "TextPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
-    pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
-        .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
-        .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-        .addInputBindingDescription(std::span<const VkVertexInputBindingDescription>(&vertex_layout->binding, 1))
-        .addInputAttributeDescription(vertex_layout->attributes);
-    for (const auto& stage : compiled_shaders->stages) {
-        if (!stage) continue;
-        pipeline.addStage(Uni_ShaderSpv(new ShaderSpv(*stage)));
+    if (!CreateTextPipelineForPrimitive(
+            device, rr, *primitive, offscreen_output, debug_name, m_desc.pipeline)) {
+        return;
     }
-
-    if (!pipeline.create(device, *render_pass, m_desc.pipeline)) return;
     if (!recreateFramebuffer(device)) return;
 
     rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
@@ -490,6 +540,21 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
         },
     };
     setPrepared();
+}
+
+bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResources& rr) {
+    (void)scene;
+    const auto* primitive =
+        m_desc.node != nullptr ? m_desc.node->Text() : nullptr;
+    if (primitive == nullptr) return false;
+
+    const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
+    const auto debug_name =
+        "TextPassWarmup[node=" +
+        (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
+        ",output=" + m_desc.output + "]";
+    return CreateTextPipelineForPrimitive(
+        device, rr, *primitive, offscreen_output, debug_name, m_desc.pipeline);
 }
 
 void TextPass::refreshResources(Scene& scene, const Device& device, RenderingResources& rr) {
@@ -730,16 +795,25 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
 }
 
 void TextPass::destory(const Device&, RenderingResources& rr) {
+    // Keep the cached text PSO alive through PipelineStateCache, but release every residency-bound
+    // object that points at hidden-layer textures, render targets, or dynamic-buffer suballocations.
+    m_desc.framebuffer.reset();
+    m_desc.vk_output = {};
+    m_desc.background_texture = {};
+    m_desc.page_textures.clear();
     for (auto& subref : m_background_buffers.vertex_bufs) {
         rr.dyn_buf->unallocateSubRef(subref);
     }
     if (m_background_buffers.index_buf) rr.dyn_buf->unallocateSubRef(m_background_buffers.index_buf);
+    m_background_buffers = {};
     for (auto& page_buffers : m_page_buffers) {
         for (auto& subref : page_buffers.vertex_bufs) {
             rr.dyn_buf->unallocateSubRef(subref);
         }
         if (page_buffers.index_buf) rr.dyn_buf->unallocateSubRef(page_buffers.index_buf);
     }
+    m_page_buffers.clear();
     rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
+    m_desc.ubo_buf = {};
     setPrepared(false);
 }

@@ -11,6 +11,19 @@ CopyPass::CopyPass(const Desc& desc): m_desc(desc) {}
 
 CopyPass::~CopyPass() {};
 
+std::string CopyPass::residencyKey() const {
+    return "CopyPass|src=" + m_desc.src + "|dst=" + m_desc.dst;
+}
+
+void CopyPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
+    const auto* next = dynamic_cast<const CopyPass*>(&next_pass);
+    if (next == nullptr) return;
+    // Copy passes have no PSO or private buffers, but they do carry runtime visibility gates for
+    // effect bypass paths. Reusing them keeps graph-diff accounting honest while allowing the newly
+    // built topology to replace only the frame-local gate.
+    m_desc.should_execute = next->m_desc.should_execute;
+}
+
 bool CopyPass::referencesRenderTarget(std::string_view render_target) const {
     // Copy passes only need a resource refresh when their source or destination render target was
     // resized/recreated. Skipping unrelated copies keeps text bridge updates from walking the
@@ -19,6 +32,7 @@ bool CopyPass::referencesRenderTarget(std::string_view render_target) const {
 }
 
 void CopyPass::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
+    (void)rr;
     if (scene.renderTargets.count(m_desc.src) == 0) {
         LOG_ERROR("%s not found", m_desc.src.c_str());
         return;

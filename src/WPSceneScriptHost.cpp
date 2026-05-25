@@ -23,7 +23,10 @@
 
 #include "Scene/Scene.h"
 #include "Scene/include/Scene/SceneImageEffectLayer.h"
+#include "Scene/include/Scene/SceneMaterial.h"
+#include "Scene/include/Scene/SceneMesh.h"
 #include "Scene/include/Scene/SceneNode.h"
+#include "Scene/include/Scene/SceneTextPrimitive.h"
 #include "Audio/SoundManager.h"
 #include "Fs/VFS.h"
 #include "Particle/ParticleSystem.h"
@@ -303,6 +306,8 @@ bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque,
 bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 bool MaterializeDeferredVisibleLayerTreeIfNeeded(WPSceneScriptHost::Opaque* opaque,
                                                  int32_t                    root_layer_id);
+void QueueHiddenLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque,
+                                         int32_t                    root_layer_id);
 bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, SceneNode* node);
 bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance);
@@ -2710,6 +2715,294 @@ bool MaterializeDeferredVisibleLayerTreeIfNeeded(WPSceneScriptHost::Opaque* opaq
     return true;
 }
 
+struct LayerResidencyResources {
+    std::unordered_set<std::string> static_textures;
+    std::unordered_set<std::string> video_textures;
+    std::unordered_set<std::string> render_targets;
+};
+
+bool RetainsGpuResidencyWhileHidden(const Scene& scene, int32_t layer_id) {
+    if (layer_id == 0) return true;
+    if (scene.IsLayerVisible(layer_id)) return true;
+    return scene.offscreenDependencyLayerIds.count(layer_id) != 0;
+}
+
+void MergeResidencyResources(LayerResidencyResources& target,
+                             const LayerResidencyResources& source) {
+    target.static_textures.insert(source.static_textures.begin(), source.static_textures.end());
+    target.video_textures.insert(source.video_textures.begin(), source.video_textures.end());
+    target.render_targets.insert(source.render_targets.begin(), source.render_targets.end());
+}
+
+template<typename Callback>
+void VisitLayerTree(const Scene& scene, int32_t root_layer_id, Callback&& callback) {
+    std::vector<int32_t>        stack { root_layer_id };
+    std::unordered_set<int32_t> visited;
+
+    while (!stack.empty()) {
+        const auto layer_id = stack.back();
+        stack.pop_back();
+        if (layer_id == 0 || !visited.insert(layer_id).second) continue;
+
+        callback(layer_id);
+
+        for (const auto child_id : scene.GetLayerChildren(layer_id)) {
+            stack.push_back(child_id);
+        }
+    }
+}
+
+void PushUniqueResidencyNode(SceneNode* node, std::vector<SceneNode*>& nodes,
+                             std::unordered_set<SceneNode*>& seen) {
+    if (node == nullptr || !seen.insert(node).second) return;
+    nodes.push_back(node);
+}
+
+void CollectLayerEffectResidencyNodes(const Scene& scene, int32_t layer_id,
+                                      std::vector<SceneNode*>& nodes,
+                                      std::unordered_set<SceneNode*>& seen) {
+    auto camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
+    if (camera_names_it == scene.objectRuntimeCameraNames.end()) return;
+
+    for (const auto& camera_name : camera_names_it->second) {
+        auto camera_it = scene.cameras.find(camera_name);
+        if (camera_it == scene.cameras.end() || !camera_it->second ||
+            !camera_it->second->HasImgEffect()) {
+            continue;
+        }
+
+        auto* effect_layer = camera_it->second->GetImgEffect().get();
+        if (effect_layer == nullptr) continue;
+
+        if (effect_layer->HasFinalComposite()) {
+            PushUniqueResidencyNode(&effect_layer->FinalNode(), nodes, seen);
+        }
+
+        for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
+            auto& effect = effect_layer->GetEffect(effect_index);
+            if (!effect) continue;
+            for (auto& effect_node : effect->nodes) {
+                PushUniqueResidencyNode(effect_node.sceneNode.get(), nodes, seen);
+            }
+        }
+    }
+}
+
+std::vector<SceneNode*> CollectLayerResidencyNodes(const Scene& scene, int32_t layer_id) {
+    std::vector<SceneNode*> nodes;
+    std::unordered_set<SceneNode*> seen;
+
+    if (auto runtime_nodes_it = scene.objectRuntimeNodes.find(layer_id);
+        runtime_nodes_it != scene.objectRuntimeNodes.end()) {
+        for (auto* node : runtime_nodes_it->second) {
+            PushUniqueResidencyNode(node, nodes, seen);
+        }
+    }
+    CollectLayerEffectResidencyNodes(scene, layer_id, nodes, seen);
+    return nodes;
+}
+
+void CollectResidencyTextureKey(const Scene& scene, const std::string& key,
+                                LayerResidencyResources& resources) {
+    if (key.empty() || IsSpecLinkTex(key) || key == SpecTex_Default) return;
+
+    if (scene.renderTargets.count(key) != 0 || IsSpecTex(key)) {
+        resources.render_targets.insert(key);
+        return;
+    }
+
+    if (auto texture_it = scene.textures.find(key);
+        texture_it != scene.textures.end() && texture_it->second.isVideo) {
+        resources.video_textures.insert(key);
+        return;
+    }
+
+    resources.static_textures.insert(key);
+}
+
+void CollectResidencyMaterialResources(const Scene& scene, const SceneMaterial& material,
+                                       LayerResidencyResources& resources) {
+    for (const auto& key : material.textures) {
+        CollectResidencyTextureKey(scene, key, resources);
+    }
+}
+
+void CollectResidencyNodeResources(const Scene& scene, SceneNode* node,
+                                   LayerResidencyResources& resources) {
+    if (node == nullptr) return;
+
+    if (auto* mesh = node->Mesh(); mesh != nullptr && mesh->Material() != nullptr) {
+        CollectResidencyMaterialResources(scene, *mesh->Material(), resources);
+    }
+
+    if (auto* text = node->Text(); text != nullptr) {
+        for (const auto& page : text->layout.glyph_pages) {
+            if (!page.texture_key.empty()) resources.static_textures.insert(page.texture_key);
+        }
+    }
+}
+
+LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32_t layer_id) {
+    LayerResidencyResources resources;
+
+    for (auto* node : CollectLayerResidencyNodes(scene, layer_id)) {
+        CollectResidencyNodeResources(scene, node, resources);
+    }
+
+    if (auto render_targets_it = scene.objectRuntimeRenderTargets.find(layer_id);
+        render_targets_it != scene.objectRuntimeRenderTargets.end()) {
+        for (const auto& key : render_targets_it->second) {
+            if (!key.empty() && key != SpecTex_Default) resources.render_targets.insert(key);
+        }
+    }
+
+    return resources;
+}
+
+LayerResidencyResources CollectRetainedResidencyResources(
+    const Scene& scene, const std::unordered_set<int32_t>& excluded_layers = {}) {
+    LayerResidencyResources resources;
+    std::unordered_set<int32_t> visited_layers;
+
+    for (const auto& [layer_id, _] : scene.objectRuntimeNodes) {
+        (void)_;
+        if (!visited_layers.insert(layer_id).second) continue;
+        if (excluded_layers.count(layer_id) != 0) continue;
+        if (!RetainsGpuResidencyWhileHidden(scene, layer_id)) continue;
+
+        MergeResidencyResources(resources, CollectLayerResidencyResources(scene, layer_id));
+    }
+
+    for (const auto& node : scene.bloom.nodes) {
+        if (node) CollectResidencyNodeResources(scene, node.get(), resources);
+    }
+    if (scene.bloom.node) CollectResidencyNodeResources(scene, scene.bloom.node.get(), resources);
+
+    return resources;
+}
+
+void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
+                               const LayerResidencyResources& retained_resources,
+                               const char* reason) {
+    const auto resources = CollectLayerResidencyResources(scene, layer_id);
+    std::size_t queued_static = 0;
+    std::size_t queued_video = 0;
+    std::size_t queued_render_targets = 0;
+
+    for (const auto& key : resources.static_textures) {
+        if (retained_resources.static_textures.count(key) != 0) continue;
+        queued_static += scene.pendingStaticTextureReleaseKeys.insert(key).second ? 1 : 0;
+    }
+    for (const auto& key : resources.video_textures) {
+        if (retained_resources.video_textures.count(key) != 0) continue;
+        queued_video += scene.pendingVideoTextureReleaseKeys.insert(key).second ? 1 : 0;
+    }
+    for (const auto& key : resources.render_targets) {
+        if (retained_resources.render_targets.count(key) != 0) continue;
+        queued_render_targets += scene.pendingRenderTargetReleaseKeys.insert(key).second ? 1 : 0;
+    }
+
+    if (queued_static != 0 || queued_video != 0 || queued_render_targets != 0) {
+        LOG_INFO("SceneResidencyQueueRelease: reason=%s layer=%d static=%zu video=%zu "
+                 "render-target=%zu",
+                 reason != nullptr ? reason : "unknown",
+                 layer_id,
+                 queued_static,
+                 queued_video,
+                 queued_render_targets);
+    }
+}
+
+void QueueHiddenLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque,
+                                         int32_t                    root_layer_id) {
+    if (opaque == nullptr || opaque->scene == nullptr || root_layer_id == 0) return;
+
+    auto& scene = *opaque->scene;
+    const auto retained_resources = CollectRetainedResidencyResources(scene);
+
+    std::size_t queued_static = 0;
+    std::size_t queued_video = 0;
+    std::size_t queued_render_targets = 0;
+
+    VisitLayerTree(scene, root_layer_id, [&](int32_t layer_id) {
+        if (!RetainsGpuResidencyWhileHidden(scene, layer_id)) {
+            const auto static_before = scene.pendingStaticTextureReleaseKeys.size();
+            const auto video_before = scene.pendingVideoTextureReleaseKeys.size();
+            const auto render_target_before = scene.pendingRenderTargetReleaseKeys.size();
+            QueueLayerResourceRelease(scene, layer_id, retained_resources, "hidden");
+            queued_static += scene.pendingStaticTextureReleaseKeys.size() - static_before;
+            queued_video += scene.pendingVideoTextureReleaseKeys.size() - video_before;
+            queued_render_targets +=
+                scene.pendingRenderTargetReleaseKeys.size() - render_target_before;
+        }
+    });
+
+    if (queued_static != 0 || queued_video != 0 || queued_render_targets != 0) {
+        LOG_INFO("SceneResidencyQueueRelease: root-layer=%d static=%zu video=%zu render-target=%zu",
+                 root_layer_id,
+                 queued_static,
+                 queued_video,
+                 queued_render_targets);
+    }
+}
+
+void CancelLayerResourceRelease(Scene& scene, int32_t layer_id, const char* reason,
+                                std::size_t& cancelled_static,
+                                std::size_t& cancelled_video,
+                                std::size_t& cancelled_render_targets) {
+    const auto resources = CollectLayerResidencyResources(scene, layer_id);
+    std::size_t layer_static = 0;
+    std::size_t layer_video = 0;
+    std::size_t layer_render_targets = 0;
+    for (const auto& key : resources.static_textures) {
+        layer_static += scene.pendingStaticTextureReleaseKeys.erase(key);
+    }
+    for (const auto& key : resources.video_textures) {
+        layer_video += scene.pendingVideoTextureReleaseKeys.erase(key);
+    }
+    for (const auto& key : resources.render_targets) {
+        layer_render_targets += scene.pendingRenderTargetReleaseKeys.erase(key);
+    }
+
+    cancelled_static += layer_static;
+    cancelled_video += layer_video;
+    cancelled_render_targets += layer_render_targets;
+
+    if (layer_static != 0 || layer_video != 0 || layer_render_targets != 0) {
+        LOG_INFO("SceneResidencyCancelRelease: reason=%s layer=%d static=%zu video=%zu "
+                 "render-target=%zu",
+                 reason != nullptr ? reason : "unknown",
+                 layer_id,
+                 layer_static,
+                 layer_video,
+                 layer_render_targets);
+    }
+}
+
+void CancelLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque,
+                                    int32_t                    root_layer_id) {
+    if (opaque == nullptr || opaque->scene == nullptr || root_layer_id == 0) return;
+
+    auto& scene = *opaque->scene;
+    std::size_t cancelled_static = 0;
+    std::size_t cancelled_video = 0;
+    std::size_t cancelled_render_targets = 0;
+
+    VisitLayerTree(scene, root_layer_id, [&](int32_t layer_id) {
+        // Visibility can flip more than once before the render thread drains pending releases. When
+        // a hidden branch becomes visible again in the same frame, its resources are retained by the
+        // new graph and must be removed from the eviction queue before Vulkan sees them. This is the
+        // same generation-cancel idea mature engines use for streamed residency requests, just
+        // scoped to the synchronous render-thread queue we already own.
+        CancelLayerResourceRelease(scene,
+                                   layer_id,
+                                   "visible",
+                                   cancelled_static,
+                                   cancelled_video,
+                                   cancelled_render_targets);
+    });
+}
+
 std::optional<uint32_t> FindSoundHandleByLayerId(const WPSceneScriptHost::Opaque* opaque,
                                                  int32_t                          layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return std::nullopt;
@@ -3382,7 +3675,17 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
     std::vector<int32_t> pending = std::move(opaque->pending_destroy_layer_ids);
     opaque->pending_destroy_layer_ids.clear();
 
+    std::unordered_set<int32_t> destroying_layers(pending.begin(), pending.end());
+    const auto retained_resources =
+        CollectRetainedResidencyResources(*opaque->scene, destroying_layers);
+
     for (const int32_t layer_id : pending) {
+        // Dynamic deletion used to get GPU cleanup as an accidental side effect of the broad
+        // topology-rebuild cache clear. Topology rebuilds are now cache-preserving, so delete must
+        // explicitly queue only the resources owned by the removed layer and not by another still
+        // retained layer.
+        QueueLayerResourceRelease(*opaque->scene, layer_id, retained_resources, "destroy");
+
         auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
 
         std::unordered_set<SceneNode*>          destroyed_nodes;
@@ -4824,11 +5127,25 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
         if (opaque != nullptr && opaque->scene != nullptr) {
             const auto layer_id = FindNodeId(opaque, node);
             if (layer_id != 0) {
+                const bool was_effectively_visible = opaque->scene->IsLayerVisible(layer_id);
                 opaque->scene->SetLayerLocalVisibility(layer_id, visible);
                 if (visible && ! MaterializeDeferredVisibleLayerTreeIfNeeded(opaque, layer_id)) {
                     return false;
                 }
                 opaque->scene->ApplyLayerVisibility(layer_id);
+                const bool is_effectively_visible = opaque->scene->IsLayerVisible(layer_id);
+                if (was_effectively_visible != is_effectively_visible) {
+                    // Visibility is now a render-graph residency boundary, not just a draw-time
+                    // branch. Hidden layers are pruned from the graph so their pass-owned GPU
+                    // resources can be released; visible layers must be reintroduced into the
+                    // topology before their next frame can draw.
+                    opaque->scene->MarkRenderGraphTopologyDirty();
+                    if (!is_effectively_visible) {
+                        QueueHiddenLayerTreeResourceRelease(opaque, layer_id);
+                    } else {
+                        CancelLayerTreeResourceRelease(opaque, layer_id);
+                    }
+                }
                 return true;
             }
         }
@@ -8556,6 +8873,82 @@ void WPSceneScriptHost::Initialize() {
     ApplyGeneralSettings(m_impl->general_settings, true);
     ApplyUserProperties(m_impl->user_properties, true);
     ApplyMediaState(m_impl->media_state, true);
+}
+
+void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
+    if (!Ready() || m_scene == nullptr) return;
+
+    std::vector<int32_t>        layer_ids;
+    std::unordered_set<int32_t> queued;
+    auto append_if_deferred = [&](int32_t layer_id) {
+        if (layer_id == 0 || !queued.insert(layer_id).second) return;
+        if (!IsDeferredRuntimeLayer(m_impl, layer_id)) return;
+        layer_ids.push_back(layer_id);
+    };
+
+    for (const auto layer_id : m_scene->layerOrder) {
+        append_if_deferred(layer_id);
+    }
+    for (const auto layer_id : m_scene->deferredRuntimeImageLayerIds) {
+        append_if_deferred(layer_id);
+    }
+    for (const auto layer_id : m_scene->deferredRuntimeParticleLayerIds) {
+        append_if_deferred(layer_id);
+    }
+    for (const auto layer_id : m_scene->deferredRuntimeTextLayerIds) {
+        append_if_deferred(layer_id);
+    }
+    if (layer_ids.empty()) return;
+
+    const auto started_at = std::chrono::steady_clock::now();
+    std::size_t materialized_layers = 0;
+
+    auto register_new_scene_registrations = [&](std::size_t binding_start,
+                                                std::size_t animation_start,
+                                                std::size_t script_start) {
+        for (std::size_t i = binding_start; i < m_scene->bindingRegistrations.size(); ++i) {
+            RegisterPropertyBinding(m_scene->bindingRegistrations[i]);
+        }
+        for (std::size_t i = animation_start; i < m_scene->propertyAnimationRegistrations.size();
+             ++i) {
+            RegisterPropertyAnimation(m_scene->propertyAnimationRegistrations[i]);
+        }
+        for (std::size_t i = script_start; i < m_scene->scriptRegistrations.size(); ++i) {
+            RegisterPropertyScript(m_scene->scriptRegistrations[i]);
+        }
+    };
+
+    for (const auto layer_id : layer_ids) {
+        if (!IsDeferredRuntimeLayer(m_impl, layer_id)) continue;
+
+        const auto binding_start = m_scene->bindingRegistrations.size();
+        const auto animation_start = m_scene->propertyAnimationRegistrations.size();
+        const auto script_start = m_scene->scriptRegistrations.size();
+
+        // This is a residency warm-up: build the full CPU/runtime layer identity after init scripts
+        // have had a chance to settle visibility, but rely on render-graph pruning to keep hidden
+        // layers out of GPU memory. Later visible=true toggles then skip JSON/material parsing and
+        // only need to compile/prepare the graph resources for the newly visible branch.
+        if (!MaterializeDeferredImageLayerIfNeeded(m_impl, layer_id)) continue;
+        if (!MaterializeDeferredParticleLayerIfNeeded(m_impl, layer_id)) continue;
+        if (!MaterializeDeferredTextLayerIfNeeded(m_impl, layer_id)) continue;
+
+        register_new_scene_registrations(binding_start, animation_start, script_start);
+        materialized_layers++;
+    }
+
+    const auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started_at)
+            .count();
+    LOG_INFO("DeferredRuntimeResidencyWarmup: requested=%zu materialized=%zu duration=%.2fms "
+             "remaining-image=%zu remaining-particle=%zu remaining-text=%zu",
+             layer_ids.size(),
+             materialized_layers,
+             elapsed_us / 1000.0,
+             m_scene->deferredRuntimeImageLayerIds.size(),
+             m_scene->deferredRuntimeParticleLayerIds.size(),
+             m_scene->deferredRuntimeTextLayerIds.size());
 }
 
 void WPSceneScriptHost::FrameBegin(double frame_time) {

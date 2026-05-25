@@ -188,6 +188,7 @@ public:
         m_parallaxOffsetCache.clear();
         m_attachmentTransformCache.clear();
     }
+    void     AdvanceAllPuppets();
     uint64_t NextPuppetFrameSerial() const noexcept { return m_puppet_frame_serial + 1; }
 
     void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }

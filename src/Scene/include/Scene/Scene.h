@@ -1,6 +1,9 @@
 #pragma once
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <future>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -24,6 +27,7 @@ class ParticleSystem;
 class ParticleSubSystem;
 class IShaderValueUpdater;
 class IImageParser;
+struct Image;
 struct SceneImageEffect;
 namespace audio
 {
@@ -97,6 +101,18 @@ public:
         std::vector<std::string>                outputs;
     };
 
+    enum class ParsedImageRequestState
+    {
+        Ready,
+        Pending,
+        Failed,
+    };
+
+    struct ParsedImageRequest {
+        ParsedImageRequestState state { ParsedImageRequestState::Failed };
+        std::shared_ptr<Image>  image;
+    };
+
     Scene();
     ~Scene();
 
@@ -124,6 +140,11 @@ public:
                                                      uint32_t effect_index, bool visible);
     bool                    SetEffectLocalVisibilityById(int32_t owner_layer_id,
                                                          int32_t effect_id, bool visible);
+    std::shared_ptr<Image>  GetParsedImageIfReady(const std::string& texture_key);
+    std::shared_ptr<Image>  ParseImageBlockingCached(const std::string& texture_key);
+    ParsedImageRequest      RequestParsedImageAsync(const std::string& texture_key);
+    void                    DropParsedImageCache(std::string_view texture_key);
+    void                    ClearParsedImageCache();
 
     std::unordered_map<std::string, SceneTexture>      textures;
     std::unordered_map<std::string, SceneRenderTarget> renderTargets;
@@ -178,6 +199,15 @@ public:
     UserPropertyMap                      userProperties;
     std::set<std::string>                dirtyImportedTextureKeys;
     std::unordered_set<std::string>      dirtyRenderTargetKeys;
+    // Runtime visibility changes now use explicit resource residency instead of relying on a broad
+    // texture-cache clear during every render-graph topology rebuild. Script/property code records
+    // the concrete cache keys owned only by a hidden layer branch here, and the Vulkan render thread
+    // drains the sets after old passes have released their descriptors but before the new graph is
+    // prepared. Keeping the queue on Scene preserves thread ownership: scene mutation decides what
+    // became unreachable, while Vulkan owns the actual GPU/video destruction.
+    std::unordered_set<std::string>      pendingStaticTextureReleaseKeys;
+    std::unordered_set<std::string>      pendingVideoTextureReleaseKeys;
+    std::unordered_set<std::string>      pendingRenderTargetReleaseKeys;
     // Direct text rerastering changes pass-owned atlas and mesh resources without naming a
     // render-target dependency, so text layers need their own resource-refresh dirty key set.
     std::unordered_set<int32_t>          dirtyTextLayerIds;
@@ -302,5 +332,23 @@ public:
             }
         }
     }
+
+private:
+    struct PendingParsedImageRequest {
+        std::future<std::shared_ptr<Image>>    future;
+        std::chrono::steady_clock::time_point  started_at;
+    };
+
+    std::shared_ptr<Image> CacheParsedImageResultLocked(
+        const std::string& texture_key,
+        std::shared_ptr<Image> image,
+        std::chrono::steady_clock::time_point started_at,
+        const char* success_event,
+        const char* failure_event);
+
+    mutable std::mutex m_parsed_image_mutex;
+    std::unordered_map<std::string, std::shared_ptr<Image>> m_parsed_image_cache;
+    std::unordered_map<std::string, PendingParsedImageRequest> m_pending_parsed_images;
+    std::unordered_set<std::string> m_failed_parsed_images;
 };
 } // namespace wallpaper

@@ -72,6 +72,7 @@ public:
     bool RegisterPropertyScript(WPSceneScriptRegistration registration);
     bool RegisterPropertyAnimation(WPSceneScriptRegistration registration);
     void Initialize();
+    void MaterializeDeferredRuntimeLayersForResidency();
     void FrameBegin(double frame_time);
     void ApplyUserProperties(const UserPropertyMap& user_properties, bool initial_dispatch);
     void ApplyGeneralSettings(const std::unordered_map<std::string, std::string>& general_settings,
