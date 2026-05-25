@@ -1,5 +1,6 @@
 #include "Scene.h"
 
+#include "Image.hpp"
 #include "SceneCamera.h"
 
 #include "Fs/VFS.h"
@@ -9,7 +10,9 @@
 #include "Utils/Logging.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <future>
 #include <unordered_set>
 
 namespace wallpaper 
@@ -17,6 +20,23 @@ namespace wallpaper
 
 namespace
 {
+std::size_t EstimateParsedImageBytes(const std::shared_ptr<Image>& image) {
+    if (image == nullptr) return 0;
+
+    std::size_t total = 0;
+    for (const auto& slot : image->slots) {
+        for (const auto& mipmap : slot.mipmaps) {
+            if (mipmap.size > 0) {
+                total += static_cast<std::size_t>(mipmap.size);
+                continue;
+            }
+            total += static_cast<std::size_t>(std::max(mipmap.width, 0)) *
+                     static_cast<std::size_t>(std::max(mipmap.height, 0)) * 4u;
+        }
+    }
+    return total;
+}
+
 std::string FindDinoRunScoreLayerName(const Scene& scene, int32_t layer_id) {
     if (scene.scene_id.find("dino_run") == std::string::npos) return {};
 
@@ -222,7 +242,191 @@ void ApplyCameraProjectionState(Scene& scene,
 } // namespace
 
 Scene::Scene(): sceneGraph(std::make_shared<SceneNode>()) ,paritileSys(std::make_unique<ParticleSystem>(*this)) {}
-Scene::~Scene() = default;
+
+Scene::~Scene() {
+    ClearParsedImageCache();
+}
+
+std::shared_ptr<Image> Scene::CacheParsedImageResultLocked(
+    const std::string& texture_key,
+    std::shared_ptr<Image> image,
+    std::chrono::steady_clock::time_point started_at,
+    const char* success_event,
+    const char* failure_event) {
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count();
+    if (image != nullptr) {
+        m_parsed_image_cache[texture_key] = image;
+        LOG_INFO("%s: key='%s' bytes=%zu duration=%.2fms",
+                 success_event,
+                 texture_key.c_str(),
+                 EstimateParsedImageBytes(image),
+                 static_cast<double>(elapsed_us) / 1000.0);
+        return image;
+    }
+
+    m_failed_parsed_images.insert(texture_key);
+    LOG_ERROR("%s: key='%s' duration=%.2fms",
+              failure_event,
+              texture_key.c_str(),
+              static_cast<double>(elapsed_us) / 1000.0);
+    return {};
+}
+
+std::shared_ptr<Image> Scene::GetParsedImageIfReady(const std::string& texture_key) {
+    if (texture_key.empty()) return {};
+
+    std::lock_guard lock(m_parsed_image_mutex);
+    if (const auto cached_it = m_parsed_image_cache.find(texture_key);
+        cached_it != m_parsed_image_cache.end()) {
+        return cached_it->second;
+    }
+    if (m_failed_parsed_images.count(texture_key) != 0) return {};
+
+    const auto pending_it = m_pending_parsed_images.find(texture_key);
+    if (pending_it == m_pending_parsed_images.end()) return {};
+    if (pending_it->second.future.wait_for(std::chrono::milliseconds(0)) !=
+        std::future_status::ready) {
+        return {};
+    }
+
+    const auto started_at = pending_it->second.started_at;
+    auto       image      = pending_it->second.future.get();
+    m_pending_parsed_images.erase(pending_it);
+
+    return CacheParsedImageResultLocked(texture_key,
+                                        std::move(image),
+                                        started_at,
+                                        "SceneImageAsyncParseComplete",
+                                        "SceneImageAsyncParseFailed");
+}
+
+std::shared_ptr<Image> Scene::ParseImageBlockingCached(const std::string& texture_key) {
+    if (texture_key.empty() || imageParser == nullptr) return {};
+
+    {
+        std::lock_guard lock(m_parsed_image_mutex);
+        if (const auto cached_it = m_parsed_image_cache.find(texture_key);
+            cached_it != m_parsed_image_cache.end()) {
+            return cached_it->second;
+        }
+        if (m_failed_parsed_images.count(texture_key) != 0) return {};
+
+        const auto pending_it = m_pending_parsed_images.find(texture_key);
+        if (pending_it != m_pending_parsed_images.end()) {
+            const auto started_at = pending_it->second.started_at;
+            auto       image      = pending_it->second.future.get();
+            m_pending_parsed_images.erase(pending_it);
+            return CacheParsedImageResultLocked(texture_key,
+                                                std::move(image),
+                                                started_at,
+                                                "SceneImageAsyncParseJoined",
+                                                "SceneImageAsyncParseFailed");
+        }
+    }
+
+    const auto started_at = std::chrono::steady_clock::now();
+    auto       image      = imageParser->Parse(texture_key);
+
+    std::lock_guard lock(m_parsed_image_mutex);
+    return CacheParsedImageResultLocked(texture_key,
+                                        std::move(image),
+                                        started_at,
+                                        "SceneImageParseBlocking",
+                                        "SceneImageParseBlockingFailed");
+}
+
+Scene::ParsedImageRequest Scene::RequestParsedImageAsync(const std::string& texture_key) {
+    if (texture_key.empty() || imageParser == nullptr) {
+        return { ParsedImageRequestState::Failed, {} };
+    }
+
+    if (auto image = GetParsedImageIfReady(texture_key); image != nullptr) {
+        return { ParsedImageRequestState::Ready, image };
+    }
+
+    {
+        std::lock_guard lock(m_parsed_image_mutex);
+        if (const auto cached_it = m_parsed_image_cache.find(texture_key);
+            cached_it != m_parsed_image_cache.end()) {
+            return { ParsedImageRequestState::Ready, cached_it->second };
+        }
+        if (m_failed_parsed_images.count(texture_key) != 0) {
+            return { ParsedImageRequestState::Failed, {} };
+        }
+        if (m_pending_parsed_images.count(texture_key) != 0) {
+            return { ParsedImageRequestState::Pending, {} };
+        }
+
+        auto*       parser   = imageParser.get();
+        std::string key_copy = texture_key;
+        PendingParsedImageRequest pending;
+        pending.started_at = std::chrono::steady_clock::now();
+        pending.future     = std::async(std::launch::async, [parser, key_copy]() {
+            return parser != nullptr ? parser->Parse(key_copy) : std::shared_ptr<Image> {};
+        });
+        m_pending_parsed_images.emplace(texture_key, std::move(pending));
+    }
+
+    LOG_INFO("SceneImageAsyncParseQueued: key='%s'", texture_key.c_str());
+    return { ParsedImageRequestState::Pending, {} };
+}
+
+void Scene::DropParsedImageCache(std::string_view texture_key) {
+    if (texture_key.empty()) return;
+
+    const std::string key(texture_key);
+    std::future<std::shared_ptr<Image>> pending_future;
+    std::size_t dropped_bytes = 0;
+    bool dropped_cached_image = false;
+    bool dropped_pending_parse = false;
+    {
+        std::lock_guard lock(m_parsed_image_mutex);
+        if (auto cached_it = m_parsed_image_cache.find(key);
+            cached_it != m_parsed_image_cache.end()) {
+            dropped_bytes = EstimateParsedImageBytes(cached_it->second);
+            m_parsed_image_cache.erase(cached_it);
+            dropped_cached_image = true;
+        }
+        if (auto pending_it = m_pending_parsed_images.find(key);
+            pending_it != m_pending_parsed_images.end()) {
+            pending_future = std::move(pending_it->second.future);
+            m_pending_parsed_images.erase(pending_it);
+            dropped_pending_parse = true;
+        }
+        m_failed_parsed_images.erase(key);
+    }
+    if (dropped_cached_image || dropped_pending_parse) {
+        LOG_INFO("SceneImageCacheDrop: key='%s' cached=%s bytes=%zu pending=%s",
+                 key.c_str(),
+                 dropped_cached_image ? "true" : "false",
+                 dropped_bytes,
+                 dropped_pending_parse ? "true" : "false");
+    }
+    if (pending_future.valid()) pending_future.wait();
+}
+
+void Scene::ClearParsedImageCache() {
+    std::vector<std::future<std::shared_ptr<Image>>> pending_futures;
+    {
+        std::lock_guard lock(m_parsed_image_mutex);
+        pending_futures.reserve(m_pending_parsed_images.size());
+        for (auto& [_, request] : m_pending_parsed_images) {
+            if (request.future.valid()) pending_futures.emplace_back(std::move(request.future));
+        }
+        m_parsed_image_cache.clear();
+        m_pending_parsed_images.clear();
+        m_failed_parsed_images.clear();
+    }
+
+    if (!pending_futures.empty()) {
+        LOG_INFO("SceneImageAsyncParseJoin: pending=%zu", pending_futures.size());
+        for (auto& future : pending_futures) {
+            if (future.valid()) future.wait();
+        }
+    }
+}
 
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;

@@ -130,6 +130,7 @@ struct ExtraInfo {
     // clear depth once for each target, then load it for later chunks without touching 2D passes.
     std::unordered_set<std::string> model_depth_outputs_seen {};
     bool                       use_mipmap_framebuffer { false };
+    bool                       include_hidden_for_pipeline_warmup { false };
 };
 
 static bool IsOffscreenDependencyLayer(const ExtraInfo& extra, i32 imgId) {
@@ -177,6 +178,21 @@ static int32_t NodeLayerId(const Scene& scene, SceneNode* node) {
         return owner_it->second;
     }
     return node->ID();
+}
+
+static bool ShouldEmitLayerNodeForResidency(Scene& scene, SceneNode* node, const ExtraInfo& extra) {
+    if (node == nullptr || node == scene.sceneGraph.get()) return true;
+    if (extra.include_hidden_for_pipeline_warmup) return true;
+
+    const int32_t layer_id = NodeLayerId(scene, node);
+    if (layer_id == 0) return true;
+    if (scene.IsLayerVisible(layer_id)) return true;
+
+    // Dependency-source layers are the one hidden case that must stay resident in the graph: other
+    // visible effects can sample their private offscreen outputs. Ordinary hidden layers are
+    // pruned so their passes, framebuffers, descriptors, imported textures, and video decoders can
+    // be released until the layer becomes visible again.
+    return scene.offscreenDependencyLayerIds.count(layer_id) != 0;
 }
 
 static size_t NodeLayerOrderIndex(SceneNode* node, const ExtraInfo& extra) {
@@ -290,6 +306,7 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
             // ordinary effect passes on the same stable render-graph contract.
             pdesc.scene      = &scene;
             pdesc.node       = node;
+            pdesc.layer_id   = imgId;
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
             pdesc.should_execute      = should_execute;
             pdesc.output     = output_key;
@@ -410,6 +427,16 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                      detached_source_node ? "detached-source" : "proxy");
             return;
         }
+    }
+
+    if (node != nullptr && !ShouldEmitLayerNodeForResidency(scene, node, extra)) {
+        LOG_INFO("SceneRenderGraphResidencySkip: layer=%d name='%s' local-visible=%s "
+                 "layer-visible=%s",
+                 NodeLayerId(scene, node),
+                 node->Name().c_str(),
+                 scene.GetLayerLocalVisibility(NodeLayerId(scene, node)) ? "true" : "false",
+                 node->LayerVisible() ? "true" : "false");
+        return;
     }
 
     std::string_view         output = inherited_output;
@@ -619,19 +646,24 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     }
 }
 
-std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
+static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
+    Scene& scene, bool include_hidden_for_pipeline_warmup) {
     std::unique_ptr<rg::RenderGraph> rgraph = std::make_unique<rg::RenderGraph>();
-    ExtraInfo                        extra { .rgraph = rgraph.get(), .scene = &scene };
+    ExtraInfo                        extra { .rgraph = rgraph.get(),
+                                             .scene = &scene,
+                                             .include_hidden_for_pipeline_warmup =
+                                                 include_hidden_for_pipeline_warmup };
     for (size_t index = 0; index < scene.layerOrder.size(); index++) {
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
     LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu proxy-parent-count=%zu proxy-node-count=%zu "
-             "detached-anchor-count=%zu detached-source-count=%zu",
+             "detached-anchor-count=%zu detached-source-count=%zu warmup-hidden=%s",
              scene.layerOrder.size(),
              scene.renderOrderProxyChildren.size(),
              scene.renderOrderProxyNodes.size(),
              scene.detachedEffectSourceNodesByWorldNode.size(),
-             scene.detachedEffectSourceNodes.size());
+             scene.detachedEffectSourceNodes.size(),
+             include_hidden_for_pipeline_warmup ? "true" : "false");
     ToGraphPass(scene.sceneGraph.get(), SpecTex_Default, scene.sceneGraph->ID(), extra);
 
     for (auto& info : extra.link_info) {
@@ -706,4 +738,12 @@ std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
     }
 
     return rgraph;
+}
+
+std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
+    return SceneToRenderGraphImpl(scene, false);
+}
+
+std::unique_ptr<rg::RenderGraph> wallpaper::sceneToPipelineWarmupRenderGraph(Scene& scene) {
+    return SceneToRenderGraphImpl(scene, true);
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -26,6 +27,7 @@ public:
 private:
     std::unique_ptr<IImageParser>                    m_fallback;
     std::unordered_map<std::string, std::shared_ptr<Image>> m_images;
+    mutable std::mutex                               m_mutex;
 };
 
 WPSyntheticImageParser* AsSyntheticImageParser(IImageParser* parser);

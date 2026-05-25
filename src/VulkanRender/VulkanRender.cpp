@@ -21,13 +21,20 @@
 #include "VulkanPass.hpp"
 #include "PrePass.hpp"
 #include "FinPass.hpp"
+#include "CopyPass.hpp"
 #include "Resource.hpp"
 
 #include "Core/ArrayHelper.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <deque>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if ENABLE_RENDERDOC_API
@@ -37,7 +44,9 @@
 using namespace wallpaper::vulkan;
 
 constexpr uint64_t vk_wait_time { 10u * 1000u * 1000000u };
-constexpr uint32_t vk_command_num { 2 };
+constexpr uint32_t vk_command_num { 1 };
+constexpr std::size_t kDeferredPrepareMaxPassesPerFrame { 96 };
+constexpr double      kDeferredPrepareFrameBudgetMs { 2.0 };
 
 constexpr std::array base_inst_exts {
     Extension { false, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME },
@@ -53,6 +62,26 @@ constexpr std::array base_device_exts {
     Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME }
 };
 
+namespace
+{
+
+std::string MakeResidencyInstanceKey(
+    const VulkanPass& pass, std::unordered_map<std::string, std::size_t>& occurrence_counts) {
+    const auto base_key = pass.residencyKey();
+    if (base_key.empty()) return {};
+
+    const auto instance = occurrence_counts[base_key]++;
+    return base_key + "|instance=" + std::to_string(instance);
+}
+
+void DestroyPassOnce(VulkanPass* pass, const Device& device, RenderingResources& resources,
+                     std::unordered_set<VulkanPass*>& destroyed) {
+    if (pass == nullptr || !destroyed.insert(pass).second) return;
+    pass->destory(device, resources);
+}
+
+} // namespace
+
 struct VulkanRender::Impl {
     Impl()  = default;
     ~Impl() = default;
@@ -66,15 +95,18 @@ struct VulkanRender::Impl {
     bool CreateRenderingResource(RenderingResources&);
     void DestroyRenderingResource(RenderingResources&);
 
-    void clearLastRenderGraph();
+    void clearLastRenderGraph(bool clear_scene_caches);
     void clearRenderGraphResources();
+    void releasePendingSceneResources(Scene&);
     void compileRenderGraph(Scene&, rg::RenderGraph&, bool refresh_resources_only);
+    void warmupRenderGraphPipelines(Scene&, rg::RenderGraph&);
     void refreshImportedTextures(Scene&);
     void UpdateCameraFillMode(Scene&, wallpaper::FillMode);
 
     bool initRes();
     void drawFrameSwapchain();
     void drawFrameOffscreen();
+    void processDeferredGraphPreparation(Scene&);
     void setRenderTargetSize(Scene&, rg::RenderGraph&);
     bool isDeviceFaultResult(VkResult) const;
     bool checkVkResult(VkResult, const char* operation);
@@ -93,7 +125,6 @@ struct VulkanRender::Impl {
     std::unique_ptr<StagingBuffer> m_dyn_buf { nullptr };
 
     vvk::CommandBuffers m_cmds;
-    vvk::CommandBuffer  m_upload_cmd;
     vvk::CommandBuffer  m_render_cmd;
 
     bool m_with_surface { false };
@@ -101,11 +132,14 @@ struct VulkanRender::Impl {
     bool m_pass_loaded { false };
     bool m_device_faulted { false };
     bool m_device_fault_log_emitted { false };
+    std::deque<std::size_t> m_deferred_prepare_indices;
+    std::unordered_set<std::size_t> m_deferred_waiting_indices_logged;
 
     std::unique_ptr<VulkanExSwapchain> m_ex_swapchain;
     RenderingResources                 m_rendering_resources;
 
     std::vector<VulkanPass*> m_passes;
+    std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
 
 };
 
@@ -118,10 +152,15 @@ bool VulkanRender::init(RenderInitInfo info) { return pImpl->init(info); }
 void VulkanRender::destroy() { pImpl->destroy(); }
 void VulkanRender::drawFrame(Scene& scene) { pImpl->drawFrame(scene); };
 void VulkanRender::setPaused(bool paused) { pImpl->setPaused(paused); };
-void VulkanRender::clearLastRenderGraph() { pImpl->clearLastRenderGraph(); };
+void VulkanRender::clearLastRenderGraph(bool clear_scene_caches) {
+    pImpl->clearLastRenderGraph(clear_scene_caches);
+};
 void VulkanRender::clearRenderGraphResources() { pImpl->clearRenderGraphResources(); };
 void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg, bool refresh_resources_only) {
     pImpl->compileRenderGraph(scene, rg, refresh_resources_only);
+};
+void VulkanRender::warmupRenderGraphPipelines(Scene& scene, rg::RenderGraph& rg) {
+    pImpl->warmupRenderGraphPipelines(scene, rg);
 };
 void VulkanRender::refreshImportedTextures(Scene& scene) {
     pImpl->refreshImportedTextures(scene);
@@ -289,8 +328,7 @@ bool VulkanRender::Impl::initRes() {
     {
         auto& pool = m_device->cmd_pool();
         VVK_CHECK_BOOL_RE(pool.Allocate(vk_command_num, VK_COMMAND_BUFFER_LEVEL_PRIMARY, m_cmds));
-        m_upload_cmd = vvk::CommandBuffer(m_cmds[0], m_device->handle().Dispatch());
-        m_render_cmd = vvk::CommandBuffer(m_cmds[1], m_device->handle().Dispatch());
+        m_render_cmd = vvk::CommandBuffer(m_cmds[0], m_device->handle().Dispatch());
     }
     if (! CreateRenderingResource(m_rendering_resources)) return false;
 
@@ -316,11 +354,19 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
         image.handle.abandon();
     }
     m_rendering_resources.model_depth_images.clear();
+    if (m_rendering_resources.pipeline_cache) {
+        m_rendering_resources.pipeline_cache->abandon();
+    }
+    if (m_device) {
+        m_device->tex_cache().CancelDeferredGraphActivation();
+    }
     m_rendering_resources.vertex_buf = nullptr;
     m_rendering_resources.dyn_buf = nullptr;
+    m_deferred_prepare_indices.clear();
+    m_deferred_waiting_indices_logged.clear();
 
-    m_upload_cmd.abandon();
     m_render_cmd.abandon();
+    m_compiled_pass_refs.clear();
     m_passes.clear();
     (void)m_prepass.release();
     (void)m_finpass.release();
@@ -349,6 +395,14 @@ void VulkanRender::Impl::destroy() {
         // res
         for (auto& p : m_passes) {
             p->destory(*m_device, m_rendering_resources);
+        }
+        m_compiled_pass_refs.clear();
+        m_passes.clear();
+        m_deferred_prepare_indices.clear();
+        m_deferred_waiting_indices_logged.clear();
+        m_device->tex_cache().CancelDeferredGraphActivation();
+        if (m_rendering_resources.pipeline_cache) {
+            m_rendering_resources.pipeline_cache->clear();
         }
         m_vertex_buf->destroy();
         m_dyn_buf->destroy();
@@ -379,6 +433,7 @@ bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
 
     rr.vertex_buf = m_vertex_buf.get();
     rr.dyn_buf    = m_dyn_buf.get();
+    rr.pipeline_cache = std::make_shared<GraphicsPipelineStateCache>();
     return true;
 }
 
@@ -399,6 +454,7 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
     // removes only the requests whose concrete GStreamer pipeline already exists.
     m_device->video_tex_cache().ApplySeekRequests(scene.videoTextureSeekRequests);
     m_device->video_tex_cache().Poll();
+    processDeferredGraphPreparation(scene);
 
         // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);
 
@@ -432,11 +488,119 @@ void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {
     if (!m_device) return;
 
     for (const auto& key : scene.dirtyImportedTextureKeys) {
-        auto image = scene.imageParser ? scene.imageParser->Parse(key) : nullptr;
+        scene.DropParsedImageCache(key);
+        auto image = scene.ParseImageBlockingCached(key);
         if (!image) continue;
         m_device->tex_cache().CreateTex(*image);
+        scene.DropParsedImageCache(key);
     }
     scene.dirtyImportedTextureKeys.clear();
+}
+
+void VulkanRender::Impl::processDeferredGraphPreparation(Scene& scene) {
+    if (m_deferred_prepare_indices.empty()) return;
+    if (m_device_faulted || !m_device) return;
+
+    const auto batch_started_at = std::chrono::steady_clock::now();
+    std::size_t attempted = 0;
+    std::size_t prepared = 0;
+    bool glslang_scope_open = false;
+
+    while (attempted < kDeferredPrepareMaxPassesPerFrame && !m_deferred_prepare_indices.empty()) {
+        if (attempted != 0) {
+            const auto batch_elapsed_ms =
+                static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - batch_started_at)
+                                        .count()) /
+                1000.0;
+            if (batch_elapsed_ms >= kDeferredPrepareFrameBudgetMs) {
+                break;
+            }
+        }
+
+        const auto pass_index = m_deferred_prepare_indices.front();
+        if (pass_index >= m_passes.size()) {
+            m_deferred_prepare_indices.pop_front();
+            m_deferred_waiting_indices_logged.erase(pass_index);
+            continue;
+        }
+
+        auto* pass = m_passes[pass_index];
+        if (pass == nullptr || pass->prepared()) {
+            m_deferred_prepare_indices.pop_front();
+            m_deferred_waiting_indices_logged.erase(pass_index);
+            continue;
+        }
+
+        const auto key = pass->residencyKey();
+        const auto resources_state = pass->requestDeferredPrepareResources(scene, *m_device);
+        if (resources_state == DeferredPrepareResourcesState::Waiting) {
+            if (m_deferred_waiting_indices_logged.insert(pass_index).second) {
+                LOG_INFO("RenderGraphDeferredPrepareWait: index=%zu remaining=%zu key='%s'",
+                         pass_index,
+                         m_deferred_prepare_indices.size(),
+                         key.c_str());
+            }
+            break;
+        }
+
+        m_deferred_waiting_indices_logged.erase(pass_index);
+        if (!glslang_scope_open) {
+            WPShaderParser::InitGlslang("render-graph-deferred-prepare");
+            glslang_scope_open = true;
+        }
+
+        const auto pass_started_at = std::chrono::steady_clock::now();
+        pass->prepareDeferred(scene, *m_device, m_rendering_resources);
+        const auto pass_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - pass_started_at)
+                                         .count();
+        attempted++;
+        if (pass->prepared()) {
+            prepared++;
+            m_deferred_prepare_indices.pop_front();
+        }
+
+        LOG_INFO("RenderGraphDeferredPreparePass: index=%zu prepared=%s remaining=%zu "
+                 "duration=%.2fms key='%s'",
+                 pass_index,
+                 pass->prepared() ? "true" : "false",
+                 m_deferred_prepare_indices.size(),
+                 static_cast<double>(pass_elapsed_us) / 1000.0,
+                 key.c_str());
+        if (!pass->prepared()) {
+            break;
+        }
+        const auto batch_elapsed_ms =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - batch_started_at)
+                                    .count()) /
+            1000.0;
+        if (batch_elapsed_ms >= kDeferredPrepareFrameBudgetMs) {
+            break;
+        }
+    }
+    if (glslang_scope_open) {
+        WPShaderParser::FinalGlslang("render-graph-deferred-prepare");
+    }
+
+    const auto batch_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - batch_started_at)
+                                      .count();
+    if (attempted != 0) {
+        LOG_INFO("RenderGraphDeferredPrepareBatch: attempted=%zu prepared=%zu remaining=%zu "
+                 "duration=%.2fms",
+                 attempted,
+                 prepared,
+                 m_deferred_prepare_indices.size(),
+                 static_cast<double>(batch_elapsed_us) / 1000.0);
+    }
+
+    if (m_deferred_prepare_indices.empty()) {
+        m_deferred_waiting_indices_logged.clear();
+        m_device->tex_cache().EndDeferredGraphActivation();
+        LOG_INFO("RenderGraphDeferredPrepareComplete");
+    }
 }
 
 void VulkanRender::Impl::drawFrameSwapchain() {
@@ -473,7 +637,13 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin swapchain frame command buffer"))
         return;
+    // Deferred pass preparation can allocate and write static vertex/index subranges between
+    // frames. Recording the static upload here keeps those newly resident passes drawable without
+    // a compile-time WaitIdle, matching the frame-budgeted residency model used by streaming
+    // renderers.
+    m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
+    m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
     for (auto* p : m_passes) {
         if (p->prepared()) {
@@ -514,6 +684,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
 
     if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait swapchain frame fence"))
         return;
+    m_device->tex_cache().RetireCompletedUploads();
     if (!checkVkResult(rr.fence_frame.Reset(), "reset swapchain frame fence"))
         return;
 }
@@ -538,7 +709,9 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
+    m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
+    m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
 
     for (auto* p : m_passes) {
@@ -562,6 +735,7 @@ void VulkanRender::Impl::drawFrameOffscreen() {
 
     if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
         return;
+    m_device->tex_cache().RetireCompletedUploads();
     if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
         return;
     m_ex_swapchain->renderFrame();
@@ -732,7 +906,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     ApplyTextLayerScreenAnchorTransforms(scene);
 }
 
-void VulkanRender::Impl::clearLastRenderGraph() {
+void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     if (m_device_faulted) {
         // After device loss, pass destruction can call vkDestroyPipeline and friends on a driver
         // context that already timed out.  Leave the bounded stale graph abandoned with the renderer
@@ -747,8 +921,21 @@ void VulkanRender::Impl::clearLastRenderGraph() {
         p->destory(*m_device, m_rendering_resources);
     }
     m_passes.clear();
-    m_device->tex_cache().Clear();
-    m_device->video_tex_cache().Clear();
+    m_compiled_pass_refs.clear();
+    m_deferred_prepare_indices.clear();
+    m_deferred_waiting_indices_logged.clear();
+    m_device->tex_cache().CancelDeferredGraphActivation();
+    if (clear_scene_caches) {
+        // Scene switches and renderer shutdown still own a full cache teardown. Ordinary topology
+        // rebuilds no longer do this: visibility-driven residency now releases only the keys that
+        // became unreachable, so showing one deferred layer cannot evict every unrelated texture
+        // and video decoder in the wallpaper.
+        m_device->tex_cache().Clear();
+        m_device->video_tex_cache().Clear();
+        if (m_rendering_resources.pipeline_cache) {
+            m_rendering_resources.pipeline_cache->clear();
+        }
+    }
     // Shared model depth images are tied to the compiled graph's output targets. Dropping them on
     // full graph rebuilds keeps 3D model depth opt-in and avoids stale depth attachments surviving
     // after scene topology or render-target ownership changes.
@@ -759,6 +946,58 @@ void VulkanRender::Impl::clearLastRenderGraph() {
 
     m_vertex_buf->allocate();
     m_dyn_buf->allocate();
+}
+
+void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
+    if (m_device_faulted || !m_device) return;
+    if (scene.pendingStaticTextureReleaseKeys.empty() &&
+        scene.pendingVideoTextureReleaseKeys.empty() &&
+        scene.pendingRenderTargetReleaseKeys.empty()) {
+        return;
+    }
+
+    const auto before_texture_bytes = m_device->tex_cache().GetTrackedBytes();
+    const auto before_texture_count = m_device->tex_cache().GetTrackedImageCount();
+    const auto before_video_bytes   = m_device->video_tex_cache().GetTrackedBytes();
+    const auto before_video_count   = m_device->video_tex_cache().GetTrackedEntryCount();
+
+    std::size_t released_static = 0;
+    std::size_t released_render_targets = 0;
+    std::size_t released_videos = 0;
+
+    for (const auto& key : scene.pendingStaticTextureReleaseKeys) {
+        if (m_device->tex_cache().ReleaseTexture(key)) released_static++;
+        scene.DropParsedImageCache(key);
+    }
+    for (const auto& key : scene.pendingRenderTargetReleaseKeys) {
+        if (m_device->tex_cache().ReleaseRenderTarget(key)) released_render_targets++;
+    }
+    for (const auto& key : scene.pendingVideoTextureReleaseKeys) {
+        if (m_device->video_tex_cache().Release(key)) released_videos++;
+    }
+
+    LOG_INFO("SceneResidencyRelease: static=%zu/%zu render-target=%zu/%zu video=%zu/%zu "
+             "texture-bytes-before=%zu texture-bytes-after=%zu texture-images-before=%zu "
+             "texture-images-after=%zu video-bytes-before=%zu video-bytes-after=%zu "
+             "video-entries-before=%zu video-entries-after=%zu",
+             released_static,
+             scene.pendingStaticTextureReleaseKeys.size(),
+             released_render_targets,
+             scene.pendingRenderTargetReleaseKeys.size(),
+             released_videos,
+             scene.pendingVideoTextureReleaseKeys.size(),
+             before_texture_bytes,
+             m_device->tex_cache().GetTrackedBytes(),
+             before_texture_count,
+             m_device->tex_cache().GetTrackedImageCount(),
+             before_video_bytes,
+             m_device->video_tex_cache().GetTrackedBytes(),
+             before_video_count,
+             m_device->video_tex_cache().GetTrackedEntryCount());
+
+    scene.pendingStaticTextureReleaseKeys.clear();
+    scene.pendingVideoTextureReleaseKeys.clear();
+    scene.pendingRenderTargetReleaseKeys.clear();
 }
 
 void VulkanRender::Impl::clearRenderGraphResources() {
@@ -774,34 +1013,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     if (m_device_faulted) return;
     if (! m_inited) return;
     m_pass_loaded = false;
-
-    auto submit_pending_uploads = [&]() -> bool {
-        if (!checkVkResult(m_upload_cmd.Begin(VkCommandBufferBeginInfo {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .pNext = nullptr,
-            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        }), "begin upload command buffer"))
-            return false;
-        m_vertex_buf->recordUpload(m_upload_cmd);
-        // Resource refresh can now update dynamic text meshes and text-backed effect quads before
-        // the first post-refresh frame is recorded. Uploading the dynamic buffer here makes those
-        // writes visible immediately, instead of waiting for the next frame and briefly drawing
-        // resized text bridge passes with stale or uninitialized GPU subranges.
-        m_dyn_buf->recordUpload(m_upload_cmd);
-        if (!checkVkResult(m_upload_cmd.End(), "end upload command buffer"))
-            return false;
-        VkSubmitInfo sub_info {
-            .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext              = nullptr,
-            .commandBufferCount = 1,
-            .pCommandBuffers    = m_upload_cmd.address(),
-        };
-        if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, {}), "submit render graph uploads"))
-            return false;
-        if (!checkVkResult(m_device->handle().WaitIdle(), "wait idle after render graph uploads"))
-            return false;
-        return true;
-    };
+    const bool had_resident_graph = !m_compiled_pass_refs.empty();
 
     if (refresh_resources_only && !m_passes.empty()) {
         setRenderTargetSize(scene, rg);
@@ -848,7 +1060,10 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         (void)refresh_all;
         (void)refreshed_passes;
         (void)prepared_passes;
-        if (!submit_pending_uploads()) return;
+        // Mature renderers do not submit a separate upload command and idle the whole device while
+        // rebuilding resource bindings. The next draw command records all dirty vertex, dynamic,
+        // and texture uploads before executing passes, preserving ordering without a render-thread
+        // queue drain.
         m_pass_loaded = true;
         return;
     }
@@ -857,27 +1072,88 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     auto node_release_texs = rg.getLastReadTexs(nodes);
 
     m_passes.clear();
+    m_deferred_prepare_indices.clear();
+    m_deferred_waiting_indices_logged.clear();
+    m_device->tex_cache().CancelDeferredGraphActivation();
     m_passes.resize(nodes.size());
 
-    std::transform(nodes.begin(),
-                   nodes.end(),
-                   node_release_texs.begin(),
-                   m_passes.begin(),
-                   [&rg](auto& id, auto& texs) {
-                       auto* pass = rg.getPass(id);
-                       assert(pass != nullptr);
-                       VulkanPass* vpass = static_cast<VulkanPass*>(pass);
-                       // Release ownership is compiled from the current render graph topology, not
-                       // from pass construction. Clear stale metadata before assigning this graph's
-                       // final-reader keys so reused pass objects keep an exact lifecycle contract.
-                       vpass->clearReleaseTexs();
-                       // LOG_INFO("----release tex");
-                       for (auto& tex : texs) {
-                           vpass->addReleaseTexs(spanone<const std::string_view> { tex->key() });
-                           //    LOG_INFO("%s", tex->key().data());
-                       }
-                       return vpass;
-                   });
+    std::unordered_map<std::string, std::shared_ptr<rg::Pass>> reusable_passes;
+    std::unordered_map<std::string, std::size_t> old_key_counts;
+    for (const auto& old_pass_ref : m_compiled_pass_refs) {
+        auto old_pass = std::dynamic_pointer_cast<VulkanPass>(old_pass_ref);
+        if (!old_pass) continue;
+        const auto key = MakeResidencyInstanceKey(*old_pass, old_key_counts);
+        if (!key.empty()) reusable_passes.emplace(key, old_pass_ref);
+    }
+
+    std::unordered_map<std::string, std::size_t> new_key_counts;
+    std::unordered_set<VulkanPass*> reused_passes;
+    std::vector<std::shared_ptr<rg::Pass>> next_compiled_pass_refs;
+    next_compiled_pass_refs.reserve(nodes.size());
+    std::size_t reused_count = 0;
+    std::size_t new_count = 0;
+
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        const auto node_id = nodes[index];
+        auto       pass_ref = rg.getPassShared(node_id);
+        assert(pass_ref != nullptr);
+        auto*      vpass = dynamic_cast<VulkanPass*>(pass_ref.get());
+        assert(vpass != nullptr);
+
+        const auto key = MakeResidencyInstanceKey(*vpass, new_key_counts);
+        if (!key.empty()) {
+            if (auto reusable_it = reusable_passes.find(key);
+                reusable_it != reusable_passes.end()) {
+                auto reusable_vpass = std::dynamic_pointer_cast<VulkanPass>(reusable_it->second);
+                if (reusable_vpass && reusable_vpass->canReuseForResidency(*vpass)) {
+                    // Mature renderers do not destroy every pipeline just because one layer toggled
+                    // visibility. The new render graph describes the fresh topology, while this
+                    // handoff keeps matching prepared pass objects alive and updates only their
+                    // graph-local gates/texture declarations. Removed passes are retired below,
+                    // which preserves hidden-layer resource release without a whole-scene PSO
+                    // rebuild.
+                    reusable_vpass->absorbResidencyGraphState(*vpass);
+                    pass_ref = reusable_it->second;
+                    vpass = reusable_vpass.get();
+                    rg.replacePass(node_id, pass_ref);
+                    reused_passes.insert(vpass);
+                    reused_count++;
+                    reusable_passes.erase(reusable_it);
+                }
+            }
+        }
+        if (reused_passes.count(vpass) == 0) {
+            new_count++;
+        }
+
+        // Release ownership is compiled from the current render graph topology, not from pass
+        // construction. Clear stale metadata before assigning this graph's final-reader keys so
+        // reused pass objects keep an exact lifecycle contract.
+        vpass->clearReleaseTexs();
+        for (auto& tex : node_release_texs[index]) {
+            vpass->addReleaseTexs(spanone<const std::string_view> { tex->key() });
+        }
+        m_passes[index] = vpass;
+        next_compiled_pass_refs.push_back(std::move(pass_ref));
+    }
+
+    std::unordered_set<VulkanPass*> destroyed_passes;
+    std::size_t retired_count = 0;
+    for (const auto& [_, stale_pass_ref] : reusable_passes) {
+        auto stale_pass = std::dynamic_pointer_cast<VulkanPass>(stale_pass_ref);
+        if (!stale_pass) continue;
+        const auto before_destroy_count = destroyed_passes.size();
+        DestroyPassOnce(stale_pass.get(), *m_device, m_rendering_resources, destroyed_passes);
+        if (destroyed_passes.size() != before_destroy_count) retired_count++;
+    }
+    m_compiled_pass_refs = std::move(next_compiled_pass_refs);
+    releasePendingSceneResources(scene);
+
+    LOG_INFO("RenderGraphResidencyDiff: reused=%zu new=%zu retired=%zu graph-passes=%zu",
+             reused_count,
+             new_count,
+             retired_count,
+             nodes.size());
 
     m_passes.insert(m_passes.begin(), m_prepass.get());
     m_passes.push_back(m_finpass.get());
@@ -885,21 +1161,120 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     setRenderTargetSize(scene, rg);
 
     WPShaderParser::InitGlslang("render-graph-compile");
+    std::size_t reused_refreshed_count = 0;
+    std::size_t refreshed_count = 0;
+    std::size_t prepared_count = 0;
+    std::size_t dependency_prepared_count = 0;
+    std::size_t deferred_count = 0;
+    std::size_t deferred_waiting_count = 0;
+    std::size_t already_prepared_count = 0;
+    // CopyPass is a lightweight graph-residency pass, not a heavy shader pass: it registers
+    // dynamic copy render targets such as `_rt_default_*_copy` in Scene::renderTargets and binds
+    // their TextureCache images. Reused shader passes can legitimately sample those copy targets
+    // during the same topology compile, so deferring CopyPass creation lets refreshed passes see a
+    // missing input and black out the frame. Prepare copy dependencies up front, then keep the
+    // expensive shader/image passes on the deferred residency queue.
     for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
         auto* p = m_passes[pass_index];
-        LOG_INFO("RenderGraphCompile: prepare index=%zu type=%s prepared=%s",
-                 pass_index,
-                 p != nullptr ? typeid(*p).name() : "(null)",
-                 p != nullptr && p->prepared() ? "true" : "false");
+        if (p == nullptr || p->prepared()) continue;
+        if (dynamic_cast<CopyPass*>(p) == nullptr) continue;
+        p->prepare(scene, *m_device, m_rendering_resources);
+        dependency_prepared_count++;
+    }
+    for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
+        auto* p = m_passes[pass_index];
+        if (p != nullptr && reused_passes.count(p) != 0 && p->prepared()) {
+            p->refreshResources(scene, *m_device, m_rendering_resources);
+            reused_refreshed_count++;
+        }
         if (refresh_resources_only && p != nullptr && p->prepared()) {
             p->refreshResources(scene, *m_device, m_rendering_resources);
+            refreshed_count++;
         }
         if (p != nullptr && !p->prepared()) {
-            p->prepare(scene, *m_device, m_rendering_resources);
+            const bool is_copy_dependency = dynamic_cast<CopyPass*>(p) != nullptr;
+            const bool can_defer_runtime_prepare =
+                had_resident_graph && !refresh_resources_only && p != m_prepass.get() &&
+                p != m_finpass.get() && !is_copy_dependency;
+            if (can_defer_runtime_prepare) {
+                // Runtime visibility changes should not monopolize the render thread by making
+                // every newly-visible layer allocate textures, framebuffers, and staging uploads in
+                // one compile call. Queue cold passes and let drawFrame() advance residency a pass
+                // at a time while already-prepared scene content keeps rendering.
+                if (p->requestDeferredPrepareResources(scene, *m_device) ==
+                    DeferredPrepareResourcesState::Waiting) {
+                    deferred_waiting_count++;
+                }
+                m_deferred_prepare_indices.push_back(pass_index);
+                deferred_count++;
+            } else {
+                p->prepare(scene, *m_device, m_rendering_resources);
+                prepared_count++;
+            }
+        } else if (p != nullptr) {
+            already_prepared_count++;
         }
     }
     WPShaderParser::FinalGlslang("render-graph-compile");
 
-    if (!submit_pending_uploads()) return;
+    LOG_INFO("RenderGraphCompileSummary: total=%zu reused-refreshed=%zu refreshed=%zu "
+             "prepared=%zu dependency-prepared=%zu deferred=%zu already-prepared=%zu mode=%s",
+             m_passes.size(),
+             reused_refreshed_count,
+             refreshed_count,
+             prepared_count,
+             dependency_prepared_count,
+             deferred_count,
+             already_prepared_count,
+             refresh_resources_only ? "resources" : "topology");
+    if (deferred_count > 0) {
+        m_device->tex_cache().BeginDeferredGraphActivation();
+        LOG_INFO("RenderGraphDeferredPrepareQueued: count=%zu max-passes-per-frame=%zu "
+                 "frame-budget=%.2fms resource-waiting=%zu",
+                 deferred_count,
+                 kDeferredPrepareMaxPassesPerFrame,
+                 kDeferredPrepareFrameBudgetMs,
+                 deferred_waiting_count);
+    }
+
+    // Upload work queued by prepare() is recorded at the start of the next frame command buffer.
+    // Avoiding a compile-time queue submit + DeviceWaitIdle is what keeps visibility-driven graph
+    // changes from behaving like a scene load.
     m_pass_loaded = true;
 };
+
+void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGraph& rg) {
+    if (m_device_faulted) return;
+    if (!m_inited || !m_device || !m_rendering_resources.pipeline_cache) return;
+
+    const auto started_at = std::chrono::steady_clock::now();
+    auto       nodes      = rg.topologicalOrder();
+
+    setRenderTargetSize(scene, rg);
+
+    std::size_t pipeline_passes = 0;
+    std::size_t warmed_passes   = 0;
+
+    WPShaderParser::InitGlslang("render-graph-pipeline-warmup");
+    for (const auto node_id : nodes) {
+        auto pass_ref = rg.getPassShared(node_id);
+        auto vpass = std::dynamic_pointer_cast<VulkanPass>(pass_ref);
+        if (!vpass) continue;
+        pipeline_passes++;
+        if (vpass->warmupPipeline(scene, *m_device, m_rendering_resources)) {
+            warmed_passes++;
+        }
+    }
+    WPShaderParser::FinalGlslang("render-graph-pipeline-warmup");
+
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count();
+    LOG_INFO("RenderGraphPipelineWarmup: graph-passes=%zu pipeline-passes=%zu warmed=%zu "
+             "cached-states=%zu duration=%.2fms",
+             nodes.size(),
+             pipeline_passes,
+             warmed_passes,
+             m_rendering_resources.pipeline_cache->size(),
+             static_cast<double>(elapsed_us) / 1000.0);
+}

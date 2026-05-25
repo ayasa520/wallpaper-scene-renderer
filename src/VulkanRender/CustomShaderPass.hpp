@@ -27,6 +27,7 @@ public:
         // sizes diverge from the authored logical content rectangle.
         Scene*                   scene { nullptr };
         SceneNode*               node { nullptr };
+        int32_t                  layer_id { 0 };
         bool                     execute_when_hidden { false };
         // Optional runtime gate for topology-stable helper passes. This is used for the synthetic
         // hidden-final-effect composite: the pass exists in the graph, but it must only draw on
@@ -75,10 +76,16 @@ public:
     void setDescTex(u32 index, std::string_view tex_key);
 
     void prepare(Scene&, const Device&, RenderingResources&) override;
+    void prepareDeferred(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
     void updateBeforeUpload() override;
+    DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) override;
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
+    bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;
+    std::string residencyKey() const override;
+    bool canReuseForResidency(const VulkanPass& next_pass) const override;
+    void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
 
 private:

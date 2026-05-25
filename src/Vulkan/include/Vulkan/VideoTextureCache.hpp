@@ -50,6 +50,7 @@ public:
     void          Poll();
     void          RecordUploads(vvk::CommandBuffer&);
     void          Clear();
+    bool          Release(std::string_view key);
     std::size_t   GetTrackedBytes() const;
     std::size_t   GetTrackedEntryCount() const;
 

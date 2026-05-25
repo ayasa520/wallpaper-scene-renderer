@@ -1,5 +1,6 @@
 #pragma once
 #include "Core/NoCopyMove.hpp"
+#include "Vulkan/GraphicsPipeline.hpp"
 #include "Vulkan/StagingBuffer.hpp"
 #include "vvk/vma_wrapper.hpp"
 #include <memory>
@@ -20,6 +21,8 @@ struct RenderingResources {
 
     StagingBuffer* vertex_buf;
     StagingBuffer* dyn_buf;
+
+    std::shared_ptr<GraphicsPipelineStateCache> pipeline_cache;
 
     // 3D model chunks are emitted as separate CustomShaderPass instances, but authored WE models
     // rely on them sharing one depth buffer per output target. Keeping that depth storage here makes

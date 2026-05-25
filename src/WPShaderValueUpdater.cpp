@@ -186,6 +186,7 @@ void WPShaderValueUpdater::FrameBegin() {
     if (!(m_parallax.delay > 0.0f) || !std::isfinite(m_parallax.delay)) {
         m_mousePosLast     = previousMousePos;
         m_mousePos         = m_mousePosInput;
+        AdvanceAllPuppets();
         return;
     }
 
@@ -195,6 +196,29 @@ void WPShaderValueUpdater::FrameBegin() {
     m_mousePosLast     = previousMousePos;
     m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
                                       (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
+    AdvanceAllPuppets();
+}
+
+void WPShaderValueUpdater::AdvanceAllPuppets() {
+    if (!m_scene) return;
+    const double frame_time = m_scene->frameTime;
+
+    for (auto& [addr, nodeData] : m_nodeDataMap) {
+        if (!nodeData.puppet_layer.hasPuppet()) continue;
+        nodeData.puppet_layer.AdvanceIfNeeded(frame_time, m_puppet_frame_serial);
+
+        if (nodeData.transform_binding.IsBoneAttachment()) {
+            auto* parent = nodeData.transform_binding.parent;
+            if (parent != nullptr) {
+                auto parent_it = m_nodeDataMap.find(parent);
+                if (parent_it != m_nodeDataMap.end() &&
+                    parent_it->second.puppet_layer.hasPuppet()) {
+                    parent_it->second.puppet_layer.AdvanceIfNeeded(
+                        frame_time, m_puppet_frame_serial);
+                }
+            }
+        }
+    }
 }
 
 void WPShaderValueUpdater::FrameEnd() {}

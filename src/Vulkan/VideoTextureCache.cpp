@@ -2087,6 +2087,27 @@ void VideoTextureCache::Clear() {
     m_entries.clear();
 }
 
+bool VideoTextureCache::Release(std::string_view key) {
+    const auto iter =
+        std::find_if(m_entries.begin(), m_entries.end(), [key](const auto& entry) {
+            return entry != nullptr && entry->key == key;
+        });
+    if (iter == m_entries.end()) return false;
+
+    const std::string key_string(key);
+    const auto        before_bytes = GetTrackedBytes();
+    const auto        before_count = GetTrackedEntryCount();
+    m_entries.erase(iter);
+    LOG_INFO("VideoTextureCacheRelease: key='%s' bytes-before=%zu bytes-after=%zu "
+             "entries-before=%zu entries-after=%zu",
+             key_string.c_str(),
+             before_bytes,
+             GetTrackedBytes(),
+             before_count,
+             GetTrackedEntryCount());
+    return true;
+}
+
 std::size_t VideoTextureCache::GetTrackedBytes() const {
     std::size_t total = 0;
     for (const auto& entry : m_entries) {

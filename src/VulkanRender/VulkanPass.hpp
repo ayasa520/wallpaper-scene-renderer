@@ -20,6 +20,12 @@ class Device;
 class RenderingResources;
 class Resource;
 
+enum class DeferredPrepareResourcesState
+{
+    Ready,
+    Waiting,
+};
+
 class VulkanPass : public rg::Pass {
 public:
     VulkanPass()                                                     = default;
@@ -37,8 +43,29 @@ public:
     // intentionally stay on execute() because text/effect composites depend on the original pass
     // ordering for their transform and texture-projection state.
     virtual void updateBeforeUpload() {}
+    // Deferred runtime preparation is split into an asset-streaming phase and a Vulkan residency
+    // phase. A pass returns Waiting after it has queued background CPU work, allowing the renderer
+    // to keep drawing prepared content instead of blocking the render thread on asset decoding.
+    virtual DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) {
+        return DeferredPrepareResourcesState::Ready;
+    }
+    // Deferred preparation is used for runtime visibility changes after a resident graph already
+    // exists. The default path is equivalent to ordinary prepare(), while heavier passes can
+    // override it to enforce a non-blocking streaming contract before any synchronous fallback work
+    // is allowed to run on the render thread.
+    virtual void prepareDeferred(Scene& scene, const Device& device, RenderingResources& resources) {
+        prepare(scene, device, resources);
+    }
     virtual void execute(const Device&, RenderingResources&)         = 0;
     virtual void destory(const Device&, RenderingResources&)         = 0;
+    // Pipeline warm-up mirrors PSO precompilation in game engines: build immutable pipeline state
+    // without binding layer-owned textures, framebuffers, or mesh buffers. Hidden deferred layers
+    // can therefore keep memory residency at zero while their future visible frame avoids
+    // vkCreateGraphicsPipelines.
+    virtual bool warmupPipeline(Scene&, const Device&, RenderingResources&) { return false; }
+    virtual std::string residencyKey() const { return {}; }
+    virtual bool canReuseForResidency(const VulkanPass& next_pass) const;
+    virtual void absorbResidencyGraphState(const VulkanPass&) {}
     virtual bool referencesRenderTarget(std::string_view) const { return false; }
     virtual bool referencesTextLayer(int32_t) const { return false; }
 

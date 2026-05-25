@@ -5,6 +5,11 @@
 
 using namespace wallpaper::vulkan;
 
+bool VulkanPass::canReuseForResidency(const VulkanPass& next_pass) const {
+    const auto key = residencyKey();
+    return !key.empty() && key == next_pass.residencyKey();
+}
+
 void VulkanPass::releaseFinalReadTexs(const Device& device) const {
     for (const auto& tex : releaseTexs()) {
         // A pass-local release key means this pass is the render graph's final reader for that
