@@ -43,7 +43,7 @@ public:
     float                bloomstrength { 0.0f };
     float                bloomthreshold { 1.0f };
     std::array<float, 3> bloomtint { 1.0f, 1.0f, 1.0f };
-    bool                 bloomhdr { false };
+    bool                 hdr { false };
     float                bloomhdrstrength { 0.0f };
     float                bloomhdrthreshold { 1.0f };
     float                bloomhdrscatter { 1.0f };
