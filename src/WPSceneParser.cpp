@@ -2748,7 +2748,7 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
     scene.bloom.strength               = sc.general.bloomstrength;
     scene.bloom.threshold              = sc.general.bloomthreshold;
     scene.bloom.tint                   = sc.general.bloomtint;
-    scene.bloom.hdr                    = sc.general.bloomhdr;
+    scene.bloom.hdr                    = sc.general.hdr;
     scene.bloom.hdrStrength            = sc.general.bloomhdrstrength;
     scene.bloom.hdrThreshold           = sc.general.bloomhdrthreshold;
     scene.bloom.hdrScatter             = sc.general.bloomhdrscatter;
