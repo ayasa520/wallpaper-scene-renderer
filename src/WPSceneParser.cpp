@@ -4133,6 +4133,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
 
             // fbo name map and effect command
             std::string effaddr = getAddr(imgEffectLayer.get());
+            const auto  feedback_fbos = wpeffobj.FeedbackFboNames();
 
             std::unordered_map<std::string, std::string> fboMap;
             {
@@ -4140,13 +4141,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 for (usize i = 0; i < wpeffobj.fbos.size(); i++) {
                     const auto& wpfbo  = wpeffobj.fbos.at(i);
                     std::string rtname = wpfbo.name + "_" + effaddr;
-                    if (wpimgobj.fullscreen) {
+                    const auto  fbo_size = wpfbo.ResolveSize(effect_source_size);
+                    const bool  persistent_feedback_fbo =
+                        feedback_fbos.count(wpfbo.name) != 0;
+                    if (wpimgobj.fullscreen && wpfbo.fit == 0) {
                         scene.renderTargets[rtname] = {
                             .width      = 2,
                             .height     = 2,
                             .mapWidth   = 2,
                             .mapHeight  = 2,
-                            .allowReuse = true,
+                            .allowReuse = ! persistent_feedback_fbo,
                         };
                         scene.renderTargets[rtname].bind = {
                             .enable = true,
@@ -4154,14 +4158,32 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                             .scale  = 1.0 / wpfbo.scale,
                         };
                     } else {
-                        // i+2 for not override object's rt
+                        // `fit`-sized feedback buffers are authored simulation textures, not
+                        // display-space framebuffers. Resolve them directly here so shaders see the
+                        // intended texel size through g_TextureNResolution and their diffusion
+                        // kernels advance at Wallpaper Engine's authored rate.
                         scene.renderTargets[rtname] = {
-                            .width      = (uint16_t)(effect_source_size[0] / (float)wpfbo.scale),
-                            .height     = (uint16_t)(effect_source_size[1] / (float)wpfbo.scale),
-                            .mapWidth   = (uint16_t)(effect_source_size[0] / (float)wpfbo.scale),
-                            .mapHeight  = (uint16_t)(effect_source_size[1] / (float)wpfbo.scale),
-                            .allowReuse = true
+                            .width      = fbo_size[0],
+                            .height     = fbo_size[1],
+                            .mapWidth   = fbo_size[0],
+                            .mapHeight  = fbo_size[1],
+                            .allowReuse = ! persistent_feedback_fbo,
                         };
+                    }
+                    if (wpfbo.fit > 0 || persistent_feedback_fbo) {
+                        LOG_INFO("SceneEffectFboResolve: layer=%d effect-id=%d effect='%s' "
+                                 "fbo='%s' target='%s' size=%dx%d scale=%u fit=%u "
+                                 "persistent-feedback=%s",
+                                 wpimgobj.id,
+                                 wpeffobj.id,
+                                 wpeffobj.name.c_str(),
+                                 wpfbo.name.c_str(),
+                                 rtname.c_str(),
+                                 fbo_size[0],
+                                 fbo_size[1],
+                                 wpfbo.scale,
+                                 wpfbo.fit,
+                                 persistent_feedback_fbo ? "true" : "false");
                     }
                     scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(rtname);
                     fboMap[wpfbo.name] = rtname;
@@ -4485,32 +4507,41 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             }
             std::unordered_map<std::string, std::string> fbo_map;
             fbo_map["previous"] = in_rt;
+            const auto feedback_fbos = wp_effect.FeedbackFboNames();
 
             for (const auto& wp_fbo : wp_effect.fbos) {
                 const std::string rt_name = wp_fbo.name + "_" + effect_addr;
-                // The first-class text bridge uses exact logical sizes for every effect target.
-                // Converting the authored FBO scale through an explicit floating-point divisor
-                // avoids the accidental int/uint max() mixing that would otherwise keep this new
-                // path from compiling cleanly.
-                const double  fbo_scale = static_cast<double>(std::max<uint32_t>(1u, wp_fbo.scale));
-                const int32_t scaled_width =
-                    std::max(1,
-                             static_cast<int32_t>(
-                                 std::lround(primitive->VisibleSourceSize()[0] / fbo_scale)));
-                const int32_t scaled_height =
-                    std::max(1,
-                             static_cast<int32_t>(
-                                 std::lround(primitive->VisibleSourceSize()[1] / fbo_scale)));
+                const auto        fbo_size = wp_fbo.ResolveSize(primitive->VisibleSourceSize());
+                const bool        persistent_feedback_fbo =
+                    feedback_fbos.count(wp_fbo.name) != 0;
                 scene.renderTargets[rt_name] = SceneRenderTarget {
-                    .width      = scaled_width,
-                    .height     = scaled_height,
-                    .mapWidth   = scaled_width,
-                    .mapHeight  = scaled_height,
-                    .allowReuse = true,
+                    .width      = fbo_size[0],
+                    .height     = fbo_size[1],
+                    .mapWidth   = fbo_size[0],
+                    .mapHeight  = fbo_size[1],
+                    .allowReuse = ! persistent_feedback_fbo,
                 };
+                if (wp_fbo.fit > 0 || persistent_feedback_fbo) {
+                    LOG_INFO("SceneTextEffectFboResolve: layer=%d effect-id=%d effect='%s' "
+                             "fbo='%s' target='%s' size=%dx%d scale=%u fit=%u "
+                             "persistent-feedback=%s",
+                             text_obj.id,
+                             wp_effect.id,
+                             wp_effect.name.c_str(),
+                             wp_fbo.name.c_str(),
+                             rt_name.c_str(),
+                             fbo_size[0],
+                             fbo_size[1],
+                             wp_fbo.scale,
+                             wp_fbo.fit,
+                             persistent_feedback_fbo ? "true" : "false");
+                }
                 scene.objectRuntimeRenderTargets[text_obj.id].push_back(rt_name);
                 primitive->bridge.render_targets.push_back(TextBridgeRenderTarget {
-                    .name = rt_name, .scale = std::max<uint32_t>(1u, wp_fbo.scale) });
+                    .name = rt_name,
+                    .scale = std::max<uint32_t>(1u, wp_fbo.scale),
+                    .fit = wp_fbo.fit,
+                });
                 fbo_map[wp_fbo.name] = rt_name;
             }
 

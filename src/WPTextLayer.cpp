@@ -511,6 +511,27 @@ bool GrowTextDependencyRenderTarget(SceneRenderTarget& render_target,
     return changed;
 }
 
+std::array<float, 2> ResolveTextBridgeRenderTargetSourceSize(
+    const TextBridgeRenderTarget& bridge_target, std::array<float, 2> dependency_source_size) {
+    const float source_width  = std::max(1.0f, dependency_source_size[0]);
+    const float source_height = std::max(1.0f, dependency_source_size[1]);
+
+    if (bridge_target.fit > 0) {
+        const float longest_edge = std::max(source_width, source_height);
+        const float fit_scale    = static_cast<float>(bridge_target.fit) / longest_edge;
+        return {
+            std::max(1.0f, source_width * fit_scale),
+            std::max(1.0f, source_height * fit_scale),
+        };
+    }
+
+    const float scale = static_cast<float>(std::max<uint32_t>(1u, bridge_target.scale));
+    return {
+        std::max(1.0f, source_width / scale),
+        std::max(1.0f, source_height / scale),
+    };
+}
+
 std::array<float, 2> ResolveFullTextDisplaySize(const TextLayerRuntimeState& state) {
     if (state.primitive == nullptr) {
         return state.object.size;
@@ -2525,11 +2546,8 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
             auto& render_target = render_target_it->second;
             if (render_target.bind.enable) continue;
 
-            const float scale = static_cast<float>(std::max<uint32_t>(1u, bridge_target.scale));
-            const std::array<float, 2> scaled_source_size {
-                std::max(1.0f, next_geometry.dependency_source_size[0] / scale),
-                std::max(1.0f, next_geometry.dependency_source_size[1] / scale),
-            };
+            const auto scaled_source_size = ResolveTextBridgeRenderTargetSourceSize(
+                bridge_target, next_geometry.dependency_source_size);
             const bool dependency_rt_changed =
                 GrowTextDependencyRenderTarget(render_target, scaled_source_size);
             bridge_render_target_changed = bridge_render_target_changed || dependency_rt_changed;

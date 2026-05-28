@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -36,9 +37,15 @@ public:
 class WPEffectFbo {
 public:
     bool        FromJson(const nlohmann::json&);
+    std::array<int32_t, 2> ResolveSize(std::array<float, 2> source_size) const;
     std::string name;
     std::string format;
     uint32_t    scale { 1 };
+    // Wallpaper Engine effect FBOs can use either `scale` (divide the source size) or `fit`
+    // (fit the source aspect into a fixed longest edge). Cursor ripple uses `fit=512` for its
+    // simulation buffers; treating that as scale=1 makes the propagation texel step several times
+    // too small and the authored wavefront appears not to spread.
+    uint32_t    fit { 0 };
 };
 
 class WPImageEffect {
@@ -51,6 +58,7 @@ public:
     // Returns true when a parsed effect enables a shader combo either through scene pass overrides
     // or through the resolved material, giving object parsers one semantic query for feature gates.
     bool                         HasEnabledCombo(const std::string& combo_name) const;
+    std::unordered_set<std::string> FeedbackFboNames() const;
     int32_t                      id { 0 };
     std::string                  name;
     bool                         visible { true };
@@ -66,7 +74,7 @@ public:
     std::vector<WPEffectFbo>     fbos;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, fit);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageEffect, name, visible, passes, fbos, materials);
 
 } // namespace wpscene
