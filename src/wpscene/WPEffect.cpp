@@ -1,5 +1,7 @@
 #include "wpscene/WPEffect.h"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 #include "Fs/VFS.h"
@@ -29,6 +31,10 @@ void ReadVisibleBinding(const nlohmann::json& json, wallpaper::VisibleBinding* b
     GET_JSON_NAME_VALUE_NOWARN(user, "condition", binding->user.condition);
 }
 
+int32_t PositiveRoundedPixel(float value) {
+    return std::max(1, static_cast<int32_t>(std::lround(std::max(1.0f, value))));
+}
+
 } // namespace
 
 bool WPEffectCommand::FromJson(const nlohmann::json& json) {
@@ -42,12 +48,33 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "name", name);
     GET_JSON_NAME_VALUE(json, "format", format);
 
-    GET_JSON_NAME_VALUE(json, "scale", scale);
+    GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
+    GET_JSON_NAME_VALUE_NOWARN(json, "fit", fit);
     if(scale == 0) { 
         LOG_ERROR("fbo scale can't be 0");
         scale = 1;
     }
     return true;
+}
+
+std::array<int32_t, 2> WPEffectFbo::ResolveSize(std::array<float, 2> source_size) const {
+    const float source_width  = std::max(1.0f, source_size[0]);
+    const float source_height = std::max(1.0f, source_size[1]);
+
+    if (fit > 0) {
+        const float longest_edge = std::max(source_width, source_height);
+        const float fit_scale    = static_cast<float>(fit) / longest_edge;
+        return {
+            PositiveRoundedPixel(source_width * fit_scale),
+            PositiveRoundedPixel(source_height * fit_scale),
+        };
+    }
+
+    const float divisor = static_cast<float>(std::max<uint32_t>(1u, scale));
+    return {
+        PositiveRoundedPixel(source_width / divisor),
+        PositiveRoundedPixel(source_height / divisor),
+    };
 }
 
 // The blacklist belongs to the shared effect parser, not to WPImageObject. Text effects and image
@@ -99,6 +126,52 @@ bool WPImageEffect::HasEnabledCombo(const std::string& combo_name) const {
     }
 
     return false;
+}
+
+std::unordered_set<std::string> WPImageEffect::FeedbackFboNames() const {
+    // A normal transient effect FBO only needs to survive until its final reader in the same frame.
+    // Feedback simulations are different: they sample one of their own FBOs before any pass has
+    // written that FBO in the current frame, so the sampler intentionally reads last frame's state.
+    // Cursor ripple is the canonical case: pass 0 reads `_rt_EightBuffer2`, pass 1 writes it back
+    // after diffusion, and the next frame starts from that stored wave field. Detecting the
+    // read-before-write contract from the authored pass order keeps this generic and avoids
+    // hard-coding cursor-ripple resource names in the renderer.
+    std::unordered_set<std::string> fbo_names;
+    for (const auto& fbo : fbos) {
+        if (! fbo.name.empty()) fbo_names.insert(fbo.name);
+    }
+
+    std::unordered_set<std::string> written_this_frame;
+    std::unordered_set<std::string> feedback_fbos;
+
+    auto read_fbo = [&](const std::string& name) {
+        if (fbo_names.count(name) == 0) return;
+        if (written_this_frame.count(name) == 0) feedback_fbos.insert(name);
+    };
+
+    auto write_fbo = [&](const std::string& name) {
+        if (fbo_names.count(name) != 0) written_this_frame.insert(name);
+    };
+
+    auto apply_commands_at = [&](int32_t afterpos) {
+        for (const auto& command : commands) {
+            if (command.afterpos != afterpos) continue;
+            read_fbo(command.source);
+            write_fbo(command.target);
+        }
+    };
+
+    for (std::size_t pass_index = 0; pass_index < passes.size(); pass_index++) {
+        apply_commands_at(static_cast<int32_t>(pass_index));
+        const auto& pass = passes[pass_index];
+        for (const auto& binding : pass.bind) {
+            read_fbo(binding.name);
+        }
+        write_fbo(pass.target);
+    }
+    apply_commands_at(static_cast<int32_t>(passes.size()));
+
+    return feedback_fbos;
 }
 
 bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {

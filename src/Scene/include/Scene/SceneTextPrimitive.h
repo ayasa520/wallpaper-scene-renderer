@@ -47,10 +47,13 @@ struct TextLayoutResult {
 
 struct TextBridgeRenderTarget {
     // A first-class text bridge owns exact-size offscreen targets that image effects sample from.
-    // The scale field lets runtime updates resize authored fbo targets without reintroducing
-    // text-specific logical/physical compensation inside shader passes.
+    // `scale` and `fit` mirror Wallpaper Engine's authored effect FBO sizing rules so runtime text
+    // updates can recompute the same target dimensions that parse-time image/text effect material
+    // construction used. Keeping the sizing metadata with the bridge avoids texture-resolution
+    // hacks inside shader passes when an effect target is resized after text content changes.
     std::string name;
     uint32_t    scale { 1 };
+    uint32_t    fit { 0 };
 };
 
 struct TextSourceBridge {
