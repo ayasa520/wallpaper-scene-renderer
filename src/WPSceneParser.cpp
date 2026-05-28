@@ -6590,6 +6590,12 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     auto node_it = context.object_nodes.find(layer_id);
     if (node_it == context.object_nodes.end() || ! node_it->second) return false;
 
+    // The initial scene script scan can only register layer-level properties for deferred image
+    // placeholders. Effect visibility targets do not exist until this late materialization pass builds
+    // the actual effect chain, so register them here while the authored effect ids and the concrete
+    // SceneImageEffect instances are both available.
+    RegisterEffectVisibilityBindings(context, object_json);
+
     ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
     scene.layerNodes[layer_id] = node_it->second.get();
     RestoreRenderOrderProxyChildrenForLayer(scene, layer_id, node_it->second.get());
@@ -6678,6 +6684,12 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
                                              const UserPropertyMap* user_properties) {
     if (scene.deferredRuntimeTextLayerIds.count(layer_id) == 0) return false;
 
+    const auto config_it = scene.initialLayerConfigJson.find(layer_id);
+    if (config_it == scene.initialLayerConfigJson.end()) return false;
+
+    nlohmann::json object_json;
+    if (! PARSE_JSON(config_it->second, object_json)) return false;
+
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
     ScopedGlslangSession glslang_scope("deferred-text-parse");
@@ -6691,11 +6703,6 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
         object = state_it->second.object;
     } else {
-        const auto config_it = scene.initialLayerConfigJson.find(layer_id);
-        if (config_it == scene.initialLayerConfigJson.end()) return false;
-
-        nlohmann::json object_json;
-        if (! PARSE_JSON(config_it->second, object_json)) return false;
         if (! object.FromJson(object_json, *context.vfs)) return false;
     }
 
@@ -6723,6 +6730,11 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     ParseTextObj(context, object);
     auto node_it = context.object_nodes.find(layer_id);
     if (node_it == context.object_nodes.end() || ! node_it->second) return false;
+
+    // Deferred text effects follow the same late-target rule as image effects: their concrete effect
+    // passes are absent during the initial placeholder scan, so user-bound effect visibility must be
+    // registered after ParseTextObj() creates the runtime effect chain.
+    RegisterEffectVisibilityBindings(context, object_json);
 
     ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
     scene.layerNodes[layer_id] = node_it->second.get();
