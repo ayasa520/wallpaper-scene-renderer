@@ -2782,11 +2782,20 @@ bool ConfigureSceneBloomPass(ParseContext& context) {
     // Build the Bloom node even when the authored user toggle currently disables it, as long as the
     // scene carries non-zero Bloom settings. Runtime toggles can then update `u_enabled` in place
     // instead of forcing a render-graph rebuild just to add or remove this final post-process pass.
-    if (! scene.bloom.enabled && scene.bloom.strength <= 0.0f && ! scene.bloom.hdr) {
-        LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f active=false",
+    //
+    // HDR support is intentionally excluded from this predicate for now. Wallpaper Engine's
+    // `general.hdr` selects an HDR post-processing path, but Hanabi currently has only an LDR Bloom
+    // chain and no HDR render target, tone mapper, or compositor hand-off. Parsing and logging the
+    // authored HDR metadata keeps the future implementation path open without letting `hdr=true`
+    // create or suppress any current LDR rendering.
+    const bool has_ldr_bloom_work = scene.bloom.enabled || scene.bloom.strength > 0.0f;
+    if (! has_ldr_bloom_work) {
+        LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f "
+                 "hdr-requested=%s render-hdr=false active=false",
                  scene.bloom.enabled ? "true" : "false",
                  scene.bloom.strength,
-                 scene.bloom.threshold);
+                 scene.bloom.threshold,
+                 scene.bloom.hdr ? "true" : "false");
         return false;
     }
 
@@ -3098,9 +3107,11 @@ void main() {
         SpecTex_Default.data(),
     };
 
-    LOG_INFO("SceneBloomConfig: enabled=true strength=%.3f threshold=%.3f tint=[%.3f,%.3f,%.3f] "
-             "hdr=%s hdr-strength=%.3f hdr-threshold=%.3f hdr-scatter=%.3f hdr-feather=%.3f "
-             "hdr-iterations=%d active=true passes=%zu quarter=%dx%d eighth=%dx%d",
+    LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f tint=[%.3f,%.3f,%.3f] "
+             "hdr-requested=%s render-hdr=false hdr-strength=%.3f hdr-threshold=%.3f "
+             "hdr-scatter=%.3f hdr-feather=%.3f hdr-iterations=%d active=true passes=%zu "
+             "quarter=%dx%d eighth=%dx%d",
+             scene.bloom.enabled ? "true" : "false",
              scene.bloom.strength,
              scene.bloom.threshold,
              scene.bloom.tint[0],

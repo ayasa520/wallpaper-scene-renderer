@@ -36,9 +36,9 @@ class WPSceneGeneral {
 public:
     bool                 FromJson(const nlohmann::json&);
     std::array<float, 3> clearcolor { 0.0f, 0.0f, 0.0f };
-    // Wallpaper Engine stores Bloom in scene `general`, not in a layer effect list. Keep the
-    // authored basic/HDR values here so the parser can create a scene-wide post-process pass after
-    // all layers have rendered into the default framebuffer.
+    // Wallpaper Engine stores Bloom in scene `general`, not in a layer effect list. Keep both the
+    // ordinary LDR Bloom values and the authored HDR metadata here, but the parser must not treat
+    // `hdr` as an active render feature until a real HDR pipeline/tone-map path is implemented.
     bool                 bloom { false };
     float                bloomstrength { 0.0f };
     float                bloomthreshold { 1.0f };

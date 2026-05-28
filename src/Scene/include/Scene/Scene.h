@@ -87,6 +87,9 @@ public:
         float                      strength { 0.0f };
         float                      threshold { 1.0f };
         std::array<float, 3>       tint { 1.0f, 1.0f, 1.0f };
+        // Authored HDR bloom metadata is kept for future HDR support, but today it is not a render
+        // capability flag. The LDR bloom graph must decide from the ordinary Bloom controls only,
+        // otherwise a scene-level `hdr=true` would silently change rendering before HDR exists.
         bool                       hdr { false };
         float                      hdrStrength { 0.0f };
         float                      hdrThreshold { 1.0f };
