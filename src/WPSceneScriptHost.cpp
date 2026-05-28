@@ -47,6 +47,16 @@ extern "C" {
 
 namespace wallpaper
 {
+
+struct SceneRegistrationRange {
+    std::size_t binding_start { 0 };
+    std::size_t binding_end { std::numeric_limits<std::size_t>::max() };
+    std::size_t animation_start { 0 };
+    std::size_t animation_end { std::numeric_limits<std::size_t>::max() };
+    std::size_t script_start { 0 };
+    std::size_t script_end { std::numeric_limits<std::size_t>::max() };
+};
+
 namespace
 {
 
@@ -301,6 +311,8 @@ bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
                             const WPSceneScriptRegistration& registration,
                             const WPDynamicValue&            value);
 void RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque, int32_t layer_id, SceneNode* node);
+void RegisterSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque,
+                                    const SceneRegistrationRange& range);
 bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
@@ -2062,6 +2074,7 @@ struct WPSceneScriptHost::Opaque {
     uint64_t                                     next_timer_id { 1 };
     double                                       runtime_seconds { 0.0 };
     bool                                         initialized { false };
+    bool                                         applying_user_properties { false };
     std::vector<WPSceneScriptRegistration>       property_bindings;
     std::vector<PropertyAnimationInstance>       property_animations;
     std::vector<std::unique_ptr<ScriptInstance>> instances;
@@ -2084,6 +2097,7 @@ struct WPSceneScriptHost::Opaque {
     WPSceneScriptMediaState      dispatched_media_state;
     std::unordered_set<uint32_t> hovered_instances;
     std::unordered_set<uint32_t> pressed_instances;
+    std::vector<SceneRegistrationRange> pending_scene_registration_ranges;
 };
 
 std::optional<WPDynamicValue> ReadOriginalLayerPropertyValue(
@@ -2605,9 +2619,93 @@ void RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque, int32_t layer_i
     }
 }
 
+SceneRegistrationRange CaptureSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque) {
+    if (opaque == nullptr || opaque->scene == nullptr) {
+        return SceneRegistrationRange {};
+    }
+
+    return SceneRegistrationRange {
+        .binding_start = opaque->scene->bindingRegistrations.size(),
+        .animation_start = opaque->scene->propertyAnimationRegistrations.size(),
+        .script_start = opaque->scene->scriptRegistrations.size(),
+    };
+}
+
+bool SceneRegistrationRangeHasNewEntries(WPSceneScriptHost::Opaque* opaque,
+                                         const SceneRegistrationRange& range) {
+    if (opaque == nullptr || opaque->scene == nullptr) return false;
+    return range.binding_start < range.binding_end ||
+           range.animation_start < range.animation_end ||
+           range.script_start < range.script_end;
+}
+
+void RegisterSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque,
+                                    const SceneRegistrationRange& range) {
+    if (opaque == nullptr || opaque->scene == nullptr) return;
+
+    auto resolved_range = range;
+    if (resolved_range.binding_end == std::numeric_limits<std::size_t>::max()) {
+        resolved_range.binding_end = opaque->scene->bindingRegistrations.size();
+    }
+    if (resolved_range.animation_end == std::numeric_limits<std::size_t>::max()) {
+        resolved_range.animation_end = opaque->scene->propertyAnimationRegistrations.size();
+    }
+    if (resolved_range.script_end == std::numeric_limits<std::size_t>::max()) {
+        resolved_range.script_end = opaque->scene->scriptRegistrations.size();
+    }
+    resolved_range.binding_end = std::max(
+        resolved_range.binding_start,
+        std::min(resolved_range.binding_end, opaque->scene->bindingRegistrations.size()));
+    resolved_range.animation_end = std::max(
+        resolved_range.animation_start,
+        std::min(resolved_range.animation_end,
+                 opaque->scene->propertyAnimationRegistrations.size()));
+    resolved_range.script_end = std::max(
+        resolved_range.script_start,
+        std::min(resolved_range.script_end, opaque->scene->scriptRegistrations.size()));
+    if (! SceneRegistrationRangeHasNewEntries(opaque, resolved_range)) return;
+
+    if (opaque->applying_user_properties) {
+        // A visible-property write can materialize a hidden language branch while ApplyUserProperties()
+        // is iterating the current binding vector. Queue the newly parsed registrations and attach
+        // them after that pass, so vector growth cannot invalidate the active dispatch entry while the
+        // same user-property payload still reaches the late-created bindings.
+        opaque->pending_scene_registration_ranges.push_back(std::move(resolved_range));
+        return;
+    }
+
+    if (! opaque->scene->scriptHost) return;
+
+    auto* host = opaque->scene->scriptHost.get();
+
+    for (std::size_t i = resolved_range.binding_start; i < resolved_range.binding_end; ++i) {
+        host->RegisterPropertyBinding(opaque->scene->bindingRegistrations[i]);
+    }
+    for (std::size_t i = resolved_range.animation_start; i < resolved_range.animation_end; ++i) {
+        host->RegisterPropertyAnimation(opaque->scene->propertyAnimationRegistrations[i]);
+    }
+    for (std::size_t i = resolved_range.script_start; i < resolved_range.script_end; ++i) {
+        host->RegisterPropertyScript(opaque->scene->scriptRegistrations[i]);
+    }
+}
+
+void FlushPendingSceneRegistrationRanges(WPSceneScriptHost::Opaque* opaque) {
+    if (opaque == nullptr) return;
+
+    while (! opaque->pending_scene_registration_ranges.empty()) {
+        std::vector<SceneRegistrationRange> pending;
+        pending.swap(opaque->pending_scene_registration_ranges);
+        for (const auto& range : pending) {
+            RegisterSceneRegistrationRange(opaque, range);
+        }
+    }
+}
+
 bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
     if (opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) == 0) return true;
+
+    const auto registration_range = CaptureSceneRegistrationRange(opaque);
 
     if (! wallpaper::MaterializeDeferredParticleLayer(
             *opaque->scene, layer_id, &opaque->user_properties)) {
@@ -2622,6 +2720,7 @@ bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque,
     }
 
     RebindLayerRegistrations(opaque, layer_id, node);
+    RegisterSceneRegistrationRange(opaque, registration_range);
     EnsureTextureAnimationStatesForNode(opaque, node);
     // Realizing a deferred particle layer inserts the actual runtime scene node and the particle
     // render work that did not exist when the graph was compiled with only the hidden placeholder.
@@ -2636,6 +2735,8 @@ bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, in
     if (opaque == nullptr || opaque->scene == nullptr) return false;
     if (opaque->scene->deferredRuntimeImageLayerIds.count(layer_id) == 0) return true;
 
+    const auto registration_range = CaptureSceneRegistrationRange(opaque);
+
     if (! wallpaper::MaterializeDeferredImageLayer(
             *opaque->scene, layer_id, &opaque->user_properties)) {
         LOG_ERROR("DeferredRuntimeImageRealize: failed for layer=%d", layer_id);
@@ -2649,6 +2750,7 @@ bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, in
     }
 
     RebindLayerRegistrations(opaque, layer_id, node);
+    RegisterSceneRegistrationRange(opaque, registration_range);
     EnsureTextureAnimationStatesForNode(opaque, node);
     // Deferred image layers are the expensive case for multilingual scenes: the hidden placeholder
     // had no material/effect passes, so turning it visible changes graph topology and must rebuild
@@ -2661,6 +2763,8 @@ bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, in
 bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
     if (opaque->scene->deferredRuntimeTextLayerIds.count(layer_id) == 0) return true;
+
+    const auto registration_range = CaptureSceneRegistrationRange(opaque);
 
     if (! wallpaper::MaterializeDeferredTextLayer(
             *opaque->scene, layer_id, &opaque->user_properties)) {
@@ -2675,6 +2779,7 @@ bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int
     }
 
     RebindLayerRegistrations(opaque, layer_id, node);
+    RegisterSceneRegistrationRange(opaque, registration_range);
     EnsureTextureAnimationStatesForNode(opaque, node);
     // Deferred text materialization follows the same contract as particles: the render graph built
     // while a hidden placeholder was present cannot draw the newly inserted text node until its
@@ -8903,27 +9008,8 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
     const auto started_at = std::chrono::steady_clock::now();
     std::size_t materialized_layers = 0;
 
-    auto register_new_scene_registrations = [&](std::size_t binding_start,
-                                                std::size_t animation_start,
-                                                std::size_t script_start) {
-        for (std::size_t i = binding_start; i < m_scene->bindingRegistrations.size(); ++i) {
-            RegisterPropertyBinding(m_scene->bindingRegistrations[i]);
-        }
-        for (std::size_t i = animation_start; i < m_scene->propertyAnimationRegistrations.size();
-             ++i) {
-            RegisterPropertyAnimation(m_scene->propertyAnimationRegistrations[i]);
-        }
-        for (std::size_t i = script_start; i < m_scene->scriptRegistrations.size(); ++i) {
-            RegisterPropertyScript(m_scene->scriptRegistrations[i]);
-        }
-    };
-
     for (const auto layer_id : layer_ids) {
         if (!IsDeferredRuntimeLayer(m_impl, layer_id)) continue;
-
-        const auto binding_start = m_scene->bindingRegistrations.size();
-        const auto animation_start = m_scene->propertyAnimationRegistrations.size();
-        const auto script_start = m_scene->scriptRegistrations.size();
 
         // This is a residency warm-up: build the full CPU/runtime layer identity after init scripts
         // have had a chance to settle visibility, but rely on render-graph pruning to keep hidden
@@ -8933,7 +9019,6 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
         if (!MaterializeDeferredParticleLayerIfNeeded(m_impl, layer_id)) continue;
         if (!MaterializeDeferredTextLayerIfNeeded(m_impl, layer_id)) continue;
 
-        register_new_scene_registrations(binding_start, animation_start, script_start);
         materialized_layers++;
     }
 
@@ -9081,6 +9166,8 @@ void WPSceneScriptHost::ApplyUserProperties(const UserPropertyMap& user_properti
                                             bool                   initial_dispatch) {
     if (! Ready()) return;
 
+    const bool was_applying_user_properties = m_impl->applying_user_properties;
+    m_impl->applying_user_properties = true;
     m_impl->user_properties = user_properties;
 
     JSContext* context = m_impl->runtime.context;
@@ -9149,6 +9236,11 @@ void WPSceneScriptHost::ApplyUserProperties(const UserPropertyMap& user_properti
     }
     m_impl->dispatched_user_properties = user_properties;
     JS_FreeValue(context, changed);
+
+    m_impl->applying_user_properties = was_applying_user_properties;
+    if (! m_impl->applying_user_properties) {
+        FlushPendingSceneRegistrationRanges(m_impl);
+    }
 }
 
 void WPSceneScriptHost::ApplyGeneralSettings(
