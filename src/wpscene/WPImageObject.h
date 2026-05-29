@@ -57,6 +57,15 @@ public:
     std::string                attachment;
     std::string                alignment { "center" };
     std::array<float, 2>       effectSourceSize { 0.0f, 0.0f };
+    // Some source-less effect layers need framebuffer-sized intermediate targets while their
+    // visible output still follows ordinary world-space layer geometry. This is intentionally
+    // separate from fullscreen, which also changes final projection and transform semantics.
+    bool                       effectSourceScreenBound { false };
+    // Optional final writer UV coverage. Effects such as DIRECTDRAW lightshafts can generate
+    // visible pixels outside the canonical [0, 1] quad; expanding only the final writer prevents
+    // clipping without changing the shader's authored domain.
+    bool                       effectFinalTexCoordBoundsEnabled { false };
+    std::array<float, 4>       effectFinalTexCoordBounds { 0.0f, 0.0f, 1.0f, 1.0f };
     WPMaterial                 material;
     std::vector<WPImageEffect> effects;
     Config                     config;

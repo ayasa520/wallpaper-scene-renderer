@@ -1060,6 +1060,51 @@ void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
     mesh.AddVertexArray(std::move(vertex));
 }
 
+void GenCardMeshWithTexCoordBounds(SceneMesh& mesh, const std::array<float, 2>& size,
+                                   const std::array<float, 4>& texcoord_bounds) {
+    const float width  = std::max(1.0f, size[0]);
+    const float height = std::max(1.0f, size[1]);
+    const float min_u  = texcoord_bounds[0];
+    const float min_v  = texcoord_bounds[1];
+    const float max_u  = texcoord_bounds[2];
+    const float max_v  = texcoord_bounds[3];
+    const float z      = 0.0f;
+
+    auto local_x = [width](float u) {
+        return (u - 0.5f) * width;
+    };
+    auto local_y = [height](float v) {
+        return (0.5f - v) * height;
+    };
+
+    // The final writer may need to cover UVs outside [0, 1], but the effect shader still expects
+    // its authored domain to be the original layer size. Expanding positions from UV bounds keeps
+    // those two contracts independent: shader math stays stable, while the final quad no longer
+    // clips generated DIRECTDRAW pixels at the canonical card edge.
+    const std::array pos = {
+        local_x(min_u), local_y(max_v), z,
+        local_x(min_u), local_y(min_v), z,
+        local_x(max_u), local_y(max_v), z,
+        local_x(max_u), local_y(min_v), z,
+    };
+    const std::array texCoord = {
+        min_u, max_v,
+        min_u, min_v,
+        max_u, max_v,
+        max_u, min_v,
+    };
+
+    SceneVertexArray vertex(
+        {
+            { WE_IN_POSITION.data(), VertexType::FLOAT3 },
+            { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 },
+        },
+        4);
+    vertex.SetVertex(WE_IN_POSITION, pos);
+    vertex.SetVertex(WE_IN_TEXCOORD, texCoord);
+    mesh.AddVertexArray(std::move(vertex));
+}
+
 void SetParticleMesh(SceneMesh& mesh, const wpscene::Particle& particle, uint32_t count,
                      bool thick_format) {
     (void)particle;
@@ -3807,6 +3852,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     // output turns blank.
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
     bool use_detached_effect_world_node = hasEffect && ! isCompose;
+    const bool effect_source_screen_bound =
+        wpimgobj.fullscreen || wpimgobj.effectSourceScreenBound;
     const std::array<float, 2> effect_source_size =
         wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
             ? wpimgobj.effectSourceSize
@@ -3980,8 +4027,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             const auto source_mesh_size = wpimgobj.size;
             GenCardMesh(
                 mesh, { (uint16_t)source_mesh_size[0], (uint16_t)source_mesh_size[1] }, mapRate);
-            GenCardMesh(effct_final_mesh,
-                        { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
+            if (wpimgobj.effectFinalTexCoordBoundsEnabled) {
+                GenCardMeshWithTexCoordBounds(
+                    effct_final_mesh, wpimgobj.size, wpimgobj.effectFinalTexCoordBounds);
+            } else {
+                GenCardMesh(effct_final_mesh,
+                            { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
+            }
         }
     }
     // material blendmode for last step to use
@@ -4074,12 +4126,24 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 .mapHeight  = (uint16_t)effect_source_size[1],
                 .allowReuse = true,
             };
-            if (wpimgobj.fullscreen) {
+            if (effect_source_screen_bound) {
                 scene.renderTargets[effect_ppong_a].bind = { .enable = true, .screen = true };
             }
             scene.renderTargets[effect_ppong_b] = scene.renderTargets.at(effect_ppong_a);
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_a);
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_b);
+            if (wpimgobj.effectSourceScreenBound) {
+                LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
+                         "pingpong-a='%s' pingpong-b='%s' size=[%.3f, %.3f] "
+                         "screen-bound=true fullscreen=%s",
+                         wpimgobj.id,
+                         wpimgobj.name.c_str(),
+                         effect_ppong_a.c_str(),
+                         effect_ppong_b.c_str(),
+                         effect_source_size[0],
+                         effect_source_size[1],
+                         wpimgobj.fullscreen ? "true" : "false");
+            }
         }
         if (hasAuthoredEffect) {
             // The neutral final composite is only useful when an authored effect chain can have a
@@ -4144,7 +4208,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     const auto  fbo_size = wpfbo.ResolveSize(effect_source_size);
                     const bool  persistent_feedback_fbo =
                         feedback_fbos.count(wpfbo.name) != 0;
-                    if (wpimgobj.fullscreen && wpfbo.fit == 0) {
+                    if (effect_source_screen_bound && wpfbo.fit == 0) {
                         scene.renderTargets[rtname] = {
                             .width      = 2,
                             .height     = 2,
@@ -5098,6 +5162,129 @@ bool ShapeEffectRequestsDirectDraw(const WPShapeObject& shape_obj) {
     });
 }
 
+std::string ToLowerAscii(std::string_view text) {
+    std::string lower;
+    lower.reserve(text.size());
+    for (unsigned char ch : text) {
+        lower.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return lower;
+}
+
+bool EffectLooksLikeLightshafts(const wpscene::WPImageEffect& effect) {
+    auto matches = [](std::string_view text) {
+        const std::string lower = ToLowerAscii(text);
+        return lower.find("lightshafts") != std::string::npos ||
+               lower.find("light shafts") != std::string::npos;
+    };
+
+    if (matches(effect.name)) return true;
+    for (const auto& material : effect.materials) {
+        if (matches(material.shader)) return true;
+    }
+    return false;
+}
+
+void MergeLightshaftPointValues(
+    const std::unordered_map<std::string, std::vector<float>>& values,
+    std::array<std::optional<std::array<float, 2>>, 4>&        points) {
+    for (const auto& [name, value] : values) {
+        if (value.size() < 2 || ! std::isfinite(value[0]) || ! std::isfinite(value[1])) continue;
+
+        const std::string lower = ToLowerAscii(name);
+        for (usize i = 0; i < points.size(); i++) {
+            const std::string point_name = "point" + std::to_string(i);
+            if (lower == point_name || lower == "g_" + point_name) {
+                points[i] = std::array<float, 2> { value[0], value[1] };
+                break;
+            }
+        }
+    }
+}
+
+std::optional<std::array<float, 4>>
+ResolveLightshaftsDirectDrawFinalTexCoordBounds(const WPShapeObject& shape_obj) {
+    for (const auto& effect : shape_obj.effects) {
+        if (! EffectLooksLikeLightshafts(effect)) continue;
+
+        std::array<std::optional<std::array<float, 2>>, 4> points;
+        for (usize material_index = 0; material_index < effect.materials.size(); material_index++) {
+            MergeLightshaftPointValues(effect.materials[material_index].constantshadervalues,
+                                       points);
+            if (material_index < effect.passes.size()) {
+                MergeLightshaftPointValues(effect.passes[material_index].constantshadervalues,
+                                           points);
+            }
+        }
+
+        if (! std::all_of(points.begin(), points.end(), [](const auto& point) {
+                return point.has_value();
+            })) {
+            continue;
+        }
+
+        std::array<float, 4> bounds { 0.0f, 0.0f, 1.0f, 1.0f };
+        for (const auto& point : points) {
+            bounds[0] = std::min(bounds[0], point->at(0));
+            bounds[1] = std::min(bounds[1], point->at(1));
+            bounds[2] = std::max(bounds[2], point->at(0));
+            bounds[3] = std::max(bounds[3], point->at(1));
+        }
+
+        const bool expands_default_quad = bounds[0] < 0.0f || bounds[1] < 0.0f ||
+                                          bounds[2] > 1.0f || bounds[3] > 1.0f;
+        if (expands_default_quad) return bounds;
+    }
+
+    return std::nullopt;
+}
+
+std::array<float, 2> ResolveImplicitDirectDrawShapeVisualSize(const ParseContext& context) {
+    const float scene_width  = static_cast<float>(std::max(1, context.ortho_w));
+    const float scene_height = static_cast<float>(std::max(1, context.ortho_h));
+    const float short_edge   = std::min(scene_width, scene_height);
+    return { short_edge, short_edge };
+}
+
+struct DirectDrawShapeMetrics {
+    std::array<float, 2> visual_size { 1.0f, 1.0f };
+    std::array<float, 2> effect_source_size { 0.0f, 0.0f };
+    bool                 effect_source_screen_bound { false };
+    bool                 final_texcoord_bounds_enabled { false };
+    std::array<float, 4> final_texcoord_bounds { 0.0f, 0.0f, 1.0f, 1.0f };
+    const char*          visual_policy { "authored-size" };
+    const char*          effect_source_policy { "layer-size" };
+    const char*          final_uv_policy { "default" };
+};
+
+DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context,
+                                                     const WPShapeObject& shape_obj) {
+    DirectDrawShapeMetrics metrics;
+    if (shape_obj.has_size) {
+        metrics.visual_size        = shape_obj.size;
+        metrics.effect_source_size = shape_obj.size;
+    } else {
+        // Source-less DIRECTDRAW quads carry three separate size contracts. Their visible shader
+        // domain follows the scene short edge, while the intermediate effect buffers bind to the
+        // live framebuffer. This preserves world transforms without forcing the layer through the
+        // fullscreen postprocess path.
+        metrics.visual_size                = ResolveImplicitDirectDrawShapeVisualSize(context);
+        metrics.effect_source_size         = { 0.0f, 0.0f };
+        metrics.effect_source_screen_bound = true;
+        metrics.visual_policy              = "implicit-short-edge-square";
+        metrics.effect_source_policy       = "screen-bound";
+    }
+
+    if (auto bounds = ResolveLightshaftsDirectDrawFinalTexCoordBounds(shape_obj);
+        bounds.has_value()) {
+        metrics.final_texcoord_bounds_enabled = true;
+        metrics.final_texcoord_bounds         = *bounds;
+        metrics.final_uv_policy               = "lightshafts-control-points";
+    }
+
+    return metrics;
+}
+
 void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
                    bool force_runtime_materialization = false) {
     if (! shape_obj.visible && ! force_runtime_materialization) return;
@@ -5158,12 +5345,7 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     const std::string_view direct_draw_final_blend = "additive";
     transparent_source_material.blending           = std::string(direct_draw_final_blend);
 
-    const std::array<float, 2> resolved_size =
-        shape_obj.has_size ? shape_obj.size
-                           : std::array<float, 2> {
-                                 static_cast<float>(std::max(1, context.ortho_w)),
-                                 static_cast<float>(std::max(1, context.ortho_h)),
-                             };
+    const DirectDrawShapeMetrics metrics = ResolveDirectDrawShapeMetrics(context, shape_obj);
 
     // Shape direct-draw layers have no image asset because the effect shader owns the visible
     // pixels (`DIRECTDRAW=1`). Synthesize a fully transparent image source only to reuse the
@@ -5175,7 +5357,7 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     image_obj.origin           = shape_obj.origin;
     image_obj.scale            = shape_obj.scale;
     image_obj.angles           = shape_obj.angles;
-    image_obj.size             = resolved_size;
+    image_obj.size             = metrics.visual_size;
     image_obj.parallaxDepth    = shape_obj.parallaxDepth;
     image_obj.color            = shape_obj.color;
     image_obj.alpha            = shape_obj.alpha;
@@ -5185,20 +5367,35 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     image_obj.image            = "__hanabi_shape_directdraw";
     image_obj.parent           = shape_obj.parent;
     image_obj.attachment       = shape_obj.attachment;
-    image_obj.effectSourceSize = resolved_size;
+    image_obj.effectSourceSize = metrics.effect_source_size;
+    image_obj.effectSourceScreenBound = metrics.effect_source_screen_bound;
+    image_obj.effectFinalTexCoordBoundsEnabled = metrics.final_texcoord_bounds_enabled;
+    image_obj.effectFinalTexCoordBounds        = metrics.final_texcoord_bounds;
     image_obj.material         = std::move(transparent_source_material);
     image_obj.effects          = std::move(shape_obj.effects);
     image_obj.nopadding        = true;
 
     LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
-             "size=[%.3f, %.3f] authored-size=%s transparent-texture='%.*s' final-blend='%.*s'",
+             "visual-size=[%.3f, %.3f] visual-policy=%s effect-source-policy=%s "
+             "effect-source-size=[%.3f, %.3f] authored-size=%s final-uv-policy=%s "
+             "final-uv-bounds=[%.3f, %.3f, %.3f, %.3f] transparent-texture='%.*s' "
+             "final-blend='%.*s'",
              image_obj.id,
              image_obj.name.c_str(),
              shape_obj.shape.c_str(),
              image_obj.effects.size(),
              image_obj.size[0],
              image_obj.size[1],
+             metrics.visual_policy,
+             metrics.effect_source_policy,
+             image_obj.effectSourceSize[0],
+             image_obj.effectSourceSize[1],
              shape_obj.has_size ? "true" : "false",
+             metrics.final_uv_policy,
+             metrics.final_texcoord_bounds[0],
+             metrics.final_texcoord_bounds[1],
+             metrics.final_texcoord_bounds[2],
+             metrics.final_texcoord_bounds[3],
              static_cast<int>(kSyntheticDirectDrawShapeTextureName.size()),
              kSyntheticDirectDrawShapeTextureName.data(),
              static_cast<int>(direct_draw_final_blend.size()),
