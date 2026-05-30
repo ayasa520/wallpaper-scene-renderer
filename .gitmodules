@@ -10,10 +10,6 @@
 	path = third_party/miniaudio
 	url = https://github.com/mackron/miniaudio.git
 	shallow = true
-[submodule "third_party/glslang"]
-	path = third_party/glslang
-	url = https://github.com/KhronosGroup/glslang.git
-	shallow = true
 [submodule "third_party/Eigen"]
 	path = third_party/Eigen
 	url = https://gitlab.com/libeigen/eigen.git
@@ -21,3 +17,7 @@
 [submodule "third_party/quickjs"]
 	path = third_party/quickjs
 	url = https://github.com/quickjs-ng/quickjs.git
+[submodule "third_party/dxc"]
+	path = third_party/DirectXShaderCompiler
+	url = https://github.com/microsoft/DirectXShaderCompiler.git
+	shallow = true

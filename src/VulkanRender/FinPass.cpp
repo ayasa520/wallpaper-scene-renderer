@@ -5,28 +5,36 @@
 
 using namespace wallpaper::vulkan;
 
-constexpr std::string_view vert_code = R"(#version 320 es
-layout(location = 0) in vec3 Position;
-layout(location = 1) in vec2 Texcoord;
-layout(location = 0) out vec2 v_Texcoord;
+constexpr std::string_view vert_code = R"(
+struct VSInput {
+    [[vk::location(0)]] float3 Position : POSITION0;
+    [[vk::location(1)]] float2 Texcoord : TEXCOORD0;
+};
 
-void main()
-{
-	v_Texcoord = Texcoord;
-	gl_Position = vec4(Position, 1.0);
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 texcoord : TEXCOORD0;
+};
+
+VSOutput main_vs(VSInput input) {
+    VSOutput output;
+    output.texcoord = input.Texcoord;
+    output.position = float4(input.Position, 1.0);
+    return output;
 }
 )";
 
-constexpr std::string_view frag_code = R"(#version 320 es
-layout(location = 0) in vec2 v_Texcoord;
-layout(location = 0) out vec4 out_FragColor;
+constexpr std::string_view frag_code = R"(
+struct PSInput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 texcoord : TEXCOORD0;
+};
 
-// 0 is global ublock
-layout(binding = 1) uniform sampler2D u_Texture;
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2D<float4> u_Texture;
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState u_Texture_ww_sampler;
 
-void main()
-{
-	out_FragColor = texture(u_Texture, v_Texcoord);
+float4 main_ps(PSInput input) : SV_Target0 {
+    return u_Texture.Sample(u_Texture_ww_sampler, input.texcoord);
 }
 )";
 
@@ -110,14 +118,23 @@ void FinPass::prepare(Scene& scene, const Device& device, RenderingResources& rr
     std::vector<Uni_ShaderSpv> spvs;
     {
         ShaderCompOpt opt;
-        opt.client_ver             = glslang::EShTargetVulkan_1_1;
-        opt.relaxed_errors_glsl    = true;
-        opt.relaxed_rules_vulkan   = true;
-        opt.suppress_warnings_glsl = true;
+        opt.target_env = ShaderTargetEnv::VULKAN_1_1;
 
         std::array<ShaderCompUnit, 2> units;
-        units[0] = ShaderCompUnit { .stage = EShLangVertex, .src = std::string(vert_code) };
-        units[1] = ShaderCompUnit { .stage = EShLangFragment, .src = std::string(frag_code) };
+        units[0] = ShaderCompUnit {
+            .stage = wallpaper::ShaderType::VERTEX,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name = "FinPass.vert",
+            .entry_point = "main_vs",
+            .src = std::string(vert_code),
+        };
+        units[1] = ShaderCompUnit {
+            .stage = wallpaper::ShaderType::FRAGMENT,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name = "FinPass.frag",
+            .entry_point = "main_ps",
+            .src = std::string(frag_code),
+        };
         CompileAndLinkShaderUnits(units, opt, spvs);
     }
 

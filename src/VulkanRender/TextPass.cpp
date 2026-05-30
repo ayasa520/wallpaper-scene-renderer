@@ -96,49 +96,67 @@ std::optional<TextVertexInputLayout> ResolveTextVertexInputLayout(
 
 std::optional<PreparedTextShaders> CompileTextShaders() {
     static const char* kVertexSource = R"(
-#version 450
-layout(location = 0) in vec3 a_Position;
-layout(location = 1) in vec2 a_TexCoord;
+[[vk::binding(0, 0)]] cbuffer TextUniformBlock {
+    column_major float4x4 g_ModelViewProjectionMatrix;
+    float4 g_Color4;
+};
 
-layout(binding = 0) uniform TextUniformBlock {
-    mat4 g_ModelViewProjectionMatrix;
-    vec4 g_Color4;
-} u_TextUniforms;
+struct VSInput {
+    [[vk::location(0)]] float3 a_Position : A_POSITION;
+    [[vk::location(1)]] float2 a_TexCoord : A_TEXCOORD;
+};
 
-layout(location = 0) out vec2 v_TexCoord;
-layout(location = 1) out vec4 v_Color;
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 v_TexCoord : TEXCOORD0;
+    [[vk::location(1)]] float4 v_Color : COLOR0;
+};
 
-void main() {
-    gl_Position = u_TextUniforms.g_ModelViewProjectionMatrix * vec4(a_Position, 1.0);
-    v_TexCoord = a_TexCoord;
-    v_Color = u_TextUniforms.g_Color4;
+VSOutput main_vs(VSInput input) {
+    VSOutput output;
+    output.position = mul(g_ModelViewProjectionMatrix, float4(input.a_Position, 1.0));
+    output.v_TexCoord = input.a_TexCoord;
+    output.v_Color = g_Color4;
+    return output;
 }
 )";
 
     static const char* kFragmentSource = R"(
-#version 450
-layout(binding = 1) uniform sampler2D g_Texture0;
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2D<float4> g_Texture0;
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState g_Texture0_ww_sampler;
 
-layout(location = 0) in vec2 v_TexCoord;
-layout(location = 1) in vec4 v_Color;
-layout(location = 0) out vec4 outColor;
+struct PSInput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 v_TexCoord : TEXCOORD0;
+    [[vk::location(1)]] float4 v_Color : COLOR0;
+};
 
-void main() {
-    const float coverage = texture(g_Texture0, v_TexCoord).a;
-    outColor = vec4(v_Color.rgb, v_Color.a * coverage);
+float4 main_ps(PSInput input) : SV_Target0 {
+    const float coverage = g_Texture0.Sample(g_Texture0_ww_sampler, input.v_TexCoord).a;
+    return float4(input.v_Color.rgb, input.v_Color.a * coverage);
 }
 )";
 
     ShaderCompOpt options {};
-    options.client_ver = glslang::EShTargetVulkan_1_0;
+    options.target_env = ShaderTargetEnv::VULKAN_1_0;
     options.auto_map_locations = false;
     options.auto_map_bindings = false;
-    options.relaxed_rules_vulkan = true;
-    options.global_uniform_binding = 0;
 
     std::array<ShaderCompUnit, 2> units {
-        ShaderCompUnit { .stage = EShLangVertex, .src = kVertexSource },
-        ShaderCompUnit { .stage = EShLangFragment, .src = kFragmentSource },
+        ShaderCompUnit {
+            .stage = wallpaper::ShaderType::VERTEX,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name = "TextPass.vert",
+            .entry_point = "main_vs",
+            .src = kVertexSource,
+        },
+        ShaderCompUnit {
+            .stage = wallpaper::ShaderType::FRAGMENT,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name = "TextPass.frag",
+            .entry_point = "main_ps",
+            .src = kFragmentSource,
+        },
     };
 
     PreparedTextShaders prepared;

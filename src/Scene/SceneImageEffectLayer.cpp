@@ -237,6 +237,14 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         }
         swap_pp();
     }
+
+    const bool source_less_final_output =
+        m_hidden_final_composite_policy == HiddenFinalCompositePolicy::SuppressOutput &&
+        m_final_output_effect != nullptr;
+    const bool keep_authored_final_private =
+        keep_final_output_private || source_less_final_output;
+    m_publish_final_composite = source_less_final_output && !keep_final_output_private;
+
     if (HasFinalComposite()) {
         // Prepare a neutral fallback output but do not make it the normal resolved writer. Visible
         // final effects keep Wallpaper Engine's authored behavior by drawing directly to the
@@ -269,15 +277,17 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
             material.blenmode = m_final_blend;
             m_final_node->SetCamera(std::string());
             mesh.ChangeMeshDataFrom(*m_final_mesh);
+            LOG_INFO("SceneEffectFinalCompositeResolve: layer=%d name='%s' fullscreen=false "
+                     "camera='' output='%s' source='%s' blend=%d publish=%s policy=%d",
+                     m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                     m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                     SpecTex_Default.data(),
+                     ppong_a.data(),
+                     static_cast<int>(material.blenmode),
+                     m_publish_final_composite ? "true" : "false",
+                     static_cast<int>(m_hidden_final_composite_policy));
         }
     }
-
-    const bool source_less_final_output =
-        m_hidden_final_composite_policy == HiddenFinalCompositePolicy::SuppressOutput &&
-        m_final_output_effect != nullptr;
-    const bool keep_authored_final_private =
-        keep_final_output_private || source_less_final_output;
-    m_publish_final_composite = source_less_final_output && !keep_final_output_private;
 
     if (fallback_last_output != nullptr && !keep_authored_final_private) {
         // Keep the historical visible path: the final authored shader writes the screen/default
@@ -313,6 +323,13 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
             fallback_last_output->sceneNode->SetCamera(std::string());
             fallback_last_output->sceneNode->CopyTrans(*m_final_node);
             mesh.ChangeMeshDataFrom(*m_final_mesh);
+            LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=false "
+                     "camera='' output='%s' material='%s' blend=%d private=false",
+                     m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                     m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                     SpecTex_Default.data(),
+                     material.name.c_str(),
+                     static_cast<int>(material.blenmode));
         }
     } else if (fallback_last_output != nullptr) {
         // Some final authored effects must remain private even when their owner is a visible screen
@@ -330,6 +347,17 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
             fallback_last_output->sceneNode->SetCamera(effect_cam.data());
             fallback_last_output->sceneNode->CopyTrans(default_node);
             mesh.ChangeMeshDataFrom(default_mesh);
+            LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=false "
+                     "camera='%.*s' output='%s' material='%s' blend=%d private=true "
+                     "publish-composite=%s",
+                     m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                     m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                     static_cast<int>(effect_cam.size()),
+                     effect_cam.data(),
+                     fallback_last_output->output.c_str(),
+                     material.name.c_str(),
+                     static_cast<int>(material.blenmode),
+                     m_publish_final_composite ? "true" : "false");
         }
     }
 }

@@ -4913,6 +4913,7 @@ void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key,
     opaque->scene->textures[std::string(key)] = SceneTexture {
         .url       = std::string(key),
         .sample    = image->header.sample,
+        .format    = image->header.format,
         .isVideo   = false,
         .isSprite  = false,
         .width     = image->header.width,
@@ -5036,6 +5037,22 @@ bool RegistrationUsesScriptAngleDegrees(const WPSceneScriptRegistration& registr
             registration.target_kind == WPSceneScriptTargetKind::Camera);
 }
 
+bool RegistrationUsesNumericVisibleScriptValue(const WPSceneScriptRegistration& registration) {
+    // `visible` is stored as a renderer boolean, but Wallpaper Engine scene scripts are often
+    // generated from scalar templates that expect the init/update argument to be a numeric value.
+    // The 3666041758 ferrofluid layer is one concrete case: its visible script stores
+    // `initialValue = typeof value === 'number' ? value : value.x`, so passing a JS boolean makes
+    // `initialValue` undefined and the next update returns NaN. QuickJS then coerces NaN to false
+    // for the boolean target and the renderer legitimately hides the whole layer. Keep the native
+    // property type boolean, but expose visible registration values to scripts as 1.0/0.0 so both
+    // scalar audio-response templates and normal truthy checks behave like Wallpaper Engine.
+    if (registration.property_name != "visible") return false;
+    return registration.target_kind == WPSceneScriptTargetKind::Layer ||
+           registration.target_kind == WPSceneScriptTargetKind::Camera ||
+           registration.target_kind == WPSceneScriptTargetKind::Effect ||
+           registration.target_kind == WPSceneScriptTargetKind::AnimationLayer;
+}
+
 WPDynamicValue ConvertFloat3Scale(const WPDynamicValue& value, float scale) {
     std::array<float, 3> vector {};
     if (! value.tryGet(&vector)) return value;
@@ -5049,6 +5066,11 @@ std::array<double, 3> ConvertEulerArrayScale(const std::array<double, 3>& value,
 
 WPDynamicValue ToScriptFacingRegistrationValue(const WPSceneScriptRegistration& registration,
                                                const WPDynamicValue&            value) {
+    if (RegistrationUsesNumericVisibleScriptValue(registration)) {
+        bool visible = false;
+        if (value.tryGet(&visible)) return WPDynamicValue(visible ? 1.0f : 0.0f);
+    }
+
     if (! RegistrationUsesScriptAngleDegrees(registration)) return value;
 
     // SceneScript authors write formulas such as atan2(...) * 180 / PI for layer angles. Convert

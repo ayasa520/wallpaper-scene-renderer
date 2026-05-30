@@ -103,30 +103,30 @@ std::string DescribeIndexVec(const std::vector<usize>& values) {
     return oss.str();
 }
 
-std::string DescribeShaderValueMapSummary(const ShaderValueMap& values) {
-    std::ostringstream oss;
-    oss << "{";
-    size_t count = 0;
-    for (const auto& [name, value] : values) {
-        if (count != 0) oss << ", ";
-        oss << name << "=[";
-        for (size_t i = 0; i < value.size(); i++) {
-            if (i != 0) oss << ", ";
-            oss << value[i];
-            if (i >= 3 && value.size() > 4) {
-                oss << ", ...";
-                break;
-            }
-        }
-        oss << "]";
-        count++;
-        if (count >= 12 && values.size() > count) {
-            oss << ", ...";
-            break;
-        }
+std::optional<std::string_view> TextureFormatShaderDefine(TextureFormat format) {
+    // Wallpaper Engine's stock shader headers use TEXnFORMAT preprocessor symbols to choose the
+    // correct channel layout for compressed normal maps, R/RG masks, and light-gradient textures.
+    // The old path only populated TEX0FORMAT, which left later slots such as normal maps
+    // (TEX1FORMAT), PBR gradients (TEX4FORMAT), and fur/detail masks (TEX8FORMAT) to compile as
+    // the implicit RGBA default under DXC. Keep the policy here at the material/texture binding
+    // boundary: the shader remains authored WE code, while the parser supplies the real texture
+    // metadata for every bound slot.
+    switch (format) {
+    case TextureFormat::RGBA8: return "FORMAT_RGBA8888";
+    case TextureFormat::RGB8: return "FORMAT_RGB888";
+    case TextureFormat::BC1: return "FORMAT_DXT1";
+    case TextureFormat::BC2: return "FORMAT_DXT3";
+    case TextureFormat::BC3: return "FORMAT_DXT5";
+    case TextureFormat::RG8: return "FORMAT_RG88";
+    case TextureFormat::R8: return "FORMAT_R8";
     }
-    oss << "}";
-    return oss.str();
+    return std::nullopt;
+}
+
+void SetTextureFormatShaderDefine(WPShaderInfo& shader_info, usize slot, TextureFormat format) {
+    const auto define = TextureFormatShaderDefine(format);
+    if (! define.has_value()) return;
+    shader_info.combos["TEX" + std::to_string(slot) + "FORMAT"] = std::string(*define);
 }
 
 std::string DescribeShaderValueMapFull(const ShaderValueMap& values) {
@@ -786,6 +786,7 @@ void EnsureSystemTextureRegistered(Scene& scene, std::string_view texture_key) {
                 .magFilter = TextureFilter::LINEAR,
                 .minFilter = TextureFilter::LINEAR,
             },
+        .format    = TextureFormat::RGBA8,
         .isVideo   = false,
         .isSprite  = false,
         .width     = 1,
@@ -966,18 +967,6 @@ bool ShouldDeferRuntimeLayerMaterialization(const ParseContext& context, int32_t
     // their render targets.
     return LayerHasRuntimeVisibilityInInitialAncestry(context, layer_id);
 }
-
-class ScopedGlslangSession {
-public:
-    explicit ScopedGlslangSession(std::string_view reason): m_reason(reason) {
-        WPShaderParser::InitGlslang(m_reason);
-    }
-
-    ~ScopedGlslangSession() { WPShaderParser::FinalGlslang(m_reason); }
-
-private:
-    std::string m_reason;
-};
 
 void PopulateGlobalBaseUniforms(ParseContext& context, const Scene& scene) {
     auto& gb                   = context.global_base_uniforms;
@@ -1329,8 +1318,6 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                   SceneMaterial* pMaterial, WPShaderValueData* pSvData,
                   const UserPropertyMap* user_properties = nullptr,
                   WPShaderInfo*          pWPShaderInfo   = nullptr) {
-    (void)pNode;
-
     auto& svData   = *pSvData;
     auto& material = *pMaterial;
 
@@ -1477,12 +1464,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
             const ImageHeader& texh = texHeaders.count(name) == 0
                                           ? pScene->imageParser->ParseHeader(name)
                                           : texHeaders.at(name);
-            if (i == 0) {
-                if (texh.format == TextureFormat::R8)
-                    pWPShaderInfo->combos["TEX0FORMAT"] = "FORMAT_R8";
-                else if (texh.format == TextureFormat::RG8)
-                    pWPShaderInfo->combos["TEX0FORMAT"] = "FORMAT_RG88";
-            }
+            SetTextureFormatShaderDefine(*pWPShaderInfo, i, texh.format);
             if (texh.mipmap_larger) {
                 resolution = { texh.width, texh.height, texh.mapWidth, texh.mapHeight };
             } else {
@@ -1493,6 +1475,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                 SceneTexture stex;
                 stex.sample    = texh.sample;
                 stex.url       = name;
+                stex.format    = texh.format;
                 stex.isVideo   = texh.isVideoTexture;
                 stex.width     = texh.width;
                 stex.height    = texh.height;
@@ -1541,7 +1524,9 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     material.blenmode = ParseBlendMode(wpmat.blending);
 
     for (uint i = 0; i < material.textures.size(); i++) {
-        if (! exists(sd_units[1].preprocess_info.active_tex_slots, i)) material.textures[i].clear();
+        if (! exists(sd_units[1].preprocess_info.active_tex_slots, i)) {
+            material.textures[i].clear();
+        }
     }
 
     for (const auto& el : pWPShaderInfo->baseConstSvs) {
@@ -3424,6 +3409,26 @@ public:
                         const nlohmann::json* sidecar_json)
         : context_(context), model_obj_(model_obj), sidecar_json_(sidecar_json) {}
 
+    bool AnyChunkSamplesReflection(const WPMdl& mdl) const {
+        return std::any_of(
+            mdl.static_chunks.begin(), mdl.static_chunks.end(), [this](const auto& chunk) {
+                return ChunkSamplesReflection(chunk);
+            });
+    }
+
+    bool ChunkSamplesReflection(const WPMdl::StaticChunk& chunk) const {
+        const auto source = LoadSource(chunk);
+        if (!source.has_value()) {
+            LOG_ERROR("ModelReflectionMaterial: failed to inspect layer=%d name='%s' material='%s'",
+                      model_obj_.id,
+                      model_obj_.name.c_str(),
+                      ResolvePath(chunk).c_str());
+            return false;
+        }
+
+        return ModelMaterialSamplesReflection(source->material);
+    }
+
     bool UsesTransparentBlend(const WPMdl::StaticChunk& chunk) const {
         const auto source = LoadSource(chunk);
         if (! source.has_value()) {
@@ -3607,8 +3612,8 @@ struct ModelChunkOrder {
 
         // Transparent model chunks must be appended after opaque chunks from the same authored
         // model. They still depth-test against the opaque depth buffer, but drawing them last keeps
-        // later opaque chunks such as Fantastic Car's interior from overwriting glass that does not
-        // write depth. The diagnostic records the exact parser-side order used by run.log.
+        // later opaque chunks from overwriting glass that does not write depth. The diagnostic
+        // records the exact parser-side order used by run.log.
         LOG_INFO("ModelRenderOrder: layer=%d name='%s' opaque=%s transparent=%s final=%s",
                  model_obj.id,
                  model_obj.name.c_str(),
@@ -3636,7 +3641,10 @@ public:
     void Materialize(const WPMdl& mdl) {
         root_ = CreateRootNode();
         RegisterRootNode();
-        if (model_obj_.reflected) EnsureModelReflectionTarget(context_);
+        const bool material_samples_reflection = material_loader_.AnyChunkSamplesReflection(mdl);
+        if (model_obj_.reflected || material_samples_reflection) {
+            EnsureModelReflectionTarget(context_);
+        }
 
         const auto order = ModelChunkOrder::Build(mdl, material_loader_, model_obj_);
         AppendChunks(mdl, order);
@@ -3678,15 +3686,31 @@ private:
     }
 
     void AppendChunks(const WPMdl& mdl, const ModelChunkOrder& order) {
+        // Receiver materials and producer passes are separate contracts. A material may reference
+        // `_rt_Reflection` only so its shader can bind the runtime target, while mirrored producer
+        // geometry is authored by the model object's `"reflected": true` flag. Keeping those paths
+        // separate prevents receiver-only models from drawing phantom mirrored geometry, without
+        // disabling reflected scenes that intentionally populate the target.
+        if (model_obj_.reflected) {
+            for (usize chunk_index : order.ordered) {
+                const auto& chunk = mdl.static_chunks[chunk_index];
+                AppendReflectionChunk(chunk, chunk_index);
+            }
+        }
+
         for (usize chunk_index : order.ordered) {
             const auto& chunk = mdl.static_chunks[chunk_index];
-            AppendReflectionChunk(chunk, chunk_index);
             AppendMainChunk(chunk, chunk_index);
         }
     }
 
     void AppendReflectionChunk(const WPMdl::StaticChunk& chunk, usize chunk_index) {
-        if (! model_obj_.reflected) return;
+        if (material_loader_.ChunkSamplesReflection(chunk)) {
+            // A material that samples `_rt_Reflection` is the receiver surface, not a producer for
+            // that same target. Skipping it avoids feedback/self-copy edges while still allowing
+            // authored reflected models to populate the target before the receiver draws.
+            return;
+        }
 
         auto reflection_node = MakeChunkNode(
             chunk,
@@ -3699,10 +3723,10 @@ private:
             });
         if (reflection_node == nullptr) return;
 
-        // Fantastic Car's grid samples `_rt_Reflection` as a screen-space floor mirror. Mirroring
-        // reflected chunks across the authored Y=0 floor plane gives the target the expected
-        // geometry, while `mirroredHandedness` above lets the render pass fix winding/culling
-        // without weakening cull behavior for normal 3D or any 2D scene.
+        // Some authored reflection receivers sample `_rt_Reflection` as a screen-space floor
+        // mirror. Mirroring reflected chunks across the authored Y=0 floor plane gives the target
+        // the expected geometry, while `mirroredHandedness` above lets the render pass fix
+        // winding/culling without weakening cull behavior for normal 3D or any 2D scene.
         reflection_node->SetScale(Vector3f { 1.0f, -1.0f, 1.0f });
         root_->AppendChild(reflection_node);
     }
@@ -6734,7 +6758,6 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
-    ScopedGlslangSession glslang_scope("deferred-image-parse");
 
     std::shared_ptr<SceneNode> placeholder_node;
     if (auto node_it = context.object_nodes.find(layer_id); node_it != context.object_nodes.end()) {
@@ -6824,7 +6847,6 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
-    ScopedGlslangSession glslang_scope("deferred-particle-parse");
 
     std::shared_ptr<SceneNode> placeholder_node;
     if (auto node_it = context.object_nodes.find(layer_id); node_it != context.object_nodes.end()) {
@@ -6889,7 +6911,6 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
-    ScopedGlslangSession glslang_scope("deferred-text-parse");
 
     std::shared_ptr<SceneNode> placeholder_node;
     if (auto node_it = context.object_nodes.find(layer_id); node_it != context.object_nodes.end()) {
@@ -6964,7 +6985,6 @@ bool wallpaper::CreateDynamicSceneLayer(
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
-    ScopedGlslangSession glslang_scope("dynamic-layer-parse");
 
     nlohmann::json normalized_object_json = object_json;
     int32_t        layer_id               = 0;
@@ -7305,10 +7325,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         };
     }
     context.scene->scene_id = scene_id;
-    WPShaderParser::InitGlslang("scene-parse");
-    // Scene Bloom owns a synthetic shader, so it must be built only after the scene id is final
-    // and glslang has been initialized for this parse. Running this earlier can enter shader
-    // compilation with an uninitialized compiler lifetime and crash before any graph is created.
+    // Scene Bloom owns a synthetic shader and its cache keys include the scene id, so it must be
+    // built only after the parse context has reached the same identity state as authored shaders.
     ConfigureSceneBloomPass(context);
 
     for (WPObjectVar& obj : wp_objs) {
@@ -7393,7 +7411,6 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     context.scene->ApplyAllLayerVisibility();
 
-    WPShaderParser::FinalGlslang("scene-parse");
     return context.scene;
 }
 

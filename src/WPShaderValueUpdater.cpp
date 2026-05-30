@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <limits>
 #include <numeric>
+#include <vector>
 
 using namespace wallpaper;
 using namespace Eigen;
@@ -100,6 +101,35 @@ bool IsModelRenderNode(SceneNode* node) {
 
 bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
     return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
+}
+
+ShaderValue ToDxcCBufferMatrixUniform(const Matrix4d& matrix) {
+    // The DXC WE prologue maps authored `mul(v, M)` to native `mul(M, v)` so shader code observes
+    // the same column-vector transform contract as the renderer. Keep Eigen's column-major matrix
+    // bytes untouched; changing layout here would make uniform upload policy depend on the source
+    // spelling of every shader expression instead of on the single language bridge in WPShaderParser.
+    return ShaderValue::fromMatrix(matrix.cast<float>());
+}
+
+ShaderValue ToDxcRowVectorSkinningUniform(std::span<const Affine3f> matrices) {
+    // WE authors skinning uniforms as GLSL `mat4x3`: four columns (xyz + translation) by three
+    // rows, then multiplies `mul(float4(position, 1), g_Bones[i])` to get xyz. The DXC bridge spells
+    // that type as HLSL `float3x4` and swaps the multiply to native `mul(M, v)`, which SPIR-V lowers
+    // as a row-major matrix with ArrayStride 64. Therefore each bone needs four std140 vec4 slots:
+    // the affine matrix's x/y/z rows in the first three lanes, plus a padded fourth lane that remains
+    // zero. Packing compact 12-float matrices here misaligns every bone after the first one.
+    std::vector<float> packed;
+    packed.reserve(matrices.size() * 16);
+    for (const auto& affine : matrices) {
+        const Matrix4f matrix = affine.matrix();
+        for (int column = 0; column < 4; ++column) {
+            packed.push_back(matrix(0, column));
+            packed.push_back(matrix(1, column));
+            packed.push_back(matrix(2, column));
+            packed.push_back(0.0f);
+        }
+    }
+    return ShaderValue(std::span<const float>(packed.data(), packed.size()));
 }
 
 SceneNode* RemapSceneNodeReference(SceneNode* node, SceneNode* old_node, SceneNode* new_node) {
@@ -392,7 +422,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             if (m_scene->scriptHost) {
                 m_scene->scriptHost->NotifyAnimationLayersAdvanced(pNode);
             }
-            updateOp(G_BONES, std::span<const float> { data[0].data(), data.size() * 16 });
+            updateOp(G_BONES, ToDxcRowVectorSkinningUniform(data));
         }
     }
 
@@ -407,19 +437,19 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     Matrix4d viewProTrans = camera->GetViewProjectionMatrix();
 
     if (info.has_VP) {
-        updateOp(G_VP, ShaderValue::fromMatrix(viewProTrans));
+        updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
     }
     if (reqM || reqMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
         Matrix4d modelTrans =
             transformResolver.ResolveParallaxedModelTransform(pNode, camera, cam_name != "effect");
 
-        if (reqM) updateOp(G_M, ShaderValue::fromMatrix(modelTrans));
-        if (reqAM) updateOp(G_AM, ShaderValue::fromMatrix(modelTrans));
-        if (reqMI) updateOp(G_MI, ShaderValue::fromMatrix(modelTrans.inverse()));
+        if (reqM) updateOp(G_M, ToDxcCBufferMatrixUniform(modelTrans));
+        if (reqAM) updateOp(G_AM, ToDxcCBufferMatrixUniform(modelTrans));
+        if (reqMI) updateOp(G_MI, ToDxcCBufferMatrixUniform(modelTrans.inverse()));
         if (reqMVP) {
             Matrix4d mvpTrans = viewProTrans * modelTrans;
-            updateOp(G_MVP, ShaderValue::fromMatrix(mvpTrans));
-            if (reqMVPI) updateOp(G_MVPI, ShaderValue::fromMatrix(mvpTrans.inverse()));
+            updateOp(G_MVP, ToDxcCBufferMatrixUniform(mvpTrans));
+            if (reqMVPI) updateOp(G_MVPI, ToDxcCBufferMatrixUniform(mvpTrans.inverse()));
         }
         if (reqETVP || reqETVPI) {
             const SceneNode* projectionNode      = pNode;
@@ -441,12 +471,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                                                                   projectionMesh,
                                                                   projectionModelTrans,
                                                                   projectionViewPro);
-            if (reqETVP) updateOp(G_ETVP, ShaderValue::fromMatrix(etvpTrans));
+            if (reqETVP) updateOp(G_ETVP, ToDxcCBufferMatrixUniform(etvpTrans));
             if (reqETVPI) {
                 if (std::abs(etvpTrans.determinant()) > 1e-12) {
-                    updateOp(G_ETVPI, ShaderValue::fromMatrix(etvpTrans.inverse()));
+                    updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(etvpTrans.inverse()));
                 } else {
-                    updateOp(G_ETVPI, ShaderValue::fromMatrix(Matrix4d::Identity()));
+                    updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(Matrix4d::Identity()));
                 }
             }
         }

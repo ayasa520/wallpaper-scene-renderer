@@ -8,9 +8,6 @@
 #include "Interface/IShaderValueUpdater.h"
 
 #include "Utils/Algorism.h"
-#include "WPShaderParser.hpp"
-
-#include <glslang/Public/ShaderLang.h>
 
 #include "Vulkan/Device.hpp"
 #include "Vulkan/TextureCache.hpp"
@@ -504,7 +501,6 @@ void VulkanRender::Impl::processDeferredGraphPreparation(Scene& scene) {
     const auto batch_started_at = std::chrono::steady_clock::now();
     std::size_t attempted = 0;
     std::size_t prepared = 0;
-    bool glslang_scope_open = false;
 
     while (attempted < kDeferredPrepareMaxPassesPerFrame && !m_deferred_prepare_indices.empty()) {
         if (attempted != 0) {
@@ -545,10 +541,6 @@ void VulkanRender::Impl::processDeferredGraphPreparation(Scene& scene) {
         }
 
         m_deferred_waiting_indices_logged.erase(pass_index);
-        if (!glslang_scope_open) {
-            WPShaderParser::InitGlslang("render-graph-deferred-prepare");
-            glslang_scope_open = true;
-        }
 
         const auto pass_started_at = std::chrono::steady_clock::now();
         pass->prepareDeferred(scene, *m_device, m_rendering_resources);
@@ -579,9 +571,6 @@ void VulkanRender::Impl::processDeferredGraphPreparation(Scene& scene) {
         if (batch_elapsed_ms >= kDeferredPrepareFrameBudgetMs) {
             break;
         }
-    }
-    if (glslang_scope_open) {
-        WPShaderParser::FinalGlslang("render-graph-deferred-prepare");
     }
 
     const auto batch_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1030,7 +1019,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         std::size_t refreshed_passes = 0;
         std::size_t prepared_passes = 0;
 
-        WPShaderParser::InitGlslang("render-graph-resource-refresh");
         for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
             auto* p = m_passes[pass_index];
             if (p == nullptr) continue;
@@ -1052,7 +1040,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                 prepared_passes++;
             }
         }
-        WPShaderParser::FinalGlslang("render-graph-resource-refresh");
 
         // Resource-only refreshes are intentionally silent in production; the counters stay local
         // so the branch preserves targeted text-bridge behavior without making minute rollovers
@@ -1160,7 +1147,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
 
     setRenderTargetSize(scene, rg);
 
-    WPShaderParser::InitGlslang("render-graph-compile");
     std::size_t reused_refreshed_count = 0;
     std::size_t refreshed_count = 0;
     std::size_t prepared_count = 0;
@@ -1215,7 +1201,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
             already_prepared_count++;
         }
     }
-    WPShaderParser::FinalGlslang("render-graph-compile");
 
     LOG_INFO("RenderGraphCompileSummary: total=%zu reused-refreshed=%zu refreshed=%zu "
              "prepared=%zu dependency-prepared=%zu deferred=%zu already-prepared=%zu mode=%s",
@@ -1255,7 +1240,6 @@ void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGrap
     std::size_t pipeline_passes = 0;
     std::size_t warmed_passes   = 0;
 
-    WPShaderParser::InitGlslang("render-graph-pipeline-warmup");
     for (const auto node_id : nodes) {
         auto pass_ref = rg.getPassShared(node_id);
         auto vpass = std::dynamic_pointer_cast<VulkanPass>(pass_ref);
@@ -1265,7 +1249,6 @@ void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGrap
             warmed_passes++;
         }
     }
-    WPShaderParser::FinalGlslang("render-graph-pipeline-warmup");
 
     const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - started_at)
