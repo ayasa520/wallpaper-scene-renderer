@@ -30,6 +30,7 @@ struct WPShaderInfo {
 struct WPPreprocessorInfo {
     Map<std::string, std::string> input; // name to line
     Map<std::string, std::string> output;
+    Map<std::string, std::string> uniforms; // non-sampler uniform name to WE type + optional array suffix
 
     Set<uint> active_tex_slots;
 };
@@ -38,7 +39,7 @@ struct WPShaderTexInfo {
     bool                enabled { false };
     std::array<bool, 3> composEnabled { false, false, false };
     // Some runtime render targets are meant to be sampled with screen-space UVs reconstructed by
-    // the authored shader. The shader preparer rewrites only calls that sample the affected
+    // the authored shader. The shader preparer adjusts only calls that sample the affected
     // g_TextureN slot, so ordinary textures and unrelated 2D effect targets keep their old UV path.
     bool                screenSpaceSampleYFlip { false };
 };
@@ -53,11 +54,6 @@ class WPShaderParser {
 public:
     static std::string PreShaderSrc(fs::VFS&, const std::string& src, WPShaderInfo* pWPShaderInfo,
                                     const std::vector<WPShaderTexInfo>& texs);
-
-    static std::string PreShaderHeader(const std::string& src, const Combos& combos, ShaderType);
-
-    static void InitGlslang(std::string_view reason = {});
-    static void FinalGlslang(std::string_view reason = {});
 
     static bool CompileToSpv(std::string_view         scene_id, std::span<WPShaderUnit>,
                              std::vector<ShaderCode>& spvs, fs::VFS&, WPShaderInfo*,

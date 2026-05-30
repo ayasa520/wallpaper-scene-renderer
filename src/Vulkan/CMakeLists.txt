@@ -29,14 +29,19 @@ vulkan_wrapper.cpp
 
 target_link_libraries(${LIB_NAME}
 PUBLIC
-	glslang
     spirv-reflect-static
 	${Vulkan_LIBRARIES}
     wpScene
 PRIVATE
     ${GSTREAMER_LIBRARIES}
-	SPIRV
 )
+if(HANABI_HAS_DXC)
+    target_compile_definitions(${LIB_NAME} PRIVATE HANABI_HAS_DXC=1)
+    target_link_libraries(${LIB_NAME} PRIVATE Hanabi::DxCompiler)
+    if(TARGET HanabiVendoredDxc)
+        add_dependencies(${LIB_NAME} HanabiVendoredDxc)
+    endif()
+endif()
 target_include_directories(${LIB_NAME} PUBLIC include PRIVATE include/Vulkan include/vkk ${GSTREAMER_INCLUDE_DIRS})
 target_compile_definitions(${LIB_NAME} PRIVATE GST_USE_UNSTABLE_API)
 target_compile_options(${LIB_NAME} PRIVATE ${warn_opts} -Wno-missing-field-initializers ${GSTREAMER_CFLAGS_OTHER})

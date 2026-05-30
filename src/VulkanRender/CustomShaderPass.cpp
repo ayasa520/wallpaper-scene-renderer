@@ -16,6 +16,7 @@
 #include "Core/ArrayHelper.hpp"
 
 #include <cassert>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
@@ -23,17 +24,32 @@ using namespace wallpaper::vulkan;
 
 namespace
 {
-std::string CustomShaderPipelineCompatibilityKey(VkAttachmentLoadOp load_op,
-                                                 bool               model_pass,
+std::string CustomShaderPipelineCompatibilityKey(VkAttachmentLoadOp load_op, bool model_pass,
                                                  VkAttachmentLoadOp depth_load_op) {
     // Keep this key limited to Vulkan render-pass compatibility. GraphicsPipeline adds the shader,
     // descriptor, vertex-input, blend, depth, and topology state to the final cache key, matching
     // the descriptor-driven PSO caches used by larger renderers instead of tying immutable PSOs to
     // a transient layer/pass identity.
     return "CustomShaderPass|format=rgba8|final=shader-read|load=" +
-           std::to_string(static_cast<int>(load_op)) + "|model=" +
-           (model_pass ? std::string("1") : std::string("0")) + "|depth-format=d32|depth-load=" +
-           std::to_string(static_cast<int>(depth_load_op));
+           std::to_string(static_cast<int>(load_op)) +
+           "|model=" + (model_pass ? std::string("1") : std::string("0")) +
+           "|depth-format=d32|depth-load=" + std::to_string(static_cast<int>(depth_load_op));
+}
+
+void PopulateTextureBindingsFromReflection(wallpaper::vulkan::CustomShaderPass::Desc& desc,
+                                           const wallpaper::vulkan::ShaderReflected&  ref,
+                                           size_t texture_count) {
+    desc.vk_tex_binding.clear();
+    desc.vk_tex_binding.reserve(texture_count);
+    for (size_t i = 0; i < texture_count; i++) {
+        wallpaper::i32 binding { -1 };
+        if (i < wallpaper::WE_GLTEX_NAMES.size() &&
+            wallpaper::exists(ref.binding_map, wallpaper::WE_GLTEX_NAMES[i])) {
+            binding = static_cast<wallpaper::i32>(
+                ref.binding_map.at(wallpaper::WE_GLTEX_NAMES[i]).binding);
+        }
+        desc.vk_tex_binding.push_back(binding);
+    }
 }
 
 std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent) {
@@ -105,9 +121,9 @@ CustomShaderPass::CustomShaderPass(const Desc& desc) {
 CustomShaderPass::~CustomShaderPass() {}
 
 std::string CustomShaderPass::residencyKey() const {
-    return "CustomShaderPass|layer=" + std::to_string(m_desc.layer_id) + "|node=" +
-           std::to_string(reinterpret_cast<std::uintptr_t>(m_desc.node)) + "|output=" +
-           m_desc.output;
+    return "CustomShaderPass|layer=" + std::to_string(m_desc.layer_id) +
+           "|node=" + std::to_string(reinterpret_cast<std::uintptr_t>(m_desc.node)) +
+           "|output=" + m_desc.output;
 }
 
 bool CustomShaderPass::canReuseForResidency(const VulkanPass& next_pass) const {
@@ -252,9 +268,8 @@ static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
         // Some first-party model shaders declare compact matrix uniforms such as `mat3
         // g_ModelMatrix`, while the runtime updater naturally owns a full 4x4 scene transform.
         // Writing the whole packed matrix would overflow the reflected member slot and corrupt the
-        // following uniforms, most visibly Fantastic Car's grid projection matrix. Clamp only at
-        // the upload boundary so 2D shader generation and the shared ShaderValue representation do
-        // not need a model-specific branch.
+        // following uniforms. Clamp only at the upload boundary so 2D shader generation and the
+        // shared ShaderValue representation do not need a model-specific branch.
         buf->writeToBuf(bufref, value_u8.subspan(0, reflectedSize), offset);
         return;
     }
@@ -383,15 +398,14 @@ wallpaper::SceneCullMode ResolveModelCullMode(wallpaper::SceneCullMode mode,
 }
 
 bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
-                                  std::string_view camera_name) {
+                                  std::string_view                camera_name) {
     const bool is_model_pass = material.modelRenderState.has_value();
-    // Model shaders may output non-opaque alpha for their own material math. Fantastic Car's body
-    // shader writes alpha=0.4 even though the car is an opaque final scene object; allowing that
-    // alpha into `_rt_default` makes FinPass present a translucent frame and visually crushes the
-    // lighting. Keep the RGB blend factors intact for translucent model materials, but preserve the
-    // target alpha just like global 2D passes.
+    // Model shaders may output non-opaque alpha for their own material math even when the authored
+    // object is visually opaque. Allowing that alpha into `_rt_default` makes FinPass present a
+    // translucent frame and visually crushes the lighting. Keep the RGB blend factors intact for
+    // translucent model materials, but preserve the target alpha just like global 2D passes.
     return ! is_model_pass &&
-        ! (camera_name.empty() || wallpaper::sstart_with(camera_name, "global"));
+           ! (camera_name.empty() || wallpaper::sstart_with(camera_name, "global"));
 }
 
 void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
@@ -407,25 +421,17 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     // defaults. The parser chooses a color-load mode per output target, so offscreen model buffers
     // can be cleared once per frame before later chunks load and composite into the same image.
     switch (model_state->colorLoadMode) {
-    case wallpaper::SceneModelColorLoadMode::DontCare:
-        break;
-    case wallpaper::SceneModelColorLoadMode::Load:
-        load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-        break;
-    case wallpaper::SceneModelColorLoadMode::Clear:
-        load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        break;
+    case wallpaper::SceneModelColorLoadMode::DontCare: break;
+    case wallpaper::SceneModelColorLoadMode::Load: load_op = VK_ATTACHMENT_LOAD_OP_LOAD; break;
+    case wallpaper::SceneModelColorLoadMode::Clear: load_op = VK_ATTACHMENT_LOAD_OP_CLEAR; break;
     }
 }
 
 std::string_view ModelColorLoadModeName(wallpaper::SceneModelColorLoadMode mode) {
     switch (mode) {
-    case wallpaper::SceneModelColorLoadMode::DontCare:
-        return "dont-care";
-    case wallpaper::SceneModelColorLoadMode::Load:
-        return "load";
-    case wallpaper::SceneModelColorLoadMode::Clear:
-        return "clear";
+    case wallpaper::SceneModelColorLoadMode::DontCare: return "dont-care";
+    case wallpaper::SceneModelColorLoadMode::Load: return "load";
+    case wallpaper::SceneModelColorLoadMode::Clear: return "clear";
     }
     return "unknown";
 }
@@ -434,18 +440,18 @@ VkClearValue BuildCustomShaderClearValue(const wallpaper::Scene&         scene,
                                          const wallpaper::SceneMaterial& material) {
     if (material.modelRenderState.has_value() &&
         material.modelRenderState->colorLoadMode == wallpaper::SceneModelColorLoadMode::Clear) {
-        // Model-only offscreen targets are sampled as textures by later passes. Transparent black is
-        // the neutral clear value for those buffers: uncovered pixels contribute no stale color, no
-        // alpha, and no previous-frame reflection when the current model geometry shrinks.
+        // Model-only offscreen targets are sampled as textures by later passes. Transparent black
+        // is the neutral clear value for those buffers: uncovered pixels contribute no stale color,
+        // no alpha, and no previous-frame reflection when the current model geometry shrinks.
         return VkClearValue {
             .color = { 0.0f, 0.0f, 0.0f, 0.0f },
         };
     }
 
     auto& sc = scene.clearColor;
-    // Non-model and main-target custom shader passes retain the existing scene clear color contract.
-    // Keeping this branch shared avoids changing ordinary image/effect behavior while still letting
-    // model state opt into transparent offscreen clears explicitly.
+    // Non-model and main-target custom shader passes retain the existing scene clear color
+    // contract. Keeping this branch shared avoids changing ordinary image/effect behavior while
+    // still letting model state opt into transparent offscreen clears explicitly.
     return VkClearValue {
         .color = { sc[0], sc[1], sc[2], 1.0f },
     };
@@ -568,7 +574,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
             if (image) {
                 if (scene.textures.count(tex_name) != 0 && scene.textures.at(tex_name).isVideo) {
                     const auto paused_it = scene.videoTexturePaused.find(tex_name);
-                    const bool stopped = scene.videoTextureStopped.count(tex_name) != 0;
+                    const bool stopped   = scene.videoTextureStopped.count(tex_name) != 0;
                     // Hidden video passes are kept prepared so visibility flips are cheap, but the
                     // backing decoder should still start paused unless a scene script explicitly
                     // requested playback for this texture.
@@ -577,10 +583,10 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                             ? paused_it->second
                             : (desc.node != nullptr && ! desc.node->Visible());
                     const auto initial_state =
-                        stopped ? wallpaper::VideoTexturePlaybackState::Stopped
-                                : (initially_paused
-                                       ? wallpaper::VideoTexturePlaybackState::Paused
-                                       : wallpaper::VideoTexturePlaybackState::Playing);
+                        stopped
+                            ? wallpaper::VideoTexturePlaybackState::Stopped
+                            : (initially_paused ? wallpaper::VideoTexturePlaybackState::Paused
+                                                : wallpaper::VideoTexturePlaybackState::Playing);
                     img_slots = device.video_tex_cache().Acquire(
                         tex_name, scene.textures.at(tex_name), *image, initial_state);
                 } else {
@@ -632,7 +638,7 @@ bool StaticSceneTexturesResidentForDeferredPrepare(wallpaper::Scene& scene, cons
 
         const auto texture_it = scene.textures.find(tex_name);
         if (texture_it == scene.textures.end() || texture_it->second.isVideo) continue;
-        if (!device.tex_cache().FindTex(tex_name).has_value()) {
+        if (! device.tex_cache().FindTex(tex_name).has_value()) {
             missing_textures.push_back(tex_name);
         }
     }
@@ -646,7 +652,7 @@ bool StaticSceneTexturesResidentForDeferredPrepare(wallpaper::Scene& scene, cons
     // GPU residency work.
     std::string missing;
     for (const auto texture : missing_textures) {
-        if (!missing.empty()) missing += ",";
+        if (! missing.empty()) missing += ",";
         missing += texture;
     }
     LOG_INFO("CustomShaderPassDeferredPrepareWaitTextures: node='%s' output='%s' missing='%s'",
@@ -764,12 +770,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
                 return item.second;
             });
 
-        for (usize i = 0; i < m_desc.vk_textures.size(); i++) {
-            i32 binding { -1 };
-            if (exists(ref.binding_map, WE_GLTEX_NAMES[i]))
-                binding = (i32)ref.binding_map.at(WE_GLTEX_NAMES[i]).binding;
-            m_desc.vk_tex_binding.push_back(binding);
-        }
+        PopulateTextureBindingsFromReflection(m_desc, ref, m_desc.vk_textures.size());
     }
 
     m_desc.draw_count = 0;
@@ -798,10 +799,10 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             bind_descriptions.push_back(bind_desc);
 
             for (auto& item : ref.input_location_map) {
-                auto& name   = item.first;
-                auto& input  = item.second;
+                auto&      name     = item.first;
+                auto&      input    = item.second;
                 const bool has_attr = exists(attrs_map, name);
-                usize offset = has_attr ? attrs_map[name].offset : 0;
+                usize      offset   = has_attr ? attrs_map[name].offset : 0;
 
                 VkVertexInputAttributeDescription attr_desc {
                     .location = input.location,
@@ -854,9 +855,9 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     {
         VkPipelineColorBlendAttachmentState color_blend;
         VkAttachmentLoadOp                  loadOp { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
+        VkColorComponentFlags               colorMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
         {
-            VkColorComponentFlags colorMask =
-                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
             const auto camera_name = m_desc.node != nullptr
                                          ? std::string_view(m_desc.node->Camera())
                                          : std::string_view {};
@@ -925,148 +926,151 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     if (! ref.blocks.empty()) {
         std::function<void()> update_dyn_buf_op;
         if (m_desc.dyn_vertex) {
-            auto& mesh             = *m_desc.node->Mesh();
-            auto* dyn_buf          = rr.dyn_buf;
-            auto& vertex_bufs      = m_desc.vertex_bufs;
-            auto& draw_count       = m_desc.draw_count;
-            auto& index_buf        = m_desc.index_buf;
-            auto& force_dyn_upload = m_desc.force_dyn_upload;
-            update_dyn_buf_op =
-                [&mesh, &vertex_bufs, &draw_count, &index_buf, dyn_buf, &force_dyn_upload]() {
-                    const bool dirty        = mesh.Dirty().load();
-                    const bool needs_upload = dirty || force_dyn_upload;
-                    if (needs_upload) {
-                        auto ensure_vertex_subref = [&](usize array_index,
-                                                        const wallpaper::SceneVertexArray& vertex) {
-                            if (vertex_bufs.size() <= array_index) {
-                                vertex_bufs.resize(array_index + 1);
-                            }
-
-                            auto&      buf                = vertex_bufs[array_index];
-                            const auto required_live_size = static_cast<VkDeviceSize>(
-                                std::max<usize>(vertex.DataSizeOf(), vertex.OneSizeOf()));
-                            if (buf && buf.size >= required_live_size) return true;
-
-                            // Dynamic custom-shader meshes may grow after a pass was prepared. Keep
-                            // this as a renderer-level buffer refresh mechanism for authored
-                            // dynamic meshes, while first-class text is handled by TextPass and
-                            // never enters CustomShaderPass as glyph helper nodes.
-                            const auto required_size = GrowDynamicSuballocationSize(
-                                buf ? buf.size : 0,
-                                required_live_size,
-                                static_cast<VkDeviceSize>(vertex.CapacitySizeOf()),
-                                static_cast<VkDeviceSize>(vertex.OneSizeOf()));
-                            if (required_size < required_live_size) {
-                                LOG_ERROR(
-                                    "DynamicVertexUpload: live data exceeds capacity node='%s' "
-                                    "live=%zu capacity=%zu",
-                                    mesh.Material() != nullptr ? mesh.Material()->name.c_str()
-                                                               : "<unknown>",
-                                    static_cast<size_t>(required_live_size),
-                                    static_cast<size_t>(vertex.CapacitySizeOf()));
-                                return false;
-                            }
-                            if (buf) {
-                                dyn_buf->unallocateSubRef(buf);
-                                buf = {};
-                            }
-                            if (! dyn_buf->allocateSubRef(required_size, buf)) {
-                                return false;
-                            }
-                            force_dyn_upload = true;
-                            return true;
-                        };
-
-                        auto release_unused_vertex_subrefs = [&]() {
-                            while (vertex_bufs.size() > mesh.VertexCount()) {
-                                auto& stale_buf = vertex_bufs.back();
-                                if (stale_buf) dyn_buf->unallocateSubRef(stale_buf);
-                                vertex_bufs.pop_back();
-                            }
-                        };
-
-                        auto ensure_index_subref = [&](const wallpaper::SceneIndexArray& indice) {
-                            const auto required_live_size = static_cast<VkDeviceSize>(
-                                std::max<usize>(indice.DataSizeOf(), kDynamicIndexQuadFloorSize));
-                            if (index_buf && index_buf.size >= required_live_size) return true;
-
-                            const auto required_size = GrowDynamicSuballocationSize(
-                                index_buf ? index_buf.size : 0,
-                                required_live_size,
-                                static_cast<VkDeviceSize>(indice.CapacitySizeof()),
-                                static_cast<VkDeviceSize>(sizeof(uint32_t) * 6));
-                            if (required_size < required_live_size) {
-                                LOG_ERROR("DynamicIndexUpload: live data exceeds capacity live=%zu "
-                                          "capacity=%zu",
-                                          static_cast<size_t>(required_live_size),
-                                          static_cast<size_t>(indice.CapacitySizeof()));
-                                return false;
-                            }
-                            if (index_buf) {
-                                dyn_buf->unallocateSubRef(index_buf);
-                                index_buf = {};
-                            }
-                            if (! dyn_buf->allocateSubRef(required_size, index_buf)) {
-                                return false;
-                            }
-                            force_dyn_upload = true;
-                            return true;
-                        };
-
-                        release_unused_vertex_subrefs();
-                        for (usize i = 0; i < mesh.VertexCount(); i++) {
-                            const auto& vertex = mesh.GetVertexArray(i);
-                            if (! ensure_vertex_subref(i, vertex)) {
-                                mesh.SetDirty();
-                                return;
-                            }
-                            auto& buf = vertex_bufs[i];
-                            if (! dyn_buf->writeToBuf(
-                                    buf, { (uint8_t*)vertex.Data(), vertex.DataSizeOf() })) {
-                                mesh.SetDirty();
-                                return;
-                            }
+            auto&       mesh             = *m_desc.node->Mesh();
+            auto*       dyn_buf          = rr.dyn_buf;
+            auto&       vertex_bufs      = m_desc.vertex_bufs;
+            auto&       draw_count       = m_desc.draw_count;
+            auto&       index_buf        = m_desc.index_buf;
+            auto&       force_dyn_upload = m_desc.force_dyn_upload;
+            update_dyn_buf_op                = [&mesh,
+                                                &vertex_bufs,
+                                                &draw_count,
+                                                &index_buf,
+                                                dyn_buf,
+                                                &force_dyn_upload]() {
+                const bool dirty        = mesh.Dirty().load();
+                const bool needs_upload = dirty || force_dyn_upload;
+                if (needs_upload) {
+                    auto ensure_vertex_subref = [&](usize                              array_index,
+                                                    const wallpaper::SceneVertexArray& vertex) {
+                        if (vertex_bufs.size() <= array_index) {
+                            vertex_bufs.resize(array_index + 1);
                         }
-                        if (mesh.IndexCount() > 0) {
-                            auto& indice = mesh.GetIndexArray(0);
-                            if (! ensure_index_subref(indice)) {
-                                mesh.SetDirty();
-                                return;
-                            }
-                            u32 count  = (u32)((indice.RenderDataCount() * 2) / 3);
-                            draw_count = count * 3;
-                            auto& buf  = index_buf;
-                            if (! dyn_buf->writeToBuf(
-                                    buf, { (uint8_t*)indice.Data(), indice.DataSizeOf() })) {
-                                mesh.SetDirty();
-                                return;
-                            }
-                        } else {
-                            // Dynamic non-indexed meshes are still drawable. Text effect outputs
-                            // use a four-vertex triangle-strip card that is resized in place when
-                            // Date/Day/ Clock content changes; clearing draw_count here made the
-                            // bridge and effect passes execute successfully while submitting no
-                            // final composite geometry at all. The first vertex binding defines the
-                            // vertex count for non-indexed draws, matching the static prepare
-                            // path's draw contract.
-                            draw_count = mesh.VertexCount() > 0
-                                             ? static_cast<u32>(mesh.GetVertexArray(0).DataSize() /
-                                                                mesh.GetVertexArray(0).OneSize())
-                                             : 0;
-                            if (index_buf) {
-                                dyn_buf->unallocateSubRef(index_buf);
-                                index_buf = {};
-                            }
+
+                        auto&      buf                = vertex_bufs[array_index];
+                        const auto required_live_size = static_cast<VkDeviceSize>(
+                            std::max<usize>(vertex.DataSizeOf(), vertex.OneSizeOf()));
+                        if (buf && buf.size >= required_live_size) return true;
+
+                        // Dynamic custom-shader meshes may grow after a pass was prepared. Keep
+                        // this as a renderer-level buffer refresh mechanism for authored
+                        // dynamic meshes, while first-class text is handled by TextPass and
+                        // never enters CustomShaderPass as glyph helper nodes.
+                        const auto required_size = GrowDynamicSuballocationSize(
+                            buf ? buf.size : 0,
+                            required_live_size,
+                            static_cast<VkDeviceSize>(vertex.CapacitySizeOf()),
+                            static_cast<VkDeviceSize>(vertex.OneSizeOf()));
+                        if (required_size < required_live_size) {
+                            LOG_ERROR("DynamicVertexUpload: live data exceeds capacity node='%s' "
+                                      "live=%zu capacity=%zu",
+                                      mesh.Material() != nullptr ? mesh.Material()->name.c_str()
+                                                                 : "<unknown>",
+                                      static_cast<size_t>(required_live_size),
+                                      static_cast<size_t>(vertex.CapacitySizeOf()));
+                            return false;
                         }
-                        // Clearing the pass-local bootstrap flag only after all writes succeed
-                        // keeps a freshly compiled dynamic pass from getting stuck with empty GPU
-                        // buffers if an earlier upload attempt bails out partway through due to an
-                        // allocation/write failure. Subsequent frames will keep retrying until the
-                        // first complete upload lands in the new subranges.
-                        mesh.Dirty().store(false);
-                        force_dyn_upload = false;
+                        if (buf) {
+                            dyn_buf->unallocateSubRef(buf);
+                            buf = {};
+                        }
+                        if (! dyn_buf->allocateSubRef(required_size, buf)) {
+                            return false;
+                        }
+                        force_dyn_upload = true;
+                        return true;
+                    };
+
+                    auto release_unused_vertex_subrefs = [&]() {
+                        while (vertex_bufs.size() > mesh.VertexCount()) {
+                            auto& stale_buf = vertex_bufs.back();
+                            if (stale_buf) dyn_buf->unallocateSubRef(stale_buf);
+                            vertex_bufs.pop_back();
+                        }
+                    };
+
+                    auto ensure_index_subref = [&](const wallpaper::SceneIndexArray& indice) {
+                        const auto required_live_size = static_cast<VkDeviceSize>(
+                            std::max<usize>(indice.DataSizeOf(), kDynamicIndexQuadFloorSize));
+                        if (index_buf && index_buf.size >= required_live_size) return true;
+
+                        const auto required_size = GrowDynamicSuballocationSize(
+                            index_buf ? index_buf.size : 0,
+                            required_live_size,
+                            static_cast<VkDeviceSize>(indice.CapacitySizeof()),
+                            static_cast<VkDeviceSize>(sizeof(uint32_t) * 6));
+                        if (required_size < required_live_size) {
+                            LOG_ERROR("DynamicIndexUpload: live data exceeds capacity live=%zu "
+                                      "capacity=%zu",
+                                      static_cast<size_t>(required_live_size),
+                                      static_cast<size_t>(indice.CapacitySizeof()));
+                            return false;
+                        }
+                        if (index_buf) {
+                            dyn_buf->unallocateSubRef(index_buf);
+                            index_buf = {};
+                        }
+                        if (! dyn_buf->allocateSubRef(required_size, index_buf)) {
+                            return false;
+                        }
+                        force_dyn_upload = true;
+                        return true;
+                    };
+
+                    release_unused_vertex_subrefs();
+                    for (usize i = 0; i < mesh.VertexCount(); i++) {
+                        const auto& vertex = mesh.GetVertexArray(i);
+                        if (! ensure_vertex_subref(i, vertex)) {
+                            mesh.SetDirty();
+                            return;
+                        }
+                        auto& buf = vertex_bufs[i];
+                        if (! dyn_buf->writeToBuf(
+                                buf, { (uint8_t*)vertex.Data(), vertex.DataSizeOf() })) {
+                            mesh.SetDirty();
+                            return;
+                        }
                     }
-                };
+                    if (mesh.IndexCount() > 0) {
+                        auto& indice = mesh.GetIndexArray(0);
+                        if (! ensure_index_subref(indice)) {
+                            mesh.SetDirty();
+                            return;
+                        }
+                        u32 count  = (u32)((indice.RenderDataCount() * 2) / 3);
+                        draw_count = count * 3;
+                        auto& buf  = index_buf;
+                        if (! dyn_buf->writeToBuf(
+                                buf, { (uint8_t*)indice.Data(), indice.DataSizeOf() })) {
+                            mesh.SetDirty();
+                            return;
+                        }
+                    } else {
+                        // Dynamic non-indexed meshes are still drawable. Text effect outputs
+                        // use a four-vertex triangle-strip card that is resized in place when
+                        // Date/Day/ Clock content changes; clearing draw_count here made the
+                        // bridge and effect passes execute successfully while submitting no
+                        // final composite geometry at all. The first vertex binding defines the
+                        // vertex count for non-indexed draws, matching the static prepare
+                        // path's draw contract.
+                        draw_count = mesh.VertexCount() > 0
+                                         ? static_cast<u32>(mesh.GetVertexArray(0).DataSize() /
+                                                            mesh.GetVertexArray(0).OneSize())
+                                         : 0;
+                        if (index_buf) {
+                            dyn_buf->unallocateSubRef(index_buf);
+                            index_buf = {};
+                        }
+                    }
+                    // Clearing the pass-local bootstrap flag only after all writes succeed
+                    // keeps a freshly compiled dynamic pass from getting stuck with empty GPU
+                    // buffers if an earlier upload attempt bails out partway through due to an
+                    // allocation/write failure. Subsequent frames will keep retrying until the
+                    // first complete upload lands in the new subranges.
+                    mesh.Dirty().store(false);
+                    force_dyn_upload = false;
+                }
+            };
         }
 
         auto  block  = ref.blocks.front();
@@ -1080,7 +1084,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         // The update lambda still needs the live material pointer to write authored uniforms after
         // the one-off audio diagnostics are removed; keep that dependency explicit in the capture
         // list instead of rediscovering the material through the scene node at execution time.
-        auto* material       = mesh.Material();
+        auto* material = mesh.Material();
 
         // Keep Star-River-style dynamic mesh uploads separate from general pass updates. Only the
         // vertex/index bytes need to move before m_dyn_buf->recordUpload(); uniform and sprite
@@ -1128,7 +1132,7 @@ void CustomShaderPass::prepareDeferred(Scene& scene, const Device& device, Rende
     if (requestDeferredPrepareResources(scene, device) == DeferredPrepareResourcesState::Waiting) {
         return;
     }
-    if (!StaticSceneTexturesResidentForDeferredPrepare(scene, device, m_desc)) {
+    if (! StaticSceneTexturesResidentForDeferredPrepare(scene, device, m_desc)) {
         return;
     }
     prepare(scene, device, rr);
@@ -1137,7 +1141,7 @@ void CustomShaderPass::prepareDeferred(Scene& scene, const Device& device, Rende
 DeferredPrepareResourcesState
 CustomShaderPass::requestDeferredPrepareResources(Scene& scene, const Device& device) {
     constexpr std::size_t kDeferredStaticTextureStageBudgetBytes = 64u * 1024u * 1024u;
-    bool waiting = false;
+    bool                  waiting                                = false;
 
     for (usize texture_index = 0; texture_index < m_desc.textures.size(); texture_index++) {
         const auto& tex_name = m_desc.textures[texture_index];
@@ -1146,9 +1150,8 @@ CustomShaderPass::requestDeferredPrepareResources(Scene& scene, const Device& de
         if (scene.dirtyImportedTextureKeys.count(tex_name) != 0) continue;
         if (device.tex_cache().FindTex(tex_name).has_value()) continue;
 
-        const auto pending_streaming_state =
-            device.tex_cache().StagePendingTexUploads(tex_name,
-                                                      kDeferredStaticTextureStageBudgetBytes);
+        const auto pending_streaming_state = device.tex_cache().StagePendingTexUploads(
+            tex_name, kDeferredStaticTextureStageBudgetBytes);
         if (pending_streaming_state == TextureCacheStreamingState::Waiting) {
             waiting = true;
             continue;
@@ -1189,9 +1192,7 @@ CustomShaderPass::requestDeferredPrepareResources(Scene& scene, const Device& de
                 }
             }
             break;
-        case Scene::ParsedImageRequestState::Pending:
-            waiting = true;
-            break;
+        case Scene::ParsedImageRequestState::Pending: waiting = true; break;
         case Scene::ParsedImageRequestState::Failed:
             LOG_ERROR("CustomShaderPassDeferredResources: parse failed node='%s' texture='%s'",
                       m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
@@ -1200,8 +1201,7 @@ CustomShaderPass::requestDeferredPrepareResources(Scene& scene, const Device& de
         }
     }
 
-    return waiting ? DeferredPrepareResourcesState::Waiting
-                   : DeferredPrepareResourcesState::Ready;
+    return waiting ? DeferredPrepareResourcesState::Waiting : DeferredPrepareResourcesState::Ready;
 }
 
 bool CustomShaderPass::warmupPipeline(Scene& scene, const Device& device, RenderingResources& rr) {
@@ -1218,19 +1218,18 @@ bool CustomShaderPass::warmupPipeline(Scene& scene, const Device& device, Render
     ShaderReflected            ref;
     {
         SceneShader& shader = *(mesh.Material()->customShader.shader);
-        if (!GenReflect(shader.codes, spvs, ref)) {
+        if (! GenReflect(shader.codes, spvs, ref)) {
             LOG_ERROR("pipeline warmup reflect failed, %s", shader.name.c_str());
             return false;
         }
 
         auto& bindings = descriptor_info.bindings;
         bindings.resize(ref.binding_map.size());
-        std::transform(ref.binding_map.begin(),
-                       ref.binding_map.end(),
-                       bindings.begin(),
-                       [](auto& item) {
-                           return item.second;
-                       });
+        std::transform(
+            ref.binding_map.begin(), ref.binding_map.end(), bindings.begin(), [](auto& item) {
+                return item.second;
+            });
+        PopulateTextureBindingsFromReflection(m_desc, ref, mesh.Material()->textures.size());
     }
 
     std::vector<VkVertexInputBindingDescription>   bind_descriptions;
@@ -1240,34 +1239,33 @@ bool CustomShaderPass::warmupPipeline(Scene& scene, const Device& device, Render
         auto        attrs_map = vertex.GetAttrOffsetMap();
 
         bind_descriptions.push_back(VkVertexInputBindingDescription {
-            .binding = i,
-            .stride = static_cast<uint32_t>(vertex.OneSizeOf()),
+            .binding   = i,
+            .stride    = static_cast<uint32_t>(vertex.OneSizeOf()),
             .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
         });
 
         for (auto& item : ref.input_location_map) {
-            const auto& name = item.first;
-            const auto& input = item.second;
+            const auto& name     = item.first;
+            const auto& input    = item.second;
             const bool  has_attr = exists(attrs_map, name);
-            const auto  offset = has_attr ? attrs_map[name].offset : 0;
+            const auto  offset   = has_attr ? attrs_map[name].offset : 0;
             attr_descriptions.push_back(VkVertexInputAttributeDescription {
                 .location = input.location,
-                .binding = i,
-                .format = input.format,
-                .offset = static_cast<uint32_t>(offset),
+                .binding  = i,
+                .format   = input.format,
+                .offset   = static_cast<uint32_t>(offset),
             });
         }
     }
 
     VkPipelineColorBlendAttachmentState color_blend;
     VkAttachmentLoadOp                  loadOp { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
+    VkColorComponentFlags               colorMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
     {
-        VkColorComponentFlags colorMask =
-            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
-        const auto camera_name = m_desc.node != nullptr
-                                     ? std::string_view(m_desc.node->Camera())
-                                     : std::string_view {};
-        const bool alpha       = ShouldWriteCustomShaderAlpha(*mesh.Material(), camera_name);
+        const auto camera_name =
+            m_desc.node != nullptr ? std::string_view(m_desc.node->Camera()) : std::string_view {};
+        const bool alpha = ShouldWriteCustomShaderAlpha(*mesh.Material(), camera_name);
 
         if (alpha) colorMask |= VK_COLOR_COMPONENT_A_BIT;
         color_blend.colorWriteMask = colorMask;
@@ -1287,7 +1285,7 @@ bool CustomShaderPass::warmupPipeline(Scene& scene, const Device& device, Render
                                 m_desc.model_pass,
                                 m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                    : VK_ATTACHMENT_LOAD_OP_LOAD);
-    if (!opt.has_value()) return false;
+    if (! opt.has_value()) return false;
     auto& pass = opt.value();
 
     descriptor_info.push_descriptor = true;
@@ -1572,7 +1570,7 @@ void CustomShaderPass::destory(const Device&, RenderingResources& rr) {
     m_desc.fb.reset();
     m_desc.vk_textures.clear();
     m_desc.vk_tex_binding.clear();
-    m_desc.vk_output = {};
+    m_desc.vk_output       = {};
     m_desc.depth_image_ref = nullptr;
     {
         auto& buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
