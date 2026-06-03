@@ -453,6 +453,39 @@ const char* TargetKindName(WPSceneScriptTargetKind target_kind) {
     return "layer";
 }
 
+bool IsOpacityUniformName(std::string_view property_name) {
+    return property_name == "alpha" || property_name == "g_Alpha" ||
+           property_name == "g_UserAlpha";
+}
+
+bool IsOpacityRegistration(const WPSceneScriptRegistration& registration) {
+    if (registration.target_kind == WPSceneScriptTargetKind::Layer) {
+        return registration.property_name == "alpha";
+    }
+    if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
+        return IsOpacityUniformName(registration.property_name);
+    }
+    return false;
+}
+
+float ClampOpacityScalar(float opacity) {
+    if (! std::isfinite(opacity)) return 0.0f;
+    return std::clamp(opacity, 0.0f, 1.0f);
+}
+
+WPDynamicValue ClampOpacityRegistrationValue(const WPSceneScriptRegistration& registration,
+                                             const WPDynamicValue&            value) {
+    if (! IsOpacityRegistration(registration)) return value;
+
+    float opacity = 0.0f;
+    if (! value.tryGet(&opacity)) return value;
+
+    // Opacity registrations are shader alpha inputs with a normalized 0..1 output domain. Keep
+    // this clamp at the registration boundary so authored Bezier overshoot remains available to
+    // scale, origin, color, and other non-opacity animation targets.
+    return WPDynamicValue(ClampOpacityScalar(opacity));
+}
+
 LayerValueHint SceneValueType(std::string_view property_name) {
     if (property_name == "clearcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "ambientcolor") return { WPDynamicValue::Type::Float3, true };
@@ -6038,12 +6071,13 @@ std::optional<WPDynamicValue> ReadRegistrationValue(const WPSceneScriptHost::Opa
 bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
                             const WPSceneScriptRegistration& registration,
                             const WPDynamicValue&            value) {
+    const auto runtime_value = ClampOpacityRegistrationValue(registration, value);
     const auto current = ReadRegistrationValue(opaque, registration);
     const bool is_text_registration =
         registration.target_kind == WPSceneScriptTargetKind::Layer &&
         FindTextLayerById(opaque, registration.object_id) != nullptr &&
         HasTextLayerProperty(registration.property_name);
-    if (current.has_value() && current->equals(value)) {
+    if (current.has_value() && current->equals(runtime_value)) {
         // Most scene scripts return the current value every frame even when the visual state is
         // unchanged. Treat that as a no-op without logging so steady-state text scripts behave like
         // cheap state polling instead of forcing the logger onto the critical render/update path.
@@ -6052,32 +6086,33 @@ bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
 
     if (is_text_registration) {
         return ApplyTextLayerPropertyValue(
-            opaque, registration.object_id, registration.property_name, value);
+            opaque, registration.object_id, registration.property_name, runtime_value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::AnimationLayer) {
         return ApplyAnimationLayerPropertyValue(opaque,
                                                 registration.node,
                                                 registration.target_index,
                                                 registration.property_name,
-                                                value);
+                                                runtime_value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Effect) {
-        return ApplyEffectPropertyValue(opaque, registration, value);
+        return ApplyEffectPropertyValue(opaque, registration, runtime_value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Scene) {
-        return ApplyScenePropertyValue(opaque, registration.property_name, value);
+        return ApplyScenePropertyValue(opaque, registration.property_name, runtime_value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Sound) {
         return ApplySoundPropertyValue(
-            opaque, registration.object_id, registration.property_name, value);
+            opaque, registration.object_id, registration.property_name, runtime_value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Camera) {
-        return ApplyCameraLayerPropertyValue(opaque, registration, value);
+        return ApplyCameraLayerPropertyValue(opaque, registration, runtime_value);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
-        return ApplyMaterialUniformPropertyValue(opaque, registration, value);
+        return ApplyMaterialUniformPropertyValue(opaque, registration, runtime_value);
     }
-    return ApplyLayerPropertyValue(opaque, registration.node, registration.property_name, value);
+    return ApplyLayerPropertyValue(
+        opaque, registration.node, registration.property_name, runtime_value);
 }
 
 void FreeJSValue(JSContext* context, JSValue& value) {
@@ -8102,12 +8137,14 @@ bool ApplyPropertyAnimationInstance(WPSceneScriptHost::Opaque* opaque,
                                     PropertyAnimationInstance& animation) {
     if (opaque == nullptr || animation.registration.animation == nullptr) return false;
 
-    const auto value = EvaluatePropertyAnimation(*animation.registration.animation,
-                                                 animation.state,
-                                                 animation.registration.base_value,
-                                                 animation.registration.value_type);
-    if (! value.has_value()) return false;
-    return ApplyRegistrationValue(opaque, animation.registration, *value);
+    const auto raw_value = EvaluatePropertyAnimation(*animation.registration.animation,
+                                                     animation.state,
+                                                     animation.registration.base_value,
+                                                     animation.registration.value_type);
+    if (! raw_value.has_value()) return false;
+
+    const auto value = ClampOpacityRegistrationValue(animation.registration, *raw_value);
+    return ApplyRegistrationValue(opaque, animation.registration, value);
 }
 
 void UpdatePropertyAnimations(WPSceneScriptHost::Opaque* opaque, double frame_time) {

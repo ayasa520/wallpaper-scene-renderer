@@ -298,6 +298,28 @@ const char* DynamicValueTypeName(WPDynamicValue::Type hint) {
     return "unknown";
 }
 
+bool IsParserOpacityUniformName(std::string_view uniform_name) {
+    return uniform_name == "alpha" || uniform_name == "g_Alpha" ||
+           uniform_name == "g_UserAlpha";
+}
+
+float ClampParserOpacityScalar(float opacity) {
+    if (! std::isfinite(opacity)) return 0.0f;
+    return std::clamp(opacity, 0.0f, 1.0f);
+}
+
+ShaderValue ClampParserOpacityUniformValue(std::string_view uniform_name,
+                                           const ShaderValue& value) {
+    if (! IsParserOpacityUniformName(uniform_name) || value.size() == 0) return value;
+
+    // Parser-time material constants can be consumed before the script host advances animations.
+    // Clamp only normalized opacity uniforms here so cold-start alpha writes match the runtime
+    // registration boundary without flattening intentionally overshooting non-opacity curves.
+    ShaderValue clamped = value;
+    clamped[0]          = ClampParserOpacityScalar(clamped[0]);
+    return clamped;
+}
+
 void LogTextLayerRegistration(const char* event_name, int32_t object_id,
                               const std::string& object_name, std::string_view property_name,
                               WPDynamicValue::Type hint, const WPUserSetting& setting,
@@ -2379,7 +2401,8 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
         if (glname.empty()) {
             LOG_ERROR("ShaderValue: %s not found in glsl", name.c_str());
         } else {
-            material.customShader.constValues[glname] = value;
+            material.customShader.constValues[glname] =
+                ClampParserOpacityUniformValue(glname, ShaderValue(value));
         }
     }
 }
@@ -2633,7 +2656,8 @@ void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpm
                  binding.gl_uniform_name.c_str(),
                  binding.property != nullptr ? binding.property->size() : 0);
         if (binding.property != nullptr)
-            material.customShader.constValues[binding.gl_uniform_name] = *binding.property;
+            material.customShader.constValues[binding.gl_uniform_name] =
+                ClampParserOpacityUniformValue(binding.gl_uniform_name, *binding.property);
     }
 }
 
@@ -3961,6 +3985,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     WPShaderValueData worldNodeData;
 
     ShaderValueMap baseConstSvs = context.global_base_uniforms;
+    const float    initial_alpha = ClampParserOpacityScalar(wpimgobj.alpha);
     WPShaderInfo   shaderInfo;
     {
         if (! hasEffect) {
@@ -3971,12 +3996,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         }
 
         baseConstSvs["g_Color4"] = std::array<float, 4> {
-            wpimgobj.color[0], wpimgobj.color[1], wpimgobj.color[2], wpimgobj.alpha
+            wpimgobj.color[0], wpimgobj.color[1], wpimgobj.color[2], initial_alpha
         };
         baseConstSvs["g_Color"] =
             std::array<float, 3> { wpimgobj.color[0], wpimgobj.color[1], wpimgobj.color[2] };
-        baseConstSvs["g_Alpha"]      = wpimgobj.alpha;
-        baseConstSvs["g_UserAlpha"]  = wpimgobj.alpha;
+        baseConstSvs["g_Alpha"]      = initial_alpha;
+        baseConstSvs["g_UserAlpha"]  = initial_alpha;
         baseConstSvs["g_Brightness"] = wpimgobj.brightness;
 
         shaderInfo.baseConstSvs = baseConstSvs;
@@ -4407,7 +4432,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     // The passthrough blend pass should preserve the source render target's alpha,
                     // but it must not tint that texture a second time with the object's RGB color.
                     effectBaseConstSvs["g_Color4"] =
-                        std::array<float, 4> { 1.0f, 1.0f, 1.0f, wpimgobj.alpha };
+                        std::array<float, 4> { 1.0f, 1.0f, 1.0f, initial_alpha };
                     effectBaseConstSvs["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
                 }
                 WPShaderInfo wpEffShaderInfo;
