@@ -24,6 +24,7 @@ bool HasBezierHandles(const WPPropertyAnimationKeyframe& lhs, const WPPropertyAn
 
 WPPropertyAnimationKeyframe::Handle ResolveBezierHandle(const WPPropertyAnimationKeyframe::Handle& handle,
                                                         double                                     segment_dx,
+                                                        double                                     fps,
                                                         bool                                       forward_handle) {
     if (!handle.enabled) return {};
 
@@ -36,16 +37,21 @@ WPPropertyAnimationKeyframe::Handle ResolveBezierHandle(const WPPropertyAnimatio
                              : 0.0;
     const double auto_dx = std::max(segment_dx / 3.0, 0.0);
     resolved.x = sign * auto_dx;
-    resolved.y = slope * resolved.x;
+    // Wallpaper Engine stores magic handle slopes as value-per-second, while animation keyframe
+    // positions and Bezier X control points stay in frame units. Convert the generated X distance
+    // back to seconds only for the Y offset; otherwise alpha and other scalar curves get their
+    // handle height multiplied by fps and can overshoot by tens of times the authored value range.
+    resolved.y = slope * (resolved.x / std::max(fps, std::numeric_limits<double>::epsilon()));
     return resolved;
 }
 
 double EvaluateBezierSegment(const WPPropertyAnimationKeyframe& lhs,
                              const WPPropertyAnimationKeyframe& rhs,
-                             double                             frame) {
+                             double                             frame,
+                             double                             fps) {
     const double segment_dx = std::max(rhs.frame - lhs.frame, 0.0);
-    const auto lhs_front = ResolveBezierHandle(lhs.front, segment_dx, true);
-    const auto rhs_back  = ResolveBezierHandle(rhs.back, segment_dx, false);
+    const auto lhs_front = ResolveBezierHandle(lhs.front, segment_dx, fps, true);
+    const auto rhs_back  = ResolveBezierHandle(rhs.back, segment_dx, fps, false);
     const double x0 = lhs.frame;
     const double y0 = lhs.value;
     const double x1 = lhs_front.enabled ? lhs.frame + lhs_front.x : lhs.frame;
@@ -117,9 +123,10 @@ uint32_t ChannelCountForHint(WPDynamicValue::Type hint) {
 
 double EvaluateKeyframeRange(const WPPropertyAnimationKeyframe& lhs,
                              const WPPropertyAnimationKeyframe& rhs,
-                             double                             frame) {
+                             double                             frame,
+                             double                             fps) {
     if (HasBezierHandles(lhs, rhs)) {
-        return EvaluateBezierSegment(lhs, rhs, frame);
+        return EvaluateBezierSegment(lhs, rhs, frame, fps);
     }
     const double delta = rhs.frame - lhs.frame;
     if (delta <= std::numeric_limits<double>::epsilon()) return rhs.value;
@@ -143,13 +150,13 @@ double EvaluateChannel(const WPPropertyAnimationDefinition& definition,
             WPPropertyAnimationKeyframe wrapped_last  = last;
             WPPropertyAnimationKeyframe wrapped_first = first;
             wrapped_last.frame -= frame_count;
-            return EvaluateKeyframeRange(wrapped_last, wrapped_first, frame);
+            return EvaluateKeyframeRange(wrapped_last, wrapped_first, frame, definition.fps);
         }
 
         if (frame > last.frame) {
             WPPropertyAnimationKeyframe wrapped_first = first;
             wrapped_first.frame += frame_count;
-            return EvaluateKeyframeRange(last, wrapped_first, frame);
+            return EvaluateKeyframeRange(last, wrapped_first, frame, definition.fps);
         }
     }
 
@@ -160,7 +167,7 @@ double EvaluateChannel(const WPPropertyAnimationDefinition& definition,
         const auto& lhs = channel.keyframes[i - 1];
         const auto& rhs = channel.keyframes[i];
         if (frame > rhs.frame) continue;
-        return EvaluateKeyframeRange(lhs, rhs, frame);
+        return EvaluateKeyframeRange(lhs, rhs, frame, definition.fps);
     }
 
     return last.value;
