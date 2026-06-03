@@ -459,6 +459,7 @@ std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
 
 void Scene::SetLayerLocalVisibility(int32_t layer_id, bool visible) {
     if (layer_id == 0) return;
+
     layerLocalVisibility[layer_id] = visible;
 }
 

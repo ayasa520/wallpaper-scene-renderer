@@ -112,6 +112,12 @@ CustomShaderPass::CustomShaderPass(const Desc& desc) {
     m_desc.should_execute      = desc.should_execute;
     m_desc.textures            = desc.textures;
     m_desc.output              = desc.output;
+    m_desc.force_alpha_write   = desc.force_alpha_write;
+    m_desc.premultiplied_source_blend = desc.premultiplied_source_blend;
+    m_desc.clear_before_draw   = desc.clear_before_draw;
+    m_desc.camera_override     = desc.camera_override;
+    m_desc.use_active_camera_for_uniforms = desc.use_active_camera_for_uniforms;
+    m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
     m_desc.sprites_map         = desc.sprites_map;
     m_desc.model_pass          = desc.model_pass;
     m_desc.depth_test          = desc.depth_test;
@@ -138,6 +144,21 @@ bool CustomShaderPass::canReuseForResidency(const VulkanPass& next_pass) const {
            m_desc.depth_test == next->m_desc.depth_test &&
            m_desc.depth_write == next->m_desc.depth_write &&
            m_desc.clear_depth == next->m_desc.clear_depth &&
+           // Forced alpha changes the prepared pipeline's color write mask and alpha blend factors.
+           // Reusing a pass across that boundary would keep the old alpha contract alive even after
+           // the render graph reroutes a composition child into a transparent source target.
+           m_desc.force_alpha_write == next->m_desc.force_alpha_write &&
+           m_desc.premultiplied_source_blend ==
+               next->m_desc.premultiplied_source_blend &&
+           m_desc.clear_before_draw == next->m_desc.clear_before_draw &&
+           // The uniform update lambda captures the pass camera route. Treat it as part of the
+           // prepared uniform contract so a source-space composition route cannot reuse a screen-space
+           // publisher after a topology rebuild.
+           m_desc.camera_override == next->m_desc.camera_override &&
+           m_desc.use_active_camera_for_uniforms ==
+               next->m_desc.use_active_camera_for_uniforms &&
+           m_desc.use_active_camera_for_parallax ==
+               next->m_desc.use_active_camera_for_parallax &&
            m_desc.textures.size() == next->m_desc.textures.size();
 }
 
@@ -153,6 +174,12 @@ void CustomShaderPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.should_execute = next->m_desc.should_execute;
     m_desc.textures       = next->m_desc.textures;
     m_desc.output         = next->m_desc.output;
+    m_desc.force_alpha_write = next->m_desc.force_alpha_write;
+    m_desc.premultiplied_source_blend = next->m_desc.premultiplied_source_blend;
+    m_desc.clear_before_draw = next->m_desc.clear_before_draw;
+    m_desc.camera_override = next->m_desc.camera_override;
+    m_desc.use_active_camera_for_uniforms = next->m_desc.use_active_camera_for_uniforms;
+    m_desc.use_active_camera_for_parallax = next->m_desc.use_active_camera_for_parallax;
     m_desc.sprites_map    = next->m_desc.sprites_map;
 }
 
@@ -398,14 +425,81 @@ wallpaper::SceneCullMode ResolveModelCullMode(wallpaper::SceneCullMode mode,
 }
 
 bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
-                                  std::string_view                camera_name) {
+                                  std::string_view                camera_name,
+                                  bool                             force_alpha_write) {
     const bool is_model_pass = material.modelRenderState.has_value();
     // Model shaders may output non-opaque alpha for their own material math even when the authored
     // object is visually opaque. Allowing that alpha into `_rt_default` makes FinPass present a
     // translucent frame and visually crushes the lighting. Keep the RGB blend factors intact for
     // translucent model materials, but preserve the target alpha just like global 2D passes.
-    return ! is_model_pass &&
-           ! (camera_name.empty() || wallpaper::sstart_with(camera_name, "global"));
+    if (is_model_pass) return false;
+
+    // Only neutral publisher passes may opt in to camera-less alpha writes. Authored effect shaders
+    // such as auto_sway can legally output alpha=1 for helper regions; letting those shaders write
+    // alpha directly into a parent composition source turns the source into a dark matte instead of
+    // the resolved child texture.
+    if (force_alpha_write) return true;
+
+    return ! (camera_name.empty() || wallpaper::sstart_with(camera_name, "global"));
+}
+
+std::string_view EffectiveCustomShaderCamera(
+    const wallpaper::vulkan::CustomShaderPass::Desc& desc) {
+    if (! desc.camera_override.empty()) return desc.camera_override;
+    return desc.node != nullptr ? std::string_view(desc.node->Camera()) : std::string_view {};
+}
+
+void PreservePublisherAlpha(bool             source_over_alpha,
+                                      bool             writes_alpha,
+                                      VkPipelineColorBlendAttachmentState& blend_state) {
+    if (! source_over_alpha || ! writes_alpha || ! blend_state.blendEnable) {
+        return;
+    }
+
+    // Neutral publisher passes are the last step that places a resolved private effect texture into
+    // a composition source. Keep their RGB blend authored, but compose alpha as source-over coverage
+    // so the parent effect receives the child's real silhouette.
+    blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+}
+
+void ApplyPremultipliedSourceBlend(
+    const wallpaper::vulkan::CustomShaderPass::Desc& desc,
+    bool                                             writes_alpha,
+    VkPipelineColorBlendAttachmentState&             blend_state) {
+    if (! desc.premultiplied_source_blend || ! blend_state.blendEnable) return;
+
+    // The private layer-surface puppet pass has already composited straight-alpha texture samples
+    // into a transparent render target. Its sampled RGB is premultiplied, while alpha remains the
+    // correct source-over coverage. Keep the authored destination factor from the material blend
+    // mode, but consume RGB as premultiplied color so the final publisher does not fade animated
+    // eye/eyelid pixels before the puppet mesh actually covers them.
+    blend_state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    if (writes_alpha) {
+        blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    }
+}
+
+void LogForcedAlphaPolicy(const wallpaper::vulkan::CustomShaderPass::Desc& desc,
+                          const wallpaper::SceneMaterial&                  material,
+                          std::string_view                                 camera_name,
+                          bool                                             writes_alpha,
+                          VkColorComponentFlags                            color_mask) {
+    if (! desc.force_alpha_write) return;
+
+    LOG_INFO("CustomShaderForceAlphaPolicy: layer=%d node='%s' camera='%.*s' material='%s' "
+             "output='%s' writes-alpha=%s color-mask=0x%x blend=%d premultiplied-source=%s",
+             desc.layer_id,
+             desc.node != nullptr ? desc.node->Name().c_str() : "",
+             static_cast<int>(camera_name.size()),
+             camera_name.data(),
+             material.name.c_str(),
+             desc.output.c_str(),
+             writes_alpha ? "true" : "false",
+             static_cast<unsigned>(color_mask),
+             static_cast<int>(material.blenmode),
+             desc.premultiplied_source_blend ? "true" : "false");
 }
 
 void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
@@ -437,7 +531,14 @@ std::string_view ModelColorLoadModeName(wallpaper::SceneModelColorLoadMode mode)
 }
 
 VkClearValue BuildCustomShaderClearValue(const wallpaper::Scene&         scene,
-                                         const wallpaper::SceneMaterial& material) {
+                                         const wallpaper::SceneMaterial& material,
+                                         bool                            transparent_clear) {
+    if (transparent_clear) {
+        return VkClearValue {
+            .color = { 0.0f, 0.0f, 0.0f, 0.0f },
+        };
+    }
+
     if (material.modelRenderState.has_value() &&
         material.modelRenderState->colorLoadMode == wallpaper::SceneModelColorLoadMode::Clear) {
         // Model-only offscreen targets are sampled as textures by later passes. Transparent black
@@ -455,6 +556,49 @@ VkClearValue BuildCustomShaderClearValue(const wallpaper::Scene&         scene,
     return VkClearValue {
         .color = { sc[0], sc[1], sc[2], 1.0f },
     };
+}
+
+void ApplyExplicitClearPolicy(const wallpaper::vulkan::CustomShaderPass::Desc& desc,
+                              const wallpaper::SceneMaterial&                  material,
+                              VkAttachmentLoadOp&                              load_op) {
+    if (!desc.clear_before_draw) return;
+
+    load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    LOG_INFO("CustomShaderExplicitClearPolicy: layer=%d node='%s' material='%s' "
+             "output='%s'",
+             desc.layer_id,
+             desc.node != nullptr ? desc.node->Name().c_str() : "",
+             material.name.c_str(),
+             desc.output.c_str());
+}
+
+struct CustomShaderRenderState {
+    VkPipelineColorBlendAttachmentState color_blend {};
+    VkAttachmentLoadOp                  color_load_op { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
+};
+
+CustomShaderRenderState BuildCustomShaderRenderState(
+    const wallpaper::SceneMaterial& material, wallpaper::vulkan::CustomShaderPass::Desc& desc) {
+    CustomShaderRenderState state;
+    VkColorComponentFlags   color_mask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    const auto camera_name = EffectiveCustomShaderCamera(desc);
+    const bool writes_alpha = ShouldWriteCustomShaderAlpha(material, camera_name, desc.force_alpha_write);
+
+    if (writes_alpha) color_mask |= VK_COLOR_COMPONENT_A_BIT;
+    state.color_blend.colorWriteMask = color_mask;
+
+    const auto blend_mode = material.blenmode;
+    SetBlend(blend_mode, state.color_blend);
+    ApplyPremultipliedSourceBlend(desc, writes_alpha, state.color_blend);
+    PreservePublisherAlpha(desc.force_alpha_write, writes_alpha, state.color_blend);
+    desc.blending = state.color_blend.blendEnable;
+
+    SetAttachmentLoadOp(blend_mode, state.color_load_op);
+    ApplyModelPassDesc(material, desc, state.color_load_op);
+    ApplyExplicitClearPolicy(desc, material, state.color_load_op);
+    LogForcedAlphaPolicy(desc, material, camera_name, writes_alpha, color_mask);
+    return state;
 }
 
 void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  material,
@@ -853,29 +997,10 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         }
     }
     {
-        VkPipelineColorBlendAttachmentState color_blend;
-        VkAttachmentLoadOp                  loadOp { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
-        VkColorComponentFlags               colorMask =
-            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
-        {
-            const auto camera_name = m_desc.node != nullptr
-                                         ? std::string_view(m_desc.node->Camera())
-                                         : std::string_view {};
-            const bool alpha       = ShouldWriteCustomShaderAlpha(*mesh.Material(), camera_name);
-
-            if (alpha) colorMask |= VK_COLOR_COMPONENT_A_BIT;
-            color_blend.colorWriteMask = colorMask;
-
-            auto blendmode = mesh.Material()->blenmode;
-            SetBlend(blendmode, color_blend);
-            m_desc.blending = color_blend.blendEnable;
-
-            SetAttachmentLoadOp(blendmode, loadOp);
-            ApplyModelPassDesc(*mesh.Material(), m_desc, loadOp);
-        }
+        auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
         auto opt = CreateRenderPass(device.handle(),
                                     VK_FORMAT_R8G8B8A8_UNORM,
-                                    loadOp,
+                                    render_state.color_load_op,
                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                     m_desc.model_pass,
                                     m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
@@ -892,7 +1017,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
             (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
             ",output=" + m_desc.output + "]";
         pipeline.addDescriptorSetInfo(spanone { descriptor_info })
-            .setColorBlendStates(spanone { color_blend })
+            .setColorBlendStates(spanone { render_state.color_blend })
             .setTopology(m_desc.index_buf ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
                                           : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
             .addInputBindingDescription(bind_descriptions)
@@ -900,7 +1025,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         for (auto& spv : spvs) pipeline.addStage(std::move(spv));
 
         m_desc.pipeline.cache_key = CustomShaderPipelineCompatibilityKey(
-            loadOp,
+            render_state.color_load_op,
             m_desc.model_pass,
             m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
         if (! pipeline.create(device, pass, m_desc.pipeline, rr.pipeline_cache.get())) return;
@@ -1092,7 +1217,10 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         // timing and do not shift when the upload fix is active.
         m_desc.update_dynamic_mesh_op = update_dyn_buf_op;
         m_desc.update_op =
-            [shader_updater, block, buf, bufref, node, material, &sprites, &vk_textures]() {
+            [shader_updater, block, buf, bufref, node, material, &sprites, &vk_textures,
+             camera_override = m_desc.camera_override,
+             use_active_camera_for_uniforms = m_desc.use_active_camera_for_uniforms,
+             use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax]() {
                 auto update_unf_op = [&block, buf, bufref](std::string_view       name,
                                                            wallpaper::ShaderValue value) {
                     UpdateUniform(buf, *bufref, block, name, value);
@@ -1100,7 +1228,20 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
                 if (material != nullptr) {
                     WriteMaterialUniforms(buf, *bufref, block, *material);
                 }
-                shader_updater->UpdateUniforms(node, sprites, update_unf_op);
+                const ShaderUniformOverrides overrides {
+                    .camera_name = camera_override,
+                    .use_camera_override = !camera_override.empty(),
+                    .use_active_camera_for_uniforms = use_active_camera_for_uniforms,
+                    .use_active_camera_for_parallax = use_active_camera_for_parallax,
+                };
+                shader_updater->UpdateUniforms(
+                    node,
+                    sprites,
+                    update_unf_op,
+                    (overrides.use_camera_override ||
+                     overrides.use_active_camera_for_uniforms)
+                        ? &overrides
+                        : nullptr);
                 // update image slot for sprites
                 {
                     for (auto& [i, sp] : sprites) {
@@ -1123,7 +1264,8 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     }
 
     {
-        m_desc.clear_value = BuildCustomShaderClearValue(scene, *mesh.Material());
+        m_desc.clear_value =
+            BuildCustomShaderClearValue(scene, *mesh.Material(), m_desc.clear_before_draw);
     }
     setPrepared();
 }
@@ -1257,30 +1399,11 @@ bool CustomShaderPass::warmupPipeline(Scene& scene, const Device& device, Render
             });
         }
     }
-
-    VkPipelineColorBlendAttachmentState color_blend;
-    VkAttachmentLoadOp                  loadOp { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
-    VkColorComponentFlags               colorMask =
-        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
-    {
-        const auto camera_name =
-            m_desc.node != nullptr ? std::string_view(m_desc.node->Camera()) : std::string_view {};
-        const bool alpha = ShouldWriteCustomShaderAlpha(*mesh.Material(), camera_name);
-
-        if (alpha) colorMask |= VK_COLOR_COMPONENT_A_BIT;
-        color_blend.colorWriteMask = colorMask;
-
-        auto blendmode = mesh.Material()->blenmode;
-        SetBlend(blendmode, color_blend);
-        m_desc.blending = color_blend.blendEnable;
-
-        SetAttachmentLoadOp(blendmode, loadOp);
-        ApplyModelPassDesc(*mesh.Material(), m_desc, loadOp);
-    }
+    auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
 
     auto opt = CreateRenderPass(device.handle(),
                                 VK_FORMAT_R8G8B8A8_UNORM,
-                                loadOp,
+                                render_state.color_load_op,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 m_desc.model_pass,
                                 m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
@@ -1297,11 +1420,11 @@ bool CustomShaderPass::warmupPipeline(Scene& scene, const Device& device, Render
         (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
     m_desc.pipeline.cache_key = CustomShaderPipelineCompatibilityKey(
-        loadOp,
+        render_state.color_load_op,
         m_desc.model_pass,
         m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
-        .setColorBlendStates(spanone { color_blend })
+        .setColorBlendStates(spanone { render_state.color_blend })
         .setTopology(mesh.IndexCount() > 0 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
                                            : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
         .addInputBindingDescription(bind_descriptions)

@@ -15,8 +15,28 @@ class SceneNode;
 class SceneMesh;
 
 struct SceneImageEffectNode {
-    std::string                output; // render target
+    // Authored effect passes use symbolic ping-pong targets. ResolveEffect() maps those symbols to
+    // concrete render targets every time the graph is built, so keep the parsed template separate
+    // from the mutable runtime output to avoid carrying one build's A/B swap into the next build.
+    std::string                authored_output; // parsed render target template
+    std::string                output;          // resolved render target for the current graph
+    std::vector<std::string>   authored_textures;
     std::shared_ptr<SceneNode> sceneNode;
+    // Effect nodes are render-graph internals, not authored scene owners. When an internal pass
+    // needs a layer-local camera, store it as a pass override instead of assigning it to
+    // SceneNode::Camera(); otherwise graph traversal may see the image-effect camera attached to
+    // that layer and recursively resolve the same effect chain a second time.
+    std::string camera_override;
+    bool        use_active_camera_for_parallax { false };
+    bool        clear_before_draw { false };
+    bool        force_alpha_write { false };
+    // Some effect chains end with a synthetic layer-surface writer. Animated puppet images with
+    // authored effects are the important case: intermediate shaders run as fullscreen private
+    // passes, then the final synthetic material samples that result through the puppet mesh so
+    // skinning, blinking, and attachment motion are still applied. If a composition-layer route
+    // keeps this final pass private, it must render through the layer's own source camera and
+    // authored final mesh instead of being collapsed to the generic 2x2 effect quad.
+    bool private_final_output_uses_layer_surface { false };
 };
 
 struct SceneImageEffect {
@@ -26,6 +46,11 @@ struct SceneImageEffect {
     };
     struct Command {
         CmdType     cmd { CmdType::Copy };
+        // Copy commands may refer to the current input ping-pong target through the same symbolic
+        // names as shader passes. The runtime src/dst below are regenerated from these parsed values
+        // on every ResolveEffect() call.
+        std::string authored_dst;
+        std::string authored_src;
         std::string dst;
         std::string src;
         i32         afterpos { 0 }; // start at 1, 0 for begin at all
@@ -82,6 +107,17 @@ public:
         PreserveSource,
         SuppressOutput,
     };
+    enum class SourcePolicy
+    {
+        OwnerNode,
+        OwnerNodeAndProxyChildren,
+        ProxyChildrenOnly,
+    };
+    enum class FinalOutputPolicy
+    {
+        AuthoredWriter,
+        PrivateAuthoredThenComposite,
+    };
 
     SceneImageEffectLayer(SceneNode* node, float w, float h, std::string_view pingpong_a,
                           std::string_view pingpong_b);
@@ -90,18 +126,27 @@ public:
     std::size_t EffectCount() const { return m_effects.size(); }
     auto&       GetEffect(std::size_t index) { return m_effects.at(index); }
     const auto& FirstTarget() const { return m_pingpong_a; }
+    SceneMesh&  SourceMesh() const { return *m_source_mesh; }
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
     SceneNode&  FinalNode() const { return *m_final_node; }
+    SourcePolicy SourceContributionPolicy() const { return m_source_policy; }
     bool        HasFinalComposite() const;
     bool        ShouldRunFinalComposite() const;
+    bool        PublishesPrivateFinalComposite() const {
+        return m_final_composite.publishes_private_output;
+    }
+    bool        FinalCompositeSamplesPremultipliedSource() const {
+        return m_final_composite.samples_premultiplied_source;
+    }
     void        SetFinalCompositeSource(std::string source);
     void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
+    void        SetSourceContributionPolicy(SourcePolicy policy) { m_source_policy = policy; }
     void        SetHiddenFinalCompositePolicy(HiddenFinalCompositePolicy policy) {
         // Hidden final effects have two valid source contracts. Ordinary images/text preserve the
         // pre-effect source when an effect is disabled. Source-less passthrough/compose helpers must
         // instead contribute nothing, because preserving their uninitialized helper target can draw
         // stale framebuffer-sized quads while the authored effect is hidden.
-        m_hidden_final_composite_policy = policy;
+        m_final_composite.hidden_policy = policy;
     }
     SceneNode*  WorldNode() const { return m_worldNode; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
@@ -110,10 +155,45 @@ public:
     void        SyncResolvedNodeToMatrix(const Eigen::Affine3f& world_affine);
 
     void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam,
+                       std::string_view layer_surface_cam,
+                       std::string_view final_output,
                        bool keep_final_output_private = false,
-                       const Eigen::Affine3f* resolved_world_affine = nullptr);
+                       const Eigen::Affine3f* resolved_world_affine = nullptr,
+                       FinalOutputPolicy final_output_policy = FinalOutputPolicy::AuthoredWriter);
 
 private:
+    struct FinalCompositeState {
+        SceneImageEffect* output_effect { nullptr };
+        // Source-less helper chains promote the neutral final composite to the stable visible
+        // publisher. Private composition-source routes use the same neutral pass differently: the
+        // authored final pass stays private, then the neutral pass publishes that resolved texture
+        // into the parent compose source. Keeping both publication modes in one state object makes
+        // the final-output state machine explicit without scattering interdependent booleans across
+        // the layer.
+        bool publishes_visible_output { false };
+        bool publishes_private_output { false };
+        bool uses_source_mesh { false };
+        // Private layer-surface puppet writers blend their straight-alpha samples into a transparent
+        // local render target before the neutral final composite publishes that target. That
+        // offscreen image therefore carries premultiplied RGB plus source-over coverage alpha; the
+        // publisher must not multiply RGB by alpha a second time.
+        bool samples_premultiplied_source { false };
+        HiddenFinalCompositePolicy hidden_policy { HiddenFinalCompositePolicy::PreserveSource };
+
+        void ResetForResolve() {
+            output_effect = nullptr;
+            publishes_visible_output = false;
+            publishes_private_output = false;
+            uses_source_mesh = false;
+            samples_premultiplied_source = false;
+        }
+    };
+
+    struct FinalOutputResolveDecision {
+        bool keep_authored_final_private { false };
+        bool private_final_uses_layer_surface { false };
+    };
+
     SceneNode*  m_worldNode;
     std::string m_pingpong_a;
     std::string m_pingpong_b;
@@ -123,7 +203,9 @@ private:
     // effect camera/fullscreen mesh path; resolving that pass through the active scene camera turns
     // a shader such as godrays_combine into a tiny world-space quad and makes the rays disappear.
     bool m_fullscreen { false };
+    SourcePolicy m_source_policy { SourcePolicy::OwnerNode };
     //    std::vector<float> m_size;
+    std::unique_ptr<SceneMesh> m_source_mesh;
     std::unique_ptr<SceneMesh> m_final_mesh;
     std::unique_ptr<SceneNode> m_final_node;
     SceneNode*                 m_resolved_output_node { nullptr };
@@ -132,18 +214,8 @@ private:
     // resolve into a private offscreen texture instead; their final pass must stay in the effect
     // camera's local fullscreen space or `_rt_imageLayerComposite_<id>` samples a shifted source.
     bool                       m_resolved_output_follows_world { true };
-    // The neutral final composite is policy-driven. Ordinary image/text layers use it as a narrow
-    // hidden-final fallback, while source-less passthrough helpers use it as the single stable
-    // screen publisher so their authored effect passes never become persistent framebuffer writers.
-    SceneImageEffect* m_final_output_effect { nullptr };
-    // This flag means the neutral final composite owns the visible `_rt_default` write for the
-    // chain. Source-less helpers set it because their own image source is intentionally empty; the
-    // publisher can then suppress output when the runtime-selected source effect is hidden instead
-    // of preserving whatever a downstream filter wrote into a private helper target.
-    bool                       m_publish_final_composite { false };
-    HiddenFinalCompositePolicy m_hidden_final_composite_policy {
-        HiddenFinalCompositePolicy::PreserveSource
-    };
+    bool                       m_resolved_output_mesh_follows_final_mesh { true };
+    FinalCompositeState        m_final_composite;
     BlendMode                  m_final_blend;
 
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
@@ -151,5 +223,35 @@ private:
     bool HasRuntimeVisibilityContract() const;
     bool HasVisibleRuntimeVisibilityContribution() const;
     bool HasVisibleSourceLessContribution() const;
+    void SyncResolvedNodeForRoute(const Eigen::Affine3f* resolved_world_affine);
+    SceneImageEffectNode* ResolveEffectPingPongChain(const SceneMesh& default_mesh,
+                                                     SceneNode& default_node,
+                                                     std::string_view effect_cam,
+                                                     std::string_view& ppong_a,
+                                                     std::string_view& ppong_b);
+    FinalOutputResolveDecision ResolveFinalOutputDecision(
+        SceneImageEffectNode* fallback_last_output,
+        std::string_view layer_surface_cam,
+        bool keep_final_output_private,
+        FinalOutputPolicy final_output_policy);
+    void ResolveFinalCompositeNode(const SceneMesh& default_mesh,
+                                   SceneNode& default_node,
+                                   std::string_view effect_cam,
+                                   std::string_view final_output,
+                                   std::string_view final_composite_source,
+                                   const Eigen::Affine3f* resolved_world_affine);
+    void ResolveVisibleFinalOutput(SceneImageEffectNode& final_output_node,
+                                   const SceneMesh& default_mesh,
+                                   SceneNode& default_node,
+                                   std::string_view effect_cam,
+                                   std::string_view final_output,
+                                   const Eigen::Affine3f* resolved_world_affine);
+    void ResolvePrivateFinalOutput(SceneImageEffectNode& final_output_node,
+                                   const SceneMesh& default_mesh,
+                                   SceneNode& default_node,
+                                   std::string_view effect_cam,
+                                   std::string_view layer_surface_cam,
+                                   bool private_final_uses_layer_surface,
+                                   const Eigen::Affine3f* resolved_world_affine);
 };
 } // namespace wallpaper

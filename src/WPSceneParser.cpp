@@ -1632,6 +1632,38 @@ ResolveHiddenFinalCompositePolicy(const wpscene::WPImageObject& image) {
         : SceneImageEffectLayer::HiddenFinalCompositePolicy::PreserveSource;
 }
 
+SceneImageEffectLayer::SourcePolicy ResolveImageEffectSourcePolicy(
+    bool is_compose_layer, const wpscene::WPImageObject& image) {
+    if (!is_compose_layer) return SceneImageEffectLayer::SourcePolicy::OwnerNode;
+    return image.copybackground ? SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren
+                                : SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly;
+}
+
+std::string_view ImageEffectSourcePolicyName(SceneImageEffectLayer::SourcePolicy policy) {
+    switch (policy) {
+    case SceneImageEffectLayer::SourcePolicy::OwnerNode: return "owner-node";
+    case SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren:
+        return "owner-node-and-proxy-children";
+    case SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly: return "proxy-children-only";
+    }
+    return "unknown";
+}
+
+struct ImageEffectCameraClipRange {
+    float near_clip { -1.0f };
+    float far_clip { 1.0f };
+};
+
+ImageEffectCameraClipRange ResolveImageEffectCameraClipRange(bool has_animated_puppet_mesh) {
+    if (! has_animated_puppet_mesh) return {};
+
+    // Animated puppet meshes are still rendered by 2D image-effect cameras, but their bone
+    // animation is not limited to the flat source-card z range. Keep ordinary non-puppet effects on
+    // the tight range and widen only puppet-capable layer-surface paths that need authored z to
+    // survive the final synthetic writer.
+    return { -1024.0f, 1024.0f };
+}
+
 void LoadAlignment(SceneNode& node, std::string_view align, Vector2f size) {
     // Alignment changes where the centered quad is drawn relative to the authored origin. Store it
     // as a local mesh offset instead of mutating translation, because translation is the pivot that
@@ -2047,12 +2079,11 @@ EffectWriterTransformContract BuildImageEffectMaterialContract(
 
     if (topology.NeedsLayerSurfaceParentParallax()) {
         // This decision is based on render topology, not on authored parallax values. Compose
-        // layers and image layers whose only effect is Hanabi's synthetic color-blend pass have no
-        // authored effect projection that should own a separate child-space parallax result; their
-        // resolved screen writer is the layer image itself, merely routed through the image-effect
-        // path. Match the no-effect image-layer contract by inheriting the authored parent's
-        // parallax anchor, so virtual render-order parents such as the 3521337568 Earth container
-        // keep the visible compose and atmosphere pixels locked together.
+        // layers and synthetic color-blend-only image layers have no authored effect projection that
+        // should own a separate child-space parallax result; their resolved screen writer is the
+        // layer image itself, merely routed through the image-effect path. Match the no-effect
+        // image-layer contract by inheriting the authored parent's parallax anchor, so virtual
+        // render-order parents keep routed visual layers locked together.
         //
         // Detached chains with real authored effects intentionally do not enter this branch. Their
         // final writer belongs to the effect pipeline, and the world route matrix already supplies
@@ -4091,23 +4122,50 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         auto& scene = *context.scene;
         // currently use addr for unique
         std::string nodeAddr = getAddr(spImgNode.get());
+        const auto  effect_camera_clip = ResolveImageEffectCameraClipRange(hasAnimatedPuppetMesh);
         // set camera to attatch effect
         if (isCompose) {
-            scene.cameras[nodeAddr] =
-                std::make_shared<SceneCamera>((int32_t)scene.activeCamera->Width(),
-                                              (int32_t)scene.activeCamera->Height(),
-                                              -1.0f,
-                                              1.0f);
-            scene.cameras.at(nodeAddr)->AttatchNode(scene.activeCamera->GetAttachedNode());
-            if (scene.linkedCameras.count("global") == 0) scene.linkedCameras["global"] = {};
-            scene.linkedCameras.at("global").push_back(nodeAddr);
+            const int32_t source_camera_width =
+                std::max<int32_t>(1, static_cast<int32_t>(std::lround(effect_source_size[0])));
+            const int32_t source_camera_height =
+                std::max<int32_t>(1, static_cast<int32_t>(std::lround(effect_source_size[1])));
+            scene.cameras[nodeAddr] = std::make_shared<SceneCamera>(
+                source_camera_width,
+                source_camera_height,
+                effect_camera_clip.near_clip,
+                effect_camera_clip.far_clip);
+            scene.cameras.at(nodeAddr)->AttatchNode(spWorldNode);
+            LOG_INFO("SceneCompositionLayerSourceCamera: layer=%d name='%s' camera='%s' "
+                     "size=[%d, %d] source-target=[%.3f, %.3f] near=%.3f far=%.3f "
+                     "animated-puppet=%s",
+                     wpimgobj.id,
+                     wpimgobj.name.c_str(),
+                     nodeAddr.c_str(),
+                     source_camera_width,
+                     source_camera_height,
+                     effect_source_size[0],
+                     effect_source_size[1],
+                     effect_camera_clip.near_clip,
+                     effect_camera_clip.far_clip,
+                     hasAnimatedPuppetMesh ? "true" : "false");
         } else {
             // Keep the effect camera extents in display units. The render target
             // resolution below may still be reduced independently.
             i32 w                   = (i32)wpimgobj.size[0];
             i32 h                   = (i32)wpimgobj.size[1];
-            scene.cameras[nodeAddr] = std::make_shared<SceneCamera>(w, h, -1.0f, 1.0f);
+            scene.cameras[nodeAddr] = std::make_shared<SceneCamera>(
+                w, h, effect_camera_clip.near_clip, effect_camera_clip.far_clip);
             scene.cameras.at(nodeAddr)->AttatchNode(context.effect_camera_node);
+            LOG_INFO("SceneImageEffectSourceCamera: layer=%d name='%s' camera='%s' "
+                     "size=[%d, %d] near=%.3f far=%.3f animated-puppet=%s",
+                     wpimgobj.id,
+                     wpimgobj.name.c_str(),
+                     nodeAddr.c_str(),
+                     w,
+                     h,
+                     effect_camera_clip.near_clip,
+                     effect_camera_clip.far_clip,
+                     hasAnimatedPuppetMesh ? "true" : "false");
         }
         scene.objectRuntimeCameraNames[wpimgobj.id].push_back(nodeAddr);
         spImgNode->SetCamera(nodeAddr);
@@ -4131,8 +4189,20 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // active scene camera.
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalBlend(imgBlendMode);
+            const auto source_policy = ResolveImageEffectSourcePolicy(isCompose, wpimgobj);
+            imgEffectLayer->SetSourceContributionPolicy(source_policy);
+            if (isCompose) {
+                LOG_INFO("SceneCompositionLayerSourcePolicy: layer=%d name='%s' "
+                         "copybackground=%s policy=%.*s",
+                         wpimgobj.id,
+                         wpimgobj.name.c_str(),
+                         wpimgobj.copybackground ? "true" : "false",
+                         static_cast<int>(ImageEffectSourcePolicyName(source_policy).size()),
+                         ImageEffectSourcePolicyName(source_policy).data());
+            }
             imgEffectLayer->SetHiddenFinalCompositePolicy(
                 ResolveHiddenFinalCompositePolicy(wpimgobj));
+            imgEffectLayer->SourceMesh().ChangeMeshDataFrom(mesh);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
             imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
                                                                                  : *spImgNode);
@@ -4290,10 +4360,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                   el.source.c_str());
                         continue;
                     }
-                    imgEffect->commands.push_back({ .cmd      = SceneImageEffect::CmdType::Copy,
-                                                    .dst      = fboMap[el.target],
-                                                    .src      = fboMap[el.source],
-                                                    .afterpos = el.afterpos });
+                    const auto resolved_dst = fboMap[el.target];
+                    const auto resolved_src = fboMap[el.source];
+                    imgEffect->commands.push_back({ .cmd          = SceneImageEffect::CmdType::Copy,
+                                                    .authored_dst = resolved_dst,
+                                                    .authored_src = resolved_src,
+                                                    .dst          = resolved_dst,
+                                                    .src          = resolved_src,
+                                                    .afterpos     = el.afterpos });
                 }
             }
 
@@ -4377,6 +4451,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                         svData.puppet_layer.prepared(wpimgobj.puppet_layers);
                     }
                 }
+                const auto authored_textures = material.textures;
                 spMesh->AddMaterial(std::move(material));
                 spEffNode->AddMesh(spMesh);
                 RegisterUserShaderValueBindings(
@@ -4393,7 +4468,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
 
                 context.shader_updater->SetNodeData(spEffNode.get(), svData);
                 context.scene->nodeOwners[spEffNode.get()] = wpimgobj.id;
-                imgEffect->nodes.push_back({ matOutRT, spEffNode });
+                imgEffect->nodes.push_back({ .authored_output = matOutRT,
+                                             .output = matOutRT,
+                                             .authored_textures = authored_textures,
+                                             .sceneNode = spEffNode,
+                                             .private_final_output_uses_layer_surface =
+                                                 hasAnimatedPuppetMesh && wpmat.use_puppet });
             }
 
             if (eff_mat_ok) {
@@ -4637,10 +4717,14 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 if (command.command != "copy") continue;
                 if (fbo_map.count(command.target) == 0 || fbo_map.count(command.source) == 0)
                     continue;
-                img_effect->commands.push_back({ .cmd      = SceneImageEffect::CmdType::Copy,
-                                                 .dst      = fbo_map.at(command.target),
-                                                 .src      = fbo_map.at(command.source),
-                                                 .afterpos = command.afterpos });
+                const auto resolved_dst = fbo_map.at(command.target);
+                const auto resolved_src = fbo_map.at(command.source);
+                img_effect->commands.push_back({ .cmd          = SceneImageEffect::CmdType::Copy,
+                                                 .authored_dst = resolved_dst,
+                                                 .authored_src = resolved_src,
+                                                 .dst          = resolved_dst,
+                                                 .src          = resolved_src,
+                                                 .afterpos     = command.afterpos });
             }
 
             bool effect_materials_ok = true;
@@ -4702,6 +4786,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                     context,
                     BuildTextEffectMaterialContract(text_obj, *imgEffectLayer),
                     effect_node_data);
+                const auto authored_textures = effect_material.textures;
                 spMesh->AddMaterial(std::move(effect_material));
                 spEffectNode->AddMesh(spMesh);
                 RegisterUserShaderValueBindings(context,
@@ -4725,7 +4810,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                     material_index);
                 context.shader_updater->SetNodeData(spEffectNode.get(), effect_node_data);
                 context.scene->nodeOwners[spEffectNode.get()] = text_obj.id;
-                img_effect->nodes.push_back({ material_output, spEffectNode });
+                img_effect->nodes.push_back({ .authored_output = material_output,
+                                              .output = material_output,
+                                              .authored_textures = authored_textures,
+                                              .sceneNode = spEffectNode });
             }
 
             if (effect_materials_ok) {

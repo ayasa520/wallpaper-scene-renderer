@@ -66,6 +66,7 @@ public:
     // clipping without changing the shader's authored domain.
     bool                       effectFinalTexCoordBoundsEnabled { false };
     std::array<float, 4>       effectFinalTexCoordBounds { 0.0f, 0.0f, 1.0f, 1.0f };
+    bool                       copybackground { false };
     WPMaterial                 material;
     std::vector<WPImageEffect> effects;
     Config                     config;
