@@ -4615,14 +4615,6 @@ bool ApplyMaterialUniformPropertyValue(WPSceneScriptHost::Opaque*       opaque,
     // Updating this map is therefore enough for live user-property colors to reach the next draw
     // without rebuilding the render graph or reloading the scene package.
     material->customShader.constValues[registration.property_name] = *shader_value;
-    LOG_INFO("SceneMaterialUniformApply: layer=%d name='%s' user='%s' uniform='%s' value=%s",
-             registration.object_id,
-             registration.object_name.c_str(),
-             registration.setting.property.has_value()
-                 ? registration.setting.property->name.c_str()
-                 : "",
-             registration.property_name.c_str(),
-             value.describe().c_str());
     (void)opaque;
     return true;
 }

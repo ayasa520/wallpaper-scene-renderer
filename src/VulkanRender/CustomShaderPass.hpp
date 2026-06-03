@@ -35,6 +35,26 @@ public:
         std::function<bool()>    should_execute;
         std::vector<std::string> textures;
         std::string              output;
+        bool                     force_alpha_write { false };
+        // Some helper passes publish an offscreen target whose RGB is already premultiplied by the
+        // producer's translucent blend. The pass still uses the material's authored blend mode, but
+        // the RGB source factor must be ONE to avoid multiplying color by alpha twice.
+        bool                     premultiplied_source_blend { false };
+        // Some render-order composition routes seed a private effect source before publishing the
+        // resolved result into a parent compose layer. Those source targets must start from
+        // transparent pixels, but later authored effect passes still keep their normal load policy.
+        bool                     clear_before_draw { false };
+        // Render-order composition routes can draw an otherwise ordinary scene node into an offscreen
+        // composition source. The node must keep its authored camera binding for graph ownership, but
+        // this particular pass needs to project through the composition layer's source camera so the
+        // target texture uses the layer's own aspect ratio instead of the global framebuffer aspect.
+        std::string              camera_override;
+        // Framebuffer-seeded compose layers are the inverse: the pass writes an offscreen source
+        // target, while uniforms such as g_ModelViewProjectionMatrix must describe the active screen
+        // camera so the composelayer shader samples the current framebuffer region that the final
+        // world-space writer will replace.
+        bool                     use_active_camera_for_uniforms { false };
+        bool                     use_active_camera_for_parallax { false };
         sprite_map_t             sprites_map;
 
         // -----prepared

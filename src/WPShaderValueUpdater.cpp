@@ -302,14 +302,65 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
 }
 
 void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprites,
-                                          const UpdateUniformOp& updateOp) {
+                                          const UpdateUniformOp& updateOp,
+                                          const ShaderUniformOverrides* overrides) {
+    const auto node_cam_name = ResolveEffectiveNodeCameraName(pNode);
+    const bool use_active_camera_for_uniforms =
+        overrides != nullptr && overrides->use_active_camera_for_uniforms;
+    const bool has_named_camera_override =
+        overrides != nullptr && overrides->use_camera_override && !overrides->camera_name.empty();
+    const bool has_camera_override = use_active_camera_for_uniforms || has_named_camera_override;
+    const std::string_view uniform_cam_name =
+        use_active_camera_for_uniforms
+            ? std::string_view {}
+            : (has_named_camera_override ? overrides->camera_name : node_cam_name);
+
+    const SceneCamera* camera;
+    if (! uniform_cam_name.empty()) {
+        auto camera_it = m_scene->cameras.find(std::string(uniform_cam_name));
+        if (camera_it != m_scene->cameras.end()) {
+            camera = camera_it->second.get();
+        } else {
+            LOG_ERROR("ShaderUniformCameraOverride: camera '%.*s' not found for node '%s'",
+                      static_cast<int>(uniform_cam_name.size()),
+                      uniform_cam_name.data(),
+                      pNode != nullptr ? pNode->Name().c_str() : "<null>");
+            camera = m_scene->activeCamera;
+        }
+    } else {
+        camera = m_scene->activeCamera;
+    }
+
+    if (! camera) return;
+
+    const bool use_active_parallax_camera =
+        has_camera_override && overrides->use_active_camera_for_parallax &&
+        m_scene->activeCamera != nullptr;
+    const SceneCamera* model_parallax_camera =
+        use_active_parallax_camera ? m_scene->activeCamera : camera;
+    const bool use_camera_local_transform_caches =
+        has_camera_override && model_parallax_camera != m_scene->activeCamera;
+
+    Map<void*, Matrix4d> localModelTransformCache;
+    Map<void*, Vector3f> localParallaxOffsetCache;
+    Map<void*, Affine3f> localAttachmentTransformCache;
+    auto& modelTransformCache =
+        use_camera_local_transform_caches ? localModelTransformCache : m_modelTransformCache;
+    auto& parallaxOffsetCache =
+        use_camera_local_transform_caches ? localParallaxOffsetCache : m_parallaxOffsetCache;
+    auto& attachmentTransformCache =
+        use_camera_local_transform_caches ? localAttachmentTransformCache
+                                          : m_attachmentTransformCache;
+
     WPNodeTransformResolver transformResolver(*m_scene,
                                               m_parallax,
                                               m_nodeDataMap,
-                                              m_modelTransformCache,
-                                              m_parallaxOffsetCache,
-                                              m_attachmentTransformCache,
-                                              m_scene->activeCamera,
+                                              modelTransformCache,
+                                              parallaxOffsetCache,
+                                              attachmentTransformCache,
+                                              use_camera_local_transform_caches
+                                                  ? model_parallax_camera
+                                                  : m_scene->activeCamera,
                                               m_mousePos,
                                               m_puppet_frame_serial);
 
@@ -319,9 +370,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         auto localTransform = transformResolver.ResolveAttachmentLocalTransform(pNode);
         if (localTransform.has_value()) {
             SceneImageEffectLayer* effectLayer { nullptr };
-            const auto effective_camera = ResolveEffectiveNodeCameraName(pNode);
-            if (!effective_camera.empty()) {
-                auto camera_it = m_scene->cameras.find(effective_camera.data());
+            if (!node_cam_name.empty()) {
+                auto camera_it = m_scene->cameras.find(std::string(node_cam_name));
                 if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
                     effectLayer = camera_it->second->GetImgEffect().get();
                 }
@@ -341,17 +391,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
     pNode->UpdateTrans();
 
-    const SceneCamera* camera;
-    const auto         cam_name = ResolveEffectiveNodeCameraName(pNode);
-    if (! cam_name.empty()) {
-        camera = m_scene->cameras.at(cam_name.data()).get();
-    } else
-        camera = m_scene->activeCamera;
-
-    if (! camera) return;
-
-    if (! cam_name.empty()) {
-        auto camera_it = m_scene->cameras.find(cam_name.data());
+    if (! node_cam_name.empty()) {
+        auto camera_it = m_scene->cameras.find(std::string(node_cam_name));
         if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
             auto* effectLayer = camera_it->second->GetImgEffect().get();
             auto* worldNode   = effectLayer->WorldNode();
@@ -375,8 +416,18 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                 if (worldNodeData.InheritsSceneParentTransform() || worldNodeData.IsBoneAttached()) {
                     const SceneCamera* displayCamera =
                         m_scene->activeCamera != nullptr ? m_scene->activeCamera : camera;
-                    const auto worldModel = transformResolver.ResolveParallaxedModelTransform(
-                        worldNode, displayCamera, displayCamera != nullptr);
+                    // Composition source routes publish a child layer's private authored effect
+                    // through the neutral final composite. Keep that publisher on the raw routed
+                    // world transform here; the actual compose-source pass applies the chosen
+                    // source camera and camera-parallax exactly once. Syncing it to the active
+                    // screen camera here would bake one parallax offset into the node transform,
+                    // then the compose pass would add another one, which pulls effect-backed body
+                    // parts away from direct siblings such as faces and eyes.
+                    const auto worldModel =
+                        effectLayer->PublishesPrivateFinalComposite()
+                            ? transformResolver.ResolveRawModelTransform(worldNode)
+                            : transformResolver.ResolveParallaxedModelTransform(
+                                  worldNode, displayCamera, displayCamera != nullptr);
                     effectLayer->SyncResolvedNodeToMatrix(Affine3f(worldModel.cast<float>()));
                 }
             }
@@ -441,7 +492,30 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     }
     if (reqM || reqMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
         Matrix4d modelTrans =
-            transformResolver.ResolveParallaxedModelTransform(pNode, camera, cam_name != "effect");
+            transformResolver.ResolveParallaxedModelTransform(
+                pNode, model_parallax_camera, uniform_cam_name != "effect");
+        if (use_active_parallax_camera) {
+            const auto source_camera_node = camera->GetAttachedNode();
+            const auto source_camera_data =
+                source_camera_node != nullptr && exists(m_nodeDataMap, source_camera_node.get())
+                    ? &m_nodeDataMap.at(source_camera_node.get())
+                    : nullptr;
+            if (source_camera_data != nullptr && source_camera_data->AppliesModelParallax()) {
+                // Composition-source routes project a child through the source camera, then the
+                // parent composition layer publishes that source texture through its own final
+                // scene-space writer. The child model therefore needs active-camera parallax minus
+                // the parallax already represented by the source camera's attached layer; otherwise
+                // parent depth is added twice for authored parallax groups, while source-camera
+                // relative parallax drops the root fallback movement for groups whose final writer
+                // deliberately suppresses its own model parallax.
+                const auto source_parallax =
+                    transformResolver.ResolveParallaxOffset(source_camera_node.get(),
+                                                            model_parallax_camera);
+                modelTrans =
+                    Affine3d(Eigen::Translation3d((-source_parallax).cast<double>())).matrix() *
+                    modelTrans;
+            }
+        }
 
         if (reqM) updateOp(G_M, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqAM) updateOp(G_AM, ToDxcCBufferMatrixUniform(modelTrans));
