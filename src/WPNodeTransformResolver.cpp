@@ -2,6 +2,7 @@
 
 #include "Scene/Scene.h"
 #include "Scene/SceneNode.h"
+#include "WPImageAlignment.hpp"
 
 #include <Eigen/Geometry>
 
@@ -90,8 +91,11 @@ Matrix4d WPNodeTransformResolver::ResolveModelTransform(SceneNode* node,
         node_data->TransformParent() != nullptr &&
         exists(m_node_data_map, node_data->TransformParent())) {
         const auto& parent_data = m_node_data_map.at(node_data->TransformParent());
-        resolved = ResolveModelTransform(node_data->TransformParent(), &parent_data) *
-                   node->GetLocalTrans();
+        auto*       parent_node  = node_data->TransformParent();
+        const auto  parent_model =
+            RemoveImageAlignmentOffsetFromModel(ResolveModelTransform(parent_node, &parent_data),
+                                                parent_node->AlignmentOffset());
+        resolved = parent_model * node->GetLocalTrans();
     } else {
         node->UpdateTrans();
         resolved = node->ModelTrans();
