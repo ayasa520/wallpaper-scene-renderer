@@ -5,6 +5,7 @@
 #include "SpecTexs.hpp"
 #include "Core/MapSet.hpp"
 #include "Utils/Logging.h"
+#include "WPImageAlignment.hpp"
 
 #include "VulkanRender/AllPasses.hpp"
 
@@ -437,7 +438,10 @@ static std::optional<Eigen::Matrix4d> BuildChildRouteModel(
     // Proxy routing is order-only in the physical SceneNode tree, but render-time transforms still
     // need to follow Wallpaper Engine's authored parent. Propagating a resolved route matrix lets
     // effect final passes use the same virtual parent chain that shader uniforms use later.
-    return ResolveRouteModel(parent, parent_route_model) * child->GetLocalTrans();
+    const auto parent_route =
+        RemoveImageAlignmentOffsetFromModel(ResolveRouteModel(parent, parent_route_model),
+                                            parent->AlignmentOffset());
+    return parent_route * child->GetLocalTrans();
 }
 
 static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode* node,

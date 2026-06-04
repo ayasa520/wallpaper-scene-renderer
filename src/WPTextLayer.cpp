@@ -2162,6 +2162,21 @@ bool TextAnchorContains(std::string_view anchor, std::string_view token) {
     return anchor.find(token) != std::string_view::npos;
 }
 
+bool HasDirectionalTextScreenAnchor(const wpscene::WPTextObject& object) {
+    if (! HasExplicitTextScreenAnchor(object)) return false;
+    return TextAnchorContains(object.anchor, "left") || TextAnchorContains(object.anchor, "right") ||
+           TextAnchorContains(object.anchor, "top") || TextAnchorContains(object.anchor, "bottom");
+}
+
+std::string ResolveTextContentAlignment(const wpscene::WPTextObject& object) {
+    std::string alignment;
+    if (object.verticalalign == "top") alignment += "top";
+    if (object.verticalalign == "bottom") alignment += "bottom";
+    if (object.horizontalalign == "left") alignment += "left";
+    if (object.horizontalalign == "right") alignment += "right";
+    return alignment;
+}
+
 struct ScreenAnchorFrame {
     double view_left { 0.0 };
     double view_right { 0.0 };
@@ -2466,14 +2481,11 @@ void wallpaper::RebuildTextPrimitiveVisibleMesh(SceneMesh* mesh,
 }
 
 std::string wallpaper::ResolveTextLayerSceneAlignment(const wpscene::WPTextObject& object) {
-    if (! object.anchor.empty() && object.anchor != "none") return object.anchor;
-
-    std::string alignment;
-    if (object.verticalalign == "top") alignment += "top";
-    if (object.verticalalign == "bottom") alignment += "bottom";
-    if (object.horizontalalign == "left") alignment += "left";
-    if (object.horizontalalign == "right") alignment += "right";
-    return alignment;
+    // Directional anchors bind the layer to a screen edge and also provide the local placement edge.
+    // A plain center anchor only moves the layer with the screen center; text layout still follows
+    // horizontalalign/verticalalign inside the authored text box.
+    if (HasDirectionalTextScreenAnchor(object)) return object.anchor;
+    return ResolveTextContentAlignment(object);
 }
 
 TextLayerPropertyUpdateStrategy wallpaper::ResolveTextLayerPropertyUpdateStrategy(

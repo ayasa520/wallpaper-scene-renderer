@@ -4,6 +4,7 @@
 #include <string_view>
 
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 
 namespace wallpaper
 {
@@ -39,6 +40,20 @@ inline Eigen::Vector3f ResolveImageAlignmentOffset(std::string_view alignment,
 inline Eigen::Vector3f ResolveImageAlignmentOffset(std::string_view alignment,
                                                    const std::array<float, 2>& size) {
     return ResolveImageAlignmentOffset(alignment, Eigen::Vector2f { size[0], size[1] });
+}
+
+inline Eigen::Matrix4d RemoveImageAlignmentOffsetFromModel(
+    const Eigen::Matrix4d& model,
+    const Eigen::Vector3f& alignment_offset) {
+    if (alignment_offset.isZero(0.0f)) return model;
+
+    // SceneNode::GetLocalTrans() appends alignment as the final local-space translate so the
+    // layer's own mesh is visually placed around the authored pivot. Children and detached final
+    // writers must inherit that authored pivot, not the mesh placement offset, so callers remove
+    // the appended translate by post-multiplying its inverse.
+    Eigen::Affine3d inverse_alignment = Eigen::Affine3d::Identity();
+    inverse_alignment.translate((-alignment_offset).cast<double>());
+    return model * inverse_alignment.matrix();
 }
 
 } // namespace wallpaper
