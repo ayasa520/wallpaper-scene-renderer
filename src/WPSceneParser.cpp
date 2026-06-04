@@ -4619,9 +4619,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
 
         const auto display_size = primitive->VisibleDisplaySize();
         SceneMesh  effect_final_mesh {};
-        GenCardMesh(effect_final_mesh,
-                    { static_cast<uint16_t>(std::max(1.0f, display_size[0])),
-                      static_cast<uint16_t>(std::max(1.0f, display_size[1])) });
+        RebuildTextPrimitiveVisibleMesh(&effect_final_mesh, *primitive);
 
         scene.cameras[camera_name] = std::make_shared<SceneCamera>(
             std::max(1, static_cast<int32_t>(std::lround(display_size[0]))),
@@ -4874,9 +4872,9 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
     };
 
-    const auto resolved =
-        ResolveTextLayerNodeTranslation(context.scene->textLayers[text_obj.id], text_obj.origin);
-    spWorldNode->SetTranslate(Eigen::Vector3f { resolved[0], resolved[1], resolved[2] });
+    ApplyTextLayerNodePlacement(spWorldNode.get(),
+                                context.scene->textLayers[text_obj.id],
+                                text_obj.origin);
 
     RegisterLayerSceneState(
         context, text_obj.id, text_obj.parent, text_obj.attachment, text_obj.visible);

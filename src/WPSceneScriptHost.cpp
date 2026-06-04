@@ -5151,10 +5151,9 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
     const auto* text_layer =
         text_layer_id != 0 ? FindTextLayerById(opaque, text_layer_id) : nullptr;
     if (text_layer != nullptr && property_name == "origin") {
-        // Text nodes store a resolved scene translation that includes alignment and cropped-glyph
-        // offsets. Wallpaper Engine scripts, however, read and persist thisLayer.origin as the
-        // authored logical origin. Returning the resolved node translation here corrupts draggable
-        // text scripts because cursorUp saves that shifted value and init later applies it again.
+        // Text nodes keep their authored origin as the scene translation. Returning the registry value
+        // rather than the node transform still matters for screen-anchored text, where the renderer may
+        // temporarily shift the node into the active camera frame without changing script-visible state.
         return WPDynamicValue(text_layer->object.origin);
     }
     if (property_name == "origin") {
@@ -5516,48 +5515,36 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
     std::array<float, 3> vector {};
     if (! value.tryGet(&vector)) return false;
     const auto layer_id = opaque != nullptr ? FindNodeId(opaque, node) : 0;
+    auto apply_text_layer_transform = [&](std::string_view transform_name) -> std::optional<bool> {
+        if (opaque == nullptr || opaque->scene == nullptr || layer_id == 0) return std::nullopt;
+        if (FindTextLayerById(opaque, layer_id) == nullptr) return std::nullopt;
+
+        const bool applied = ApplyTextLayerTransformValue(
+            *opaque->scene, layer_id, node, transform_name, vector);
+        if (applied) SyncEffectLayerTransforms(opaque, layer_id, node);
+        return applied;
+    };
 
     if (property_name == "origin") {
-        if (opaque != nullptr && layer_id != 0) {
-            if (auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
-                text_layer->object.origin = vector;
-                const auto resolved       = ResolveTextLayerNodeTranslation(*text_layer, vector);
-                node->SetTranslate(Eigen::Vector3f { resolved[0], resolved[1], resolved[2] });
-                SyncEffectLayerTransforms(opaque, layer_id, node);
-                return true;
-            }
-        }
+        if (auto text_result = apply_text_layer_transform(property_name);
+            text_result.has_value()) return *text_result;
 
         node->SetTranslate(Eigen::Vector3f { vector[0], vector[1], vector[2] });
         if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
         return true;
     }
     if (property_name == "angles") {
-        if (opaque != nullptr && layer_id != 0) {
-            if (auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
-                text_layer->object.angles = vector;
-            }
-        }
+        if (auto text_result = apply_text_layer_transform(property_name);
+            text_result.has_value()) return *text_result;
+
         node->SetRotation(Eigen::Vector3f { vector[0], vector[1], vector[2] });
         if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
         return true;
     }
     if (property_name == "scale") {
-        if (opaque != nullptr && layer_id != 0) {
-            if (auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
-                text_layer->object.scale = vector;
-                node->SetScale(Eigen::Vector3f { vector[0], vector[1], vector[2] });
-                // Text-layer root translation depends on scale because cropped glyph bounds can
-                // offset the visible quad relative to the authored origin. When runtime scripts
-                // animate scale, we must recompute that translation immediately or labels keep the
-                // old offset and appear to drift even though the size update itself is correct.
-                const auto resolved =
-                    ResolveTextLayerNodeTranslation(*text_layer, text_layer->object.origin);
-                node->SetTranslate(Eigen::Vector3f { resolved[0], resolved[1], resolved[2] });
-                SyncEffectLayerTransforms(opaque, layer_id, node);
-                return true;
-            }
-        }
+        if (auto text_result = apply_text_layer_transform(property_name);
+            text_result.has_value()) return *text_result;
+
         node->SetScale(Eigen::Vector3f { vector[0], vector[1], vector[2] });
         if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
         return true;

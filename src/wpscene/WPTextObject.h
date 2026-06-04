@@ -47,13 +47,17 @@ struct WPTextObject {
     bool                       limitwidth { false };
     int32_t                    maxrows { 1 };
     int32_t                    padding { 0 };
+    std::array<int32_t, 4>     padding_edges { 0, 0, 0, 0 }; // top, right, bottom, left
     int32_t                    parent { 0 };
     std::string                attachment;
     std::string                text;
     std::string                font;
     std::string                horizontalalign { "left" };
     std::string                verticalalign { "top" };
-    std::string                anchor { "center" };
+    // Wallpaper Engine omits the text anchor field when it uses the default "none" contract.
+    // Treating missing anchors as "center" changes newer unpacked scenes into explicit
+    // screen-centered text and shifts left/top authored labels.
+    std::string                anchor { "none" };
     std::string                depthtest { "disabled" };
     // Text effects share the neutral wallpaper effect model with image layers, but the text object
     // no longer includes WPImageObject just to reference that effect chain.

@@ -15,6 +15,7 @@ namespace wallpaper
 {
 
 class Scene;
+class SceneMesh;
 class SceneNode;
 
 namespace fs
@@ -44,9 +45,9 @@ struct TextRasterLayoutResult {
     std::array<float, 2>   glyph_display_size { 0.0f, 0.0f };
     std::array<float, 2>   glyph_source_size { 0.0f, 0.0f };
     std::array<float, 2>   glyph_offset { 0.0f, 0.0f };
-    // `display_offset` is part of the canonical glyph-only geometry contract. When the text layer
-    // does not render an opaque background, the visible layer bounds follow the cropped glyph
-    // content instead of the authored logical box, and this offset keeps the world position stable.
+    // `display_offset` records where cropped glyph bounds sit inside the authored logical box.
+    // Node placement keeps the pivot on `logical_size`; glyph/final-output meshes consume resolved
+    // local centers derived from this crop delta and the authored alignment/origin.
     std::array<float, 2>   display_offset { 0.0f, 0.0f };
     // The new renderer keeps glyph raster data in atlas pages and stores per-glyph quads separately
     // from the logical layer box. Runtime updates can now rebuild only the page meshes/materials
@@ -80,8 +81,14 @@ std::string ResolveTextLayerSceneAlignment(const wpscene::WPTextObject& object);
 TextLayerPropertyUpdateStrategy ResolveTextLayerPropertyUpdateStrategy(
     const TextLayerRuntimeState& state,
     std::string_view             property_name);
-std::array<float, 3> ResolveTextLayerNodeTranslation(const TextLayerRuntimeState& state,
-                                                     std::array<float, 3>         origin);
+bool ApplyTextLayerNodePlacement(SceneNode*                     node,
+                                 const TextLayerRuntimeState&   state,
+                                 std::array<float, 3>           origin);
+bool ApplyTextLayerTransformValue(Scene&                  scene,
+                                  int32_t                 layer_id,
+                                  SceneNode*              node,
+                                  std::string_view        property_name,
+                                  std::array<float, 3>    value);
 bool ApplyTextLayerScreenAnchorTransforms(Scene& scene);
 bool        HasTextLayerProperty(std::string_view property_name);
 std::optional<WPDynamicValue> ReadTextLayerProperty(const TextLayerRuntimeState& state,
@@ -105,6 +112,7 @@ bool BuildSceneTextPrimitive(fs::VFS&                         vfs,
                              double                           render_scale,
                              std::shared_ptr<SceneTextPrimitive>* out_primitive,
                              std::string*                     out_error = nullptr);
+void RebuildTextPrimitiveVisibleMesh(SceneMesh* mesh, const SceneTextPrimitive& primitive);
 bool UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id);
 bool UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_id);
 bool RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id);
