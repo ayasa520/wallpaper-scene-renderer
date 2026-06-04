@@ -31,9 +31,10 @@ struct TextLayoutResult {
     std::array<float, 2> logical_size { 0.0f, 0.0f };
     std::array<float, 2> logical_source_size { 0.0f, 0.0f };
 
-    // Glyph-only text exposes cropped glyph bounds as visible geometry. When an opaque background
-    // is authored, visible geometry switches to `logical_size` while glyph content keeps this
-    // inner box plus its local offset inside the logical rectangle.
+    // Glyph-only text can expose cropped glyph bounds as visible geometry, but placement still
+    // belongs to `logical_size`. The cropped visible quad starts from its measured local offset from
+    // that logical rectangle; WPTextLayer resolves the final mesh center from these crop metrics and
+    // the authored alignment/origin.
     std::array<float, 2> glyph_display_size { 0.0f, 0.0f };
     std::array<float, 2> glyph_source_size { 0.0f, 0.0f };
     std::array<float, 2> glyph_offset { 0.0f, 0.0f };
@@ -87,9 +88,6 @@ public:
     [[nodiscard]] std::array<float, 2> VisibleDisplaySize() const { return layout.visible_display_size; }
     [[nodiscard]] std::array<float, 2> VisibleSourceSize() const { return layout.visible_source_size; }
     [[nodiscard]] std::array<float, 2> VisibleDisplayOffset() const { return layout.visible_display_offset; }
-    [[nodiscard]] std::array<float, 2> GlyphLocalOffset() const {
-        return object.opaquebackground ? layout.glyph_offset : std::array<float, 2> { 0.0f, 0.0f };
-    }
     [[nodiscard]] std::array<float, 2> BackgroundLocalOffset() const {
         return object.opaquebackground
             ? std::array<float, 2> { 0.0f, 0.0f }

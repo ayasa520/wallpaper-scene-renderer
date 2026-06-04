@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -14,11 +15,14 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <cairo/cairo.h>
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
 #include <pango/pangofc-fontmap.h>
+
+#include <Eigen/Geometry>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -26,9 +30,9 @@
 #include "Fs/VFS.h"
 #include "Scene/include/Scene/SceneCamera.h"
 #include "Scene/include/Scene/SceneImageEffectLayer.h"
+#include "Scene/include/Scene/SceneNode.h"
 #include "Scene/include/Scene/Scene.h"
 #include "SpecTexs.hpp"
-#include "Utils/Logging.h"
 #include "Utils/Sha.hpp"
 #include "WPSceneScriptMedia.hpp"
 
@@ -43,6 +47,7 @@ constexpr float  kMinTextVisualScaleFactor { 0.0625f };
 constexpr int    kTextGlyphAtlasMaxExtent { 1024 };
 constexpr int    kTextGlyphAtlasPadding { 1 };
 constexpr float  kScreenAnchoredTextStackGap { 1.0f };
+constexpr float  kTextPlacementEpsilon { 0.000001f };
 
 uint16_t ResolveTextMeshExtent(float value) {
     return static_cast<uint16_t>(std::max(1, static_cast<int>(std::lround(value))));
@@ -110,6 +115,137 @@ void ReadLiteralOrDynamicValue(const nlohmann::json& json, const char* name, T* 
     if (value_node == nullptr) return;
 
     GET_JSON_VALUE_NOWARN(*value_node, *out_value);
+}
+
+std::array<int32_t, 4> UniformTextPadding(int32_t value) {
+    return { value, value, value, value };
+}
+
+int32_t MaxTextPaddingEdge(const std::array<int32_t, 4>& padding) {
+    return std::max({ padding[0], padding[1], padding[2], padding[3] });
+}
+
+std::array<int32_t, 4> ClampTextPaddingEdges(std::array<int32_t, 4> padding) {
+    for (auto& edge : padding) edge = std::max(edge, 0);
+    return padding;
+}
+
+int TextPaddingHorizontal(const std::array<int32_t, 4>& padding) {
+    return padding[3] + padding[1];
+}
+
+int TextPaddingVertical(const std::array<int32_t, 4>& padding) {
+    return padding[0] + padding[2];
+}
+
+bool ParseTextPaddingComponentString(std::string_view text, std::vector<double>* out_components) {
+    if (out_components == nullptr) return false;
+
+    std::istringstream input { std::string(text) };
+    std::vector<double> components;
+    double component = 0.0;
+    while (input >> component) components.push_back(component);
+    input >> std::ws;
+    if (!input.eof() || components.empty()) return false;
+
+    *out_components = std::move(components);
+    return true;
+}
+
+bool ReadTextPaddingComponents(const nlohmann::json& value_node,
+                               std::vector<double>* out_components) {
+    if (out_components == nullptr) return false;
+
+    if (value_node.is_number()) {
+        *out_components = { value_node.get<double>() };
+        return true;
+    }
+
+    if (value_node.is_string()) {
+        return ParseTextPaddingComponentString(value_node.get_ref<const std::string&>(),
+                                               out_components);
+    }
+
+    if (value_node.is_array()) {
+        std::vector<double> components;
+        components.reserve(value_node.size());
+        for (const auto& item : value_node) {
+            if (item.is_number()) {
+                components.push_back(item.get<double>());
+                continue;
+            }
+            if (item.is_string()) {
+                std::vector<double> item_components;
+                if (!ParseTextPaddingComponentString(item.get_ref<const std::string&>(),
+                                                     &item_components)) {
+                    return false;
+                }
+                components.insert(components.end(), item_components.begin(), item_components.end());
+                continue;
+            }
+            return false;
+        }
+        if (components.empty()) return false;
+        *out_components = std::move(components);
+        return true;
+    }
+
+    return false;
+}
+
+int32_t RoundTextPaddingComponent(double value) {
+    if (!std::isfinite(value)) return 0;
+    return static_cast<int32_t>(std::lround(value));
+}
+
+std::optional<std::array<int32_t, 4>> ExpandTextPaddingComponents(
+    const std::vector<double>& components) {
+    if (components.empty() || components.size() > 4) return std::nullopt;
+
+    const auto edge = [&](size_t index) { return RoundTextPaddingComponent(components[index]); };
+
+    // Text padding is a shorthand, not a scalar. Keep the same expansion model as CSS:
+    // one value applies to every edge; two values are vertical/horizontal; three values are
+    // top/horizontal/bottom; four values are top/right/bottom/left.
+    if (components.size() == 1) return UniformTextPadding(edge(0));
+    if (components.size() == 2) return { { edge(0), edge(1), edge(0), edge(1) } };
+    if (components.size() == 3) return { { edge(0), edge(1), edge(2), edge(1) } };
+    return { { edge(0), edge(1), edge(2), edge(3) } };
+}
+
+void ReadTextPaddingValue(const nlohmann::json& json,
+                          int32_t              object_id,
+                          int32_t*             out_legacy_padding,
+                          std::array<int32_t, 4>* out_padding_edges) {
+    if (out_legacy_padding == nullptr || out_padding_edges == nullptr ||
+        !json.contains("padding") || json.at("padding").is_null()) {
+        return;
+    }
+
+    const auto* value_node = ResolveTextPropertyValueNode(json.at("padding"));
+    if (value_node == nullptr) return;
+
+    std::vector<double> components;
+    if (!ReadTextPaddingComponents(*value_node, &components)) {
+        const std::string raw = value_node->dump();
+        LOG_ERROR("TextPaddingParse: layer=%d unsupported padding=%s",
+                  object_id,
+                  raw.c_str());
+        return;
+    }
+
+    const auto expanded = ExpandTextPaddingComponents(components);
+    if (!expanded.has_value()) {
+        const std::string raw = value_node->dump();
+        LOG_ERROR("TextPaddingParse: layer=%d invalid component-count=%zu padding=%s",
+                  object_id,
+                  components.size(),
+                  raw.c_str());
+        return;
+    }
+
+    *out_padding_edges  = ClampTextPaddingEdges(*expanded);
+    *out_legacy_padding = MaxTextPaddingEdge(*out_padding_edges);
 }
 
 std::string NormalizeAssetPath(fs::VFS& vfs, std::string_view path) {
@@ -425,6 +561,124 @@ bool TextLayerUsesMaterialTint(const wpscene::WPTextObject& object) {
     return true;
 }
 
+bool TextLayerUsesTightTransparentGlyphBounds(const wpscene::WPTextObject& object) {
+    return !object.opaquebackground && object.effects.empty();
+}
+
+std::array<int32_t, 4> ResolveTextLayoutPadding(const wpscene::WPTextObject& object) {
+    // Wallpaper Engine's padding belongs to text that keeps its authored logical rectangle alive:
+    // opaque-background text needs room for the background quad, and effect-backed text needs the
+    // extra transparent source pixels that shaders may sample. Plain transparent text, however,
+    // exposes tight glyph coverage to the scene; carrying padding through that direct path turns
+    // invisible padding into visible placement geometry and moves the crop center away from the
+    // authored text placement.
+    return TextLayerUsesTightTransparentGlyphBounds(object)
+               ? UniformTextPadding(0)
+               : ClampTextPaddingEdges(object.padding_edges);
+}
+
+bool TextObjectUsesImplicitSceneAlignment(const wpscene::WPTextObject& object) {
+    return object.anchor.empty() || object.anchor == "none";
+}
+
+bool TextObjectUsesParagraphCenterPivot(const wpscene::WPTextObject& object) {
+    return TextObjectUsesImplicitSceneAlignment(object) &&
+           object.horizontalalign == "center" && object.verticalalign == "center";
+}
+
+bool TextObjectUsesAutoSizedParagraphBox(const wpscene::WPTextObject& object) {
+    return !object.limitwidth && !object.limitrows;
+}
+
+enum class TextCropCenterProjection
+{
+    LocalLayoutBox,
+    ParentCrossAxis,
+};
+
+TextCropCenterProjection ResolveTextCropCenterProjection(const wpscene::WPTextObject& object) {
+    if (TextLayerUsesTightTransparentGlyphBounds(object) &&
+        TextObjectUsesParagraphCenterPivot(object) && TextObjectUsesAutoSizedParagraphBox(object)) {
+        return TextCropCenterProjection::ParentCrossAxis;
+    }
+    return TextCropCenterProjection::LocalLayoutBox;
+}
+
+Eigen::Matrix3f BuildTextPlacementRotation(const wpscene::WPTextObject& object) {
+    Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+    transform.prerotate(Eigen::AngleAxisf(object.angles[0], Eigen::Vector3f::UnitX()));
+    transform.prerotate(Eigen::AngleAxisf(object.angles[1], Eigen::Vector3f::UnitY()));
+    transform.prerotate(Eigen::AngleAxisf(object.angles[2], Eigen::Vector3f::UnitZ()));
+    return transform.linear();
+}
+
+Eigen::Matrix3f BuildTextPlacementLinearTransform(const wpscene::WPTextObject& object) {
+    Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+    transform.prescale(Eigen::Vector3f { object.scale[0], object.scale[1], object.scale[2] });
+    transform.prerotate(Eigen::AngleAxisf(object.angles[0], Eigen::Vector3f::UnitX()));
+    transform.prerotate(Eigen::AngleAxisf(object.angles[1], Eigen::Vector3f::UnitY()));
+    transform.prerotate(Eigen::AngleAxisf(object.angles[2], Eigen::Vector3f::UnitZ()));
+    return transform.linear();
+}
+
+std::optional<Eigen::Vector3f> ResolveTextLocalOffsetForParentOffset(
+    const wpscene::WPTextObject& object,
+    const Eigen::Vector3f&       parent_offset) {
+    const auto linear = BuildTextPlacementLinearTransform(object);
+    if (std::abs(linear.determinant()) <= kTextPlacementEpsilon) return std::nullopt;
+    return linear.inverse() * parent_offset;
+}
+
+Eigen::Vector3f OriginVector(std::array<float, 3> origin) {
+    return Eigen::Vector3f { origin[0], origin[1], origin[2] };
+}
+
+float SignedScaleUnit(float value) {
+    return value < 0.0f ? -1.0f : 1.0f;
+}
+
+std::array<float, 2> ResolveTextCropLocalCenter(
+    const wpscene::WPTextObject& object,
+    std::array<float, 3>         origin,
+    std::array<float, 2>         crop_center) {
+    if (ResolveTextCropCenterProjection(object) != TextCropCenterProjection::ParentCrossAxis ||
+        std::abs(crop_center[0]) <= kTextPlacementEpsilon) {
+        return crop_center;
+    }
+
+    Eigen::Vector3f parent_cross_direction =
+        BuildTextPlacementRotation(object) * Eigen::Vector3f::UnitY();
+    const float direction_length = parent_cross_direction.norm();
+    if (direction_length <= kTextPlacementEpsilon) return crop_center;
+    parent_cross_direction /= direction_length;
+
+    const float origin_cross = OriginVector(origin).dot(parent_cross_direction);
+    if (std::abs(origin_cross) <= kTextPlacementEpsilon) return crop_center;
+
+    // Auto-sized transparent text can expose a tight cropped glyph rectangle while the scene node
+    // still places the authored paragraph box. For an implicit paragraph-center pivot, inline crop
+    // bias and the matching cross-axis correction must be projected through the same scale/rotation
+    // transform that SceneNode consumes. This keeps the rule data-driven: character shape only
+    // contributes measured crop metrics, while placement is determined by paragraph alignment,
+    // origin, scale, and angles.
+    Eigen::Vector3f resolved_center {
+        crop_center[0] * SignedScaleUnit(object.scale[0]),
+        0.0f,
+        0.0f,
+    };
+    const Eigen::Vector3f parent_cross_offset =
+        parent_cross_direction * -std::copysign(std::abs(crop_center[0]), origin_cross);
+    const auto local_cross_offset =
+        ResolveTextLocalOffsetForParentOffset(object, parent_cross_offset);
+    if (!local_cross_offset.has_value()) return crop_center;
+
+    resolved_center += *local_cross_offset;
+    return {
+        resolved_center.x(),
+        resolved_center.y(),
+    };
+}
+
 std::array<float, 2> ComputeCroppedDisplayOffset(std::string_view     alignment,
                                                  std::array<float, 2> full_display_size,
                                                  float crop_x, float crop_y, float crop_width,
@@ -583,7 +837,9 @@ std::array<float, 2> ResolveVisibleTextDisplayOffset(const TextLayerRuntimeState
     return ResolveDerivedTextDisplayOffset(state, alignment);
 }
 
-int ResolvePadding(const wpscene::WPTextObject& object) { return std::max(object.padding, 0); }
+int ResolvePadding(const wpscene::WPTextObject& object) {
+    return MaxTextPaddingEdge(ClampTextPaddingEdges(object.padding_edges));
+}
 
 float ResolveTextVisualScaleFactor(const wpscene::WPTextObject& object) {
     return std::max(
@@ -797,7 +1053,8 @@ struct TextSurfaceCrop {
 
 TextSurfaceCrop ResolveTextSurfaceCrop(const wpscene::WPTextObject& object, int raster_width,
                                        int raster_height, double raster_scale, int draw_x,
-                                       int draw_y, const PangoRectangle& ink_rect) {
+                                       int draw_y, const PangoRectangle& ink_rect,
+                                       int crop_padding) {
     TextSurfaceCrop crop {
         .x       = 0,
         .y       = 0,
@@ -827,7 +1084,7 @@ TextSurfaceCrop ResolveTextSurfaceCrop(const wpscene::WPTextObject& object, int 
 
     const int effect_margin =
         object.effects.empty() ? 0 : std::max(1, static_cast<int>(std::ceil(raster_scale)));
-    crop.margin = std::max({ static_cast<int>(std::lround(ResolvePadding(object) * raster_scale)),
+    crop.margin = std::max({ static_cast<int>(std::lround(std::max(crop_padding, 0) * raster_scale)),
                              effect_margin,
                              std::max(1, static_cast<int>(std::ceil(raster_scale))) });
 
@@ -842,6 +1099,55 @@ TextSurfaceCrop ResolveTextSurfaceCrop(const wpscene::WPTextObject& object, int 
     crop.height  = std::max(1, max_y - min_y + 1);
     crop.applied = crop.width < raster_width || crop.height < raster_height;
     return crop;
+}
+
+struct TextGlyphSourceBounds {
+    float min_x { 0.0f };
+    float min_y { 0.0f };
+    float max_x { 0.0f };
+    float max_y { 0.0f };
+    bool  valid { false };
+};
+
+TextGlyphSourceBounds ResolveGlyphQuadSourceBounds(
+    const std::vector<TextRasterLayoutResult::GlyphQuad>& quads) {
+    TextGlyphSourceBounds bounds;
+    bounds.min_x = std::numeric_limits<float>::max();
+    bounds.min_y = std::numeric_limits<float>::max();
+    bounds.max_x = std::numeric_limits<float>::lowest();
+    bounds.max_y = std::numeric_limits<float>::lowest();
+
+    for (const auto& quad : quads) {
+        const float x = quad.source_rect[0];
+        const float y = quad.source_rect[1];
+        const float width = quad.source_rect[2];
+        const float height = quad.source_rect[3];
+        if (width <= 0.0f || height <= 0.0f) continue;
+        if (!std::isfinite(x) || !std::isfinite(y) ||
+            !std::isfinite(width) || !std::isfinite(height)) {
+            continue;
+        }
+
+        bounds.min_x = std::min(bounds.min_x, x);
+        bounds.min_y = std::min(bounds.min_y, y);
+        bounds.max_x = std::max(bounds.max_x, x + width);
+        bounds.max_y = std::max(bounds.max_y, y + height);
+        bounds.valid = true;
+    }
+
+    if (!bounds.valid) {
+        bounds.min_x = bounds.min_y = bounds.max_x = bounds.max_y = 0.0f;
+    }
+    return bounds;
+}
+
+void NormalizeGlyphQuadSourceBounds(std::vector<TextRasterLayoutResult::GlyphQuad>& quads,
+                                    const TextGlyphSourceBounds& bounds) {
+    if (!bounds.valid) return;
+    for (auto& quad : quads) {
+        quad.source_rect[0] -= bounds.min_x;
+        quad.source_rect[1] -= bounds.min_y;
+    }
 }
 
 std::shared_ptr<Image> BuildImageFromRgbaPixels(const std::string&             texture_key,
@@ -1480,8 +1786,10 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
                              TextRasterLayoutResult* out_image, std::string* out_error) {
     if (out_image == nullptr) return false;
 
-    const auto   font_family    = ResolveFontFamily(vfs, object.font).value_or("Sans");
-    const int    authored_padding = ResolvePadding(object);
+    const auto   input_size          = object.size;
+    const bool   input_size_explicit = object.size_explicit;
+    const auto   font_family      = ResolveFontFamily(vfs, object.font).value_or("Sans");
+    const auto   authored_padding = ResolveTextLayoutPadding(object);
     const double scene_scale    = std::max(1.0, render_scale);
     const float  raster_density = ResolveTextRasterDensityFactor(object);
     // Text layout has two deliberately different scale contracts. Glyphs are still shaped at the
@@ -1503,8 +1811,18 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
                             std::lround(value / std::max(display_units_per_layout_unit,
                                                           static_cast<double>(kMinTextVisualScaleFactor)))));
     };
-    const int padding = scale_display_metric_to_layout_pixels(
-        static_cast<double>(authored_padding), authored_padding > 0 ? 1 : 0);
+    std::array<int32_t, 4> padding {
+        scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[0]),
+                                              authored_padding[0] > 0 ? 1 : 0),
+        scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[1]),
+                                              authored_padding[1] > 0 ? 1 : 0),
+        scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[2]),
+                                              authored_padding[2] > 0 ? 1 : 0),
+        scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[3]),
+                                              authored_padding[3] > 0 ? 1 : 0),
+    };
+    const int padding_horizontal = TextPaddingHorizontal(padding);
+    const int padding_vertical   = TextPaddingVertical(padding);
 
     auto* measure_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 4, 4);
     auto* measure_cr      = cairo_create(measure_surface);
@@ -1521,7 +1839,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     const int requested_max_width =
         scale_display_metric_to_layout_pixels(static_cast<double>(object.maxwidth), 0);
     const int measure_width =
-        object.limitwidth ? std::max(0, requested_max_width - padding * 2) : -1;
+        object.limitwidth ? std::max(0, requested_max_width - padding_horizontal) : -1;
     ConfigureLayout(measure_layout, object, measure_width);
 
     int            layout_width  = 0;
@@ -1543,8 +1861,9 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         scale_display_metric_to_layout_pixels(static_cast<double>(object.size[1]), 1);
     if (! object.size_explicit || object.size[0] <= 0.0f || object.size[1] <= 0.0f) {
         resolved_width =
-            requested_max_width > 0 ? requested_max_width : std::max(bounds_width + padding * 2, 1);
-        resolved_height = std::max(bounds_height + padding * 2, 1);
+            requested_max_width > 0 ? requested_max_width
+                                    : std::max(bounds_width + padding_horizontal, 1);
+        resolved_height = std::max(bounds_height + padding_vertical, 1);
         object.size     = {
             static_cast<float>(static_cast<double>(resolved_width) *
                                display_units_per_layout_unit),
@@ -1554,8 +1873,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     } else if (! object.limitwidth) {
         // Non-width-limited text should never be clipped just because Linux font
         // metrics are a few pixels wider than the original authoring environment.
-        resolved_width  = std::max(resolved_width, bounds_width + padding * 2);
-        resolved_height = std::max(resolved_height, bounds_height + padding * 2);
+        resolved_width  = std::max(resolved_width, bounds_width + padding_horizontal);
+        resolved_height = std::max(resolved_height, bounds_height + padding_vertical);
         object.size     = {
             static_cast<float>(static_cast<double>(resolved_width) *
                                display_units_per_layout_unit),
@@ -1586,7 +1905,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     ApplyWallpaperEngineTextSize(draw_desc, effective_point_size);
     pango_layout_set_font_description(layout, draw_desc);
 
-    const int content_width      = std::max(width - padding * 2, 1);
+    const int content_width      = std::max(width - padding_horizontal, 1);
     const int draw_content_width = object.limitwidth ? content_width : -1;
     ConfigureLayout(layout, object, draw_content_width);
     pango_layout_get_pixel_size(layout, &layout_width, &layout_height);
@@ -1604,16 +1923,16 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         return std::min(std::max(value, low), high);
     };
 
-    int draw_x = padding + draw_overhang_left;
-    int draw_y = padding + draw_overhang_top;
+    int draw_x = padding[3] + draw_overhang_left;
+    int draw_y = padding[0] + draw_overhang_top;
     if (! object.limitwidth) {
         const int min_draw_x = draw_overhang_left;
         const int max_draw_x = std::max(min_draw_x, width - draw_bounds_width + draw_overhang_left);
-        int       preferred_draw_x = padding + draw_overhang_left;
+        int       preferred_draw_x = padding[3] + draw_overhang_left;
         if (object.horizontalalign == "center") {
             preferred_draw_x = (width - draw_bounds_width) / 2 + draw_overhang_left;
         } else if (object.horizontalalign == "right") {
-            preferred_draw_x = width - padding - draw_bounds_width + draw_overhang_left;
+            preferred_draw_x = width - padding[1] - draw_bounds_width + draw_overhang_left;
         }
         draw_x = clamp_int(preferred_draw_x, min_draw_x, max_draw_x);
     }
@@ -1621,41 +1940,30 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         const int min_draw_y = draw_overhang_top;
         const int max_draw_y =
             std::max(min_draw_y, height - draw_bounds_height + draw_overhang_top);
-        int preferred_draw_y = padding + draw_overhang_top;
+        int preferred_draw_y = padding[0] + draw_overhang_top;
         if (object.verticalalign == "center") {
             preferred_draw_y = (height - draw_bounds_height) / 2 + draw_overhang_top;
         } else if (object.verticalalign == "bottom") {
-            preferred_draw_y = height - padding - draw_bounds_height + draw_overhang_top;
+            preferred_draw_y = height - padding[2] - draw_bounds_height + draw_overhang_top;
         }
         draw_y = clamp_int(preferred_draw_y, min_draw_y, max_draw_y);
     }
 
     const auto crop = ResolveTextSurfaceCrop(
-        object, raster_width, raster_height, raster_scale, draw_x, draw_y, ink_rect);
+        object,
+        raster_width,
+        raster_height,
+        raster_scale,
+        draw_x,
+        draw_y,
+        ink_rect,
+        MaxTextPaddingEdge(padding));
     const std::array<float, 2> full_display_size {
         static_cast<float>(static_cast<double>(raster_width) * static_cast<double>(display_scale)),
         static_cast<float>(static_cast<double>(raster_height) * static_cast<double>(display_scale)),
     };
-    const std::array<float, 2> cropped_display_size {
-        static_cast<float>(static_cast<double>(crop.width) * static_cast<double>(display_scale)),
-        static_cast<float>(static_cast<double>(crop.height) * static_cast<double>(display_scale)),
-    };
-    const auto scene_alignment = ResolveTextLayerSceneAlignment(object);
-    const auto display_offset =
-        ComputeCroppedDisplayOffset(scene_alignment,
-                                    full_display_size,
-                                    static_cast<float>(crop.x) * display_scale,
-                                    static_cast<float>(crop.y) * display_scale,
-                                    cropped_display_size[0],
-                                    cropped_display_size[1]);
-    const auto glyph_offset =
-        ComputeCroppedContentCenter(full_display_size,
-                                    static_cast<float>(crop.x) * display_scale,
-                                    static_cast<float>(crop.y) * display_scale,
-                                    cropped_display_size[0],
-                                    cropped_display_size[1]);
 
-    const auto atlas_result = BuildTextGlyphAtlas(
+    auto atlas_result = BuildTextGlyphAtlas(
         layout, texture_key, raster_scale, crop, draw_x, draw_y, out_error);
     if (!atlas_result.has_value()) {
         if (out_error != nullptr && out_error->empty()) {
@@ -1668,6 +1976,43 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         return false;
     }
 
+    float visible_source_x = static_cast<float>(crop.x);
+    float visible_source_y = static_cast<float>(crop.y);
+    float visible_source_width = static_cast<float>(crop.width);
+    float visible_source_height = static_cast<float>(crop.height);
+    const bool normalized_direct_text = TextLayerUsesTightTransparentGlyphBounds(object);
+    if (normalized_direct_text) {
+        const auto glyph_bounds = ResolveGlyphQuadSourceBounds(atlas_result->quads);
+        if (glyph_bounds.valid) {
+            NormalizeGlyphQuadSourceBounds(atlas_result->quads, glyph_bounds);
+            visible_source_x += glyph_bounds.min_x;
+            visible_source_y += glyph_bounds.min_y;
+            visible_source_width = std::max(1.0f, glyph_bounds.max_x - glyph_bounds.min_x);
+            visible_source_height = std::max(1.0f, glyph_bounds.max_y - glyph_bounds.min_y);
+        }
+    }
+
+    const std::array<float, 2> cropped_display_size {
+        static_cast<float>(static_cast<double>(visible_source_width) *
+                           static_cast<double>(display_scale)),
+        static_cast<float>(static_cast<double>(visible_source_height) *
+                           static_cast<double>(display_scale)),
+    };
+    const auto scene_alignment = ResolveTextLayerSceneAlignment(object);
+    const auto display_offset =
+        ComputeCroppedDisplayOffset(scene_alignment,
+                                    full_display_size,
+                                    visible_source_x * static_cast<float>(display_scale),
+                                    visible_source_y * static_cast<float>(display_scale),
+                                    cropped_display_size[0],
+                                    cropped_display_size[1]);
+    const auto glyph_offset =
+        ComputeCroppedContentCenter(full_display_size,
+                                    visible_source_x * static_cast<float>(display_scale),
+                                    visible_source_y * static_cast<float>(display_scale),
+                                    cropped_display_size[0],
+                                    cropped_display_size[1]);
+
     out_image->logical_size = full_display_size;
     out_image->logical_source_size = {
         static_cast<float>(raster_width),
@@ -1675,8 +2020,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     };
     out_image->glyph_display_size = cropped_display_size;
     out_image->glyph_source_size  = {
-        static_cast<float>(crop.width),
-        static_cast<float>(crop.height),
+        visible_source_width,
+        visible_source_height,
     };
     out_image->glyph_offset   = glyph_offset;
     out_image->display_offset = display_offset;
@@ -1705,38 +2050,70 @@ Eigen::Vector3f AlignmentOffset(std::string_view alignment, std::array<float, 2>
     return offset;
 }
 
-std::array<float, 2> ScaleTextDisplayMetric(std::array<float, 2>        value,
-                                            const std::array<float, 3>& scale) {
-    return {
-        value[0] * std::abs(scale[0]),
-        value[1] * std::abs(scale[1]),
-    };
+std::array<float, 2> ResolveTextPlacementDisplaySize(const TextLayerRuntimeState& state) {
+    if (state.primitive != nullptr) return state.primitive->layout.logical_size;
+    return state.object.size;
 }
 
-void AdjustAlignedTranslation(SceneNode* node, std::string_view old_alignment,
-                              std::array<float, 2> old_size, std::array<float, 2> old_offset,
-                              const std::array<float, 3>& old_scale, std::string_view new_alignment,
-                              std::array<float, 2> new_size, std::array<float, 2> new_offset,
-                              const std::array<float, 3>& new_scale) {
+std::array<float, 2> ResolveTextLayerVisibleLocalCenter(const TextLayerRuntimeState& state) {
+    if (state.primitive == nullptr || state.object.opaquebackground) return { 0.0f, 0.0f };
+    return ResolveTextCropLocalCenter(state.object,
+                                      state.object.origin,
+                                      state.primitive->layout.glyph_offset);
+}
+
+Eigen::Vector3f ResolveTextPlacementLocalOffset(std::string_view     alignment,
+                                                std::array<float, 2> placement_size) {
+    // Text placement is anchored to the authored logical text box. Cropping can shrink the glyph
+    // texture and move the visible quad inside that box, but it must not change the meaning of
+    // `origin`, `anchor`, or top/left/right/bottom alignment.
+    return AlignmentOffset(alignment, placement_size);
+}
+
+Eigen::Vector3f ResolveTextLayerPlacementLocalOffset(const TextLayerRuntimeState& state,
+                                                     std::string_view             alignment) {
+    return ResolveTextPlacementLocalOffset(alignment, ResolveTextPlacementDisplaySize(state));
+}
+
+Eigen::Affine3f BuildTextPlacementLocalTransform(const wpscene::WPTextObject& object,
+                                                 const Eigen::Vector3f&       origin,
+                                                 const Eigen::Vector3f&       local_offset) {
+    // Mirror SceneNode::GetLocalTrans() exactly for candidate screen-anchor bounds. Using the same
+    // transform order here keeps collision/snapping math aligned with the actual draw transform while
+    // avoiding temporary SceneNode mutation during the placement solve.
+    Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+    transform.prescale(Eigen::Vector3f { object.scale[0], object.scale[1], object.scale[2] });
+    transform.prerotate(Eigen::AngleAxisf(object.angles[0], Eigen::Vector3f::UnitX()));
+    transform.prerotate(Eigen::AngleAxisf(object.angles[1], Eigen::Vector3f::UnitY()));
+    transform.prerotate(Eigen::AngleAxisf(object.angles[2], Eigen::Vector3f::UnitZ()));
+    transform.pretranslate(origin);
+    transform.translate(local_offset);
+    return transform;
+}
+
+bool NearlyEqual(const Eigen::Vector3f& lhs, const Eigen::Vector3f& rhs) {
+    return (lhs - rhs).squaredNorm() <= 0.000001f;
+}
+
+bool TextMetricChanged(std::array<float, 2> lhs, std::array<float, 2> rhs) {
+    return std::abs(lhs[0] - rhs[0]) > 0.001f || std::abs(lhs[1] - rhs[1]) > 0.001f;
+}
+
+void ApplyTextLayerNodeAlignmentOffset(SceneNode* node, const TextLayerRuntimeState& state) {
     if (node == nullptr) return;
-    const auto scaled_old_size   = ScaleTextDisplayMetric(old_size, old_scale);
-    const auto scaled_new_size   = ScaleTextDisplayMetric(new_size, new_scale);
-    const auto scaled_old_offset = ScaleTextDisplayMetric(old_offset, old_scale);
-    const auto scaled_new_offset = ScaleTextDisplayMetric(new_offset, new_scale);
-    node->SetTranslate(node->Translate() - AlignmentOffset(old_alignment, scaled_old_size) -
-                       Eigen::Vector3f(scaled_old_offset[0], scaled_old_offset[1], 0.0f) +
-                       AlignmentOffset(new_alignment, scaled_new_size) +
-                       Eigen::Vector3f(scaled_new_offset[0], scaled_new_offset[1], 0.0f));
+    node->SetAlignmentOffset(
+        ResolveTextLayerPlacementLocalOffset(state, ResolveTextLayerSceneAlignment(state.object)));
 }
 
-void RebuildTextMesh(SceneMesh* mesh, std::array<float, 2> size) {
+void RebuildTextMesh(SceneMesh* mesh, std::array<float, 2> size,
+                     std::array<float, 2> local_center = { 0.0f, 0.0f }) {
     if (mesh == nullptr) return;
 
     SceneMesh   rebuilt(mesh->Dynamic());
-    const float left   = -(size[0] / 2.0f);
-    const float right  = size[0] / 2.0f;
-    const float bottom = -(size[1] / 2.0f);
-    const float top    = size[1] / 2.0f;
+    const float left   = local_center[0] - (size[0] / 2.0f);
+    const float right  = local_center[0] + (size[0] / 2.0f);
+    const float bottom = local_center[1] - (size[1] / 2.0f);
+    const float top    = local_center[1] + (size[1] / 2.0f);
 
     const std::array pos = {
         left, bottom, 0.0f, left, top, 0.0f, right, bottom, 0.0f, right, top, 0.0f,
@@ -1754,6 +2131,19 @@ void RebuildTextMesh(SceneMesh* mesh, std::array<float, 2> size) {
     rebuilt.AddVertexArray(std::move(vertex));
     mesh->ChangeMeshDataFrom(rebuilt);
     mesh->SetDirty();
+}
+
+std::array<float, 2> ResolveTextVisibleLocalCenter(const SceneTextPrimitive& primitive) {
+    if (primitive.object.opaquebackground) return { 0.0f, 0.0f };
+    return ResolveTextCropLocalCenter(primitive.object,
+                                      primitive.object.origin,
+                                      primitive.layout.glyph_offset);
+}
+
+std::array<float, 2> ResolveTextGlyphPageLocalOffset(const SceneTextPrimitive& primitive) {
+    if (primitive.object.opaquebackground) return primitive.layout.glyph_offset;
+    if (!primitive.object.effects.empty()) return { 0.0f, 0.0f };
+    return ResolveTextVisibleLocalCenter(primitive);
 }
 
 bool IsCameraLinkedFromScene(const Scene& scene, std::string_view camera_name) {
@@ -1855,15 +2245,41 @@ struct ScreenAnchoredTextPlacement {
 ScreenAnchoredTextBounds ResolveScreenAnchoredTextBounds(const TextLayerRuntimeState& state,
                                                          const Eigen::Vector3f& translation) {
     const auto visible_display_size = ResolveVisibleTextDisplaySize(state);
-    const auto scaled_visible_size = ScaleTextDisplayMetric(visible_display_size, state.object.scale);
-    const float half_width = scaled_visible_size[0] * 0.5f;
-    const float half_height = scaled_visible_size[1] * 0.5f;
-    return {
-        translation.x() - half_width,
-        translation.x() + half_width,
-        translation.y() - half_height,
-        translation.y() + half_height,
+    const auto visible_local_center = ResolveTextLayerVisibleLocalCenter(state);
+    const auto alignment = ResolveTextLayerSceneAlignment(state.object);
+    const auto local_offset = ResolveTextLayerPlacementLocalOffset(state, alignment);
+    const auto transform = BuildTextPlacementLocalTransform(state.object, translation, local_offset);
+    const float half_width = visible_display_size[0] * 0.5f;
+    const float half_height = visible_display_size[1] * 0.5f;
+    const std::array<Eigen::Vector3f, 4> corners {
+        Eigen::Vector3f { visible_local_center[0] - half_width,
+                          visible_local_center[1] - half_height,
+                          0.0f },
+        Eigen::Vector3f { visible_local_center[0] - half_width,
+                          visible_local_center[1] + half_height,
+                          0.0f },
+        Eigen::Vector3f { visible_local_center[0] + half_width,
+                          visible_local_center[1] - half_height,
+                          0.0f },
+        Eigen::Vector3f { visible_local_center[0] + half_width,
+                          visible_local_center[1] + half_height,
+                          0.0f },
     };
+
+    ScreenAnchoredTextBounds bounds {
+        .left = std::numeric_limits<float>::max(),
+        .right = std::numeric_limits<float>::lowest(),
+        .bottom = std::numeric_limits<float>::max(),
+        .top = std::numeric_limits<float>::lowest(),
+    };
+    for (const auto& corner : corners) {
+        const Eigen::Vector3f world = transform * corner;
+        bounds.left = std::min(bounds.left, world.x());
+        bounds.right = std::max(bounds.right, world.x());
+        bounds.bottom = std::min(bounds.bottom, world.y());
+        bounds.top = std::max(bounds.top, world.y());
+    }
+    return bounds;
 }
 
 bool ScreenAnchoredTextOverlapsHorizontally(const ScreenAnchoredTextBounds& lhs,
@@ -2043,6 +2459,12 @@ void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id, SceneNode* nod
 
 } // namespace
 
+void wallpaper::RebuildTextPrimitiveVisibleMesh(SceneMesh* mesh,
+                                                const SceneTextPrimitive& primitive) {
+    if (mesh == nullptr) return;
+    RebuildTextMesh(mesh, primitive.VisibleDisplaySize(), ResolveTextVisibleLocalCenter(primitive));
+}
+
 std::string wallpaper::ResolveTextLayerSceneAlignment(const wpscene::WPTextObject& object) {
     if (! object.anchor.empty() && object.anchor != "none") return object.anchor;
 
@@ -2087,7 +2509,7 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     ReadLiteralOrDynamicValue(json, "pointsize", &pointsize);
     ReadLiteralOrDynamicValue(json, "maxwidth", &maxwidth);
     ReadLiteralOrDynamicValue(json, "maxrows", &maxrows);
-    ReadLiteralOrDynamicValue(json, "padding", &padding);
+    ReadTextPaddingValue(json, id, &padding, &padding_edges);
     GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
     GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
     ReadLiteralOrDynamicValue(json, "visible", &visible);
@@ -2245,8 +2667,15 @@ bool wallpaper::ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
 
     if (property_name == "padding") {
         int32_t padding = 0;
-        if (! value.tryGet(&padding)) return false;
-        object.padding = padding;
+        if (! value.tryGet(&padding)) {
+            LOG_ERROR("TextLayerPropertyApply: layer=%d name='%s' property='padding' "
+                      "failed to read scalar runtime value",
+                      object.id,
+                      object.name.c_str());
+            return false;
+        }
+        object.padding       = padding;
+        object.padding_edges = UniformTextPadding(padding);
         applied = true;
     }
     if (!applied && property_name == "maxrows") {
@@ -2300,9 +2729,9 @@ TextLayoutResult BuildCanonicalTextLayoutResult(const wpscene::WPTextObject& obj
                                                           : generated.glyph_display_size;
     result.visible_source_size = object.opaquebackground ? generated.logical_source_size
                                                          : generated.glyph_source_size;
-    // The visible offset is the canonical scene-space contract for glyph-only text. Once the
-    // opaque background is enabled the logical box becomes the visible root, so that extra offset
-    // collapses back to zero and the glyph content is positioned locally inside the logical box.
+    // The visible offset records where cropped glyph bounds sit relative to the authored logical
+    // box. Node placement consumes the logical box instead; this offset remains available for
+    // background composition, diagnostics, and compatibility with callers that need the crop delta.
     result.visible_display_offset =
         object.opaquebackground ? std::array<float, 2> { 0.0f, 0.0f } : generated.display_offset;
     result.glyph_pages.reserve(generated.glyph_pages.size());
@@ -2352,7 +2781,7 @@ std::shared_ptr<SceneMesh> BuildTextPrimitiveGlyphPageMesh(const SceneTextPrimit
 
     const float scale_x = primitive.layout.glyph_display_size[0] / primitive.layout.glyph_source_size[0];
     const float scale_y = primitive.layout.glyph_display_size[1] / primitive.layout.glyph_source_size[1];
-    const auto glyph_local_offset = primitive.GlyphLocalOffset();
+    const auto glyph_local_offset = ResolveTextGlyphPageLocalOffset(primitive);
 
     std::vector<TextGlyphRun> page_runs;
     page_runs.reserve(primitive.layout.glyph_runs.size());
@@ -2424,10 +2853,11 @@ std::shared_ptr<SceneMesh> BuildTextPrimitiveGlyphPageMesh(const SceneTextPrimit
 
 struct TextLayerSceneGeometrySnapshot {
     std::string         alignment;
+    std::array<float, 2> placement_display_size { 0.0f, 0.0f };
     std::array<float, 2> visible_display_size { 0.0f, 0.0f };
     std::array<float, 2> visible_source_size { 0.0f, 0.0f };
     std::array<float, 2> dependency_source_size { 0.0f, 0.0f };
-    std::array<float, 2> visible_display_offset { 0.0f, 0.0f };
+    std::array<float, 2> visible_local_center { 0.0f, 0.0f };
 };
 
 TextLayerSceneGeometrySnapshot CaptureTextLayerSceneGeometry(const TextLayerRuntimeState& state) {
@@ -2436,10 +2866,11 @@ TextLayerSceneGeometrySnapshot CaptureTextLayerSceneGeometry(const TextLayerRunt
                                         : state.applied_alignment;
     return TextLayerSceneGeometrySnapshot {
         .alignment = alignment,
+        .placement_display_size = ResolveTextPlacementDisplaySize(state),
         .visible_display_size = ResolveVisibleTextDisplaySize(state),
         .visible_source_size = ResolveVisibleTextSourceSize(state),
         .dependency_source_size = ResolveEffectDependencyTextSourceSize(state),
-        .visible_display_offset = ResolveVisibleTextDisplayOffset(state, alignment),
+        .visible_local_center = ResolveTextLayerVisibleLocalCenter(state),
     };
 }
 
@@ -2483,32 +2914,25 @@ void SyncTextPrimitiveCanonicalState(TextLayerRuntimeState& state, bool rebuild_
 bool ApplyTextLayerSceneGeometry(Scene&                         scene,
                                  int32_t                        layer_id,
                                  TextLayerRuntimeState&         state,
-                                 const TextLayerSceneGeometrySnapshot& previous_geometry,
-                                 const std::array<float, 3>&    previous_scale) {
+                                 const TextLayerSceneGeometrySnapshot& previous_geometry) {
     const auto next_geometry = CaptureTextLayerSceneGeometry(state);
+    const bool placement_display_size_changed =
+        TextMetricChanged(previous_geometry.placement_display_size,
+                          next_geometry.placement_display_size);
     const bool visible_display_size_changed =
-        std::abs(previous_geometry.visible_display_size[0] - next_geometry.visible_display_size[0]) > 0.001f ||
-        std::abs(previous_geometry.visible_display_size[1] - next_geometry.visible_display_size[1]) > 0.001f;
+        TextMetricChanged(previous_geometry.visible_display_size, next_geometry.visible_display_size);
     const bool dependency_source_size_changed =
-        std::abs(previous_geometry.dependency_source_size[0] - next_geometry.dependency_source_size[0]) > 0.001f ||
-        std::abs(previous_geometry.dependency_source_size[1] - next_geometry.dependency_source_size[1]) > 0.001f;
-    const bool visible_display_offset_changed =
-        std::abs(previous_geometry.visible_display_offset[0] - next_geometry.visible_display_offset[0]) > 0.001f ||
-        std::abs(previous_geometry.visible_display_offset[1] - next_geometry.visible_display_offset[1]) > 0.001f;
+        TextMetricChanged(previous_geometry.dependency_source_size,
+                          next_geometry.dependency_source_size);
+    const bool visible_local_center_changed =
+        TextMetricChanged(previous_geometry.visible_local_center,
+                          next_geometry.visible_local_center);
     const bool alignment_changed = previous_geometry.alignment != next_geometry.alignment;
 
-    if (visible_display_size_changed || visible_display_offset_changed || alignment_changed) {
+    if (placement_display_size_changed || alignment_changed) {
         if (auto layer_node_it = scene.layerNodes.find(layer_id);
             layer_node_it != scene.layerNodes.end()) {
-            AdjustAlignedTranslation(layer_node_it->second,
-                                     previous_geometry.alignment,
-                                     previous_geometry.visible_display_size,
-                                     previous_geometry.visible_display_offset,
-                                     previous_scale,
-                                     next_geometry.alignment,
-                                     next_geometry.visible_display_size,
-                                     next_geometry.visible_display_offset,
-                                     state.object.scale);
+            ApplyTextLayerNodeAlignmentOffset(layer_node_it->second, state);
         }
     }
 
@@ -2533,7 +2957,9 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
             // Text bridges now expose exact-size source images. Once the canonical visible box is
             // known, every downstream effect pass can keep using a plain full-UV card; runtime text
             // updates only need to resize that card to the latest visible display size.
-            RebuildTextMesh(&effect_layer.FinalMesh(), camera_size);
+            RebuildTextMesh(&effect_layer.FinalMesh(),
+                            camera_size,
+                            next_geometry.visible_local_center);
             effect_layer.SyncResolvedOutputMesh();
             effect_layer.SyncResolvedNodeToWorld();
         }
@@ -2557,7 +2983,8 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
     const bool has_bridge_resources =
         state.primitive != nullptr && !state.primitive->bridge.render_targets.empty();
     if (has_bridge_resources &&
-        (visible_display_size_changed || dependency_source_size_changed ||
+        (visible_display_size_changed || visible_local_center_changed ||
+         dependency_source_size_changed ||
          bridge_render_target_changed)) {
         // The final text bridge keeps a stable pass identity and exact-size backing images. The
         // only Vulkan resources affected by a text size change are the bridge outputs and the
@@ -2569,6 +2996,57 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
     }
 
     return true;
+}
+
+bool SyncTextLayerSceneGeometry(Scene&                         scene,
+                                int32_t                        layer_id,
+                                TextLayerRuntimeState&         state,
+                                const TextLayerSceneGeometrySnapshot& previous_geometry) {
+    SyncTextPrimitiveCanonicalState(state, false);
+    const auto next_geometry = CaptureTextLayerSceneGeometry(state);
+    const bool visible_local_center_changed =
+        TextMetricChanged(previous_geometry.visible_local_center,
+                          next_geometry.visible_local_center);
+
+    if (visible_local_center_changed && TextLayerUsesTightTransparentGlyphBounds(state.object)) {
+        // Transform-only script writes can alter the projected crop center without changing shaped
+        // glyph data. The canonical primitive therefore needs a mesh-only refresh: reuse the current
+        // atlas/layout, rebuild local quad positions from the new transform inputs, and mark the
+        // owning TextPass so GPU buffers are refreshed before the next recorded draw.
+        SyncTextPrimitiveCanonicalState(state, true);
+        scene.MarkTextLayerResourcesDirty(layer_id);
+    }
+
+    return ApplyTextLayerSceneGeometry(scene, layer_id, state, previous_geometry);
+}
+
+bool ApplyTextLayerObjectTransform(TextLayerRuntimeState& state,
+                                   SceneNode*            node,
+                                   std::string_view      property_name,
+                                   std::array<float, 3>  value) {
+    if (node == nullptr) return false;
+
+    if (property_name == "origin") {
+        state.object.origin = value;
+        ApplyTextLayerNodePlacement(node, state, value);
+        return true;
+    }
+
+    if (property_name == "angles") {
+        state.object.angles = value;
+        node->SetRotation(Eigen::Vector3f { value[0], value[1], value[2] });
+        ApplyTextLayerNodePlacement(node, state, state.object.origin);
+        return true;
+    }
+
+    if (property_name == "scale") {
+        state.object.scale = value;
+        node->SetScale(Eigen::Vector3f { value[0], value[1], value[2] });
+        ApplyTextLayerNodePlacement(node, state, state.object.origin);
+        return true;
+    }
+
+    return false;
 }
 
 } // namespace
@@ -2649,42 +3127,42 @@ bool wallpaper::UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id) {
 
     auto&      state = state_it->second;
     const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
-    const auto previous_scale = state.object.scale;
-    const auto next_alignment = ResolveTextLayerSceneAlignment(state.object);
-    SyncTextPrimitiveCanonicalState(state, false);
-
-    if (previous_geometry.alignment == next_alignment) {
-        return true;
-    }
-
-    if (!ApplyTextLayerSceneGeometry(scene,
-                                     layer_id,
-                                     state,
-                                     previous_geometry,
-                                     previous_scale)) {
-        return false;
-    }
-
-    return true;
+    return SyncTextLayerSceneGeometry(scene, layer_id, state, previous_geometry);
 }
 
-std::array<float, 3> wallpaper::ResolveTextLayerNodeTranslation(const TextLayerRuntimeState& state,
-                                                                std::array<float, 3> origin) {
-    // Translation queries need the current authored alignment, not the last applied one, because
-    // callers use this helper while actively mutating origin/scale on the authored text object.
+bool wallpaper::ApplyTextLayerNodePlacement(SceneNode*                   node,
+                                            const TextLayerRuntimeState& state,
+                                            std::array<float, 3>         origin) {
+    if (node == nullptr) return false;
+
     const auto alignment = ResolveTextLayerSceneAlignment(state.object);
-    const auto visible_display_size = ResolveVisibleTextDisplaySize(state);
-    const auto visible_display_offset = ResolveVisibleTextDisplayOffset(state, alignment);
-    const auto scaled_visible_size = ScaleTextDisplayMetric(visible_display_size, state.object.scale);
-    const auto scaled_visible_offset =
-        ScaleTextDisplayMetric(visible_display_offset, state.object.scale);
-    const auto alignment_offset = AlignmentOffset(alignment, scaled_visible_size);
-    const std::array<float, 3> resolved {
-        origin[0] + alignment_offset.x() + scaled_visible_offset[0],
-        origin[1] + alignment_offset.y() + scaled_visible_offset[1],
-        origin[2],
-    };
-    return resolved;
+    const auto placement_display_size = ResolveTextPlacementDisplaySize(state);
+    const Eigen::Vector3f next_translation { origin[0], origin[1], origin[2] };
+    const auto next_alignment_offset =
+        ResolveTextPlacementLocalOffset(alignment, placement_display_size);
+    const bool changed = !NearlyEqual(node->Translate(), next_translation) ||
+                         !NearlyEqual(node->AlignmentOffset(), next_alignment_offset);
+
+    if (changed) {
+        node->SetTranslate(next_translation);
+        node->SetAlignmentOffset(next_alignment_offset);
+    }
+    return changed;
+}
+
+bool wallpaper::ApplyTextLayerTransformValue(Scene&               scene,
+                                             int32_t              layer_id,
+                                             SceneNode*           node,
+                                             std::string_view     property_name,
+                                             std::array<float, 3> value) {
+    auto state_it = scene.textLayers.find(layer_id);
+    if (state_it == scene.textLayers.end()) return false;
+
+    auto&      state = state_it->second;
+    const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
+    if (!ApplyTextLayerObjectTransform(state, node, property_name, value)) return false;
+
+    return SyncTextLayerSceneGeometry(scene, layer_id, state, previous_geometry);
 }
 
 bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
@@ -2710,8 +3188,11 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
 
         SceneNode* layer_node = layer_node_it->second;
         const auto anchored_origin = ResolveScreenAnchoredTextOrigin(*frame, state.object);
-        const auto resolved = ResolveTextLayerNodeTranslation(state, anchored_origin);
-        const Eigen::Vector3f next_translation { resolved[0], resolved[1], resolved[2] };
+        const Eigen::Vector3f next_translation {
+            anchored_origin[0],
+            anchored_origin[1],
+            anchored_origin[2],
+        };
         placements.push_back(ScreenAnchoredTextPlacement {
             .layer_id = layer_id,
             .state = &state,
@@ -2731,8 +3212,7 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
 
     bool changed_any_node = false;
     for (const auto& placement : placements) {
-        const Eigen::Vector3f delta = placement.node->Translate() - placement.translation;
-        if (delta.squaredNorm() <= 0.000001f) {
+        if (placement.state == nullptr) {
             continue;
         }
 
@@ -2740,7 +3220,13 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
         // update instead of accumulating deltas. Fill-mode changes can run every frame when camera
         // layers animate, and using the authored origin as the base keeps screen-anchored text
         // deterministic while preserving script-visible `thisLayer.origin` values.
-        placement.node->SetTranslate(placement.translation);
+        const bool changed = ApplyTextLayerNodePlacement(
+            placement.node,
+            *placement.state,
+            { placement.translation.x(), placement.translation.y(), placement.translation.z() });
+        if (!changed) {
+            continue;
+        }
         SyncTextLayerEffectTransform(scene, placement.layer_id, placement.node);
         changed_any_node = true;
     }
@@ -2760,7 +3246,6 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
     }
 
     const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
-    const auto previous_scale = state.object.scale;
     // Bridge-resource updates are the permanent cheap path for geometry changes that do not alter
     // shaping results, such as toggling the opaque background. The primitive keeps the existing
     // atlas/layout data and only rebuilds the meshes whose local placement depends on the
@@ -2769,8 +3254,7 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
     if (!ApplyTextLayerSceneGeometry(scene,
                                      layer_id,
                                      state,
-                                     previous_geometry,
-                                     previous_scale)) {
+                                     previous_geometry)) {
         return false;
     }
 
@@ -2792,15 +3276,7 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     }
 
     auto&      state                 = state_it->second;
-    const auto previous_scale        = state.object.scale;
-    const auto previous_alignment =
-        state.applied_alignment.empty() ? ResolveTextLayerSceneAlignment(state.object)
-                                        : state.applied_alignment;
-    const auto previous_visible_display_size = ResolveVisibleTextDisplaySize(state);
-    const auto previous_visible_source_size = ResolveVisibleTextSourceSize(state);
-    const auto previous_dependency_source_size = ResolveEffectDependencyTextSourceSize(state);
-    const auto previous_visible_display_offset =
-        ResolveVisibleTextDisplayOffset(state, previous_alignment);
+    const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
     // Atlas revisions now live on the scene-owned primitive itself. Runtime layout rebuilds only
     // need the next monotonically increasing atlas version so the dedicated text pass refreshes
     // page textures after a reraster; keeping that counter on the primitive removes another piece
@@ -2840,18 +3316,10 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     state.object = rebuilt_primitive->object;
     SyncTextPrimitiveCanonicalState(state, false);
 
-    const TextLayerSceneGeometrySnapshot previous_geometry {
-        .alignment = previous_alignment,
-        .visible_display_size = previous_visible_display_size,
-        .visible_source_size = previous_visible_source_size,
-        .dependency_source_size = previous_dependency_source_size,
-        .visible_display_offset = previous_visible_display_offset,
-    };
     if (!ApplyTextLayerSceneGeometry(scene,
                                      layer_id,
                                      state,
-                                     previous_geometry,
-                                     previous_scale)) {
+                                     previous_geometry)) {
         return false;
     }
 
