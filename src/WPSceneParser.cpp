@@ -39,6 +39,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <cctype>
@@ -2381,32 +2382,6 @@ void ReplaceDeferredPlaceholderNode(ParseContext& context, int32_t layer_id,
     }
 }
 
-void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
-                    const WPShaderInfo& info) {
-    // load glname from alias and load to constvalue
-    for (const auto& cs : wpmat.constantshadervalues) {
-        const auto&               name  = cs.first;
-        const std::vector<float>& value = cs.second;
-        std::string               glname;
-        if (info.alias.count(name) != 0) {
-            glname = info.alias.at(name);
-        } else {
-            for (const auto& el : info.alias) {
-                if (el.second.substr(2) == name) {
-                    glname = el.second;
-                    break;
-                }
-            }
-        }
-        if (glname.empty()) {
-            LOG_ERROR("ShaderValue: %s not found in glsl", name.c_str());
-        } else {
-            material.customShader.constValues[glname] =
-                ClampParserOpacityUniformValue(glname, ShaderValue(value));
-        }
-    }
-}
-
 struct ResolvedUserShaderValueBinding {
     std::string        user_property_name;
     std::string        material_value_name;
@@ -2415,27 +2390,204 @@ struct ResolvedUserShaderValueBinding {
     bool               legacy_reversed { false };
 };
 
-std::string ResolveMaterialValueUniformName(const WPShaderInfo& info,
-                                            const std::string&  material_value_name) {
-    if (const auto alias_it = info.alias.find(material_value_name); alias_it != info.alias.end()) {
-        return alias_it->second;
+enum class MaterialValueUniformResolutionKind
+{
+    ExactAlias,
+    UniformName,
+    UniformSuffix,
+    NormalizedAlias,
+    AmbiguousNormalizedAlias,
+    Unresolved,
+};
+
+struct MaterialValueUniformResolution {
+    std::string                        uniform_name;
+    std::string                        matched_alias;
+    MaterialValueUniformResolutionKind kind {
+        MaterialValueUniformResolutionKind::Unresolved
+    };
+
+    bool resolved() const noexcept {
+        return kind != MaterialValueUniformResolutionKind::Unresolved &&
+               kind != MaterialValueUniformResolutionKind::AmbiguousNormalizedAlias;
+    }
+};
+
+const char* MaterialValueUniformResolutionKindName(MaterialValueUniformResolutionKind kind) {
+    switch (kind) {
+    case MaterialValueUniformResolutionKind::ExactAlias: return "exact-alias";
+    case MaterialValueUniformResolutionKind::UniformName: return "uniform-name";
+    case MaterialValueUniformResolutionKind::UniformSuffix: return "uniform-suffix";
+    case MaterialValueUniformResolutionKind::NormalizedAlias: return "normalized-alias";
+    case MaterialValueUniformResolutionKind::AmbiguousNormalizedAlias:
+        return "ambiguous-normalized-alias";
+    case MaterialValueUniformResolutionKind::Unresolved: return "unresolved";
+    }
+    return "unknown";
+}
+
+bool IsDirectMaterialValueResolution(MaterialValueUniformResolutionKind kind) {
+    return kind == MaterialValueUniformResolutionKind::ExactAlias ||
+           kind == MaterialValueUniformResolutionKind::UniformName ||
+           kind == MaterialValueUniformResolutionKind::UniformSuffix;
+}
+
+std::string NormalizeMaterialValueAlias(std::string_view name) {
+    std::string normalized;
+    int         parenthetical_depth = 0;
+    for (unsigned char raw_ch : name) {
+        const char ch = static_cast<char>(raw_ch);
+        if (ch == '(') {
+            parenthetical_depth++;
+            continue;
+        }
+        if (ch == ')') {
+            if (parenthetical_depth > 0) parenthetical_depth--;
+            continue;
+        }
+        if (parenthetical_depth > 0) continue;
+
+        if (std::isalnum(raw_ch)) {
+            normalized.push_back(static_cast<char>(std::tolower(raw_ch)));
+        }
     }
 
-    for (const auto& el : info.alias) {
-        if (el.second == material_value_name) {
-            return el.second;
+    // Wallpaper Engine sometimes serializes constants by editor label ("Texture parallax depth")
+    // while the shader metadata only exposes numbered material keys ("4textureParallaxDepth").
+    // Dropping only leading digits lets those two forms meet without treating unrelated numeric
+    // suffixes as equivalent.
+    const auto first_non_digit =
+        std::find_if(normalized.begin(), normalized.end(), [](unsigned char ch) {
+            return ! std::isdigit(ch);
+        });
+    normalized.erase(normalized.begin(), first_non_digit);
+    return normalized;
+}
+
+MaterialValueUniformResolution
+ResolveMaterialValueUniform(const WPShaderInfo& info, std::string_view material_value_name,
+                            bool allow_normalized_alias) {
+    const std::string material_value_key(material_value_name);
+    if (const auto alias_it = info.alias.find(material_value_key); alias_it != info.alias.end()) {
+        return {
+            .uniform_name  = alias_it->second,
+            .matched_alias = alias_it->first,
+            .kind          = MaterialValueUniformResolutionKind::ExactAlias,
+        };
+    }
+
+    for (const auto& [alias_name, uniform_name] : info.alias) {
+        if (uniform_name == material_value_key) {
+            return {
+                .uniform_name  = uniform_name,
+                .matched_alias = alias_name,
+                .kind          = MaterialValueUniformResolutionKind::UniformName,
+            };
         }
 
         // Some shader metadata stores material aliases like `color1`, while the parsed GLSL
         // uniform is named `g_Color1`. Keep this suffix match so user-facing project properties
         // can still target old stock shaders whose material JSON uses the shorter alias instead
         // of the final GLSL symbol.
-        if (el.second.size() > 2 && el.second.substr(2) == material_value_name) {
-            return el.second;
+        if (uniform_name.size() > 2 && uniform_name.substr(2) == material_value_key) {
+            return {
+                .uniform_name  = uniform_name,
+                .matched_alias = alias_name,
+                .kind          = MaterialValueUniformResolutionKind::UniformSuffix,
+            };
         }
     }
 
-    return material_value_name;
+    if (! allow_normalized_alias) {
+        return {
+            .uniform_name = material_value_key,
+            .kind         = MaterialValueUniformResolutionKind::Unresolved,
+        };
+    }
+
+    const auto normalized_key = NormalizeMaterialValueAlias(material_value_key);
+    if (normalized_key.empty()) {
+        return {
+            .uniform_name = material_value_key,
+            .kind         = MaterialValueUniformResolutionKind::Unresolved,
+        };
+    }
+
+    std::optional<MaterialValueUniformResolution> candidate;
+    for (const auto& [alias_name, uniform_name] : info.alias) {
+        if (NormalizeMaterialValueAlias(alias_name) != normalized_key) continue;
+
+        if (candidate.has_value() && candidate->uniform_name != uniform_name) {
+            return {
+                .uniform_name  = material_value_key,
+                .matched_alias = alias_name,
+                .kind = MaterialValueUniformResolutionKind::AmbiguousNormalizedAlias,
+            };
+        }
+
+        candidate = MaterialValueUniformResolution {
+            .uniform_name  = uniform_name,
+            .matched_alias = alias_name,
+            .kind          = MaterialValueUniformResolutionKind::NormalizedAlias,
+        };
+    }
+
+    if (candidate.has_value()) return *candidate;
+    return {
+        .uniform_name = material_value_key,
+        .kind         = MaterialValueUniformResolutionKind::Unresolved,
+    };
+}
+
+std::string ResolveMaterialValueUniformName(const WPShaderInfo& info,
+                                            const std::string&  material_value_name) {
+    const auto resolution = ResolveMaterialValueUniform(info, material_value_name, true);
+    return resolution.resolved() ? resolution.uniform_name : material_value_name;
+}
+
+void ApplyResolvedConstvalue(SceneMaterial& material, const std::string& material_value_name,
+                             const std::vector<float>&                 value,
+                             const MaterialValueUniformResolution&     resolution) {
+    if (! resolution.resolved()) return;
+    if (resolution.kind == MaterialValueUniformResolutionKind::NormalizedAlias) {
+        LOG_INFO("ShaderValueAliasFallback: material-value='%s' alias='%s' uniform='%s'",
+                 material_value_name.c_str(),
+                 resolution.matched_alias.c_str(),
+                 resolution.uniform_name.c_str());
+    }
+
+    material.customShader.constValues[resolution.uniform_name] =
+        ClampParserOpacityUniformValue(resolution.uniform_name, ShaderValue(value));
+}
+
+void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
+                    const WPShaderInfo& info) {
+    // Apply exact authored material keys before display-name fallbacks. Some Wallpaper Engine
+    // projects serialize both forms in one pass; the display-name value is the editor-visible
+    // override and must be allowed to replace the internal default key deterministically.
+    for (const auto& [name, value] : wpmat.constantshadervalues) {
+        const auto resolution = ResolveMaterialValueUniform(info, name, false);
+        if (! resolution.resolved()) continue;
+        ApplyResolvedConstvalue(material, name, value, resolution);
+    }
+
+    for (const auto& [name, value] : wpmat.constantshadervalues) {
+        const auto direct_resolution = ResolveMaterialValueUniform(info, name, false);
+        if (direct_resolution.resolved() &&
+            IsDirectMaterialValueResolution(direct_resolution.kind)) {
+            continue;
+        }
+
+        const auto resolution = ResolveMaterialValueUniform(info, name, true);
+        if (resolution.resolved()) {
+            ApplyResolvedConstvalue(material, name, value, resolution);
+            continue;
+        }
+
+        LOG_WARN("ShaderValue: material-value='%s' skipped reason=%s",
+                 name.c_str(),
+                 MaterialValueUniformResolutionKindName(resolution.kind));
+    }
 }
 
 std::vector<ResolvedUserShaderValueBinding>
@@ -2574,16 +2726,18 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         const bool  has_animation = binding.animation != nullptr && binding.animation->valid();
         if (! setting.hasUserBinding() && ! setting.hasScript() && ! has_animation) continue;
 
-        const auto gl_uniform_name = ResolveMaterialValueUniformName(info, material_value_name);
+        const auto  resolution      = ResolveMaterialValueUniform(info, material_value_name, true);
+        const auto& gl_uniform_name = resolution.uniform_name;
         if (! SceneMaterialHasUniform(*node->Mesh()->Material(), gl_uniform_name)) {
             LOG_INFO("ConstantShaderValueRegister: layer=%d effect-id=%d effect-index=%d "
-                     "material-index=%zu material-value='%s' unresolved uniform='%s'",
+                     "material-index=%zu material-value='%s' unresolved uniform='%s' reason=%s",
                      object_id,
                      effect_id,
                      effect_index,
                      material_index,
                      material_value_name.c_str(),
-                     gl_uniform_name.c_str());
+                     gl_uniform_name.c_str(),
+                     MaterialValueUniformResolutionKindName(resolution.kind));
             continue;
         }
 
@@ -4019,27 +4173,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         };
         LoadConstvalue(material, wpimgobj.material, shaderInfo);
         LoadUserShaderValue(material, wpimgobj.material, shaderInfo, context.user_properties);
-    }
-
-    for (const auto& cs : wpimgobj.material.constantshadervalues) {
-        const auto&               name  = cs.first;
-        const std::vector<float>& value = cs.second;
-        std::string               glname;
-        if (shaderInfo.alias.count(name) != 0) {
-            glname = shaderInfo.alias.at(name);
-        } else {
-            for (const auto& el : shaderInfo.alias) {
-                if (el.second.substr(2) == name) {
-                    glname = el.second;
-                    break;
-                }
-            }
-        }
-        if (glname.empty()) {
-            LOG_ERROR("ShaderValue: %s not found in glsl", name.c_str());
-        } else {
-            material.customShader.constValues[glname] = value;
-        }
     }
 
     // mesh

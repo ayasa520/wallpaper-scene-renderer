@@ -386,18 +386,17 @@ static bool CompileShaderUnitWithDxc(const ShaderCompUnit& unit,
                           IID_PPV_ARGS(&result));
     if (! DxcSucceeded(compile_hr, "compile-call")) return false;
 
-    const auto errors = DxcErrorText(result);
-    if (! errors.empty()) {
-        const auto debug_name = EffectiveDebugName(unit);
-        LOG_ERROR("dxc(%.*s): %s",
-                  static_cast<int>(debug_name.size()),
-                  debug_name.data(),
-                  errors.c_str());
-    }
-
     HRESULT status = S_OK;
     if (! DxcSucceeded(result->GetStatus(&status), "get-status")) return false;
+    const auto errors = DxcErrorText(result);
     if (FAILED(status)) {
+        if (! errors.empty()) {
+            const auto debug_name = EffectiveDebugName(unit);
+            LOG_ERROR("dxc(%.*s): %s",
+                      static_cast<int>(debug_name.size()),
+                      debug_name.data(),
+                      errors.c_str());
+        }
         std::string tmp_name = logToTmpfileWithSha1(unit.src, "%s", unit.src.c_str());
         const auto debug_name = EffectiveDebugName(unit);
         LOG_ERROR("dxc(%.*s): shader source is at %s",
@@ -405,6 +404,13 @@ static bool CompileShaderUnitWithDxc(const ShaderCompUnit& unit,
                   debug_name.data(),
                   tmp_name.c_str());
         return false;
+    }
+    if (! errors.empty()) {
+        const auto debug_name = EffectiveDebugName(unit);
+        LOG_WARN("dxc(%.*s): %s",
+                 static_cast<int>(debug_name.size()),
+                 debug_name.data(),
+                 errors.c_str());
     }
 
     CComPtr<IDxcBlob> object;
