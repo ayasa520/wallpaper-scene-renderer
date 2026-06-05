@@ -53,6 +53,21 @@ void ReadVisibleProperty(const nlohmann::json& json, bool* visible,
     }
 }
 
+void ApplyImageInstanceMaterialOverride(const nlohmann::json& object_json, WPMaterial& material) {
+    if (! object_json.contains("instance") || object_json.at("instance").is_null()) return;
+    const auto& instance_json = object_json.at("instance");
+    if (! instance_json.is_object()) return;
+
+    // Instanced image models keep their base material in the model asset and their per-layer
+    // texture bindings on the scene object. Media cover layers use that override to replace the
+    // model's `util/white` placeholder with `$mediaThumbnail`, so it must be merged before the
+    // material is handed to LoadMaterial.
+    WPMaterialPass instance_override;
+    if (instance_override.FromJson(instance_json)) {
+        material.MergePass(instance_override);
+    }
+}
+
 } // namespace
 
 bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
@@ -116,6 +131,7 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
             return false;
         }
         material.FromJson(jMat);
+        ApplyImageInstanceMaterialOverride(json, material);
     } else {
         LOG_INFO("image object no material");
         return false;

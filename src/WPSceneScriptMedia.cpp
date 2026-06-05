@@ -31,6 +31,12 @@ std::shared_ptr<Image> CreateImageWithStorage(std::string_view       key,
     image->header.count = 1;
     image->header.format = TextureFormat::RGBA8;
     image->header.type = ImageType::PNG;
+    // Scene-script media images are generated at runtime instead of loaded from a .tex header.
+    // Publish the same RGB component flags that ordinary RGBA textures expose so texture-driven
+    // shader combos keep their sampler branches when bound to `$mediaThumbnail`.
+    image->header.extraHeader["compo1"].val = 1;
+    image->header.extraHeader["compo2"].val = 1;
+    image->header.extraHeader["compo3"].val = 1;
     image->header.sample.wrapS = TextureWrap::CLAMP_TO_EDGE;
     image->header.sample.wrapT = TextureWrap::CLAMP_TO_EDGE;
     image->header.sample.magFilter = TextureFilter::LINEAR;

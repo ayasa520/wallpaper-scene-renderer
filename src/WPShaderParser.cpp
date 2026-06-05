@@ -29,6 +29,11 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 #define SHADER_SRC_DIR "prepared-shaders02"
 #define SHADER_SRC_SUFFIX "wpsrc"
 
+static constexpr int              kPreparedShaderSourceVersion { 4 };
+static constexpr std::string_view kPreparedShaderPipelineKey {
+    "prepared-shader-v19-dxc-interface-sanitize\n"
+};
+
 using namespace wallpaper;
 
 namespace
@@ -371,6 +376,17 @@ inline std::optional<DeclMatch> TryParseDeclLine(
     const auto name     = line.substr(pos, name_end - pos);
 
     pos = SkipWhitespace(line, name_end);
+    if (pos < line.size() && line[pos] == '.' &&
+        (storage == "attribute" || storage == "varying" || storage == "in" || storage == "out")) {
+        // Some Workshop effects export declarations such as `varying vec4 v_Size.xy;`. The suffix
+        // is a stray swizzle on the declaration, while later `v_Size.xy` expressions are valid.
+        // Treat the declaration as `v_Size` so the DXC bridge strips it and emits a valid interface.
+        pos++;
+        if (pos >= line.size() || ! IsIdentifierStart(line[pos])) return std::nullopt;
+        const auto suffix_end = SkipIdentifier(line, pos);
+        pos = SkipWhitespace(line, suffix_end);
+    }
+
     std::string array;
     if (pos < line.size() && line[pos] == '[') {
         const auto array_begin = pos;
@@ -1696,7 +1712,7 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
                                          const Combos& combos,
                                          std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "prepared-shader-v18-dxc-perspective-matrix-compat\n";
+    out << kPreparedShaderPipelineKey;
     for (const auto& unit : units) {
         out << static_cast<int>(unit.stage) << '\n';
         out << utils::genSha1(unit.src) << '\n';
@@ -1884,7 +1900,7 @@ inline ExpandedShaderSource ExpandShaderSource(fs::VFS& vfs, const std::string& 
 
 inline bool LoadPreparedShaderUnits(std::span<WPShaderUnit> units, fs::IBinaryStream& file) {
     const auto version = ReadVersion("WSRC", file);
-    if (version != 3) return false;
+    if (version != kPreparedShaderSourceVersion) return false;
 
     const auto count = file.ReadUint32();
     if (count != units.size()) return false;
@@ -1914,7 +1930,7 @@ inline bool LoadPreparedShaderUnits(std::span<WPShaderUnit> units, fs::IBinarySt
 }
 
 inline void SavePreparedShaderUnits(std::span<const WPShaderUnit> units, fs::IBinaryStreamW& file) {
-    WriteVersion("WSRC", file, 3);
+    WriteVersion("WSRC", file, kPreparedShaderSourceVersion);
     file.WriteUint32(static_cast<u32>(units.size()));
     for (const auto& unit : units) {
         file.WriteInt32(static_cast<int32_t>(unit.stage));

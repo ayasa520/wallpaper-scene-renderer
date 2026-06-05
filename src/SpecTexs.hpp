@@ -57,6 +57,8 @@ constexpr std::string_view WE_PRENDER_ROPE_SUBDIVISION { "PRENDER_ROPE_SUBDIVISI
 constexpr std::string_view G_M { "g_ModelMatrix" };
 constexpr std::string_view G_VP { "g_ViewProjectionMatrix" };
 constexpr std::string_view G_MVP { "g_ModelViewProjectionMatrix" };
+constexpr std::string_view G_LMM { "g_LayerModelMatrix" };
+constexpr std::string_view G_EMVP { "g_EffectModelViewProjectionMatrix" };
 constexpr std::string_view G_AM { "g_AltModelMatrix" };
 constexpr std::string_view G_MI { "g_ModelMatrixInverse" };
 constexpr std::string_view G_MVPI { "g_ModelViewProjectionMatrixInverse" };

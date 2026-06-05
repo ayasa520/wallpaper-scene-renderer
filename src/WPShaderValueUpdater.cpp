@@ -265,6 +265,8 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_M                  = existsOp(G_M);
     info.has_AM                 = existsOp(G_AM);
     info.has_MVP                = existsOp(G_MVP);
+    info.has_LMM                = existsOp(G_LMM);
+    info.has_EMVP               = existsOp(G_EMVP);
     info.has_MVPI               = existsOp(G_MVPI);
     info.has_ETVP               = existsOp(G_ETVP);
     info.has_ETVPI              = existsOp(G_ETVPI);
@@ -481,6 +483,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     bool reqM     = info.has_M;
     bool reqAM    = info.has_AM;
     bool reqMVP   = info.has_MVP;
+    bool reqLMM   = info.has_LMM;
+    bool reqEMVP  = info.has_EMVP;
     bool reqMVPI  = info.has_MVPI;
     bool reqETVP  = info.has_ETVP;
     bool reqETVPI = info.has_ETVPI;
@@ -490,7 +494,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_VP) {
         updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
     }
-    if (reqM || reqMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
+    if (reqM || reqMVP || reqLMM || reqEMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
         Matrix4d modelTrans =
             transformResolver.ResolveParallaxedModelTransform(
                 pNode, model_parallax_camera, uniform_cam_name != "effect");
@@ -519,10 +523,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
         if (reqM) updateOp(G_M, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqAM) updateOp(G_AM, ToDxcCBufferMatrixUniform(modelTrans));
+        if (reqLMM) updateOp(G_LMM, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqMI) updateOp(G_MI, ToDxcCBufferMatrixUniform(modelTrans.inverse()));
-        if (reqMVP) {
+        if (reqMVP || reqEMVP) {
             Matrix4d mvpTrans = viewProTrans * modelTrans;
-            updateOp(G_MVP, ToDxcCBufferMatrixUniform(mvpTrans));
+            if (reqMVP) updateOp(G_MVP, ToDxcCBufferMatrixUniform(mvpTrans));
+            if (reqEMVP) updateOp(G_EMVP, ToDxcCBufferMatrixUniform(mvpTrans));
             if (reqMVPI) updateOp(G_MVPI, ToDxcCBufferMatrixUniform(mvpTrans.inverse()));
         }
         if (reqETVP || reqETVPI) {

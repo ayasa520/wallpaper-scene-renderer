@@ -25,6 +25,11 @@ struct WPUniformInfo {
     bool has_M { false };
     bool has_AM { false };
     bool has_MVP { false };
+    // Wallpaper Engine effect passes can render through helper meshes while shader math still
+    // depends on the authored layer transform. Track these matrix uniforms separately so effect
+    // shaders get that contract without requiring a g_ModelViewProjectionMatrix declaration too.
+    bool has_LMM { false };
+    bool has_EMVP { false };
     bool has_MVPI { false };
     bool has_ETVP { false };
     bool has_ETVPI { false };
