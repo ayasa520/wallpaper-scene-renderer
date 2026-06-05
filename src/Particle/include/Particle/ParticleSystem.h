@@ -135,9 +135,8 @@ private:
     SpawnType m_spawn_type { SpawnType::STATIC };
     SceneNode* m_node { nullptr };
     bool       m_logged_event_anchor_transform_error { false };
-    // Wallpaper particle `instanceoverride.colorn` is an initializer-time color during cold parse,
-    // while user-property edits arrive after the initializer list has already produced live
-    // particles. Store the normalized runtime color separately so both future spawns and already
+    // Runtime particle color edits arrive after the initializer list has already produced live
+    // particles. Store the normalized replacement color separately so both future spawns and already
     // alive particles can be synchronized without rebuilding the whole particle subsystem.
     std::optional<std::array<float, 3>> m_runtime_color_override;
     // Wallpaper particle `instanceoverride.size` is a multiplier baked into each particle's

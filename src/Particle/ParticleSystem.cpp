@@ -113,15 +113,13 @@ void ParticleSubSystem::ApplyRuntimeColorOverrideToInstances() {
 
 void ParticleSubSystem::SetRuntimeColorOverride(const std::array<float, 3>& color) {
     m_runtime_color_override = color;
-    // Live user-property color edits must affect particles that have already been emitted. Future
-    // particles will receive the same value through Emitt(), but the currently visible trail would
-    // otherwise keep the cold-parse color until it naturally expires.
+    // Live user-property color edits must affect particles that have already been emitted. This is
+    // intentionally scoped to the layer's own particle subsystem: nested child particle assets keep
+    // their authored initializers, including colorrandom. Wallpaper Engine's composition layers can
+    // then color-grade the combined result with their parent effects instead of receiving a flat
+    // white child trail from a root-layer colorn override.
     ApplyRuntimeColorOverrideToInstances();
     if (m_mesh) m_mesh->SetDirty();
-
-    for (auto& child : m_children) {
-        if (child) child->SetRuntimeColorOverride(color);
-    }
 }
 
 std::optional<std::array<float, 3>> ParticleSubSystem::RuntimeColorOverride() const {

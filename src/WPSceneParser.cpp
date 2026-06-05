@@ -309,6 +309,21 @@ float ClampParserOpacityScalar(float opacity) {
     return std::clamp(opacity, 0.0f, 1.0f);
 }
 
+std::array<i32, 4> ResolvePaddedSpriteSheetResolution(const ImageHeader& texh,
+                                                       const SpriteFrame& frame) {
+    const auto physical_width  = texh.width > 0 ? texh.width : texh.mapWidth;
+    const auto physical_height = texh.height > 0 ? texh.height : texh.mapHeight;
+    auto       content_width   = texh.mapWidth > 0 ? texh.mapWidth : physical_width;
+    auto       content_height  = texh.mapHeight > 0 ? texh.mapHeight : physical_height;
+
+    const auto frame_width = static_cast<i32>(std::lround(frame.width));
+    if (frame_width > 0) content_width -= content_width % frame_width;
+    const auto frame_height = static_cast<i32>(std::lround(frame.height));
+    if (frame_height > 0) content_height -= content_height % frame_height;
+
+    return { physical_width, physical_height, content_width, content_height };
+}
+
 ShaderValue ClampParserOpacityUniformValue(std::string_view uniform_name,
                                            const ShaderValue& value) {
     if (! IsParserOpacityUniformName(uniform_name) || value.size() == 0) return value;
@@ -1213,11 +1228,27 @@ void LoadControlPoint(ParticleSubSystem& pSys, const wpscene::Particle& wp,
     }
     ApplyLayerControlPointOverrides(pSys, over, layer_id, layer_name);
 }
+
+wpscene::ParticleInstanceoverride ResolveParticleSubsystemOverride(
+    const wpscene::ParticleInstanceoverride& layer_override, bool is_child_subsystem) {
+    if (! is_child_subsystem) return layer_override;
+
+    auto child_override = layer_override;
+    // Scene-layer instanceoverride.color/colorn targets the particle object instance placed on the
+    // layer. Child particle definitions are authored inside that asset and keep their own color
+    // initializers. Propagating the root color override into children erases those initializers; in
+    // composition layers using color/luminance blend modes, a root colorn=[1,1,1] then turns the
+    // whole child trail into a white source before the parent tint effect has a chance to grade it.
+    child_override.overColor  = false;
+    child_override.overColorn = false;
+    return child_override;
+}
+
 void LoadInitializer(ParticleSubSystem& pSys, const wpscene::Particle& wp,
                      const wpscene::ParticleInstanceoverride& over) {
-    const bool has_color_override = over.enabled && (over.overColor || over.overColorn);
+    const bool replaces_color = over.enabled && (over.overColor || over.overColorn);
     for (const auto& ini : wp.initializers) {
-        if (has_color_override && ini.contains("name") && ini.at("name").is_string() &&
+        if (replaces_color && ini.contains("name") && ini.at("name").is_string() &&
             ini.at("name").get<std::string>() == "colorrandom") {
             continue;
         }
@@ -1519,8 +1550,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                     if (algorism::IsPowOfTwo((u32)texh.width) &&
                         algorism::IsPowOfTwo((u32)texh.height)) {
                         pWPShaderInfo->combos["SPRITESHEETBLENDNPOT"] = "1";
-                        resolution[2] = resolution[0] - resolution[0] % (int)f1.width;
-                        resolution[3] = resolution[1] - resolution[1] % (int)f1.height;
+                        resolution = ResolvePaddedSpriteSheetResolution(texh, f1);
                     }
                     materialShader.constValues["g_RenderVar1"] = std::array {
                         f1.xAxis[0], f1.yAxis[1], (float)(texh.spriteAnim.numFrames()), f1.rate
@@ -5079,7 +5109,8 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                                                      wppartobj.name);
     }
 
-    wpscene::ParticleInstanceoverride override = wppartobj.instanceoverride;
+    wpscene::ParticleInstanceoverride override =
+        ResolveParticleSubsystemOverride(wppartobj.instanceoverride, is_child);
 
     auto& particle_obj = *p_particle_obj;
     auto& vfs          = *context.vfs;
@@ -5122,9 +5153,11 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     if (is_child) {
         switch (spawn_type) {
         case ParticleSubSystem::SpawnType::STATIC:
-            // Runtime static children create one persistent child instance. Their authored
-            // `maxcount` controls child subsystem policy, but it does not mean "duplicate this
-            // mesh capacity N times" during scene parsing.
+            // A static child relationship creates one persistent child emitter at this authored
+            // transform. Its `maxcount` is a runtime cap for reusable child instances, not a request
+            // to pre-seed N identical emitters. Pre-seeding duplicates this transform exactly; for
+            // additive sprite effects such as the Matrix rain that stacks the same glyph stream on
+            // itself, over-brightens the result, and washes the parent blue tint toward white.
             mesh_instancecount = 1;
             break;
         case ParticleSubSystem::SpawnType::EVENT_FOLLOW:
@@ -5298,9 +5331,10 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         context.scene->objectRuntimeParticleSubsystems[wppartobj.id].push_back(particle_subsystem);
     }
 
-    if (is_child)
+    if (is_child) {
         child_ptr.node_parent->AppendChild(spNode);
-    else {
+        svData.InheritParentTransform(child_ptr.node_parent);
+    } else {
         if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
             ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
