@@ -245,15 +245,31 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
     }
 
     if (info.offscreen) {
-        m_ex_swapchain = CreateExSwapchain(*m_device,
-                                           extent.width,
-                                           extent.height,
-                                           (info.offscreen_tiling == TexTiling::OPTIMAL
-                                                ? VK_IMAGE_TILING_OPTIMAL
-                                                : VK_IMAGE_TILING_LINEAR),
-                                           info.export_mode,
-                                           info.export_drm_fourcc,
-                                           info.export_drm_modifiers);
+        if (info.ex_swapchain_factory) {
+            const RenderInitInfo::ExSwapchainHandles handles {
+                .instance = *m_instance.inst(),
+                .physical_device = *m_instance.gpu(),
+                .device = *m_device->handle(),
+                .graphics_queue = *m_device->graphics_queue().handle,
+                .graphics_queue_family = m_device->graphics_queue().family_index,
+                .renderer_device = m_device.get(),
+            };
+            m_ex_swapchain = info.ex_swapchain_factory(handles);
+            if (!m_ex_swapchain) {
+                LOG_ERROR("external offscreen swapchain factory returned null");
+                return false;
+            }
+        } else {
+            m_ex_swapchain = CreateExSwapchain(*m_device,
+                                               extent.width,
+                                               extent.height,
+                                               (info.offscreen_tiling == TexTiling::OPTIMAL
+                                                    ? VK_IMAGE_TILING_OPTIMAL
+                                                    : VK_IMAGE_TILING_LINEAR),
+                                               info.export_mode,
+                                               info.export_drm_fourcc,
+                                               info.export_drm_modifiers);
+        }
         m_with_surface = false;
     }
 
