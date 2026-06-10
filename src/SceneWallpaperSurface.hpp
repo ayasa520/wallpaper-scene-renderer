@@ -2,6 +2,7 @@
 #include "SceneWallpaper.hpp"
 
 #include <functional>
+#include <memory>
 #include <string_view>
 #include <vulkan/vulkan.h>
 #include <cstdint>
@@ -11,6 +12,12 @@
 namespace wallpaper
 {
 using ReDrawCB = std::function<void()>;
+
+namespace vulkan
+{
+class Device;
+class VulkanExSwapchain;
+}
 
 enum class VulkanDevicePreference {
     Default,
@@ -46,6 +53,24 @@ struct RenderInitInfo {
     uint16_t height { 1080 };
     double   render_scale { 1.0 };
     ReDrawCB redraw_callback;
+
+    /*
+     * Offscreen producers can inject the final export route after the renderer
+     * has picked its physical device and created VkDevice. This mirrors
+     * waywallen's ex_swapchain_factory: scene rendering and video decoding are
+     * peers that publish into a route-owned swapchain, instead of either
+     * backend being hard-coded as the owner of the whole producer output path.
+     */
+    struct ExSwapchainHandles {
+        VkInstance       instance { VK_NULL_HANDLE };
+        VkPhysicalDevice physical_device { VK_NULL_HANDLE };
+        VkDevice         device { VK_NULL_HANDLE };
+        VkQueue          graphics_queue { VK_NULL_HANDLE };
+        uint32_t         graphics_queue_family { 0 };
+        const vulkan::Device* renderer_device { nullptr };
+    };
+    std::function<std::unique_ptr<vulkan::VulkanExSwapchain>(const ExSwapchainHandles&)>
+        ex_swapchain_factory;
 };
 
 } // namespace wallpaper
