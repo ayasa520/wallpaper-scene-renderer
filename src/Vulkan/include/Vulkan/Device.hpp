@@ -21,7 +21,7 @@ public:
                        std::span<const Extension> exts,
                        VkExtent2D extent,
                        Device&,
-                       VideoTexturePipelineSettings video_texture_settings = {});
+                       VideoTextureDecoderSettings video_texture_settings = {});
     static bool CheckGPU(vvk::PhysicalDevice gpu, std::span<const Extension> exts, VkSurfaceKHR surface);
 
     void Destroy();

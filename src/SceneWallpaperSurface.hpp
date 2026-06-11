@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vulkan/vulkan.h>
 #include <cstdint>
@@ -25,9 +26,8 @@ enum class VulkanDevicePreference {
     PreferDiscrete,
 };
 
-enum class GpuPipelinePreference {
+enum class VideoTextureDecoderRoute {
     Nvidia,
-    NvidiaStateless,
     Va,
 };
 
@@ -42,8 +42,17 @@ struct RenderInitInfo {
     ExternalFrameExportMode export_mode { ExternalFrameExportMode::OPAQUE_FD };
 
     std::span<const std::uint8_t> uuid;
-    VulkanDevicePreference        device_preference { VulkanDevicePreference::Default };
-    GpuPipelinePreference         gpu_pipeline_preference { GpuPipelinePreference::Nvidia };
+    VulkanDevicePreference   device_preference { VulkanDevicePreference::Default };
+    VideoTextureDecoderRoute video_texture_decoder_route { VideoTextureDecoderRoute::Nvidia };
+    /*
+     * DRM render node of the device selected via `uuid` (e.g.
+     * "/dev/dri/renderD129"). Scene video textures use this as a runtime proof:
+     * a VA decoder/postproc factory is accepted only when its readable
+     * "device-path" property exactly matches this node. Empty means the caller
+     * did not prove a renderer node, so the GPU-only video texture path must
+     * fail instead of guessing a default GPU.
+     */
+    std::string                   render_node;
     TexTiling                     offscreen_tiling { TexTiling::OPTIMAL };
     uint32_t                      export_drm_fourcc { 0 };
     std::vector<uint64_t>         export_drm_modifiers;
