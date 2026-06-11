@@ -9,8 +9,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
+#include <limits.h>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -47,6 +50,10 @@ gboolean gst_cuda_context_pop(CUcontext* cuda_ctx);
 
 CUresult CUDAAPI CuGetErrorName(CUresult error, const char** pStr);
 CUresult CUDAAPI CuGetErrorString(CUresult error, const char** pStr);
+CUresult CUDAAPI CuInit(unsigned int Flags);
+CUresult CUDAAPI CuDeviceGetCount(int* count);
+CUresult CUDAAPI CuDeviceGet(CUdevice* device, int ordinal);
+CUresult CUDAAPI CuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev);
 CUresult CUDAAPI CuImportExternalMemory(CUexternalMemory* extMem_out,
                                         const CUDA_EXTERNAL_MEMORY_HANDLE_DESC* memHandleDesc);
 CUresult CUDAAPI CuDestroyExternalMemory(CUexternalMemory extMem);
@@ -192,30 +199,222 @@ const char* CudaErrorName(CUresult result) {
     return "unknown";
 }
 
+bool EnsureCudaDriverInitialized(std::string& diagnostic) {
+    /*
+     * Video textures use CUDA only to prove that NVDEC and the Vulkan renderer
+     * are on the same physical NVIDIA GPU. The CUDA driver API requires an
+     * explicit initialization before device enumeration on some systems, so do
+     * that here and keep failures diagnostic instead of falling back elsewhere.
+     */
+    const CUresult result = CuInit(0);
+    if (result == CUDA_SUCCESS) return true;
+
+    diagnostic = std::string("cuInit failed: ") + CudaErrorName(result);
+    return false;
+}
+
+std::string PciAddressForRenderNode(const std::string& render_node) {
+    if (render_node.empty()) return {};
+
+    const auto slash = render_node.rfind('/');
+    const std::string basename =
+        slash == std::string::npos ? render_node : render_node.substr(slash + 1);
+    const std::string sysfs_path = "/sys/class/drm/" + basename + "/device";
+
+    char resolved[PATH_MAX] = {0};
+    if (realpath(sysfs_path.c_str(), resolved) == nullptr) return {};
+
+    const char* address = std::strrchr(resolved, '/');
+    address = address != nullptr ? address + 1 : resolved;
+    return address != nullptr ? std::string(address) : std::string {};
+}
+
+std::optional<unsigned int>
+CudaDeviceIdForPciAddress(const std::string& pci_address, std::string& diagnostic) {
+    unsigned int domain = 0;
+    unsigned int bus = 0;
+    unsigned int device = 0;
+    unsigned int function = 0;
+    if (std::sscanf(pci_address.c_str(),
+                    "%x:%x:%x.%x",
+                    &domain,
+                    &bus,
+                    &device,
+                    &function) != 4) {
+        diagnostic = "invalid PCI address '" +
+            (pci_address.empty() ? std::string("(empty)") : pci_address) + "'";
+        return std::nullopt;
+    }
+
+    if (! EnsureCudaDriverInitialized(diagnostic)) return std::nullopt;
+
+    int count = 0;
+    CUresult result = CuDeviceGetCount(&count);
+    if (result != CUDA_SUCCESS) {
+        diagnostic = std::string("cuDeviceGetCount failed: ") + CudaErrorName(result);
+        return std::nullopt;
+    }
+
+    for (int ordinal = 0; ordinal < count; ++ordinal) {
+        CUdevice cuda_device = 0;
+        result = CuDeviceGet(&cuda_device, ordinal);
+        if (result != CUDA_SUCCESS) continue;
+
+        int cuda_domain = 0;
+        int cuda_bus = 0;
+        int cuda_device_number = 0;
+        if (CuDeviceGetAttribute(&cuda_domain,
+                                 CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID,
+                                 cuda_device) != CUDA_SUCCESS ||
+            CuDeviceGetAttribute(&cuda_bus,
+                                 CU_DEVICE_ATTRIBUTE_PCI_BUS_ID,
+                                 cuda_device) != CUDA_SUCCESS ||
+            CuDeviceGetAttribute(&cuda_device_number,
+                                 CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID,
+                                 cuda_device) != CUDA_SUCCESS) {
+            continue;
+        }
+
+        if (static_cast<unsigned int>(cuda_domain) == domain &&
+            static_cast<unsigned int>(cuda_bus) == bus &&
+            static_cast<unsigned int>(cuda_device_number) == device) {
+            return static_cast<unsigned int>(ordinal);
+        }
+    }
+
+    char message[128] = {0};
+    std::snprintf(message,
+                  sizeof(message),
+                  "no CUDA device matches PCI %04x:%02x:%02x.%x",
+                  domain,
+                  bus,
+                  device,
+                  function);
+    diagnostic = message;
+    return std::nullopt;
+}
+
+std::optional<unsigned int>
+CudaDeviceIdForRenderNode(const std::string& render_node, std::string& diagnostic) {
+    const std::string pci_address = PciAddressForRenderNode(render_node);
+    if (pci_address.empty()) {
+        diagnostic = "render node '" +
+            (render_node.empty() ? std::string("(empty)") : render_node) +
+            "' has no PCI address";
+        return std::nullopt;
+    }
+    return CudaDeviceIdForPciAddress(pci_address, diagnostic);
+}
+
+std::optional<unsigned int> CudaDeviceIdFromContext(GstCudaContext* cuda_context) {
+    if (cuda_context == nullptr ||
+        !g_object_class_find_property(G_OBJECT_GET_CLASS(cuda_context), "cuda-device-id")) {
+        return std::nullopt;
+    }
+
+    guint cuda_device_id = G_MAXUINT;
+    g_object_get(cuda_context, "cuda-device-id", &cuda_device_id, nullptr);
+    if (cuda_device_id == G_MAXUINT) return std::nullopt;
+    return cuda_device_id;
+}
+
+bool CudaContextMatchesExpected(GstCudaContext* cuda_context,
+                                int expected_cuda_device_id,
+                                std::string_view owner_label) {
+    if (expected_cuda_device_id < 0) return true;
+
+    const auto actual = CudaDeviceIdFromContext(cuda_context);
+    if (! actual.has_value()) {
+        LOG_ERROR("%.*s: CUDA context has no readable cuda-device-id; refusing "
+                  "NVIDIA decode because the selected GPU cannot be proven",
+                  static_cast<int>(owner_label.size()),
+                  owner_label.data());
+        return false;
+    }
+
+    if (actual.value() != static_cast<unsigned int>(expected_cuda_device_id)) {
+        LOG_ERROR("%.*s: CUDA context device mismatch expected=%d actual=%u; "
+                  "refusing cross-GPU NVIDIA decode",
+                  static_cast<int>(owner_label.size()),
+                  owner_label.data(),
+                  expected_cuda_device_id,
+                  actual.value());
+        return false;
+    }
+
+    return true;
+}
+
+bool DecoderElementMatchesExpectedCudaDevice(GstElement* decoder,
+                                             int expected_cuda_device_id) {
+    if (expected_cuda_device_id < 0) return true;
+
+    if (decoder == nullptr ||
+        !g_object_class_find_property(G_OBJECT_GET_CLASS(decoder), "cuda-device-id")) {
+        LOG_ERROR("video texture NVIDIA decoder exposes no cuda-device-id; "
+                  "refusing decode because selected GPU cannot be proven");
+        return false;
+    }
+
+    guint actual_cuda_device_id = G_MAXUINT;
+    g_object_get(decoder, "cuda-device-id", &actual_cuda_device_id, nullptr);
+    if (actual_cuda_device_id != static_cast<unsigned int>(expected_cuda_device_id)) {
+        LOG_ERROR("video texture NVIDIA decoder CUDA device mismatch expected=%d "
+                  "actual=%u; refusing cross-GPU decode",
+                  expected_cuda_device_id,
+                  actual_cuda_device_id);
+        return false;
+    }
+    return true;
+}
+
 bool EndsWith(std::string_view value, std::string_view suffix) {
     return value.size() >= suffix.size() &&
            value.substr(value.size() - suffix.size(), suffix.size()) == suffix;
 }
 
 struct DecoderSettings {
-    VideoTextureGpuPipeline gpu_pipeline { VideoTextureGpuPipeline::Nvidia };
+    VideoTextureDecoderRoute decoder_route { VideoTextureDecoderRoute::Nvidia };
+    std::string              render_node;
 };
 
-const char* PipelinePolicyName(VideoTextureGpuPipeline policy) {
-    switch (policy) {
-    case VideoTextureGpuPipeline::Va: return "va";
-    case VideoTextureGpuPipeline::NvidiaStateless: return "nvidia-stateless";
-    case VideoTextureGpuPipeline::Nvidia: return "nvidia";
+const char* DecoderRouteName(VideoTextureDecoderRoute route) {
+    switch (route) {
+    case VideoTextureDecoderRoute::Va: return "va";
+    case VideoTextureDecoderRoute::Nvidia: return "nvidia";
     }
     return "nvidia";
 }
 
-DecoderSettings MakeDecoderSettings(VideoTexturePipelineSettings runtime_settings) {
+std::string VaElementFactoryName(const std::string& render_node, const char* element_suffix) {
+    constexpr std::string_view default_node = "/dev/dri/renderD128";
+    if (render_node.empty() || render_node == default_node)
+        return std::string("va") + element_suffix;
+
+    const auto slash = render_node.rfind('/');
+    const std::string basename =
+        slash == std::string::npos ? render_node : render_node.substr(slash + 1);
+    return std::string("va") + basename + element_suffix;
+}
+
+std::vector<std::string> VaElementFactoryCandidates(const std::string& render_node,
+                                                    const char* element_suffix) {
+    std::vector<std::string> candidates;
+    const std::string node_factory = VaElementFactoryName(render_node, element_suffix);
+    candidates.push_back(node_factory);
+    const std::string plain_factory = std::string("va") + element_suffix;
+    if (plain_factory != node_factory) candidates.push_back(plain_factory);
+    return candidates;
+}
+
+DecoderSettings MakeDecoderSettings(VideoTextureDecoderSettings runtime_settings) {
     DecoderSettings settings {
-        .gpu_pipeline = runtime_settings.gpu_pipeline,
+        .decoder_route = runtime_settings.decoder_route,
+        .render_node   = runtime_settings.render_node,
     };
-    LOG_INFO("VideoTextureSettings: resolved-pipeline=%s",
-             PipelinePolicyName(settings.gpu_pipeline));
+    LOG_INFO("VideoTextureSettings: decoder-route=%s render-node=%s",
+             DecoderRouteName(settings.decoder_route),
+             settings.render_node.empty() ? "(unresolved)" : settings.render_node.c_str());
     return settings;
 }
 
@@ -244,30 +443,19 @@ void SetPluginDecoderRanks(const char* plugin_name, guint rank, bool use_statele
 }
 
 void ConfigureDecoderRanks(const DecoderSettings& settings) {
-    // Renderer.js gives the resolved GPU pipeline a clear rank advantage so
-    // decodebin cannot make a different same-rank choice from native scene
-    // video textures.  Mirror that exact policy here before explicit pipeline
-    // selection reads factory ranks.
+    // The producer resolves the physical GPU before scene Vulkan starts. These
+    // rank tweaks only make the selected decoder route deterministic inside
+    // GStreamer; they are not a separate GPU selection policy.
     constexpr guint preferred_rank = GST_RANK_PRIMARY + 4;
-    if (settings.gpu_pipeline == VideoTextureGpuPipeline::Va) {
+    if (settings.decoder_route == VideoTextureDecoderRoute::Va) {
         SetPluginDecoderRanks("va", preferred_rank, false);
         SetPluginDecoderRanks("nvcodec", GST_RANK_NONE, false);
         SetPluginDecoderRanks("nvcodec", GST_RANK_NONE, true);
     } else {
         SetPluginDecoderRanks("va", GST_RANK_NONE, false);
-        SetPluginDecoderRanks("nvcodec", preferred_rank, false);
-        if (settings.gpu_pipeline == VideoTextureGpuPipeline::NvidiaStateless)
-            SetPluginDecoderRanks("nvcodec", preferred_rank + 1, true);
-        else
-            SetPluginDecoderRanks("nvcodec", GST_RANK_NONE, true);
+        SetPluginDecoderRanks("nvcodec", preferred_rank + 1, false);
+        SetPluginDecoderRanks("nvcodec", preferred_rank, true);
     }
-}
-
-bool HasElementFactory(const char* name) {
-    GstElementFactory* factory = gst_element_factory_find(name);
-    if (factory == nullptr) return false;
-    gst_object_unref(factory);
-    return true;
 }
 
 std::optional<guint> ElementFactoryRank(const char* name) {
@@ -278,30 +466,115 @@ std::optional<guint> ElementFactoryRank(const char* name) {
     return rank;
 }
 
-enum class VideoPipelineMode
+std::string ElementDevicePath(const char* factory_name) {
+    GstElement* element = gst_element_factory_make(factory_name, nullptr);
+    if (element == nullptr) return {};
+
+    std::string path;
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "device-path")) {
+        gchar* raw_path = nullptr;
+        g_object_get(element, "device-path", &raw_path, nullptr);
+        if (raw_path != nullptr) {
+            path = raw_path;
+            g_free(raw_path);
+        }
+    }
+    gst_object_unref(element);
+    return path;
+}
+
+struct VaElementSelection {
+    std::string factory_name;
+    std::string device_path;
+    guint rank { GST_RANK_NONE };
+};
+
+std::optional<VaElementSelection> SelectVaElementFactoryForRenderNode(const std::string& render_node,
+                                                                      const char* element_suffix,
+                                                                      bool require_positive_rank,
+                                                                      std::string& diagnostic) {
+    std::vector<std::string> details;
+
+    if (render_node.empty()) {
+        diagnostic = "selected render-node is empty";
+        return std::nullopt;
+    }
+
+    /*
+     * Factory names alone are not a reliable device identity. Depending on the
+     * VA plugin/device layout, "vah264dec" can point at /dev/dri/renderD129
+     * while "varenderD129h264dec" is not registered at all. The renderer is
+     * already pinned to a Vulkan device by UUID, so the decode side must prove
+     * that the accepted VA element advertises the same DRM render node.
+     */
+    for (const std::string& candidate : VaElementFactoryCandidates(render_node, element_suffix)) {
+        const auto rank = ElementFactoryRank(candidate.c_str());
+        const std::string device_path =
+            rank.has_value() ? ElementDevicePath(candidate.c_str()) : "";
+
+        gchar* detail = g_strdup_printf("%s(rank=%u device-path=%s)",
+                                        candidate.c_str(),
+                                        rank.value_or(GST_RANK_NONE),
+                                        device_path.empty() ? "(none)" : device_path.c_str());
+        details.emplace_back(detail ? detail : "");
+        g_free(detail);
+
+        if (! rank.has_value()) continue;
+        if (require_positive_rank && rank.value() == GST_RANK_NONE) continue;
+        if (device_path != render_node) continue;
+        return VaElementSelection {
+            .factory_name = candidate,
+            .device_path = device_path,
+            .rank = rank.value(),
+        };
+    }
+
+    diagnostic.clear();
+    for (std::size_t i = 0; i < details.size(); ++i) {
+        if (i > 0) diagnostic += ", ";
+        diagnostic += details[i];
+    }
+    return std::nullopt;
+}
+
+enum class VideoTextureTransferPath
 {
-    CpuRgba,
+    None,
     VaMemoryBgra,
     NvidiaCudaNv12,
     NvidiaStatelessCudaNv12,
 };
 
-bool IsNvidiaCudaMode(VideoPipelineMode mode) {
-    return mode == VideoPipelineMode::NvidiaCudaNv12 ||
-           mode == VideoPipelineMode::NvidiaStatelessCudaNv12;
+bool IsNvidiaCudaPath(VideoTextureTransferPath path) {
+    return path == VideoTextureTransferPath::NvidiaCudaNv12 ||
+           path == VideoTextureTransferPath::NvidiaStatelessCudaNv12;
 }
 
-struct VideoPipelineConfig {
-    VideoPipelineMode mode { VideoPipelineMode::CpuRgba };
-    const char* name { "cpu-rgba" };
-    const char* sink_caps { "video/x-raw,format=(string)RGBA" };
+const char* VideoTextureTransferPathName(VideoTextureTransferPath path) {
+    switch (path) {
+    case VideoTextureTransferPath::VaMemoryBgra: return "va-vamemory-bgra";
+    case VideoTextureTransferPath::NvidiaCudaNv12: return "nvidia-cuda-nv12";
+    case VideoTextureTransferPath::NvidiaStatelessCudaNv12: return "nvidia-stateless-cuda-nv12";
+    case VideoTextureTransferPath::None: return "none";
+    }
+    return "none";
+}
+
+struct VideoTextureDecodeGraph {
+    VideoTextureTransferPath path { VideoTextureTransferPath::None };
+    const char* name { "none" };
+    const char* sink_caps { "" };
     std::string description;
 };
 
-VideoPipelineConfig BuildVideoOnlyPipelineConfig(VideoPipelineMode mode) {
-    if (mode == VideoPipelineMode::VaMemoryBgra) {
-        return VideoPipelineConfig {
-            .mode = mode,
+std::optional<VideoTextureDecodeGraph>
+BuildVideoTextureDecodeGraph(VideoTextureTransferPath path,
+                             const std::string& decoder_factory,
+                             const std::string& postproc_factory) {
+    if (path == VideoTextureTransferPath::VaMemoryBgra) {
+        if (decoder_factory.empty() || postproc_factory.empty()) return std::nullopt;
+        return VideoTextureDecodeGraph {
+            .path = path,
             .name = "va-vamemory-bgra-vulkan-image",
             .sink_caps = "video/x-raw(memory:VAMemory),format=(string)BGRA",
             .description =
@@ -309,16 +582,17 @@ VideoPipelineConfig BuildVideoOnlyPipelineConfig(VideoPipelineMode mode) {
                 "! qtdemux name=demux "
                 "demux.video_0 ! queue "
                 "! h264parse "
-                "! vah264dec "
-                "! vapostproc "
+                "! " + decoder_factory + " name=video_texture_decoder "
+                "! " + postproc_factory + " name=video_texture_postproc "
                 "! video/x-raw(memory:VAMemory),format=(string)BGRA "
                 "! appsink name=sink sync=true max-buffers=1 drop=true",
         };
     }
 
-    if (mode == VideoPipelineMode::NvidiaCudaNv12) {
-        return VideoPipelineConfig {
-            .mode = mode,
+    if (path == VideoTextureTransferPath::NvidiaCudaNv12) {
+        if (decoder_factory.empty()) return std::nullopt;
+        return VideoTextureDecodeGraph {
+            .path = path,
             .name = "nvidia-cuda-nv12-vulkan-buffer",
             .sink_caps = "video/x-raw(memory:CUDAMemory),format=(string)NV12",
             .description =
@@ -326,15 +600,16 @@ VideoPipelineConfig BuildVideoOnlyPipelineConfig(VideoPipelineMode mode) {
                 "! qtdemux name=demux "
                 "demux.video_0 ! queue "
                 "! h264parse "
-                "! nvh264dec "
+                "! " + decoder_factory + " name=video_texture_decoder "
                 "! video/x-raw(memory:CUDAMemory),format=(string)NV12 "
                 "! appsink name=sink sync=true max-buffers=1 drop=true",
         };
     }
 
-    if (mode == VideoPipelineMode::NvidiaStatelessCudaNv12) {
-        return VideoPipelineConfig {
-            .mode = mode,
+    if (path == VideoTextureTransferPath::NvidiaStatelessCudaNv12) {
+        if (decoder_factory.empty()) return std::nullopt;
+        return VideoTextureDecodeGraph {
+            .path = path,
             .name = "nvidia-stateless-cuda-nv12-vulkan-buffer",
             .sink_caps = "video/x-raw(memory:CUDAMemory),format=(string)NV12",
             .description =
@@ -342,25 +617,13 @@ VideoPipelineConfig BuildVideoOnlyPipelineConfig(VideoPipelineMode mode) {
                 "! qtdemux name=demux "
                 "demux.video_0 ! queue "
                 "! h264parse "
-                "! nvh264sldec "
+                "! " + decoder_factory + " name=video_texture_decoder "
                 "! video/x-raw(memory:CUDAMemory),format=(string)NV12 "
                 "! appsink name=sink sync=true max-buffers=1 drop=true",
         };
     }
 
-    return VideoPipelineConfig {
-        .mode = VideoPipelineMode::CpuRgba,
-        .name = "cpu-rgba",
-        .sink_caps = "video/x-raw,format=(string)RGBA",
-        .description =
-            "giostreamsrc name=src "
-            "! qtdemux name=demux "
-            "demux.video_0 ! queue "
-            "! h264parse "
-            "! decodebin "
-            "! videoconvert "
-            "! appsink name=sink sync=true max-buffers=1 drop=true",
-    };
+    return std::nullopt;
 }
 
 bool SupportsVaDmabufImport(const Device& device) {
@@ -369,86 +632,140 @@ bool SupportsVaDmabufImport(const Device& device) {
            device.supportExt(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
 }
 
-VideoPipelineMode SelectVideoPipelineMode(const Device& device, const DecoderSettings& settings) {
-    const bool has_va_h264_decoder = HasElementFactory("vah264dec");
-    const bool has_va_postproc = HasElementFactory("vapostproc");
+struct VideoTextureDecoderSelection {
+    VideoTextureTransferPath path { VideoTextureTransferPath::None };
+    const char* name { "none" };
+    std::string decoder_factory;
+    std::string postproc_factory;
+    std::string decoder_device_path;
+    std::string postproc_device_path;
+    guint rank { GST_RANK_NONE };
+    int expected_cuda_device_id { -1 };
+};
+
+std::optional<VideoTextureDecoderSelection>
+SelectVideoTextureDecoder(const Device& device, const DecoderSettings& settings) {
     const bool has_va_dmabuf_import = SupportsVaDmabufImport(device);
     const bool has_cuda_loader = gst_cuda_load_library();
+    std::string cuda_diagnostic;
+    std::optional<unsigned int> expected_cuda_device;
+    if (settings.decoder_route == VideoTextureDecoderRoute::Nvidia && has_cuda_loader) {
+        expected_cuda_device =
+            CudaDeviceIdForRenderNode(settings.render_node, cuda_diagnostic);
+        /*
+         * NVDEC has no VA-style render-node property. Map the renderer's DRM
+         * node to PCI and then to CUDA ordinal; without that proof, accepting
+         * nvh264dec would usually mean "CUDA device 0", not necessarily the
+         * scene GPU selected by RenderInitInfo::uuid.
+         */
+        if (! expected_cuda_device.has_value()) {
+            LOG_ERROR("VideoTextureDecoderSelect: selected NVIDIA render-node=%s "
+                      "has no matching CUDA device id: %s; CPU fallback is disabled",
+                      settings.render_node.empty() ? "(unresolved)" : settings.render_node.c_str(),
+                      cuda_diagnostic.empty() ? "(unknown)" : cuda_diagnostic.c_str());
+            return std::nullopt;
+        }
+    }
+    std::string va_decoder_diagnostic;
+    std::string va_postproc_diagnostic;
+    std::optional<VaElementSelection> va_decoder;
+    std::optional<VaElementSelection> va_postproc;
 
-    struct PipelineCandidate {
-        VideoPipelineMode mode;
-        const char* name;
-        const char* decoder;
-        guint rank;
-    };
-    std::vector<PipelineCandidate> candidates;
+    if (settings.decoder_route == VideoTextureDecoderRoute::Va) {
+        va_decoder = SelectVaElementFactoryForRenderNode(settings.render_node,
+                                                         "h264dec",
+                                                         true,
+                                                         va_decoder_diagnostic);
+        va_postproc = SelectVaElementFactoryForRenderNode(settings.render_node,
+                                                          "postproc",
+                                                          false,
+                                                          va_postproc_diagnostic);
+    }
 
-    // Scene video textures are explicit zero-copy graphs, not decodebin graphs.
-    // The resolved GPU pipeline is passed in from renderer.js through RenderInitInfo
-    // so ordinary videos, the scene Vulkan device, and embedded scene videos cannot
-    // split across different GPUs when VA and NVDEC both exist.
-    if (settings.gpu_pipeline == VideoTextureGpuPipeline::Va &&
-        has_va_h264_decoder && has_va_postproc && has_va_dmabuf_import) {
-        candidates.push_back(PipelineCandidate {
-            .mode = VideoPipelineMode::VaMemoryBgra,
+    std::vector<VideoTextureDecoderSelection> candidates;
+
+    /*
+     * Scene video textures are explicit GPU decoder graphs, not decodebin
+     * graphs. The producer has already selected the Vulkan physical device by
+     * UUID and passes the matching decoder route/render node through
+     * RenderInitInfo; if that route is unavailable we fail instead of falling
+     * back to CPU decode or another GPU.
+     */
+    if (settings.decoder_route == VideoTextureDecoderRoute::Va &&
+        va_decoder.has_value() && va_postproc.has_value() && has_va_dmabuf_import) {
+        candidates.push_back(VideoTextureDecoderSelection {
+            .path = VideoTextureTransferPath::VaMemoryBgra,
             .name = "VA VAMemory BGRA",
-            .decoder = "vah264dec",
-            .rank = ElementFactoryRank("vah264dec").value_or(GST_RANK_NONE),
+            .decoder_factory = va_decoder->factory_name,
+            .postproc_factory = va_postproc->factory_name,
+            .decoder_device_path = va_decoder->device_path,
+            .postproc_device_path = va_postproc->device_path,
+            .rank = va_decoder->rank,
         });
     }
-    if ((settings.gpu_pipeline == VideoTextureGpuPipeline::Nvidia ||
-         settings.gpu_pipeline == VideoTextureGpuPipeline::NvidiaStateless) &&
-        has_cuda_loader) {
+    if (settings.decoder_route == VideoTextureDecoderRoute::Nvidia && has_cuda_loader) {
         if (auto rank = ElementFactoryRank("nvh264dec"); rank.has_value()) {
-            candidates.push_back(PipelineCandidate {
-                .mode = VideoPipelineMode::NvidiaCudaNv12,
+            candidates.push_back(VideoTextureDecoderSelection {
+                .path = VideoTextureTransferPath::NvidiaCudaNv12,
                 .name = "NVIDIA CUDA NV12",
-                .decoder = "nvh264dec",
+                .decoder_factory = "nvh264dec",
+                .postproc_factory = {},
                 .rank = rank.value(),
+                .expected_cuda_device_id = static_cast<int>(expected_cuda_device.value()),
             });
         }
-        if (settings.gpu_pipeline == VideoTextureGpuPipeline::NvidiaStateless) {
-            if (auto rank = ElementFactoryRank("nvh264sldec"); rank.has_value()) {
-                candidates.push_back(PipelineCandidate {
-                    .mode = VideoPipelineMode::NvidiaStatelessCudaNv12,
-                    .name = "NVIDIA stateless CUDA NV12",
-                    .decoder = "nvh264sldec",
-                    .rank = rank.value(),
-                });
-            }
+        if (auto rank = ElementFactoryRank("nvh264sldec"); rank.has_value()) {
+            candidates.push_back(VideoTextureDecoderSelection {
+                .path = VideoTextureTransferPath::NvidiaStatelessCudaNv12,
+                .name = "NVIDIA stateless CUDA NV12",
+                .decoder_factory = "nvh264sldec",
+                .postproc_factory = {},
+                .rank = rank.value(),
+                .expected_cuda_device_id = static_cast<int>(expected_cuda_device.value()),
+            });
         }
     }
 
     auto best = std::max_element(candidates.begin(),
                                  candidates.end(),
-                                 [](const PipelineCandidate& lhs, const PipelineCandidate& rhs) {
+                                 [](const VideoTextureDecoderSelection& lhs,
+                                    const VideoTextureDecoderSelection& rhs) {
                                      return lhs.rank < rhs.rank;
                                  });
     if (best != candidates.end() && best->rank > GST_RANK_NONE) {
-        LOG_INFO("VideoTexturePipelineSelect: selected %s path decoder=%s rank=%u "
-                 "resolved-pipeline=%s",
+        LOG_INFO("VideoTextureDecoderSelect: selected %s path decoder=%s rank=%u "
+                 "decoder-route=%s render-node=%s postproc=%s "
+                 "decoder-device-path=%s postproc-device-path=%s cuda-device=%d",
                  best->name,
-                 best->decoder,
+                 best->decoder_factory.c_str(),
                  best->rank,
-                 PipelinePolicyName(settings.gpu_pipeline));
-        return best->mode;
+                 DecoderRouteName(settings.decoder_route),
+                 settings.render_node.empty() ? "(unresolved)" : settings.render_node.c_str(),
+                 best->postproc_factory.empty() ? "(none)" : best->postproc_factory.c_str(),
+                 best->decoder_device_path.empty() ? "(none)" : best->decoder_device_path.c_str(),
+                 best->postproc_device_path.empty() ? "(none)" : best->postproc_device_path.c_str(),
+                 best->expected_cuda_device_id);
+        return *best;
     }
 
-    LOG_INFO("VideoTexturePipelineSelect: selected CPU RGBA path resolved-pipeline=%s "
-             "va-dec=%s va-postproc=%s va-dmabuf-import=%s nvh264dec-rank=%u "
-             "nvh264sldec-rank=%u cuda-loader=%s",
-             PipelinePolicyName(settings.gpu_pipeline),
-             has_va_h264_decoder ? "true" : "false",
-             has_va_postproc ? "true" : "false",
+    LOG_ERROR("VideoTextureDecoderSelect: no usable GPU decoder for decoder-route=%s "
+             "render-node=%s va-decoder-candidates=[%s] va-postproc-candidates=[%s] "
+             "va-dmabuf-import=%s "
+             "nvh264dec-rank=%u nvh264sldec-rank=%u cuda-loader=%s; "
+             "CPU fallback is disabled to preserve the selected GPU invariant",
+             DecoderRouteName(settings.decoder_route),
+             settings.render_node.empty() ? "(unresolved)" : settings.render_node.c_str(),
+             va_decoder_diagnostic.empty() ? "(not checked)" : va_decoder_diagnostic.c_str(),
+             va_postproc_diagnostic.empty() ? "(not checked)" : va_postproc_diagnostic.c_str(),
              has_va_dmabuf_import ? "true" : "false",
              ElementFactoryRank("nvh264dec").value_or(GST_RANK_NONE),
              ElementFactoryRank("nvh264sldec").value_or(GST_RANK_NONE),
              has_cuda_loader ? "true" : "false");
-    return VideoPipelineMode::CpuRgba;
+    return std::nullopt;
 }
 
-VkFormat TargetImageFormatForPipelineMode(VideoPipelineMode mode) {
-    return mode == VideoPipelineMode::VaMemoryBgra
+VkFormat TargetImageFormatForTransferPath(VideoTextureTransferPath path) {
+    return path == VideoTextureTransferPath::VaMemoryBgra
         ? VK_FORMAT_B8G8R8A8_UNORM
         : VK_FORMAT_R8G8B8A8_UNORM;
 }
@@ -1161,7 +1478,7 @@ struct VideoTextureCache::Entry {
     bool     warned_cuda_interop_failed { false };
     bool     warned_va_dmabuf_import_failed { false };
     bool     pipeline_failed { false };
-    VideoPipelineMode pipeline_mode { VideoPipelineMode::CpuRgba };
+    VideoTextureTransferPath transfer_path { VideoTextureTransferPath::None };
     bool     paused { false };
     bool     stopped { false };
     bool     eos_loop_waiting_for_sample { false };
@@ -1170,6 +1487,9 @@ struct VideoTextureCache::Entry {
     uint64_t uploaded_sample_count { 0 };
     CUmodule cuda_module {};
     CUfunction cuda_kernel {};
+    std::string decoder_factory;
+    std::string postproc_factory;
+    int expected_cuda_device_id { -1 };
 
     GstElement* pipeline { nullptr };
     GstElement* source_elem { nullptr };
@@ -1201,7 +1521,7 @@ struct VideoTextureCache::Entry {
     }
 };
 
-VideoTextureCache::VideoTextureCache(const Device& device, VideoTexturePipelineSettings settings)
+VideoTextureCache::VideoTextureCache(const Device& device, VideoTextureDecoderSettings settings)
     : m_device(device), m_settings(settings) {
     if (! gst_is_initialized()) gst_init(nullptr, nullptr);
     ConfigureDecoderRanks(MakeDecoderSettings(m_settings));
@@ -1252,8 +1572,18 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
     entry.pipeline_failed = false;
 
     GError* error = nullptr;
-    const auto pipeline_config = BuildVideoOnlyPipelineConfig(entry.pipeline_mode);
-    entry.pipeline = gst_parse_launch(pipeline_config.description.c_str(), &error);
+    const auto pipeline_config =
+        BuildVideoTextureDecodeGraph(entry.transfer_path,
+                                     entry.decoder_factory,
+                                     entry.postproc_factory);
+    if (!pipeline_config.has_value()) {
+        LOG_ERROR("video texture '%s': no GPU decode graph for transfer-path=%s render-node=%s",
+                  entry.key.c_str(),
+                  VideoTextureTransferPathName(entry.transfer_path),
+                  m_settings.render_node.empty() ? "(unresolved)" : m_settings.render_node.c_str());
+        return false;
+    }
+    entry.pipeline = gst_parse_launch(pipeline_config->description.c_str(), &error);
     if (entry.pipeline == nullptr) {
         LOG_ERROR("create video pipeline for '%s' failed: %s",
                   entry.key.c_str(),
@@ -1286,15 +1616,31 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
         stopPipeline(entry);
         return false;
     }
+    if (entry.expected_cuda_device_id >= 0) {
+        GstElement* decoder = gst_bin_get_by_name(GST_BIN(entry.pipeline),
+                                                  "video_texture_decoder");
+        const bool matches =
+            DecoderElementMatchesExpectedCudaDevice(decoder,
+                                                    entry.expected_cuda_device_id);
+        if (decoder != nullptr) gst_object_unref(decoder);
+        if (! matches) {
+            LOG_ERROR("video texture '%s': NVIDIA decoder is not on selected "
+                      "render-node=%s; refusing cross-GPU import",
+                      entry.key.c_str(),
+                      m_settings.render_node.empty() ? "(unresolved)" : m_settings.render_node.c_str());
+            stopPipeline(entry);
+            return false;
+        }
+    }
 
     g_object_set(entry.source_elem, "stream", entry.memory_stream, nullptr);
-    LOG_INFO("VideoTexturePipeline key='%s' backend='%s' source=giostreamsrc bytes=%zu desc='%s'",
+    LOG_INFO("VideoTextureDecoderGraph key='%s' backend='%s' source=giostreamsrc bytes=%zu desc='%s'",
              entry.key.c_str(),
-             pipeline_config.name,
+             pipeline_config->name,
              entry.encoded.size(),
-             pipeline_config.description.c_str());
+             pipeline_config->description.c_str());
 
-    GstCaps* sink_caps = gst_caps_from_string(pipeline_config.sink_caps);
+    GstCaps* sink_caps = gst_caps_from_string(pipeline_config->sink_caps);
     g_object_set(entry.appsink_elem, "caps", sink_caps, nullptr);
     gst_caps_unref(sink_caps);
 
@@ -1503,7 +1849,7 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
         return false;
     }
 
-    if (entry.pipeline_mode == VideoPipelineMode::VaMemoryBgra) {
+    if (entry.transfer_path == VideoTextureTransferPath::VaMemoryBgra) {
         auto imported = ImportVaDmabufRgbaImage(m_device, caps, buffer);
         if (! imported.has_value()) imported = ExportVaMemoryRgbaImage(m_device, caps, buffer);
         if (imported.has_value()) {
@@ -1539,7 +1885,7 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
         return false;
     }
 
-    if (IsNvidiaCudaMode(entry.pipeline_mode) &&
+    if (IsNvidiaCudaPath(entry.transfer_path) &&
         GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_NV12 &&
         gst_buffer_n_memory(buffer) > 0 &&
         gst_is_cuda_memory(gst_buffer_peek_memory(buffer, 0))) {
@@ -1557,6 +1903,13 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
         if (cuda_context == nullptr) {
             gst_video_frame_unmap(&frame);
             LOG_ERROR("video texture '%s': CUDA memory has no context", entry.key.c_str());
+            return false;
+        }
+        if (! CudaContextMatchesExpected(cuda_context,
+                                         entry.expected_cuda_device_id,
+                                         entry.key)) {
+            gst_video_frame_unmap(&frame);
+            entry.pipeline_failed = true;
             return false;
         }
 
@@ -1665,80 +2018,17 @@ bool VideoTextureCache::uploadSample(VideoTextureCache::Entry& entry, ::GstSampl
         return true;
     }
 
-    GstVideoFrame frame;
-    if (! gst_video_frame_map(&frame, &info, buffer, GST_MAP_READ)) {
-        return false;
+    if (! entry.warned_unexpected_format) {
+        gchar* caps_text = gst_caps_to_string(caps);
+        LOG_ERROR("video texture '%s': GPU decoder path %s produced an unsupported "
+                  "sample caps='%s'; CPU upload fallback is disabled",
+                  entry.key.c_str(),
+                  VideoTextureTransferPathName(entry.transfer_path),
+                  caps_text != nullptr ? caps_text : "unknown");
+        if (caps_text != nullptr) g_free(caps_text);
+        entry.warned_unexpected_format = true;
     }
-
-    const auto copy_width = std::min<uint32_t>(entry.width, static_cast<uint32_t>(GST_VIDEO_INFO_WIDTH(&info)));
-    const auto copy_height =
-        std::min<uint32_t>(entry.height, static_cast<uint32_t>(GST_VIDEO_INFO_HEIGHT(&info)));
-    if ((copy_width != entry.width || copy_height != entry.height) && ! entry.warned_size_mismatch) {
-        LOG_INFO("video texture '%s' decoded size %ux%u differs from texture size %ux%u",
-                 entry.key.c_str(),
-                 GST_VIDEO_INFO_WIDTH(&info),
-                 GST_VIDEO_INFO_HEIGHT(&info),
-                 entry.width,
-                 entry.height);
-        entry.warned_size_mismatch = true;
-    }
-
-    if (GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_RGBA) {
-        if (! entry.warned_unexpected_format) {
-            LOG_ERROR("video texture '%s' negotiated unexpected format %d; expected RGBA",
-                      entry.key.c_str(),
-                      GST_VIDEO_INFO_FORMAT(&info));
-            entry.warned_unexpected_format = true;
-        }
-        gst_video_frame_unmap(&frame);
-        return false;
-    }
-
-    uint8_t* mapped = entry.staging_mapped;
-    if (mapped == nullptr) {
-        gst_video_frame_unmap(&frame);
-        return false;
-    }
-
-    {
-        auto* dst = mapped;
-        const auto* src_base = static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&frame, 0));
-        const auto src_stride = static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0));
-        const auto dst_stride = static_cast<size_t>(entry.width) * 4u;
-        const auto row_bytes = static_cast<size_t>(copy_width) * 4u;
-        for (uint32_t y = 0; y < copy_height; y++) {
-            std::memcpy(dst + static_cast<size_t>(y) * dst_stride,
-                        src_base + static_cast<size_t>(y) * src_stride,
-                        row_bytes);
-            if (copy_width < entry.width) {
-                std::memset(dst + static_cast<size_t>(y) * dst_stride + row_bytes,
-                            0,
-                            dst_stride - row_bytes);
-            }
-        }
-        if (copy_height < entry.height) {
-            std::memset(dst + static_cast<size_t>(copy_height) * dst_stride,
-                        0,
-                        (static_cast<size_t>(entry.height) - copy_height) * dst_stride);
-        }
-        (void)vmaFlushAllocation(m_device.vma_allocator(),
-                                 entry.staging.handle.Allocation(),
-                                 0,
-                                 entry.staging.req_size);
-        entry.dirty = true;
-    }
-
-    gst_video_frame_unmap(&frame);
-    entry.uploaded_sample_count++;
-    if (entry.eos_loop_waiting_for_sample) {
-        LOG_INFO("VideoTexturePerf eos-loop-sample key='%s' loop=%llu uploaded=%llu",
-                 entry.key.c_str(),
-                 static_cast<unsigned long long>(entry.eos_loop_count),
-                 static_cast<unsigned long long>(entry.uploaded_sample_count));
-    }
-    entry.eos_loop_waiting_for_sample = false;
-    entry.eos_loop_rebuild_attempted = false;
-    return true;
+    return false;
 }
 
 ImageSlotsRef VideoTextureCache::Acquire(std::string_view key,
@@ -1773,13 +2063,23 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key,
     entry->height = static_cast<uint32_t>(std::max(
         1, texture.mapHeight > 0 ? texture.mapHeight
                                  : (texture.height > 0 ? texture.height : image.slots[0].height)));
-    entry->pipeline_mode = SelectVideoPipelineMode(m_device, MakeDecoderSettings(m_settings));
+    const auto decoder_selection = SelectVideoTextureDecoder(m_device, MakeDecoderSettings(m_settings));
+    if (! decoder_selection.has_value()) {
+        LOG_ERROR("video texture '%s': no GPU decoder available for render-node=%s",
+                  entry->key.c_str(),
+                  m_settings.render_node.empty() ? "(unresolved)" : m_settings.render_node.c_str());
+        return {};
+    }
+    entry->transfer_path = decoder_selection->path;
+    entry->decoder_factory = decoder_selection->decoder_factory;
+    entry->postproc_factory = decoder_selection->postproc_factory;
+    entry->expected_cuda_device_id = decoder_selection->expected_cuda_device_id;
 
     if (auto opt = CreateVideoImage(m_device,
                                     entry->width,
                                     entry->height,
                                     texture.sample,
-                                    TargetImageFormatForPipelineMode(entry->pipeline_mode),
+                                    TargetImageFormatForTransferPath(entry->transfer_path),
                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         opt.has_value()) {
         entry->image = std::move(opt.value());

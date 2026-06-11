@@ -130,7 +130,7 @@ bool Device::Create(Instance& inst,
                     std::span<const Extension> exts,
                     VkExtent2D extent,
                     Device& device,
-                    VideoTexturePipelineSettings video_texture_settings) {
+                    VideoTextureDecoderSettings video_texture_settings) {
     device.dld      = vvk::DeviceDispatch { inst.inst().Dispatch() };
     device.m_gpu    = inst.gpu();
     device.m_limits = inst.gpu().GetProperties().limits;

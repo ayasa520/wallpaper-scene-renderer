@@ -230,13 +230,12 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
 
     {
         m_device = std::make_unique<Device>();
-        const VideoTexturePipelineSettings video_texture_settings {
-            .gpu_pipeline =
-                info.gpu_pipeline_preference == wallpaper::GpuPipelinePreference::Va
-                    ? VideoTextureGpuPipeline::Va
-                    : (info.gpu_pipeline_preference == wallpaper::GpuPipelinePreference::NvidiaStateless
-                           ? VideoTextureGpuPipeline::NvidiaStateless
-                           : VideoTextureGpuPipeline::Nvidia),
+        const VideoTextureDecoderSettings video_texture_settings {
+            .decoder_route =
+                info.video_texture_decoder_route == wallpaper::VideoTextureDecoderRoute::Va
+                    ? VideoTextureDecoderRoute::Va
+                    : VideoTextureDecoderRoute::Nvidia,
+            .render_node = info.render_node,
         };
         if (! Device::Create(m_instance, device_exts, extent, *m_device, video_texture_settings)) {
             LOG_ERROR("init vulkan device failed");
