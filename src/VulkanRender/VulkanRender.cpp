@@ -141,7 +141,7 @@ struct VulkanRender::Impl {
 };
 
 VulkanRender::VulkanRender(): pImpl(std::make_unique<Impl>()) {}
-VulkanRender::~VulkanRender() {};
+VulkanRender::~VulkanRender() { pImpl->destroy(); };
 
 bool VulkanRender::inited() const { return pImpl->m_inited; }
 
@@ -378,6 +378,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     m_deferred_waiting_indices_logged.clear();
 
     m_render_cmd.abandon();
+    m_cmds.abandon();
     m_compiled_pass_refs.clear();
     m_passes.clear();
     (void)m_prepass.release();
@@ -416,12 +417,33 @@ void VulkanRender::Impl::destroy() {
         if (m_rendering_resources.pipeline_cache) {
             m_rendering_resources.pipeline_cache->clear();
         }
+        m_rendering_resources.pipeline_cache.reset();
+        m_rendering_resources.model_depth_images.clear();
         m_vertex_buf->destroy();
         m_dyn_buf->destroy();
 
+        m_rendering_resources.command.reset();
+        m_render_cmd.reset();
+        m_cmds.reset();
+
         m_device->Destroy();
     }
+    m_rendering_resources.sem_swap_wait_image.reset();
+    m_rendering_resources.sem_swap_finish.reset();
+    m_rendering_resources.fence_frame.reset();
+    m_rendering_resources.vertex_buf = nullptr;
+    m_rendering_resources.dyn_buf = nullptr;
+    m_prepass.reset();
+    m_finpass.reset();
+    m_testpass.reset();
+    m_vertex_buf.reset();
+    m_dyn_buf.reset();
+    m_ex_swapchain.reset();
+    m_device.reset();
     m_instance.Destroy();
+    m_with_surface = false;
+    m_inited = false;
+    m_pass_loaded = false;
 }
 
 bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
