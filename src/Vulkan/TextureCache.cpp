@@ -263,10 +263,14 @@ bool TextureSlotsResident(const ImageSlots& slots) {
 std::optional<vvk::DeviceMemory> AllocateMemory(const vvk::Device& device, vvk::PhysicalDevice gpu,
                                                 VkMemoryRequirements  reqs,
                                                 VkMemoryPropertyFlags property,
+                                                VkMemoryPropertyFlags forbidden_property = 0,
                                                 void*                 pNext = NULL) {
     VkPhysicalDeviceMemoryProperties pros = gpu.GetMemoryProperties().memoryProperties;
     for (uint32_t i = 0; i < pros.memoryTypeCount; ++i) {
-        if ((reqs.memoryTypeBits & (1 << i)) && (pros.memoryTypes[i].propertyFlags & property)) {
+        const VkMemoryPropertyFlags flags = pros.memoryTypes[i].propertyFlags;
+        if ((reqs.memoryTypeBits & (1 << i)) &&
+            (flags & property) == property &&
+            (forbidden_property == 0 || (flags & forbidden_property) == 0)) {
             VkMemoryAllocateInfo memory_allocate_info { .sType =
                                                             VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                                         .pNext           = pNext,
@@ -282,7 +286,9 @@ std::optional<vvk::DeviceMemory> AllocateMemory(const vvk::Device& device, vvk::
             }
         }
     }
-    LOG_ERROR("vulkan allocate memory failed, no memory match requires");
+    LOG_ERROR("vulkan allocate memory failed, no memory type matches required=0x%x forbidden=0x%x",
+              property,
+              forbidden_property);
     return std::nullopt;
 }
 
@@ -354,8 +360,26 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, 
 
         image.mem_reqs = device.GetImageMemoryRequirements(*image.handle);
 
-        if (auto opt = AllocateMemory(
-                device, gpu, image.mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ex_mem_info);
+        /*
+         * Cross-GPU DMA-BUF export from a discrete GPU must not be backed by
+         * private device-local VRAM. Integrated GPUs can expose unified memory
+         * as DEVICE_LOCAL|HOST_VISIBLE, so only filter DEVICE_LOCAL on discrete
+         * devices.
+         */
+        const bool forbid_device_local_export_memory = dmabuf_export &&
+            gpu.GetProperties().deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        const VkMemoryPropertyFlags required_memory_flags = dmabuf_export
+            ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        const VkMemoryPropertyFlags forbidden_memory_flags = forbid_device_local_export_memory
+            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            : 0;
+        if (auto opt = AllocateMemory(device,
+                                      gpu,
+                                      image.mem_reqs,
+                                      required_memory_flags,
+                                      forbidden_memory_flags,
+                                      &ex_mem_info);
             opt.has_value()) {
             image.mem = std::move(opt.value());
         } else

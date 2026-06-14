@@ -246,6 +246,25 @@ public:
     /// Destroys any held allocation.
     ~PoolAllocations() { Release(); }
 
+    /// Destroys any held allocation and leaves the wrapper empty.
+    void reset() noexcept {
+        Release();
+        allocations.reset();
+        num    = 0;
+        device = nullptr;
+        pool   = nullptr;
+        dld    = nullptr;
+    }
+
+    /// Drops ownership without freeing the allocation.
+    void abandon() noexcept {
+        allocations.reset();
+        num    = 0;
+        device = nullptr;
+        pool   = nullptr;
+        dld    = nullptr;
+    }
+
     /// Returns the number of allocations.
     std::size_t size() const noexcept { return num; }
 
