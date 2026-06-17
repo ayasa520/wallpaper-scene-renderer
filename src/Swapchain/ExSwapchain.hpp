@@ -19,6 +19,13 @@ enum class ExternalFrameExportMode
     DMA_BUF
 };
 
+enum class ExternalFrameMemoryPreference
+{
+    Default,
+    HostVisible,
+    DeviceLocal
+};
+
 enum class ExternalFrameHandleType
 {
     NONE,

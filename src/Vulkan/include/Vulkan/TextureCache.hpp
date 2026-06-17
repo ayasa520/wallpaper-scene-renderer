@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Parameters.hpp"
+#include "Swapchain/ExSwapchain.hpp"
 #include "Type.hpp"
 #include "Core/NoCopyMove.hpp"
 #include "Core/MapSet.hpp"
@@ -75,7 +76,9 @@ public:
     std::optional<ExImageParameters> CreateExTex(uint32_t witdh, uint32_t height, VkFormat,
                                                  VkImageTiling, ExternalFrameExportMode,
                                                  uint32_t export_drm_fourcc = 0,
-                                                 std::span<const uint64_t> export_drm_modifiers = {});
+                                                 std::span<const uint64_t> export_drm_modifiers = {},
+                                                 ExternalFrameMemoryPreference memory_preference =
+                                                     ExternalFrameMemoryPreference::Default);
     ImageSlotsRef                    CreateTex(Image&);
     std::optional<ImageSlotsRef>     FindTex(std::string_view key) const;
     // Continue an already-started streaming upload using the TextureCache-owned parsed image. This

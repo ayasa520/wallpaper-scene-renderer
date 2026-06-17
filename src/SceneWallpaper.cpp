@@ -28,6 +28,7 @@
 #include <chrono>
 #include <malloc.h>
 #include <atomic>
+#include <utility>
 #include <vector>
 
 using namespace wallpaper;
@@ -247,6 +248,7 @@ public:
         CMD_APPLY_AUDIO_SAMPLES,
         CMD_SET_FILLMODE,
         CMD_SET_SPEED,
+        CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
         CMD_STOP,
         CMD_DRAW,
         CMD_NO
@@ -284,6 +286,7 @@ public:
                 CASE_CMD(APPLY_MEDIA_STATE);
                 CASE_CMD(APPLY_AUDIO_SAMPLES);
                 CASE_CMD(SET_SPEED);
+                CASE_CMD(SET_OFFSCREEN_RELEASE_CALLBACK);
                 CASE_CMD(INIT_VULKAN);
             default: break;
             }
@@ -544,6 +547,14 @@ private:
         }
     }
     MHANDLER_CMD(SET_SPEED) { msg->findFloat("value", &m_speed); }
+    MHANDLER_CMD(SET_OFFSCREEN_RELEASE_CALLBACK) {
+        std::shared_ptr<vulkan::OffscreenFrameReleaseCallback> callback;
+        if (msg->findObject("value", &callback) && callback) {
+            m_render->setOffscreenFrameReleaseCallback(*callback);
+        } else {
+            m_render->setOffscreenFrameReleaseCallback({});
+        }
+    }
     MHANDLER_CMD(INIT_VULKAN) {
         std::shared_ptr<RenderInitInfo> info;
         if (msg->findObject("info", &info)) {
@@ -588,6 +599,16 @@ void SceneWallpaper::initVulkan(const RenderInitInfo& info) {
     auto                            msg =
         CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_INIT_VULKAN);
     msg->setObject("info", sp_info);
+    msg->post();
+}
+
+void SceneWallpaper::setOffscreenFrameReleaseCallback(
+    vulkan::OffscreenFrameReleaseCallback callback) {
+    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(),
+                                RenderHandler::CMD::CMD_SET_OFFSCREEN_RELEASE_CALLBACK);
+    msg->setObject("value",
+                   std::make_shared<vulkan::OffscreenFrameReleaseCallback>(
+                       std::move(callback)));
     msg->post();
 }
 

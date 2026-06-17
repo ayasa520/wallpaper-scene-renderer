@@ -4,6 +4,7 @@
 #include <functional>
 #include "Type.hpp"
 #include "Swapchain/ExSwapchain.hpp"
+#include "VulkanRender/OffscreenFrameReleaseCallback.hpp"
 
 namespace wallpaper
 {
@@ -40,6 +41,8 @@ public:
     bool inited() const;
 
     void initVulkan(const RenderInitInfo&);
+    void setOffscreenFrameReleaseCallback(
+        vulkan::OffscreenFrameReleaseCallback callback);
 
     void play();
     void pause();
