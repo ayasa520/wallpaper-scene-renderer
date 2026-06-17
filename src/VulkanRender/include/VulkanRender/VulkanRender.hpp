@@ -4,6 +4,7 @@
 #include "SceneWallpaperSurface.hpp"
 #include "Swapchain/ExSwapchain.hpp"
 #include "Type.hpp"
+#include "VulkanRender/OffscreenFrameReleaseCallback.hpp"
 
 #include <cstdio>
 #include <memory>
@@ -27,6 +28,7 @@ public:
 
     void drawFrame(Scene&);
     void setPaused(bool paused);
+    void setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback);
 
     void clearLastRenderGraph(bool clear_scene_caches = false);
     void clearRenderGraphResources();

@@ -56,6 +56,9 @@ struct RenderInitInfo {
     TexTiling                     offscreen_tiling { TexTiling::OPTIMAL };
     uint32_t                      export_drm_fourcc { 0 };
     std::vector<uint64_t>         export_drm_modifiers;
+    ExternalFrameMemoryPreference export_memory_preference {
+        ExternalFrameMemoryPreference::Default
+    };
     VulkanSurfaceInfo             surface_info;
 
     uint16_t width { 1920 };

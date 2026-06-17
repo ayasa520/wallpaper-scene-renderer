@@ -85,7 +85,9 @@ inline std::unique_ptr<VulkanExSwapchain> CreateExSwapchain(const Device& device
                                                             VkImageTiling tiling,
                                                             ExternalFrameExportMode export_mode,
                                                             uint32_t export_drm_fourcc = 0,
-                                                            std::span<const uint64_t> export_drm_modifiers = {}) {
+                                                            std::span<const uint64_t> export_drm_modifiers = {},
+                                                            ExternalFrameMemoryPreference memory_preference =
+                                                                ExternalFrameMemoryPreference::Default) {
     std::array<VulkanExHandle, 3> handles;
     for (auto& handle : handles) {
         if (auto rv = device.tex_cache().CreateExTex(
@@ -95,7 +97,8 @@ inline std::unique_ptr<VulkanExSwapchain> CreateExSwapchain(const Device& device
                 tiling,
                 export_mode,
                 export_drm_fourcc,
-                export_drm_modifiers);
+                export_drm_modifiers,
+                memory_preference);
             rv.has_value())
             handle.image = std::move(rv.value());
         else

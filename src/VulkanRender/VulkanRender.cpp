@@ -32,6 +32,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if ENABLE_RENDERDOC_API
@@ -88,6 +89,7 @@ struct VulkanRender::Impl {
 
     void drawFrame(Scene&);
     void setPaused(bool paused);
+    void setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback);
 
     bool CreateRenderingResource(RenderingResources&);
     void DestroyRenderingResource(RenderingResources&);
@@ -134,6 +136,7 @@ struct VulkanRender::Impl {
 
     std::unique_ptr<VulkanExSwapchain> m_ex_swapchain;
     RenderingResources                 m_rendering_resources;
+    OffscreenFrameReleaseCallback      m_offscreen_frame_release_cb;
 
     std::vector<VulkanPass*> m_passes;
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
@@ -149,6 +152,9 @@ bool VulkanRender::init(RenderInitInfo info) { return pImpl->init(info); }
 void VulkanRender::destroy() { pImpl->destroy(); }
 void VulkanRender::drawFrame(Scene& scene) { pImpl->drawFrame(scene); };
 void VulkanRender::setPaused(bool paused) { pImpl->setPaused(paused); };
+void VulkanRender::setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback) {
+    pImpl->setOffscreenFrameReleaseCallback(std::move(callback));
+};
 void VulkanRender::clearLastRenderGraph(bool clear_scene_caches) {
     pImpl->clearLastRenderGraph(clear_scene_caches);
 };
@@ -267,7 +273,8 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
                                                     : VK_IMAGE_TILING_LINEAR),
                                                info.export_mode,
                                                info.export_drm_fourcc,
-                                               info.export_drm_modifiers);
+                                               info.export_drm_modifiers,
+                                               info.export_memory_preference);
         }
         m_with_surface = false;
     }
@@ -518,6 +525,11 @@ void VulkanRender::Impl::setPaused(bool paused) {
     m_device->video_tex_cache().SetGlobalPaused(paused);
 }
 
+void VulkanRender::Impl::setOffscreenFrameReleaseCallback(
+    OffscreenFrameReleaseCallback callback) {
+    m_offscreen_frame_release_cb = std::move(callback);
+}
+
 void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {
     if (!m_device) return;
 
@@ -715,8 +727,24 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         return;
 }
 void VulkanRender::Impl::drawFrameOffscreen() {
-    RenderingResources& rr    = m_rendering_resources;
-    ImageParameters     image = m_ex_swapchain->GetInprogressImage();
+    RenderingResources& rr = m_rendering_resources;
+    auto* inprogress_handle = m_ex_swapchain ? m_ex_swapchain->getInprogress() : nullptr;
+    if (!inprogress_handle) return;
+
+    if (m_offscreen_frame_release_cb) {
+        /*
+         * Vivid reuses the exported offscreen image ring directly as the display
+         * transport. Mirror waywallen's BridgeProducerCore::acquireSlot(): wait
+         * for the consumer release timeline immediately before recording GPU
+         * writes into the selected slot. A timeout skips this render tick without
+         * calling renderFrame(), so the ready slot remains the last fully
+         * published image and no still-owned DMA-BUF is overwritten.
+         */
+        if (!m_offscreen_frame_release_cb(static_cast<std::uint32_t>(inprogress_handle->id())))
+            return;
+    }
+
+    ImageParameters image = m_ex_swapchain->GetInprogressImage();
 
     m_finpass->setPresent(image);
 

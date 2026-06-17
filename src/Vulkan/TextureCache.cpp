@@ -299,7 +299,8 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, 
                                                const vvk::PhysicalDevice& gpu,
                                                ExternalFrameExportMode export_mode,
                                                uint32_t export_drm_fourcc,
-                                               std::span<const uint64_t> export_drm_modifiers) {
+                                               std::span<const uint64_t> export_drm_modifiers,
+                                               ExternalFrameMemoryPreference memory_preference) {
     ExImageParameters image;
     do {
         const bool dmabuf_export = export_mode == ExternalFrameExportMode::DMA_BUF;
@@ -361,19 +362,26 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, 
         image.mem_reqs = device.GetImageMemoryRequirements(*image.handle);
 
         /*
-         * Cross-GPU DMA-BUF export from a discrete GPU must not be backed by
-         * private device-local VRAM. Integrated GPUs can expose unified memory
-         * as DEVICE_LOCAL|HOST_VISIBLE, so only filter DEVICE_LOCAL on discrete
-         * devices.
+         * Keep the historical DMA-BUF default as HOST_VISIBLE because it is the
+         * safest cross-GPU export memory class. The producer can now explicitly
+         * request DEVICE_LOCAL after it has proven that producer and consumer
+         * are on the same render node and has selected a shared DRM modifier;
+         * that is the waywallen-style fast path. Do not infer DEVICE_LOCAL from
+         * modifier tiling alone, because a modifier can still be used in a relay
+         * or cross-device topology where private VRAM is the wrong allocation.
          */
-        const bool forbid_device_local_export_memory = dmabuf_export &&
-            gpu.GetProperties().deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-        const VkMemoryPropertyFlags required_memory_flags = dmabuf_export
-            ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-            : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        const VkMemoryPropertyFlags forbidden_memory_flags = forbid_device_local_export_memory
-            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-            : 0;
+        VkMemoryPropertyFlags required_memory_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        VkMemoryPropertyFlags forbidden_memory_flags = 0;
+        if (dmabuf_export) {
+            if (memory_preference == ExternalFrameMemoryPreference::DeviceLocal) {
+                required_memory_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            } else {
+                required_memory_flags =
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                if (gpu.GetProperties().deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+                    forbidden_memory_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            }
+        }
         if (auto opt = AllocateMemory(device,
                                       gpu,
                                       image.mem_reqs,
@@ -705,7 +713,8 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
                                                            VkImageTiling tiling,
                                                            ExternalFrameExportMode export_mode,
                                                            uint32_t export_drm_fourcc,
-                                                           std::span<const uint64_t> export_drm_modifiers) {
+                                                           std::span<const uint64_t> export_drm_modifiers,
+                                                           ExternalFrameMemoryPreference memory_preference) {
     if (export_mode == ExternalFrameExportMode::DMA_BUF &&
         ! m_device.supportExt(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
         LOG_ERROR("vulkan device missing %s for dma-buf export",
@@ -745,7 +754,8 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
                              export_drm_fourcc,
                              m_device.supportExt(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)
                                  ? export_drm_modifiers
-                                 : std::span<const uint64_t> {});
+                                 : std::span<const uint64_t> {},
+                             memory_preference);
     if (opt.has_value()) {
         const auto& eximg = opt.value();
 
