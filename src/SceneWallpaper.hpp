@@ -2,6 +2,7 @@
 #include <memory>
 #include <string_view>
 #include <functional>
+#include <vector>
 #include "Type.hpp"
 #include "Swapchain/ExSwapchain.hpp"
 #include "VulkanRender/OffscreenFrameReleaseCallback.hpp"
@@ -43,6 +44,13 @@ public:
     void initVulkan(const RenderInitInfo&);
     void setOffscreenFrameReleaseCallback(
         vulkan::OffscreenFrameReleaseCallback callback);
+    bool reconfigureOffscreenExport(uint32_t width,
+                                    uint32_t height,
+                                    TexTiling tiling,
+                                    ExternalFrameExportMode export_mode,
+                                    uint32_t export_drm_fourcc,
+                                    const std::vector<uint64_t>& export_drm_modifiers,
+                                    ExternalFrameMemoryPreference memory_preference);
 
     void play();
     void pause();

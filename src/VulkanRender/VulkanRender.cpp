@@ -78,6 +78,15 @@ void DestroyPassOnce(VulkanPass* pass, const Device& device, RenderingResources&
     pass->destory(device, resources);
 }
 
+const char* ExternalMemoryPreferenceName(wallpaper::ExternalFrameMemoryPreference preference) {
+    switch (preference) {
+    case wallpaper::ExternalFrameMemoryPreference::HostVisible: return "host-visible";
+    case wallpaper::ExternalFrameMemoryPreference::DeviceLocal: return "device-local";
+    case wallpaper::ExternalFrameMemoryPreference::Default:
+    default: return "default";
+    }
+}
+
 } // namespace
 
 struct VulkanRender::Impl {
@@ -90,6 +99,13 @@ struct VulkanRender::Impl {
     void drawFrame(Scene&);
     void setPaused(bool paused);
     void setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback);
+    bool reconfigureOffscreenExport(uint32_t width,
+                                    uint32_t height,
+                                    TexTiling tiling,
+                                    ExternalFrameExportMode export_mode,
+                                    uint32_t export_drm_fourcc,
+                                    const std::vector<uint64_t>& export_drm_modifiers,
+                                    ExternalFrameMemoryPreference memory_preference);
 
     bool CreateRenderingResource(RenderingResources&);
     void DestroyRenderingResource(RenderingResources&);
@@ -154,6 +170,22 @@ void VulkanRender::drawFrame(Scene& scene) { pImpl->drawFrame(scene); };
 void VulkanRender::setPaused(bool paused) { pImpl->setPaused(paused); };
 void VulkanRender::setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback) {
     pImpl->setOffscreenFrameReleaseCallback(std::move(callback));
+};
+bool VulkanRender::reconfigureOffscreenExport(
+    uint32_t width,
+    uint32_t height,
+    TexTiling tiling,
+    ExternalFrameExportMode export_mode,
+    uint32_t export_drm_fourcc,
+    const std::vector<uint64_t>& export_drm_modifiers,
+    ExternalFrameMemoryPreference memory_preference) {
+    return pImpl->reconfigureOffscreenExport(width,
+                                             height,
+                                             tiling,
+                                             export_mode,
+                                             export_drm_fourcc,
+                                             export_drm_modifiers,
+                                             memory_preference);
 };
 void VulkanRender::clearLastRenderGraph(bool clear_scene_caches) {
     pImpl->clearLastRenderGraph(clear_scene_caches);
@@ -530,6 +562,41 @@ void VulkanRender::Impl::setOffscreenFrameReleaseCallback(
     m_offscreen_frame_release_cb = std::move(callback);
 }
 
+bool VulkanRender::Impl::reconfigureOffscreenExport(
+    uint32_t width,
+    uint32_t height,
+    TexTiling tiling,
+    ExternalFrameExportMode export_mode,
+    uint32_t export_drm_fourcc,
+    const std::vector<uint64_t>& export_drm_modifiers,
+    ExternalFrameMemoryPreference memory_preference) {
+    if (!m_inited || !m_device || !m_ex_swapchain || !m_instance.offscreen())
+        return false;
+
+    const bool ok = m_ex_swapchain->Reconfigure(*m_device,
+                                                width,
+                                                height,
+                                                tiling == TexTiling::OPTIMAL
+                                                    ? VK_IMAGE_TILING_OPTIMAL
+                                                    : VK_IMAGE_TILING_LINEAR,
+                                                export_mode,
+                                                export_drm_fourcc,
+                                                export_drm_modifiers,
+                                                memory_preference);
+    LOG_INFO("HanabiScene Vulkan: offscreen export reconfigure %s size=%ux%u "
+             "fourcc=0x%08x modifier-count=%zu first-modifier=0x%016llx memory=%s",
+             ok ? "succeeded" : "failed",
+             width,
+             height,
+             export_drm_fourcc,
+             export_drm_modifiers.size(),
+             export_drm_modifiers.empty()
+                 ? 0ull
+                 : static_cast<unsigned long long>(export_drm_modifiers.front()),
+             ExternalMemoryPreferenceName(memory_preference));
+    return ok;
+}
+
 void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {
     if (!m_device) return;
 
@@ -728,6 +795,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
 }
 void VulkanRender::Impl::drawFrameOffscreen() {
     RenderingResources& rr = m_rendering_resources;
+    auto render_lock = m_ex_swapchain ? m_ex_swapchain->acquireRenderLock() : nullptr;
     auto* inprogress_handle = m_ex_swapchain ? m_ex_swapchain->getInprogress() : nullptr;
     if (!inprogress_handle) return;
 
