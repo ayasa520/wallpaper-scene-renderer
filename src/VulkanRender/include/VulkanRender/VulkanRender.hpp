@@ -29,6 +29,13 @@ public:
     void drawFrame(Scene&);
     void setPaused(bool paused);
     void setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback);
+    bool reconfigureOffscreenExport(uint32_t width,
+                                    uint32_t height,
+                                    TexTiling tiling,
+                                    ExternalFrameExportMode export_mode,
+                                    uint32_t export_drm_fourcc,
+                                    const std::vector<uint64_t>& export_drm_modifiers,
+                                    ExternalFrameMemoryPreference memory_preference);
 
     void clearLastRenderGraph(bool clear_scene_caches = false);
     void clearRenderGraphResources();

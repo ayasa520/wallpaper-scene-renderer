@@ -28,6 +28,7 @@
 #include <chrono>
 #include <malloc.h>
 #include <atomic>
+#include <future>
 #include <utility>
 #include <vector>
 
@@ -156,6 +157,19 @@ std::string DescribeUserPropertyKeysForLog(const UserPropertyMap& properties) {
     description += "]";
     return description;
 }
+
+struct OffscreenExportReconfigureRequest {
+    uint32_t                      width { 0 };
+    uint32_t                      height { 0 };
+    TexTiling                     tiling { TexTiling::LINEAR };
+    ExternalFrameExportMode       export_mode { ExternalFrameExportMode::DMA_BUF };
+    uint32_t                      export_drm_fourcc { 0 };
+    std::vector<uint64_t>         export_drm_modifiers;
+    ExternalFrameMemoryPreference memory_preference {
+        ExternalFrameMemoryPreference::Default
+    };
+    std::promise<bool>            result;
+};
 } // namespace
 
 namespace wallpaper
@@ -249,6 +263,7 @@ public:
         CMD_SET_FILLMODE,
         CMD_SET_SPEED,
         CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
+        CMD_RECONFIGURE_OFFSCREEN_EXPORT,
         CMD_STOP,
         CMD_DRAW,
         CMD_NO
@@ -287,6 +302,7 @@ public:
                 CASE_CMD(APPLY_AUDIO_SAMPLES);
                 CASE_CMD(SET_SPEED);
                 CASE_CMD(SET_OFFSCREEN_RELEASE_CALLBACK);
+                CASE_CMD(RECONFIGURE_OFFSCREEN_EXPORT);
                 CASE_CMD(INIT_VULKAN);
             default: break;
             }
@@ -555,6 +571,24 @@ private:
             m_render->setOffscreenFrameReleaseCallback({});
         }
     }
+    MHANDLER_CMD(RECONFIGURE_OFFSCREEN_EXPORT) {
+        std::shared_ptr<OffscreenExportReconfigureRequest> request;
+        if (!msg->findObject("request", &request) || !request) return;
+
+        bool ok = false;
+        try {
+            ok = m_render->reconfigureOffscreenExport(request->width,
+                                                      request->height,
+                                                      request->tiling,
+                                                      request->export_mode,
+                                                      request->export_drm_fourcc,
+                                                      request->export_drm_modifiers,
+                                                      request->memory_preference);
+        } catch (...) {
+            ok = false;
+        }
+        request->result.set_value(ok);
+    }
     MHANDLER_CMD(INIT_VULKAN) {
         std::shared_ptr<RenderInitInfo> info;
         if (msg->findObject("info", &info)) {
@@ -610,6 +644,42 @@ void SceneWallpaper::setOffscreenFrameReleaseCallback(
                    std::make_shared<vulkan::OffscreenFrameReleaseCallback>(
                        std::move(callback)));
     msg->post();
+}
+
+bool SceneWallpaper::reconfigureOffscreenExport(
+    uint32_t width,
+    uint32_t height,
+    TexTiling tiling,
+    ExternalFrameExportMode export_mode,
+    uint32_t export_drm_fourcc,
+    const std::vector<uint64_t>& export_drm_modifiers,
+    ExternalFrameMemoryPreference memory_preference) {
+    auto request = std::make_shared<OffscreenExportReconfigureRequest>();
+    request->width = width;
+    request->height = height;
+    request->tiling = tiling;
+    request->export_mode = export_mode;
+    request->export_drm_fourcc = export_drm_fourcc;
+    request->export_drm_modifiers = export_drm_modifiers;
+    request->memory_preference = memory_preference;
+
+    auto future = request->result.get_future();
+    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(),
+                                RenderHandler::CMD::CMD_RECONFIGURE_OFFSCREEN_EXPORT);
+    msg->setObject("request", request);
+    if (msg->post() != looper::status_t::OK) return false;
+
+    /*
+     * Reconfiguration is part of the synchronous BIND_BUFFERS path.  Waiting
+     * here keeps renderer-side allocation failures in the existing negotiation
+     * flow, while the actual Vulkan image allocation still runs on the render
+     * thread that owns TextureCache and the renderer Device.
+     */
+    if (future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+        LOG_ERROR("SceneWallpaper: timed out waiting for offscreen export reconfigure");
+        return false;
+    }
+    return future.get();
 }
 
 void SceneWallpaper::play() {
