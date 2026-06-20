@@ -692,6 +692,10 @@ void SceneWallpaper::pause() {
     msg->setBool("value", true);
     msg->post();
 }
+void SceneWallpaper::requestFrame() {
+    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_DRAW);
+    msg->post();
+}
 
 void SceneWallpaper::mouseInput(double x, double y) {
     auto msg =

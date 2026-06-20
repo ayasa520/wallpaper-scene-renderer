@@ -54,6 +54,7 @@ public:
 
     void play();
     void pause();
+    void requestFrame();
     void mouseInput(double x, double y);
     void mouseLeftButton(bool down);
 
