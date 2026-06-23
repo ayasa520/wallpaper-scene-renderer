@@ -504,20 +504,11 @@ private:
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
-            const double requested_text_render_scale = std::max(1.0, m_render_scale);
-            const double parsed_text_render_scale    = m_scene->textRenderScale;
-            m_scene->textRenderScale                 = requested_text_render_scale;
-            const bool requires_initial_text_rerender =
-                std::abs(parsed_text_render_scale - requested_text_render_scale) > 0.001;
-            for (const auto& [layer_id, _] : m_scene->textLayers) {
-                if (m_scene->deferredRuntimeTextLayerIds.count(layer_id) != 0) continue;
-                if (! requires_initial_text_rerender) continue;
-
-                // Startup only needs to rebuild text when the scene was parsed at a different
-                // device scale than the active renderer. The canonical text geometry contract is
-                // otherwise already final at parse time and carries straight into runtime.
-                RebuildTextLayerSceneLayout(*m_scene, layer_id);
-            }
+            // Scene text arrives with authoring geometry already resolved by WPSceneParser. The
+            // render thread records the active density for future runtime rerasterization, but it
+            // must not rebuild parsed text just because the desktop scale changed: render scale
+            // controls atlas sharpness, while textAuthoringScale controls visible geometry.
+            m_scene->textRenderScale = std::max(1.0, m_render_scale);
             m_scene->scriptHost = std::make_unique<WPSceneScriptHost>(m_scene.get());
             for (const auto& registration : m_scene->bindingRegistrations) {
                 m_scene->scriptHost->RegisterPropertyBinding(registration);
