@@ -93,14 +93,24 @@ public:
         if (!next_handles.has_value()) return false;
 
         std::lock_guard<std::mutex> generation_lk(m_generation_mutex);
-        std::lock_guard<std::mutex> state_lk(stateMutex());
+
         /*
-         * The display protocol may still hold fds from a blacklisted generation
-         * while the renderer is negotiating a new modifier.  Keep old Vulkan
-         * images alive for the lifetime of this swapchain instead of releasing
-         * them immediately after publication switches to the next generation.
+         * Acquire the generation lock before waiting for the device. The render
+         * path holds the same lock from slot selection through queue submission,
+         * so this ordering closes the window where a renderer could submit work
+         * against the old images after WaitIdle() returned. The producer has
+         * already passed the display release gate, and WaitIdle() now guarantees
+         * that every GPU command referencing the old generation has completed
+         * before its VkImages and exported memory are destroyed.
+         *
+         * Destroying the old generation here also avoids retaining three images
+         * and their DMA-BUF fds for every rejected export contract during a
+         * multi-display negotiation loop.
          */
-        if (m_active) m_retired.push_back(std::move(m_active));
+        if (device.handle().WaitIdle() != VK_SUCCESS) return false;
+
+        std::lock_guard<std::mutex> state_lk(stateMutex());
+        m_active.reset();
         m_active = std::make_unique<Generation>(std::move(next_handles.value()),
                                                 VkExtent2D { w, h });
         activateGeneration(*m_active);
@@ -184,7 +194,6 @@ private:
 
     mutable std::mutex                m_generation_mutex;
     std::unique_ptr<Generation>       m_active;
-    std::vector<std::unique_ptr<Generation>> m_retired;
     atomic_                       m_presented { nullptr };
     atomic_                       m_ready { nullptr };
     atomic_                       m_inprogress { nullptr };

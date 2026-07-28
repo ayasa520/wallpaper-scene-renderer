@@ -361,6 +361,21 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, 
 
         image.mem_reqs = device.GetImageMemoryRequirements(*image.handle);
 
+        VkMemoryDedicatedAllocateInfo dedicated_info {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .image = *image.handle,
+            .buffer = VK_NULL_HANDLE,
+        };
+        /*
+         * Keep the producer DMA-BUF contract identical to Waywallen's Vulkan
+         * pool: one exported image owns one dedicated VkDeviceMemory
+         * allocation.  In particular, do not infer modifier-image allocation
+         * semantics from a LINEAR external-image capability query.
+         */
+        if (dmabuf_export)
+            ex_mem_info.pNext = &dedicated_info;
+
         /*
          * Keep the historical DMA-BUF default as HOST_VISIBLE because it is the
          * safest cross-GPU export memory class. The producer can now explicitly
