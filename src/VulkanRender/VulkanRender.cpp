@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,6 +63,11 @@ constexpr std::array base_device_exts {
 
 namespace
 {
+
+std::mutex& VulkanInitMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
 
 std::string MakeResidencyInstanceKey(
     const VulkanPass& pass, std::unordered_map<std::string, std::size_t>& occurrence_counts) {
@@ -207,6 +213,16 @@ void VulkanRender::UpdateCameraFillMode(Scene& scene, wallpaper::FillMode fill) 
 wallpaper::ExSwapchain* VulkanRender::exSwapchain() const { return pImpl->m_ex_swapchain.get(); };
 
 bool VulkanRender::Impl::init(RenderInitInfo info) {
+    if (m_inited) return true;
+
+    /*
+     * Independent-display mode can start several scene renderers from the same
+     * process. NVIDIA's Vulkan loader/ICD path has shown crashes when multiple
+     * threads create instances and devices at the exact same time, so serialize
+     * the one-time Vulkan bootstrap for this backend. The lock is deliberately
+     * held only during init(); steady-state rendering remains fully parallel.
+     */
+    std::lock_guard<std::mutex> vulkan_init_lock(VulkanInitMutex());
     if (m_inited) return true;
 
     m_redraw_cb = info.redraw_callback;
@@ -793,12 +809,20 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     if (!checkVkResult(rr.fence_frame.Reset(), "reset swapchain frame fence"))
         return;
 }
+
 void VulkanRender::Impl::drawFrameOffscreen() {
     RenderingResources& rr = m_rendering_resources;
-    auto render_lock = m_ex_swapchain ? m_ex_swapchain->acquireRenderLock() : nullptr;
-    auto* inprogress_handle = m_ex_swapchain ? m_ex_swapchain->getInprogress() : nullptr;
-    if (!inprogress_handle) return;
+    if (!m_ex_swapchain) {
+        return;
+    }
 
+    auto render_lock = m_ex_swapchain->acquireRenderLock();
+    auto* inprogress_handle = m_ex_swapchain->getInprogress();
+    if (!inprogress_handle) {
+        return;
+    }
+
+    const uint32_t slot_id = static_cast<uint32_t>(inprogress_handle->id());
     if (m_offscreen_frame_release_cb) {
         /*
          * Vivid reuses the exported offscreen image ring directly as the display
@@ -808,8 +832,9 @@ void VulkanRender::Impl::drawFrameOffscreen() {
          * calling renderFrame(), so the ready slot remains the last fully
          * published image and no still-owned DMA-BUF is overwritten.
          */
-        if (!m_offscreen_frame_release_cb(static_cast<std::uint32_t>(inprogress_handle->id())))
+        if (!m_offscreen_frame_release_cb(slot_id)) {
             return;
+        }
     }
 
     ImageParameters image = m_ex_swapchain->GetInprogressImage();

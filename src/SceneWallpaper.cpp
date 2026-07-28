@@ -181,6 +181,7 @@ public:
     enum class CMD
     {
         CMD_LOAD_SCENE,
+        CMD_RENDER_READY,
         CMD_SET_PROPERTY,
         CMD_STOP,
         CMD_FIRST_FRAME,
@@ -204,6 +205,7 @@ public:
             switch (cmd) {
                 CASE_CMD(SET_PROPERTY);
                 CASE_CMD(LOAD_SCENE);
+                CASE_CMD(RENDER_READY);
                 CASE_CMD(STOP);
                 CASE_CMD(FIRST_FRAME);
             default: break;
@@ -211,7 +213,7 @@ public:
         }
     }
 
-    void        sendCmdLoadScene();
+    void        sendRenderReady();
     void        sendFirstFrameOk();
     bool        isGenGraphviz() const { return m_gen_graphviz; }
     const auto& mediaState() const { return m_media_state; }
@@ -221,12 +223,14 @@ private:
     void loadScene();
 
     MHANDLER_CMD(LOAD_SCENE);
+    MHANDLER_CMD(RENDER_READY);
     MHANDLER_CMD(SET_PROPERTY);
     MHANDLER_CMD(STOP);
     MHANDLER_CMD(FIRST_FRAME);
 
 private:
     bool m_inited { false };
+    bool m_render_ready { false };
 
     std::string                              m_assets;
     std::string                              m_source;
@@ -585,9 +589,8 @@ private:
         if (msg->findObject("info", &info)) {
             m_render_scale = std::max(1.0, info->render_scale);
             m_render->init(*info);
-
-            // inited, callback to laod scene
-            main_handler.sendCmdLoadScene();
+            if (m_render->inited())
+                main_handler.sendRenderReady();
         }
     }
 
@@ -722,9 +725,21 @@ ExSwapchain* SceneWallpaper::exSwapchain() const {
 }
 
 MHANDLER_CMD_IMPL(MainHandler, LOAD_SCENE) {
-    if (m_render_handler->renderInited()) {
+    if (m_render_ready) {
         loadScene();
+    } else {
+        LOG_INFO("SceneWallpaper: deferring scene load until renderer ready source=%s assets=%s",
+                 m_source.empty() ? "missing" : "ready",
+                 m_assets.empty() ? "missing" : "ready");
     }
+}
+
+MHANDLER_CMD_IMPL(MainHandler, RENDER_READY) {
+    m_render_ready = true;
+    LOG_INFO("SceneWallpaper: renderer ready source=%s assets=%s",
+             m_source.empty() ? "missing" : "ready",
+             m_assets.empty() ? "missing" : "ready");
+    loadScene();
 }
 
 MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
@@ -938,11 +953,11 @@ void MainHandler::loadScene() {
         msg->post();
     }
 }
-void MainHandler::sendCmdLoadScene() {
+void MainHandler::sendRenderReady() {
     auto self = weak_from_this().lock();
     if (! self) return;
 
-    auto msg = CreateMsgWithCmd(self, MainHandler::CMD::CMD_LOAD_SCENE);
+    auto msg = CreateMsgWithCmd(self, MainHandler::CMD::CMD_RENDER_READY);
     msg->post();
 }
 void MainHandler::sendFirstFrameOk() {
