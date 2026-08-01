@@ -1,6 +1,5 @@
 #include "WPSceneScriptHost.hpp"
 
-#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -9,7 +8,6 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
-#include <iomanip>
 #include <memory>
 #include <limits>
 #include <optional>
@@ -126,148 +124,197 @@ struct AudioBufferBinding {
     JSValue  average { JS_UNDEFINED };
 };
 
-struct SpectrumBucketStats {
-    size_t begin { 0 };
-    size_t end { 0 };
-    float  average { 0.0f };
-    float  peak { 0.0f };
+constexpr size_t kExternalAudioSampleCount        = 128;
+constexpr size_t kSceneAudioChannelBandCount      = 64;
+constexpr size_t kSceneAudioEnvelopeGroupCount    = 16;
+constexpr size_t kSceneAudioBandsPerEnvelope      = 8;
+constexpr float  kSceneAudioSignalThreshold       = 0.0001f;
+constexpr float  kSceneAudioEnvelopeFloor         = 0.001f;
+constexpr float  kSceneAudioGlobalEnvelopeRatio   = 0.333f;
+constexpr float  kSceneAudioEnvelopeAttackRate    = 1.0f;
+constexpr float  kSceneAudioEnvelopeReleaseRate   = -0.5f;
+constexpr float  kSceneAudioTemporalSmoothingRate = 20.0f;
+constexpr float  kSceneAudioSlewRate              = 40.0f;
+
+struct ExternalAudioSpectrumCache {
+    bool valid { false };
+    std::array<std::vector<float>, 3> left;
+    std::array<std::vector<float>, 3> right;
+    std::array<std::vector<float>, 3> average;
 };
 
-constexpr int    kDetailedExternalAudioLogLimit = 6;
-std::atomic<int> g_detailed_external_audio_logs_remaining { kDetailedExternalAudioLogLimit };
+struct ExternalSceneAudioState {
+    bool has_snapshot { false };
+    std::array<float, kExternalAudioSampleCount> latest_raw {};
+    std::array<float, kSceneAudioEnvelopeGroupCount> envelope {};
+    std::array<float, kExternalAudioSampleCount> smoothed {};
+    std::array<float, kExternalAudioSampleCount> previous_output {};
+    ExternalAudioSpectrumCache cache;
+};
 
-bool ShouldLogDetailedExternalAudio(uint32_t resolution) {
-    if (resolution != 16) return false;
-
-    int remaining = g_detailed_external_audio_logs_remaining.load();
-    while (remaining > 0) {
-        if (g_detailed_external_audio_logs_remaining.compare_exchange_weak(remaining,
-                                                                           remaining - 1))
-            return true;
-    }
-    return false;
-}
-
-std::vector<float> ResampleSpectrumChannel(const std::vector<float>& values, uint32_t resolution) {
+std::vector<float> BuildSceneSpectrumChannel(const std::vector<float>& values,
+                                             uint32_t                  resolution) {
     const size_t       target_size = static_cast<size_t>(resolution);
     std::vector<float> result(target_size, 0.0f);
-    if (target_size == 0 || values.empty()) return result;
+    if (values.size() != kSceneAudioChannelBandCount ||
+        (resolution != 16 && resolution != 32 && resolution != 64)) {
+        return {};
+    }
 
-    const size_t source_size = values.size();
-    if (target_size == source_size) return values;
+    if (resolution == 64) return values;
+
+    /*
+     * Wallpaper Engine derives the lower Scene resolutions from the 64-band
+     * cache with adjacent max-pooling. Average must be pooled independently
+     * after it is built at 64 bands; averaging already-pooled left/right data
+     * produces different results when their peaks occupy different bins.
+     */
+    const size_t bucket_size = values.size() / target_size;
     for (size_t i = 0; i < target_size; i++) {
-        const double source_position =
-            ((static_cast<double>(i) + 0.5) * static_cast<double>(source_size) /
-             static_cast<double>(target_size)) -
-            0.5;
-        const double clamped_position =
-            std::clamp(source_position, 0.0, static_cast<double>(source_size - 1));
-        const size_t lower_index = static_cast<size_t>(std::floor(clamped_position));
-        const size_t upper_index = std::min(source_size - 1, lower_index + 1);
-        const float  mix = static_cast<float>(clamped_position - static_cast<double>(lower_index));
-        const float  lower_value = values[lower_index];
-        const float  upper_value = values[upper_index];
-        result[i]                = lower_value + (upper_value - lower_value) * mix;
+        const size_t begin = i * bucket_size;
+        const size_t end   = begin + bucket_size;
+        for (size_t source_index = begin; source_index < end; source_index++)
+            result[i] = std::max(result[i], values[source_index]);
     }
     return result;
 }
 
-float NormalizeExternalSpectrumValue(float value) {
+std::optional<size_t> SceneAudioResolutionIndex(uint32_t resolution) {
+    switch (resolution) {
+    case 16:
+        return 0;
+    case 32:
+        return 1;
+    case 64:
+        return 2;
+    default:
+        return std::nullopt;
+    }
+}
+
+float SanitizeExternalSpectrumValue(float value) {
     if (! std::isfinite(value) || value <= 0.0f) return 0.0f;
-
-    // Renderer-provided external audio already arrives as normalized spectrum energy.
-    // Preserve that shape here instead of re-scaling/clamping it into a flat 0..2 plateau.
-    return std::clamp(value, 0.0f, 2.0f);
+    return value;
 }
 
-std::vector<float> NormalizeExternalSpectrumChannel(const std::vector<float>& values) {
-    std::vector<float> normalized(values.size(), 0.0f);
-    for (size_t i = 0; i < values.size(); i++)
-        normalized[i] = NormalizeExternalSpectrumValue(values[i]);
-    return normalized;
-}
+ExternalAudioSpectrumCache BuildExternalAudioSpectrumCache(
+    const std::array<float, kExternalAudioSampleCount>& samples) {
+    ExternalAudioSpectrumCache cache;
+    std::vector<float> left64(samples.begin(), samples.begin() + kSceneAudioChannelBandCount);
+    std::vector<float> right64(samples.begin() + kSceneAudioChannelBandCount, samples.end());
 
-std::string FormatSpectrumSlice(const std::vector<float>& values, size_t count = 8) {
-    std::ostringstream stream;
-    stream << "[";
-    const auto limit = std::min(values.size(), count);
-    for (size_t i = 0; i < limit; i++) {
-        if (i > 0) stream << ", ";
-        stream << std::fixed << std::setprecision(4) << values[i];
+    std::vector<float> average64(kSceneAudioChannelBandCount, 0.0f);
+    for (size_t index = 0; index < average64.size(); index++)
+        average64[index] = (left64[index] + right64[index]) * 0.5f;
+
+    static constexpr std::array<uint32_t, 3> resolutions { 16, 32, 64 };
+    for (size_t index = 0; index < resolutions.size(); index++) {
+        cache.left[index] = BuildSceneSpectrumChannel(left64, resolutions[index]);
+        cache.right[index] = BuildSceneSpectrumChannel(right64, resolutions[index]);
+        cache.average[index] = BuildSceneSpectrumChannel(average64, resolutions[index]);
     }
-    if (values.size() > limit) stream << ", ...";
-    stream << "]";
-    return stream.str();
+    cache.valid = true;
+    return cache;
 }
 
-std::string FormatNormalizationPairs(const std::vector<float>& source,
-                                     const std::vector<float>& normalized, size_t count = 8) {
-    std::ostringstream stream;
-    stream << "[";
-    const auto limit = std::min({ source.size(), normalized.size(), count });
-    for (size_t i = 0; i < limit; i++) {
-        if (i > 0) stream << ", ";
-        stream << std::fixed << std::setprecision(4) << source[i] << "->" << normalized[i];
+void StoreExternalSceneAudioSnapshot(ExternalSceneAudioState* state,
+                                     const std::vector<float>& samples) {
+    if (state == nullptr) return;
+    if (samples.size() != kExternalAudioSampleCount) {
+        state->has_snapshot = false;
+        state->cache        = {};
+        return;
     }
-    if (std::min(source.size(), normalized.size()) > limit) stream << ", ...";
-    stream << "]";
-    return stream.str();
+
+    for (size_t index = 0; index < samples.size(); index++)
+        state->latest_raw[index] = SanitizeExternalSpectrumValue(samples[index]);
+    state->has_snapshot = true;
 }
 
-std::vector<SpectrumBucketStats> ComputeSpectrumBucketStats(const std::vector<float>& values,
-                                                            uint32_t                  resolution) {
-    const size_t                     target_size = static_cast<size_t>(resolution);
-    std::vector<SpectrumBucketStats> stats(target_size);
-    if (target_size == 0 || values.empty()) return stats;
+void AdvanceExternalSceneAudio(ExternalSceneAudioState* state, double frame_time) {
+    if (state == nullptr || ! state->has_snapshot) return;
 
-    const size_t source_size = values.size();
-    if (target_size >= source_size) {
-        for (size_t i = 0; i < target_size; i++) {
-            const size_t source_index = std::min(source_size - 1, (i * source_size) / target_size);
-            stats[i]                  = {
-                source_index,
-                std::min(source_size, source_index + 1),
-                values[source_index],
-                values[source_index],
-            };
+    /*
+     * Wallpaper Engine's Scene path does not publish the shared Web 128-band snapshot directly.
+     * The renderer executes this stateful stage once per render frame before SceneScript buffers
+     * and shader uniforms are updated (wallpaper64.exe 0x140111720-0x1401125e2):
+     *
+     *   1. Find a peak for every contiguous group of eight bands across Left64 + Right64.
+     *   2. Keep sixteen asymmetric attack/release envelopes, with one third of the frame-global
+     *      peak acting as the minimum target for every group.
+     *   3. Normalize each band by its group envelope, apply a 20 Hz temporal filter, then limit
+     *      the published band's rise and fall to 40 units per second.
+     *
+     * The input snapshot is intentionally retained separately from the filtered state. External
+     * audio arrives at the Web-compatible callback cadence, while this function must continue
+     * advancing the same snapshot at the Scene render cadence just like the native renderer.
+     */
+    std::array<float, kSceneAudioEnvelopeGroupCount> group_peak {};
+    float                                             global_peak = 0.0f;
+    for (size_t group = 0; group < group_peak.size(); group++) {
+        const size_t begin = group * kSceneAudioBandsPerEnvelope;
+        const size_t end   = begin + kSceneAudioBandsPerEnvelope;
+        for (size_t index = begin; index < end; index++)
+            group_peak[group] = std::max(group_peak[group], state->latest_raw[index]);
+        global_peak = std::max(global_peak, group_peak[group]);
+    }
+
+    const float delta_time = static_cast<float>(std::max(0.0, frame_time));
+    const bool  signal_active = global_peak >= kSceneAudioSignalThreshold;
+
+    // The native state initializes all group envelopes together on the first audible frame. This
+    // avoids a cold-start amplification spike before the asymmetric envelope tracker has settled.
+    if (signal_active && state->envelope.front() <= kSceneAudioSignalThreshold)
+        state->envelope.fill(1.0f);
+
+    const float global_floor = global_peak * kSceneAudioGlobalEnvelopeRatio;
+    const float envelope_step_time = std::min(1.0f, delta_time);
+    for (size_t group = 0; group < group_peak.size(); group++) {
+        const float target   = std::max(group_peak[group], global_floor);
+        const float distance = target - state->envelope[group];
+        if (std::abs(distance) <= kSceneAudioSignalThreshold) {
+            state->envelope[group] = target;
+            continue;
         }
-        return stats;
+
+        const float step = std::min(envelope_step_time, std::abs(distance));
+        state->envelope[group] +=
+            step * (distance > 0.0f ? kSceneAudioEnvelopeAttackRate
+                                    : kSceneAudioEnvelopeReleaseRate);
     }
 
-    for (size_t i = 0; i < target_size; i++) {
-        const size_t begin       = (i * source_size) / target_size;
-        const size_t end         = std::max(begin + 1, ((i + 1) * source_size) / target_size);
-        const size_t clamped_end = std::min(end, source_size);
-        float        sum { 0.0f };
-        float        peak { 0.0f };
-        for (size_t j = begin; j < clamped_end; j++) {
-            sum += values[j];
-            peak = std::max(peak, values[j]);
-        }
-        const auto count = static_cast<float>(std::max<size_t>(1, clamped_end - begin));
-        stats[i]         = {
-            begin,
-            clamped_end,
-            sum / count,
-            peak,
-        };
+    if (! signal_active) {
+        // Native Scene output becomes zero below the signal threshold without consuming the
+        // temporal-filter or slew states; those states resume from their prior values when audio
+        // becomes active again.
+        state->cache = BuildExternalAudioSpectrumCache({});
+        return;
     }
-    return stats;
-}
 
-std::string FormatSpectrumBucketStats(const std::vector<SpectrumBucketStats>& stats,
-                                      size_t                                  count = 8) {
-    std::ostringstream stream;
-    stream << "[";
-    const auto limit = std::min(stats.size(), count);
-    for (size_t i = 0; i < limit; i++) {
-        if (i > 0) stream << ", ";
-        stream << i << ":" << stats[i].begin << "-" << stats[i].end << " avg=" << std::fixed
-               << std::setprecision(4) << stats[i].average << " peak=" << stats[i].peak;
+    std::array<float, kSceneAudioEnvelopeGroupCount> reciprocal_envelope {};
+    for (size_t group = 0; group < reciprocal_envelope.size(); group++)
+        reciprocal_envelope[group] =
+            1.0f / std::max(state->envelope[group], kSceneAudioEnvelopeFloor);
+
+    const float smoothing_factor =
+        std::min(1.0f, delta_time * kSceneAudioTemporalSmoothingRate);
+    const float positive_slew_limit = std::min(1.0f, delta_time * kSceneAudioSlewRate);
+    const float negative_slew_limit = std::max(-1.0f, delta_time * -kSceneAudioSlewRate);
+
+    std::array<float, kExternalAudioSampleCount> output {};
+    for (size_t index = 0; index < output.size(); index++) {
+        const size_t group      = index / kSceneAudioBandsPerEnvelope;
+        const float  normalized = state->latest_raw[index] * reciprocal_envelope[group];
+        state->smoothed[index] +=
+            (normalized - state->smoothed[index]) * smoothing_factor;
+
+        const float output_delta = state->smoothed[index] - state->previous_output[index];
+        output[index] = state->previous_output[index] +
+                        std::clamp(output_delta, negative_slew_limit, positive_slew_limit);
     }
-    if (stats.size() > limit) stream << ", ...";
-    stream << "]";
-    return stream.str();
+
+    state->previous_output = output;
+    state->cache           = BuildExternalAudioSpectrumCache(output);
 }
 
 struct RuntimeState {
@@ -2113,7 +2160,7 @@ struct WPSceneScriptHost::Opaque {
     std::vector<std::unique_ptr<ScriptInstance>> instances;
     std::vector<ScriptTimer>                     timers;
     std::vector<AudioBufferBinding>              audio_buffers;
-    std::vector<float>                           external_audio_samples;
+    ExternalSceneAudioState                      external_audio;
     std::vector<int32_t>                         pending_destroy_layer_ids;
     UserPropertyMap                              user_properties;
     UserPropertyMap                              dispatched_user_properties;
@@ -2353,36 +2400,16 @@ bool GetExternalAudioBufferValues(WPSceneScriptHost::Opaque* opaque, uint32_t re
                                   std::vector<float>* left, std::vector<float>* right,
                                   std::vector<float>* average) {
     if (opaque == nullptr || left == nullptr || right == nullptr || average == nullptr ||
-        opaque->external_audio_samples.empty()) {
+        ! opaque->external_audio.cache.valid) {
         return false;
     }
 
-    const auto&        samples   = opaque->external_audio_samples;
-    const size_t       half_size = samples.size() >= 2 ? samples.size() / 2 : 0;
-    std::vector<float> left_source;
-    std::vector<float> right_source;
-    if (half_size > 0 && samples.size() % 2 == 0) {
-        left_source.assign(samples.begin(), samples.begin() + static_cast<ptrdiff_t>(half_size));
-        right_source.assign(samples.begin() + static_cast<ptrdiff_t>(half_size), samples.end());
-    } else {
-        left_source  = samples;
-        right_source = samples;
-    }
+    const auto index = SceneAudioResolutionIndex(resolution);
+    if (! index.has_value()) return false;
 
-    const auto left_source_raw  = left_source;
-    const auto right_source_raw = right_source;
-    left_source                 = NormalizeExternalSpectrumChannel(left_source);
-    right_source                = NormalizeExternalSpectrumChannel(right_source);
-
-    *left  = ResampleSpectrumChannel(left_source, resolution);
-    *right = ResampleSpectrumChannel(right_source, resolution);
-    average->assign(static_cast<size_t>(resolution), 0.0f);
-    for (size_t i = 0; i < average->size(); i++) {
-        const float left_value  = i < left->size() ? (*left)[i] : 0.0f;
-        const float right_value = i < right->size() ? (*right)[i] : 0.0f;
-        (*average)[i]           = (left_value + right_value) * 0.5f;
-    }
-
+    *left = opaque->external_audio.cache.left[*index];
+    *right = opaque->external_audio.cache.right[*index];
+    *average = opaque->external_audio.cache.average[*index];
     return true;
 }
 
@@ -8099,7 +8126,7 @@ bool UpdateJSFloat32Array(JSContext* context, JSValueConst target,
 
 void UpdateAudioBufferBindings(WPSceneScriptHost::Opaque* opaque) {
     if (opaque == nullptr || opaque->runtime.context == nullptr ||
-        (opaque->external_audio_samples.empty() &&
+        (! opaque->external_audio.cache.valid &&
          (opaque->scene == nullptr || opaque->scene->soundManager == nullptr))) {
         return;
     }
@@ -8110,6 +8137,8 @@ void UpdateAudioBufferBindings(WPSceneScriptHost::Opaque* opaque) {
         std::vector<float> right;
         std::vector<float> average;
         if (! GetExternalAudioBufferValues(opaque, binding.resolution, &left, &right, &average)) {
+            if (opaque->scene == nullptr || opaque->scene->soundManager == nullptr)
+                continue;
             opaque->scene->soundManager->GetSpectrum(binding.resolution, &left, &right, &average);
         }
 
@@ -9076,6 +9105,7 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
 void WPSceneScriptHost::FrameBegin(double frame_time) {
     if (! Ready()) return;
 
+    AdvanceExternalSceneAudio(&m_impl->external_audio, frame_time);
     ProcessPendingSceneLayerDestroy(m_impl);
     m_impl->runtime_seconds += std::max(0.0, frame_time);
 
@@ -9182,8 +9212,7 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
 }
 
 void WPSceneScriptHost::ApplyAudioSamples(const std::vector<float>& audio_samples) {
-    m_impl->external_audio_samples = audio_samples;
-    if (Ready()) UpdateAudioBufferBindings(m_impl);
+    StoreExternalSceneAudioSnapshot(&m_impl->external_audio, audio_samples);
 }
 
 bool WPSceneScriptHost::GetAudioSpectrum(uint32_t resolution, std::vector<float>* left,
