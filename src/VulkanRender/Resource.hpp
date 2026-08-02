@@ -1,5 +1,6 @@
 #pragma once
 #include "Core/NoCopyMove.hpp"
+#include "MaskedDrawAttachmentCache.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
 #include "Vulkan/StagingBuffer.hpp"
 #include "vvk/vma_wrapper.hpp"
@@ -28,6 +29,8 @@ struct RenderingResources {
     // rely on them sharing one depth buffer per output target. Keeping that depth storage here makes
     // the behavior opt-in for model passes and leaves all legacy 2D render targets color-only.
     std::unordered_map<std::string, VmaImageParameters> model_depth_images;
+
+    MaskedDrawAttachmentCache masked_draw_attachments;
 };
 } // namespace vulkan
 } // namespace wallpaper

@@ -71,6 +71,20 @@ struct WPMdl {
     std::vector<Vertex>                  vertexs;
     std::vector<std::array<uint16_t, 3>> indices;
 
+    struct Part {
+        uint32_t id { 0 };
+        uint32_t first_index { 0 };
+        uint32_t index_count { 0 };
+    };
+    std::vector<Part> parts;
+
+    struct MaskBlock {
+        std::string           material;
+        std::vector<uint32_t> clipped_part_indices;
+        std::vector<uint32_t> source_part_indices;
+    };
+    std::vector<MaskBlock> masks;
+
     // std::vector<Eigen::Matrix<float, 3, 4>> bones;
     std::shared_ptr<WPPuppet> puppet;
     // combo

@@ -1,20 +1,20 @@
 #pragma once
+
+#include "MaskedDrawRenderer.hpp"
 #include "ShaderDrawCore.hpp"
+#include "VulkanPass.hpp"
 
-namespace wallpaper
+namespace wallpaper::vulkan
 {
 
-namespace vulkan
-{
-
-class CustomShaderPass : public VulkanPass {
+class MaskedMeshPass final : public VulkanPass {
 public:
     using Desc = ShaderDrawRequest;
 
-    CustomShaderPass(const Desc&);
-    virtual ~CustomShaderPass();
+    explicit MaskedMeshPass(const Desc&);
+    ~MaskedMeshPass() override = default;
 
-    void setDescTex(u32 index, std::string_view tex_key);
+    void setDescTex(u32 index, std::string_view texture_key);
 
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void prepareDeferred(Scene&, const Device&, RenderingResources&) override;
@@ -25,13 +25,13 @@ public:
     void destory(const Device&, RenderingResources&) override;
     bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;
     std::string residencyKey() const override;
-    bool canReuseForResidency(const VulkanPass& next_pass) const override;
+    bool canReuseForResidency(const VulkanPass&) const override;
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
 
 private:
-    ShaderDrawCore m_core;
+    ShaderDrawCore     m_visible_draw;
+    MaskedDrawRenderer m_masked_draw;
 };
 
-} // namespace vulkan
-} // namespace wallpaper
+} // namespace wallpaper::vulkan

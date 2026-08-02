@@ -325,6 +325,273 @@ bool ReadStaticChunk(fs::IBinaryStream& f,
     UpdateStaticBounds(chunk);
     return true;
 }
+
+bool CanReadBytes(const fs::IBinaryStream& f, uint64_t byte_count) {
+    const auto position = f.Tell();
+    const auto size     = f.Size();
+    return position >= 0 && size >= position &&
+           byte_count <= static_cast<uint64_t>(size - position);
+}
+
+bool ReadBoundedString(fs::IBinaryStream& f, std::string& value) {
+    value.clear();
+    while (CanReadBytes(f, 1)) {
+        const char c = static_cast<char>(f.ReadUint8());
+        if (c == '\0') return true;
+        value.push_back(c);
+    }
+    return false;
+}
+
+bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
+                             std::string_view   path,
+                             uint32_t           vertex_count,
+                             WPMdl&             mdl) {
+    mdl.parts.clear();
+    mdl.masks.clear();
+
+    if (mdl.mdlv >= 21) {
+        if (! CanReadBytes(f, sizeof(uint8_t))) {
+            LOG_ERROR("puppet mdl auxiliary-position flag is truncated: %.*s",
+                      static_cast<int>(path.size()),
+                      path.data());
+            return false;
+        }
+
+        const uint8_t has_auxiliary_positions = f.ReadUint8();
+        if (has_auxiliary_positions > 1) {
+            LOG_ERROR("puppet mdl has invalid auxiliary-position flag %u: %.*s",
+                      has_auxiliary_positions,
+                      static_cast<int>(path.size()),
+                      path.data());
+            return false;
+        }
+        if (has_auxiliary_positions != 0) {
+            if (! CanReadBytes(f, sizeof(uint32_t) * 2)) {
+                LOG_ERROR("puppet mdl auxiliary-position header is truncated: %.*s",
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+
+            const uint32_t stream_count = f.ReadUint32();
+            const uint32_t payload_size = f.ReadUint32();
+            const uint64_t expected_size =
+                static_cast<uint64_t>(vertex_count) * 3 * sizeof(float);
+            if (stream_count != 1 || payload_size != expected_size ||
+                ! CanReadBytes(f, payload_size)) {
+                LOG_ERROR("puppet mdl has invalid auxiliary-position payload: %.*s "
+                          "streams=%u bytes=%u expected=%llu remaining=%lld",
+                          static_cast<int>(path.size()),
+                          path.data(),
+                          stream_count,
+                          payload_size,
+                          static_cast<unsigned long long>(expected_size),
+                          static_cast<long long>(f.Size() - f.Tell()));
+                return false;
+            }
+
+            // MDLV0021 and later partitioned puppet meshes can store a second xyz position for every
+            // vertex after the index buffer. The primary stream already contains the runtime-skinned
+            // position and texture coordinates; this authored reference-position stream belongs to
+            // the part/clipping metadata and is not a Vulkan vertex attribute in the current puppet
+            // shader contract. Consume it as one validated block so the following part table remains
+            // exactly aligned across MDLV0021, MDLV0022, and MDLV0023 files.
+            if (! f.SeekCur(payload_size)) {
+                LOG_ERROR("puppet mdl failed to skip auxiliary-position payload: %.*s",
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+        }
+    }
+
+    if (mdl.mdlv >= 21) {
+        if (! CanReadBytes(f, sizeof(uint8_t))) {
+            LOG_ERROR("puppet mdl part-table flag is truncated: %.*s",
+                      static_cast<int>(path.size()),
+                      path.data());
+            return false;
+        }
+
+        const uint8_t has_parts = f.ReadUint8();
+        if (has_parts > 1) {
+            LOG_ERROR("puppet mdl has invalid part-table flag %u: %.*s",
+                      has_parts,
+                      static_cast<int>(path.size()),
+                      path.data());
+            return false;
+        }
+        if (has_parts != 0) {
+            if (! CanReadBytes(f, sizeof(uint32_t))) {
+                LOG_ERROR("puppet mdl part-table size is truncated: %.*s",
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+
+            constexpr uint32_t kPartRecordBytes = sizeof(uint32_t) * 4;
+            const uint32_t     parts_size       = f.ReadUint32();
+            if (parts_size % kPartRecordBytes != 0 || ! CanReadBytes(f, parts_size)) {
+                LOG_ERROR("puppet mdl has invalid part-table byte size %u: %.*s",
+                          parts_size,
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+
+            const uint32_t scalar_index_count = static_cast<uint32_t>(mdl.indices.size() * 3);
+            const uint32_t part_count         = parts_size / kPartRecordBytes;
+            uint32_t       next_first_index   = 0;
+            mdl.parts.reserve(part_count);
+            for (uint32_t part_index = 0; part_index < part_count; part_index++) {
+                WPMdl::Part part;
+                part.id                    = f.ReadUint32();
+                const uint32_t reserved    = f.ReadUint32();
+                part.first_index           = f.ReadUint32();
+                part.index_count           = f.ReadUint32();
+                const bool range_in_bounds =
+                    part.first_index <= scalar_index_count &&
+                    part.index_count <= scalar_index_count - part.first_index;
+                if (reserved != 0 || ! range_in_bounds || part.index_count % 3 != 0 ||
+                    part.first_index != next_first_index) {
+                    LOG_ERROR("puppet mdl has invalid part %u: %.*s id=%u reserved=%u "
+                              "first-index=%u index-count=%u expected-first=%u total-indices=%u",
+                              part_index,
+                              static_cast<int>(path.size()),
+                              path.data(),
+                              part.id,
+                              reserved,
+                              part.first_index,
+                              part.index_count,
+                              next_first_index,
+                              scalar_index_count);
+                    return false;
+                }
+                next_first_index += part.index_count;
+                mdl.parts.push_back(part);
+            }
+            if (next_first_index != scalar_index_count) {
+                LOG_ERROR("puppet mdl part table does not cover its index buffer: %.*s "
+                          "covered=%u total=%u",
+                          static_cast<int>(path.size()),
+                          path.data(),
+                          next_first_index,
+                          scalar_index_count);
+                return false;
+            }
+        }
+    }
+
+    if (mdl.mdlv >= 22) {
+        if (! CanReadBytes(f, sizeof(uint32_t))) {
+            LOG_ERROR("puppet mdl mask count is truncated: %.*s",
+                      static_cast<int>(path.size()),
+                      path.data());
+            return false;
+        }
+
+        const uint32_t mask_count = f.ReadUint32();
+        mdl.masks.reserve(mask_count);
+        for (uint32_t mask_index = 0; mask_index < mask_count; mask_index++) {
+            if (! CanReadBytes(f, sizeof(uint32_t) * 2)) {
+                LOG_ERROR("puppet mdl mask %u header is truncated: %.*s",
+                          mask_index,
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+
+            WPMdl::MaskBlock mask;
+            f.ReadUint32(); // unknown mask record value
+            const uint32_t reserved_before = f.ReadUint32();
+            if (! ReadBoundedString(f, mask.material) ||
+                ! CanReadBytes(f, sizeof(uint32_t) * 2)) {
+                LOG_ERROR("puppet mdl mask %u material block is truncated: %.*s",
+                          mask_index,
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+
+            const uint32_t reserved_after = f.ReadUint32();
+            const uint32_t clipped_count  = f.ReadUint32();
+            if (clipped_count > mdl.parts.size() ||
+                ! CanReadBytes(f, static_cast<uint64_t>(clipped_count) * sizeof(uint32_t))) {
+                LOG_ERROR("puppet mdl mask %u has invalid clipped-part count %u: %.*s",
+                          mask_index,
+                          clipped_count,
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+            mask.clipped_part_indices.resize(clipped_count);
+            for (auto& part_index : mask.clipped_part_indices) {
+                part_index = f.ReadUint32();
+                if (part_index >= mdl.parts.size()) {
+                    LOG_ERROR("puppet mdl mask %u references clipped part %u of %zu: %.*s",
+                              mask_index,
+                              part_index,
+                              mdl.parts.size(),
+                              static_cast<int>(path.size()),
+                              path.data());
+                    return false;
+                }
+            }
+
+            if (! CanReadBytes(f, sizeof(uint32_t))) {
+                LOG_ERROR("puppet mdl mask %u source-part count is truncated: %.*s",
+                          mask_index,
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+            const uint32_t source_count = f.ReadUint32();
+            if (source_count > mdl.parts.size() ||
+                ! CanReadBytes(f, static_cast<uint64_t>(source_count) * sizeof(uint32_t))) {
+                LOG_ERROR("puppet mdl mask %u has invalid source-part count %u: %.*s",
+                          mask_index,
+                          source_count,
+                          static_cast<int>(path.size()),
+                          path.data());
+                return false;
+            }
+            mask.source_part_indices.resize(source_count);
+            for (auto& part_index : mask.source_part_indices) {
+                part_index = f.ReadUint32();
+                if (part_index >= mdl.parts.size()) {
+                    LOG_ERROR("puppet mdl mask %u references source part %u of %zu: %.*s",
+                              mask_index,
+                              part_index,
+                              mdl.parts.size(),
+                              static_cast<int>(path.size()),
+                              path.data());
+                    return false;
+                }
+            }
+
+            if (reserved_before != 0 || reserved_after != 0) {
+                LOG_INFO("puppet mdl mask %u has non-zero reserved values: %.*s before=%u "
+                         "after=%u",
+                         mask_index,
+                         static_cast<int>(path.size()),
+                         path.data(),
+                         reserved_before,
+                         reserved_after);
+            }
+            mdl.masks.push_back(std::move(mask));
+        }
+    }
+
+    LOG_INFO("read puppet mesh metadata: path='%.*s' mdlv=%d vertices=%u parts=%zu masks=%zu",
+             static_cast<int>(path.size()),
+             path.data(),
+             mdl.mdlv,
+             vertex_count,
+             mdl.parts.size(),
+             mdl.masks.size());
+    return true;
+}
 } // namespace
 
 // bytes * size
@@ -523,6 +790,8 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
                  indices_num);
         return true;
     }
+
+    if (! ReadPuppetPartsAndMasks(f, path, vertex_num, mdl)) return false;
 
     mdl.mdls = ReadMDLVesion(f);
     if (mdl.mdls == 0) {
@@ -780,6 +1049,86 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
 
     mesh.AddVertexArray(std::move(vertex));
     mesh.AddIndexArray(SceneIndexArray(indices));
+
+    SceneMesh::MaskedDrawPlan masked_draw;
+    if (! mdl.masks.empty()) {
+        // Resolve MDLV part indices at the parser boundary. Renderer code receives only concrete
+        // index ranges and a stable authored draw schedule, so it never needs to understand MDLV
+        // part tables or rebuild a range-to-mask lookup during Vulkan pass preparation.
+        std::vector<int32_t> group_by_part(mdl.parts.size(), -1);
+        masked_draw.groups.reserve(mdl.masks.size());
+        for (size_t group_index = 0; group_index < mdl.masks.size(); group_index++) {
+            const auto& mask = mdl.masks[group_index];
+            SceneMesh::MaskedDrawGroup group;
+            group.maskTexture = mask.material;
+            group.maskRanges.reserve(mask.source_part_indices.size());
+            for (const auto part_index : mask.source_part_indices) {
+                const auto& part = mdl.parts[part_index];
+                group.maskRanges.push_back(
+                    { .firstIndex = part.first_index, .indexCount = part.index_count });
+            }
+            group.contentRanges.reserve(mask.clipped_part_indices.size());
+            for (const auto part_index : mask.clipped_part_indices) {
+                const auto& part = mdl.parts[part_index];
+                group.contentRanges.push_back(
+                    { .firstIndex = part.first_index, .indexCount = part.index_count });
+                // Preserve the established last-mask-wins rule for malformed overlapping metadata.
+                // Valid Wallpaper Engine assets assign a clipped part to exactly one mask group.
+                group_by_part[part_index] = static_cast<int32_t>(group_index);
+            }
+            masked_draw.groups.push_back(std::move(group));
+        }
+
+        masked_draw.unmaskedRanges.reserve(mdl.parts.size());
+        masked_draw.orderedRanges.reserve(mdl.parts.size());
+        for (size_t part_index = 0; part_index < mdl.parts.size(); part_index++) {
+            const auto& part = mdl.parts[part_index];
+            const SceneMesh::DrawRange range {
+                .firstIndex = part.first_index,
+                .indexCount = part.index_count,
+            };
+            const auto group_index = group_by_part[part_index];
+            masked_draw.orderedRanges.push_back(
+                { .range = range, .groupIndex = group_index });
+            if (group_index < 0) masked_draw.unmaskedRanges.push_back(range);
+        }
+    }
+    const uint32_t bone_count = mdl.puppet != nullptr
+                                    ? static_cast<uint32_t>(mdl.puppet->bones.size())
+                                    : 0;
+    if (! masked_draw.empty()) {
+        LOG_INFO("build masked draw plan: groups=%zu unmasked-ranges=%zu ordered-ranges=%zu "
+                 "bones=%u",
+                 masked_draw.groups.size(),
+                 masked_draw.unmaskedRanges.size(),
+                 masked_draw.orderedRanges.size(),
+                 bone_count);
+        for (size_t group_index = 0; group_index < masked_draw.groups.size(); group_index++) {
+            const auto& group = masked_draw.groups[group_index];
+            LOG_INFO("masked draw group: group=%zu texture='%s' mask-ranges=%zu "
+                     "content-ranges=%zu",
+                     group_index,
+                     group.maskTexture.c_str(),
+                     group.maskRanges.size(),
+                     group.contentRanges.size());
+            for (const auto& range : group.maskRanges) {
+                LOG_INFO("masked draw range: group=%zu role=mask first-index=%u "
+                         "index-count=%u",
+                         group_index,
+                         range.firstIndex,
+                         range.indexCount);
+            }
+            for (const auto& range : group.contentRanges) {
+                LOG_INFO("masked draw range: group=%zu role=content first-index=%u "
+                         "index-count=%u",
+                         group_index,
+                         range.firstIndex,
+                         range.indexCount);
+            }
+        }
+    }
+    mesh.SetMaskedDraw(std::move(masked_draw));
+    mesh.SetSkinning({ .boneCount = bone_count });
 }
 
 void WPMdlParser::GenStaticMesh(SceneMesh& mesh, const WPMdl::StaticChunk& chunk) {
