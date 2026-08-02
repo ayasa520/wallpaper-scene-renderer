@@ -146,53 +146,6 @@ void SetTextureFormatShaderDefine(WPShaderInfo& shader_info, usize slot, Texture
     shader_info.combos["TEX" + std::to_string(slot) + "FORMAT"] = std::string(*define);
 }
 
-std::string DescribeShaderValueMapFull(const ShaderValueMap& values) {
-    std::ostringstream oss;
-    oss << "{";
-    size_t count = 0;
-    for (const auto& [name, value] : values) {
-        if (count != 0) oss << ", ";
-        oss << name << "=[";
-        for (size_t i = 0; i < value.size(); i++) {
-            if (i != 0) oss << ", ";
-            oss << value[i];
-        }
-        oss << "]";
-        count++;
-    }
-    oss << "}";
-    return oss.str();
-}
-
-std::string DescribeUserPropertyForLog(const UserPropertyMap* properties, std::string_view name) {
-    // Visibility regressions are easiest to understand at parse time, before
-    // scripts or live property updates can hide the original state.  This helper
-    // prints the exact tracked value that ResolveObjectVisibility receives.
-    if (properties == nullptr) return "map-null";
-
-    const auto iter = properties->find(std::string(name));
-    if (iter == properties->end()) return "missing";
-
-    if (const auto* string_value = std::get_if<std::string>(&iter->second.value))
-        return std::string("string:") + *string_value;
-
-    const auto* shader_value = std::get_if<ShaderValue>(&iter->second.value);
-    if (shader_value == nullptr) return "unknown";
-
-    std::ostringstream oss;
-    oss << "shader:[";
-    for (size_t index = 0; index < shader_value->size(); index++) {
-        if (index != 0) oss << ",";
-        oss << (*shader_value)[index];
-        if (index >= 3 && shader_value->size() > 4) {
-            oss << ",...";
-            break;
-        }
-    }
-    oss << "]";
-    return oss.str();
-}
-
 void ExtractReferencedLayerNamesFromScript(std::string_view                 script,
                                            std::unordered_set<std::string>& out_names) {
     auto is_identifier_char = [](char ch) {
@@ -815,13 +768,17 @@ void ApplyMissingImageParallaxFallbacks(ParseContext&                   context,
 
 namespace
 {
-constexpr std::string_view kSyntheticColorBlendEffectName {
-    "__hanabi_synthetic_color_blend_effect__"
-};
-
 constexpr std::string_view kSyntheticDirectDrawShapeTextureName {
     "__hanabi_shape_directdraw_transparent_source"
 };
+
+bool UsesShaderColorBlendMode(int32_t color_blend_mode) {
+    return color_blend_mode >= 1 && color_blend_mode <= 30;
+}
+
+BlendMode ResolveObjectFinalBlend(BlendMode authored_blend, int32_t color_blend_mode) {
+    return color_blend_mode == 31 ? BlendMode::Additive : authored_blend;
+}
 
 void EnsureSystemTextureRegistered(Scene& scene, std::string_view texture_key) {
     auto* synthetic_parser = AsSyntheticImageParser(scene.imageParser.get());
@@ -1615,6 +1572,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
 bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer& effect_layer,
                                    std::string_view initial_source, int32_t owner_layer_id,
                                    std::string_view         owner_name,
+                                   int32_t                  color_blend_mode,
                                    const WPShaderValueData* final_transform_data = nullptr) {
     auto& vfs = *context.vfs;
 
@@ -1633,6 +1591,10 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
 
     if (composite_source.textures.empty()) composite_source.textures.resize(1);
     composite_source.textures[0] = std::string(initial_source);
+    // Modes 1..30 are framebuffer-aware shader blend equations. Modes 0 and 31 use the neutral
+    // shader variant; mode 31 is expressed by the final fixed-function additive state instead.
+    composite_source.combos["BLENDMODE"] =
+        UsesShaderColorBlendMode(color_blend_mode) ? color_blend_mode : 0;
 
     WPShaderInfo composite_shader_info;
     composite_shader_info.baseConstSvs = context.global_base_uniforms;
@@ -1704,6 +1666,10 @@ ResolveHiddenFinalCompositePolicy(const wpscene::WPImageObject& image) {
 SceneImageEffectLayer::SourcePolicy ResolveImageEffectSourcePolicy(
     bool is_compose_layer, const wpscene::WPImageObject& image) {
     if (!is_compose_layer) return SceneImageEffectLayer::SourcePolicy::OwnerNode;
+    // copybackground composition layers seed their private source from the owner framebuffer
+    // material before routed children are accumulated. Ordinary composition layers instead author
+    // their source exclusively through routed children; drawing the owner framebuffer again would
+    // composite the already-rendered scene a second time and brighten the complete wallpaper.
     return image.copybackground ? SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren
                                 : SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly;
 }
@@ -2089,11 +2055,13 @@ EffectWriterTransformContract BuildImageEffectFinalCompositeContract(
     EffectWriterTransformContract contract;
     contract.parallax_depth = ImageObjectParallaxDepth(image);
     if (uses_routed_parent) {
-        // Image final composites are detached screen writers. The render graph supplies the routed
-        // parent transform, while this parallax anchor supplies only the parent mouse-parallax
-        // component needed by hidden authored-effect fallbacks.
-        contract.parent_transform =
-            ParentTransformContract::ParallaxAnchorWhenCompatible(image.parent);
+        // Effect-backed image world nodes deliberately force the authored parent as their parallax
+        // anchor because their physical SceneNode is detached and routed only for render order. The
+        // private final composite is the actual visible writer, so it must mirror that same anchor
+        // rather than re-running compatibility selection against its own synthetic node data. This
+        // keeps parented media covers and other routed effect layers moving with their authored
+        // parent while the route matrix continues to supply only the raw transform hierarchy.
+        contract.parent_transform = ParentTransformContract::ForceParallaxAnchor(image.parent);
     }
     return contract;
 }
@@ -2113,16 +2081,9 @@ struct ImageEffectMaterialTopology {
     }
 };
 
-ImageEffectWriterRole ResolveImageEffectWriterRole(bool is_compose_layer,
-                                                   const wpscene::WPImageEffect& effect,
-                                                   int32_t materialized_effect_count) {
+ImageEffectWriterRole ResolveImageEffectWriterRole(bool is_compose_layer) {
     if (is_compose_layer) return ImageEffectWriterRole::LayerSurfaceProxy;
-
-    const bool is_single_synthetic_color_blend_writer =
-        effect.name == kSyntheticColorBlendEffectName && materialized_effect_count == 1;
-    return is_single_synthetic_color_blend_writer
-               ? ImageEffectWriterRole::LayerSurfaceProxy
-               : ImageEffectWriterRole::AuthoredEffectProjection;
+    return ImageEffectWriterRole::AuthoredEffectProjection;
 }
 
 EffectWriterTransformContract BuildTextEffectFinalCompositeContract(
@@ -2130,27 +2091,40 @@ EffectWriterTransformContract BuildTextEffectFinalCompositeContract(
     EffectWriterTransformContract contract;
     contract.parallax_depth = TextObjectParallaxDepth(text);
     if (LayerUsesRoutedParent(text.parent, text.attachment)) {
-        // Text final composites also receive the routed parent transform from the render graph, but
-        // parent-routed text effect nodes already carry that parent camera-parallax through the
-        // route matrix path. This writer keeps the authored child depth while suppressing another
-        // model-parallax pass on itself.
-        contract.suppress_own_model_parallax = true;
+        // The route matrix contains the authored parent transform but never shader-time mouse
+        // parallax. Match the normal text-node contract here: zero-depth text inherits the closest
+        // compatible parent parallax anchor, while text with an independent authored depth keeps its
+        // own offset. The final composite then applies exactly one parallax contract instead of
+        // suppressing the only offset available to effect-backed weekday/date labels.
+        contract.parent_transform =
+            ParentTransformContract::ParallaxAnchorWhenCompatible(text.parent);
     }
     return contract;
 }
 
 EffectWriterTransformContract BuildImageEffectMaterialContract(
     const wpscene::WPImageObject& image, SceneImageEffectLayer& effect_layer,
-    const ImageEffectMaterialTopology& topology) {
+    const ImageEffectMaterialTopology& topology, bool private_layer_surface_writer) {
     EffectWriterTransformContract contract;
     contract.parallax_depth   = ImageObjectParallaxDepth(image);
     contract.projection_layer = &effect_layer;
 
+    if (private_layer_surface_writer) {
+        // An animated puppet surface writer rasterizes the skinned mesh through the layer-local
+        // source camera, then the neutral final composite places that resolved texture in scene
+        // space. Camera parallax belongs exclusively to that final scene-space placement. Applying
+        // it during the private puppet draw as well shifts the body inside its texture, while a
+        // bone-attached child receives the parent's parallax only through its attachment transform;
+        // the two pieces therefore separate as the pointer moves. Keep the private rasterization
+        // local so the final composite and every attachment observe one shared parallax transform.
+        contract.suppress_own_model_parallax = true;
+    }
+
     if (topology.NeedsLayerSurfaceParentParallax()) {
         // This decision is based on render topology, not on authored parallax values. Compose
-        // layers and synthetic color-blend-only image layers have no authored effect projection that
-        // should own a separate child-space parallax result; their resolved screen writer is the
-        // layer image itself, merely routed through the image-effect path. Match the no-effect
+        // layers have no authored effect projection that should own a separate child-space parallax
+        // result; their resolved screen writer is the layer image itself, merely routed through the
+        // image-effect path. Match the no-effect
         // image-layer contract by inheriting the authored parent's parallax anchor, so virtual
         // render-order parents keep routed visual layers locked together.
         //
@@ -4087,23 +4061,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         RegisterLogicalImageLayer(context, wpimgobj, false);
     };
 
-    // coloBlendMode load passthrough manaully
-    if (wpimgobj.colorBlendMode != 0) {
-        wpscene::WPImageEffect colorEffect;
-        wpscene::WPMaterial    colorMat;
-        nlohmann::json         json;
-        if (! PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
-                         json))
-            return;
-        colorMat.FromJson(json);
-        colorMat.combos["BONECOUNT"] = 1;
-        colorMat.combos["BLENDMODE"] = wpimgobj.colorBlendMode;
-        colorMat.blending            = "disabled";
-        colorEffect.name             = std::string(kSyntheticColorBlendEffectName);
-        colorEffect.materials.push_back(colorMat);
-        wpimgobj.effects.push_back(colorEffect);
-    }
-
     int32_t count_eff = 0;
     for (const auto& wpeffobj : wpimgobj.effects) {
         const auto effect_visibility =
@@ -4117,13 +4074,15 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     const bool is_offscreen_dependency_source =
         context.scene != nullptr &&
         context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0;
+    const bool has_shader_color_blend = UsesShaderColorBlendMode(wpimgobj.colorBlendMode);
     // Wallpaper Engine `dependencies` expose a layer through `_rt_imageLayerComposite_<id>`
     // even when the source layer has no authored effects. Such layers still need a private source
     // render target because the visible consumer samples that source while the layer itself remains
     // hidden in the main scene. Treating dependency-only image layers as effect-backed sources lets
     // the existing effect camera/ping-pong path materialize the raw image or mask without drawing
     // it directly into `_rt_default`.
-    bool hasEffect = hasAuthoredEffect || is_offscreen_dependency_source;
+    bool hasEffect =
+        hasAuthoredEffect || has_shader_color_blend || is_offscreen_dependency_source;
     // Detached effect world nodes still need to inherit the parent transform even though they
     // cannot become real scene-graph children of that parent. SceneScript/property-animation
     // also needs a dedicated logical/world node for image layers with effects, otherwise runtime
@@ -4237,9 +4196,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
 
         if (hasAnimatedPuppetMesh) {
             if (hasEffect) {
-                // Keep the offscreen draw extents in scene/display units so effect
-                // composition matches the original visual size. Only the backing
-                // render targets may use a reduced source resolution.
+                // Effects operate on a rectangular layer-local source, then the original image
+                // material is appended as the authoritative puppet surface writer. Reusing that
+                // material is required because puppet images may carry extra textures and shader
+                // semantics such as iris movement and blink masks that a neutral passthrough cannot
+                // reconstruct from the resolved color texture alone.
                 GenCardMesh(
                     mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
                 WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
@@ -4249,8 +4210,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 puppet_mat             = wpimgobj.material;
                 puppet_mat.textures[0] = "";
                 WPMdlParser::AddPuppetMatInfo(puppet_mat, *puppet);
-                puppet_effect.materials.push_back(puppet_mat);
-                wpimgobj.effects.push_back(puppet_effect);
+                puppet_effect.materials.push_back(std::move(puppet_mat));
+                wpimgobj.effects.push_back(std::move(puppet_effect));
             } else {
                 svData.puppet_layer = WPPuppetLayer(puppet->puppet);
                 svData.puppet_layer.prepared(wpimgobj.puppet_layers);
@@ -4296,10 +4257,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         }
     }
     // material blendmode for last step to use
-    auto imgBlendMode = material.blenmode;
+    auto imgBlendMode = ResolveObjectFinalBlend(material.blenmode, wpimgobj.colorBlendMode);
     // disable img material blend, as it's the first effect node now
     if (hasEffect) {
         material.blenmode = BlendMode::Normal;
+    } else {
+        material.blenmode = imgBlendMode;
     }
     mesh.AddMaterial(std::move(material));
     spImgNode->AddMesh(spMesh);
@@ -4393,6 +4356,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // active scene camera.
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalBlend(imgBlendMode);
+            imgEffectLayer->SetFinalOutputPolicy(
+                wpimgobj.config.authoredEffectIsFinalWriter
+                    ? SceneImageEffectLayer::FinalOutputPolicy::AuthoredWriter
+                    : SceneImageEffectLayer::FinalOutputPolicy::PrivateAuthoredThenComposite);
+            imgEffectLayer->SetCopyBackground(wpimgobj.copybackground);
             const auto source_policy = ResolveImageEffectSourcePolicy(isCompose, wpimgobj);
             imgEffectLayer->SetSourceContributionPolicy(source_policy);
             if (isCompose) {
@@ -4443,12 +4411,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                          wpimgobj.fullscreen ? "true" : "false");
             }
         }
-        if (hasAuthoredEffect) {
-            // The neutral final composite is only useful when an authored effect chain can have a
-            // hidden final output pass. Dependency-only sources intentionally stop at the first
-            // ping-pong target so `_rt_imageLayerComposite_<id>` samples the raw source texture
-            // instead of adding an unreachable screen-space fallback node that could overwrite the
-            // link-source bookkeeping.
+        if (hasAuthoredEffect || has_shader_color_blend) {
+            // Dependency-only sources intentionally stop at the first ping-pong target so
+            // `_rt_imageLayerComposite_<id>` samples the raw source texture. Every real authored
+            // chain and every framebuffer-aware color blend instead uses Wallpaper Engine's
+            // independent final passthrough publisher.
             const auto finalCompositeTransformData = BuildEffectWriterTransformData(
                 context,
                 BuildImageEffectFinalCompositeContract(wpimgobj,
@@ -4458,6 +4425,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                           effect_ppong_a,
                                           wpimgobj.id,
                                           wpimgobj.name,
+                                          wpimgobj.colorBlendMode,
                                           &finalCompositeTransformData);
         }
         int32_t i_eff = -1;
@@ -4483,11 +4451,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                          effect_visibility.initial_visible ? "true" : "false",
                          effect_visibility.authored_visible ? "true" : "false");
             }
-            const bool isSyntheticColorBlendEffect =
-                wpeffobj.name == kSyntheticColorBlendEffectName;
             const ImageEffectMaterialTopology effect_material_topology {
                 .uses_routed_parent = uses_routed_parent,
-                .writer_role        = ResolveImageEffectWriterRole(isCompose, wpeffobj, count_eff),
+                .writer_role        = ResolveImageEffectWriterRole(isCompose),
             };
 
             // this will be replace when resolve, use here to get rt info
@@ -4607,13 +4573,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 }
                 auto spEffNode = std::make_shared<SceneNode>();
                 ShaderValueMap effectBaseConstSvs = baseConstSvs;
-                if (isSyntheticColorBlendEffect) {
-                    // The passthrough blend pass should preserve the source render target's alpha,
-                    // but it must not tint that texture a second time with the object's RGB color.
-                    effectBaseConstSvs["g_Color4"] =
-                        std::array<float, 4> { 1.0f, 1.0f, 1.0f, initial_alpha };
-                    effectBaseConstSvs["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
-                }
                 WPShaderInfo wpEffShaderInfo;
                 wpEffShaderInfo.baseConstSvs = std::move(effectBaseConstSvs);
                 wpEffShaderInfo.baseConstSvs["g_EffectTextureProjectionMatrix"] =
@@ -4648,7 +4607,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                         context,
                         BuildImageEffectMaterialContract(wpimgobj,
                                                          *imgEffectLayer,
-                                                         effect_material_topology),
+                                                         effect_material_topology,
+                                                         hasAnimatedPuppetMesh && wpmat.use_puppet),
                         svData);
                     if (hasAnimatedPuppetMesh && wpmat.use_puppet) {
                         svData.puppet_layer = WPPuppetLayer(puppet->puppet);
@@ -4768,7 +4728,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             BuildEffectVisibilityContract(wp_effect, context.user_properties);
         if (! effect_visibility.can_prune_at_parse_time) text_effect_count++;
     }
-    const bool has_effect  = text_effect_count > 0;
+    const bool has_shader_color_blend = UsesShaderColorBlendMode(text_obj.colorBlendMode);
+    const bool has_effect = text_effect_count > 0 || has_shader_color_blend;
     auto       spWorldNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
                                                          Vector3f(text_obj.scale.data()),
                                                          Vector3f(text_obj.angles.data()),
@@ -4827,7 +4788,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                                       display_size[1],
                                                                       primitive->bridge.pingpong_a,
                                                                       primitive->bridge.pingpong_b);
-        imgEffectLayer->SetFinalBlend(BlendMode::Translucent);
+        imgEffectLayer->SetFinalBlend(
+            ResolveObjectFinalBlend(BlendMode::Translucent, text_obj.colorBlendMode));
         imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
         imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
         scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
@@ -4854,6 +4816,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                       primitive->bridge.pingpong_a,
                                       text_obj.id,
                                       text_obj.name,
+                                      text_obj.colorBlendMode,
                                       &finalCompositeTransformData);
 
         const std::string in_rt        = primitive->bridge.pingpong_a;
@@ -5698,6 +5661,7 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     image_obj.material         = std::move(transparent_source_material);
     image_obj.effects          = std::move(shape_obj.effects);
     image_obj.nopadding        = true;
+    image_obj.config.authoredEffectIsFinalWriter = true;
 
     LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
              "visual-size=[%.3f, %.3f] visual-policy=%s effect-source-policy=%s "
@@ -7413,34 +7377,6 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                                                       lazy_kind);
             layer_visibility_contracts[object_id] = visibility_contract;
 
-            if (object_name == "Stars" || object_id == 1183 || object_id == 413) {
-                const auto* visible_json = FindVisibleProperty(obj);
-                const auto  binding =
-                    ReadVisibleBindingFromJson(visible_json, ReadAuthoredVisibleValue(obj));
-                // The 3308867900 star-river layers are user-property controlled
-                // particle layers.  Logging their parse-time contract separates
-                // "the scene was parsed with defaults" from "runtime changed it
-                // later", which is the key distinction for switch-only flicker.
-                LOG_INFO("SceneVisibilityProbe: id=%d name='%s' particle=%s user='%s' "
-                         "condition='%s' property=%s authored=%s binding-value=%s "
-                         "initial=%s runtime-contract=%s lazy=%s",
-                         object_id,
-                         object_name.c_str(),
-                         obj.contains("particle") && ! obj.at("particle").is_null() ? "true"
-                                                                                    : "false",
-                         binding.user.name.c_str(),
-                         binding.user.condition.c_str(),
-                         DescribeUserPropertyForLog(user_properties, binding.user.name).c_str(),
-                         visibility_contract.authored_visible ? "true" : "false",
-                         binding.value ? "true" : "false",
-                         visibility_contract.initial_visible ? "true" : "false",
-                         visibility_contract.requires_runtime_contract ? "true" : "false",
-                         lazy_kind == LazyMaterializeKind::Image
-                             ? "image"
-                             : (lazy_kind == LazyMaterializeKind::Particle
-                                    ? "particle"
-                                    : (lazy_kind == LazyMaterializeKind::Text ? "text" : "none")));
-            }
         }
 
         if (obj.contains("image") && ! obj.at("image").is_null()) {

@@ -112,16 +112,26 @@ bool SceneImageEffectLayer::HasVisibleSourceLessContribution() const {
 }
 
 bool SceneImageEffectLayer::ShouldRunFinalComposite() const {
-    // The neutral final composite has two modes. Ordinary image/text layers keep their historical
-    // direct final writer while visible and use this pass only as a preserve-source hidden fallback.
-    // Source-less passthrough helpers have no meaningful base image, so this pass becomes the only
-    // screen publisher and draws only while the helper chain has a visible source contribution.
-    if (!HasFinalComposite() || m_final_composite.output_effect == nullptr) return false;
-    if (m_final_composite.publishes_visible_output) return HasVisibleSourceLessContribution();
-    if (m_final_composite.publishes_private_output) {
-        if (m_final_composite.output_effect->LocalVisible()) return true;
-        return m_final_composite.hidden_policy == HiddenFinalCompositePolicy::PreserveSource;
+    if (!HasFinalComposite()) return false;
+
+    // The neutral final composite has three explicit roles. It is the stable publisher for ordinary
+    // private-authored chains, the conditional publisher for source-less generator helpers, and the
+    // hidden-effect bypass for layers whose authored final shader normally writes the visible target.
+    // Keeping those roles state-driven prevents an AuthoredWriter layer from being drawn twice while
+    // retaining the independent publisher required by normal image/text and color-blend-only layers.
+    if (m_final_composite.publishes_visible_output) {
+        return HasVisibleSourceLessContribution();
     }
+    if (m_final_composite.publishes_private_output) {
+        if (m_final_composite.hidden_policy == HiddenFinalCompositePolicy::SuppressOutput) {
+            return HasVisibleSourceLessContribution();
+        }
+        return true;
+    }
+
+    // A configured composite with no authored output node is itself the only publisher. This occurs
+    // for contracts such as shader color blending without an authored effect list.
+    if (m_final_composite.output_effect == nullptr) return true;
     if (m_final_composite.output_effect->LocalVisible()) return false;
     return m_final_composite.hidden_policy == HiddenFinalCompositePolicy::PreserveSource;
 }
@@ -132,11 +142,9 @@ void SceneImageEffectLayer::SetFinalCompositeSource(std::string source) {
     auto* material = m_final_node->Mesh()->Material();
     if (material == nullptr) return;
 
-    // The final composite is deliberately separate from every authored effect shader. Ordinary
-    // layers use it to draw the bypassed ping-pong texture when the final authored effect is hidden.
-    // Source-less passthrough helpers use the same neutral shader as their stable screen publisher,
-    // with the authored final effect kept private so visibility changes cannot leave stale direct
-    // framebuffer writes behind.
+    // The final composite is deliberately separate from every authored effect shader. Depending on
+    // the layer publication contract it is either the stable publication boundary for the resolved
+    // ping-pong texture or the dormant bypass publisher used only when an AuthoredWriter is hidden.
     if (material->textures.empty()) material->textures.resize(1);
     material->textures[0] = std::move(source);
 }
@@ -257,7 +265,7 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
             it->camera_override.clear();
             it->use_active_camera_for_parallax = false;
             it->clear_before_draw              = false;
-            it->force_alpha_write              = false;
+            it->alpha_write_policy             = AlphaWritePolicy::Preserve;
             it->sceneNode->CopyTrans(default_node);
             it->sceneNode->Mesh()->ChangeMeshDataFrom(default_mesh);
 
@@ -315,11 +323,9 @@ void SceneImageEffectLayer::ResolveFinalCompositeNode(
     const Eigen::Affine3f* resolved_world_affine) {
     if (!HasFinalComposite()) return;
 
-    // Prepare a neutral fallback output but do not make it the normal resolved writer. Visible
-    // final effects keep Wallpaper Engine's authored behavior by drawing directly to the
-    // inherited output target. When that final effect is hidden, the renderer gates this node on
-    // and samples the bypassed ping-pong target so the layer still contributes its unmodified
-    // input instead of going blank.
+    // The independent material is prepared for both publication contracts. Private-authored layers
+    // use it as their normal layer-surface publisher; AuthoredWriter layers keep it dormant until a
+    // hidden final effect needs the current bypassed ping-pong source to remain visible.
     SetFinalCompositeSource(std::string(final_composite_source));
     auto& mesh     = *m_final_node->Mesh();
     auto& material = *mesh.Material();
@@ -452,7 +458,7 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
         final_output_node.sceneNode->SetCamera(std::string());
         final_output_node.camera_override = std::string(layer_surface_cam);
         final_output_node.use_active_camera_for_parallax = false;
-        final_output_node.force_alpha_write = true;
+        final_output_node.alpha_write_policy = AlphaWritePolicy::SourceOver;
         // The private layer-surface writer may target the same ping-pong texture that was used
         // as the initial card source. Clear it before drawing the puppet mesh so unskinned card
         // pixels cannot survive around mesh holes or transparent regions.

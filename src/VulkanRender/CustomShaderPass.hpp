@@ -35,7 +35,7 @@ public:
         std::function<bool()>    should_execute;
         std::vector<std::string> textures;
         std::string              output;
-        bool                     force_alpha_write { false };
+        AlphaWritePolicy         alpha_write_policy { AlphaWritePolicy::Preserve };
         // Some helper passes publish an offscreen target whose RGB is already premultiplied by the
         // producer's translucent blend. The pass still uses the material's authored blend mode, but
         // the RGB source factor must be ONE to avoid multiplying color by alpha twice.

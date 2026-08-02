@@ -46,10 +46,14 @@ public:
                           VideoTexturePlaybackState initial_state =
                               VideoTexturePlaybackState::Playing);
     void          ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key,
-                                      const std::unordered_set<std::string>& stopped_keys);
+                                      const std::unordered_set<std::string>& stopped_keys,
+                                      const std::unordered_map<std::string, double>& rates_by_key);
     void          SetGlobalPaused(bool paused);
     void          ApplySeekRequests(std::unordered_map<std::string, double>& seek_seconds_by_key);
     void          Poll();
+    void          PublishRuntimeStates(
+                 std::unordered_map<std::string, VideoTextureRuntimeState>& states,
+                 const std::unordered_set<std::string>& requested_keys);
     void          RecordUploads(vvk::CommandBuffer&);
     void          Clear();
     bool          Release(std::string_view key);
@@ -69,6 +73,7 @@ private:
     bool         applyPipelinePlaybackState(Entry&);
     bool         setPaused(Entry&, bool paused);
     bool         stopPlayback(Entry&);
+    bool         setPlaybackRate(Entry&, double rate);
     bool         seekTo(Entry&, double seconds);
     bool         uploadSample(Entry&, ::GstSample*);
 

@@ -19,13 +19,17 @@ namespace
 {
 constexpr std::string_view kTextBackgroundTextureKey { "__text_layer_background_white" };
 
-std::string TextPipelineCompatibilityKey(bool offscreen_output) {
+std::string TextPipelineCompatibilityKey(bool offscreen_output,
+                                         wallpaper::BlendMode blend_mode,
+                                         wallpaper::AlphaWritePolicy alpha_write_policy) {
     // Text PSOs are shared by render-pass compatibility plus the full GraphicsPipeline descriptor,
     // not by the layer that first requested them. This keeps visibility toggles on the same model
     // as engine-level PSO caches while still letting hidden text release atlas/framebuffer memory.
     return "TextPass|format=rgba8|final=shader-read|load=" +
            std::to_string(static_cast<int>(offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                            : VK_ATTACHMENT_LOAD_OP_LOAD));
+                                                            : VK_ATTACHMENT_LOAD_OP_LOAD)) +
+           "|blend=" + std::to_string(static_cast<int>(blend_mode)) +
+           "|alpha-policy=" + std::to_string(static_cast<int>(alpha_write_policy));
 }
 
 struct TextPassUniforms {
@@ -250,6 +254,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
                                     RenderingResources&                   rr,
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
+                                    wallpaper::AlphaWritePolicy           alpha_write_policy,
                                     std::string                           debug_name,
                                     PipelineParameters&                   pipeline_parameters) {
     auto render_pass =
@@ -281,15 +286,37 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
     const auto vertex_layout = ResolveTextVertexInputLayout(primitive);
     if (!vertex_layout.has_value()) return false;
 
+    // colorBlendMode 31 is Wallpaper Engine's fixed-function additive case. Shader blend modes
+    // 1..30 are handled later by the independent final passthrough, so their text source remains an
+    // ordinary translucent offscreen raster.
+    const auto blend_mode =
+        !offscreen_output && primitive.object.colorBlendMode == 31
+            ? wallpaper::BlendMode::Additive
+            : wallpaper::BlendMode::Translucent;
     VkPipelineColorBlendAttachmentState blend_state {};
-    blend_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    SetBlend(wallpaper::BlendMode::Translucent, blend_state);
+    blend_state.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    if (offscreen_output) blend_state.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+    SetBlend(blend_mode, blend_state);
+    if (offscreen_output && alpha_write_policy != wallpaper::AlphaWritePolicy::Preserve) {
+        // Composition attachments keep their authored RGB blend but use an explicit coverage
+        // equation. copybackground=false selects Alpha-MAX so later transparent draws cannot erase
+        // coverage accumulated by earlier routed children.
+        blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        if (alpha_write_policy == wallpaper::AlphaWritePolicy::Max) {
+            blend_state.alphaBlendOp = VK_BLEND_OP_MAX;
+            blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        } else {
+            blend_state.alphaBlendOp = VK_BLEND_OP_ADD;
+            blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        }
+    }
 
     GraphicsPipeline pipeline;
     pipeline.toDefault();
     pipeline_parameters.debug_name = std::move(debug_name);
-    pipeline_parameters.cache_key  = TextPipelineCompatibilityKey(offscreen_output);
+    pipeline_parameters.cache_key =
+        TextPipelineCompatibilityKey(offscreen_output, blend_mode, alpha_write_policy);
     pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -333,6 +360,7 @@ TextPass::TextPass(const Desc& desc) {
     m_desc.layer_id            = desc.layer_id;
     m_desc.execute_when_hidden = desc.execute_when_hidden;
     m_desc.output              = desc.output;
+    m_desc.alpha_write_policy  = desc.alpha_write_policy;
 }
 TextPass::~TextPass() = default;
 
@@ -348,7 +376,8 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
     // represented by the stable node/layer/output residency key. Visibility gates and the live
     // scene pointer are safe to absorb without recreating shader modules or descriptor layouts.
     return residencyKey() == next->residencyKey() &&
-           m_desc.execute_when_hidden == next->m_desc.execute_when_hidden;
+           m_desc.execute_when_hidden == next->m_desc.execute_when_hidden &&
+           m_desc.alpha_write_policy == next->m_desc.alpha_write_policy;
 }
 
 void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
@@ -359,6 +388,7 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.layer_id            = next->m_desc.layer_id;
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
     m_desc.output              = next->m_desc.output;
+    m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
 }
 
 bool TextPass::referencesRenderTarget(std::string_view render_target) const {
@@ -515,7 +545,13 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
         "TextPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
     if (!CreateTextPipelineForPrimitive(
-            device, rr, *primitive, offscreen_output, debug_name, m_desc.pipeline)) {
+            device,
+            rr,
+            *primitive,
+            offscreen_output,
+            m_desc.alpha_write_policy,
+            debug_name,
+            m_desc.pipeline)) {
         return;
     }
     if (!recreateFramebuffer(device)) return;
@@ -571,8 +607,13 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
         "TextPassWarmup[node=" +
         (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
-    return CreateTextPipelineForPrimitive(
-        device, rr, *primitive, offscreen_output, debug_name, m_desc.pipeline);
+    return CreateTextPipelineForPrimitive(device,
+                                          rr,
+                                          *primitive,
+                                          offscreen_output,
+                                          m_desc.alpha_write_policy,
+                                          debug_name,
+                                          m_desc.pipeline);
 }
 
 void TextPass::refreshResources(Scene& scene, const Device& device, RenderingResources& rr) {

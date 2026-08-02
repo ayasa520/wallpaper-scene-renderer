@@ -687,8 +687,7 @@ void SceneWallpaper::pause() {
     msg->post();
 }
 void SceneWallpaper::requestFrame() {
-    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(), RenderHandler::CMD::CMD_DRAW);
-    msg->post();
+    m_main_handler->renderHandler()->frame_timer.RequestFrame();
 }
 
 void SceneWallpaper::mouseInput(double x, double y) {
@@ -947,11 +946,10 @@ void MainHandler::loadScene() {
         msg->post();
     }
 
-    // draw first frame
-    {
-        auto msg = CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_DRAW);
-        msg->post();
-    }
+    // The timer owns the single outstanding draw gate. Startup and producer-triggered requests use
+    // that same path so scene parsing or initial Vulkan setup cannot accumulate dozens of stale
+    // CMD_DRAW messages in front of live pointer input.
+    m_render_handler->frame_timer.RequestFrame();
 }
 void MainHandler::sendRenderReady() {
     auto self = weak_from_this().lock();
@@ -980,10 +978,13 @@ bool MainHandler::init() {
     m_render_loop->registerHandler(m_render_handler);
 
     {
-        auto  msg        = CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_DRAW);
         auto& frameTimer = m_render_handler->frame_timer;
-        frameTimer.SetCallback([msg]() {
-            msg->post();
+        std::weak_ptr<RenderHandler> render_handler = m_render_handler;
+        frameTimer.SetCallback([render_handler]() {
+            if (auto handler = render_handler.lock()) {
+                auto msg = CreateMsgWithCmd(handler, RenderHandler::CMD::CMD_DRAW);
+                msg->post();
+            }
         });
         frameTimer.SetRequiredFps(15);
         frameTimer.Run();

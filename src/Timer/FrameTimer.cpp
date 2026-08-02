@@ -8,17 +8,7 @@ using micros = std::chrono::microseconds;
 using namespace std::chrono;
 
 FrameTimer::FrameTimer(std::function<void()> cb)
-    : m_callback(cb), m_frame_busy_count(0), m_timer([this]() {
-          microseconds wait_time = m_frametime.load();
-          auto         ideatime  = m_ideatime.load();
-          wait_time              = wait_time > ideatime ? wait_time / 2 : ideatime;
-          m_timer.SetInterval(wait_time);
-
-          if (m_callback && m_frame_busy_count <= 3) {
-              m_frame_busy_count++;
-              m_callback();
-          }
-      }) {
+    : m_callback(cb), m_timer([this]() { RequestFrame(); }) {
     SetRequiredFps(15);
 }
 
@@ -45,9 +35,15 @@ void FrameTimer::UpdateFrametime() {
 }
 
 void FrameTimer::SetRequiredFps(u16 value) {
-    m_req_fps             = value;
-    microseconds ideatime = milliseconds(1000 / m_req_fps);
-    m_ideatime            = ideatime;
+    m_req_fps = value;
+    // Preserve the fractional part of rates such as 60 Hz. The old millisecond division produced
+    // a 16 ms interval (62.5 Hz), which caused uneven request phases against the producer's exact
+    // 16.667 ms frame clock and increased both missed swaps and visible pointer jitter.
+    const auto ideatime = microseconds(
+        (microseconds::period::den + static_cast<uint64_t>(m_req_fps) - 1u) /
+        static_cast<uint64_t>(m_req_fps));
+    m_ideatime = ideatime;
+    m_timer.SetInterval(ideatime);
     for (usize i = 0; i < FrameTimer::FRAMETIME_QUEUE_SIZE; i++) {
         AddFrametime(ideatime);
     }
@@ -64,15 +60,32 @@ void FrameTimer::AddFrametime(micros t) {
 void FrameTimer::FrameBegin() { m_clock = steady_clock::now(); }
 void FrameTimer::FrameEnd() {
     auto now = steady_clock::now();
-    AddFrametime(duration_cast<microseconds>(now - m_clock));
+    const auto elapsed = duration_cast<microseconds>(now - m_clock);
+    AddFrametime(elapsed);
     UpdateFrametime();
 
-    i32 expected = m_frame_busy_count.load();
-    while (expected > 0) {
-        if (m_frame_busy_count.compare_exchange_weak(expected, expected - 1)) {
-            break;
-        }
+    m_frame_outstanding.store(false, std::memory_order_release);
+    if (Running() && elapsed >= m_ideatime.load()) {
+        // When rendering itself is slower than the target interval, waiting for another timer tick
+        // inserts avoidable idle time. Queue the next frame immediately, but only after releasing
+        // the outstanding gate so pointer messages already waiting on the render looper stay ahead
+        // of the new draw. RequestFrame's compare-exchange also resolves a concurrent timer tick
+        // without ever allowing two queued/in-flight draws.
+        RequestFrame();
     }
+}
+
+void FrameTimer::RequestFrame() {
+    if (! m_callback) return;
+
+    bool expected = false;
+    if (! m_frame_outstanding.compare_exchange_strong(expected,
+                                                       true,
+                                                       std::memory_order_acq_rel,
+                                                       std::memory_order_acquire)) {
+        return;
+    }
+    m_callback();
 }
 
 void FrameTimer::SetCallback(const std::function<void()>& cb) {

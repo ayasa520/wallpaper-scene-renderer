@@ -65,6 +65,17 @@ enum class BlendMode
     Normal
 };
 
+// Alpha writes need an explicit compositor contract independent from the material's RGB blend.
+// Wallpaper Engine uses ordinary material alpha state for most draws, source-over coverage for
+// resolved private publishers, and Alpha-MAX when a composition attachment must accumulate its
+// silhouette without allowing later transparent fragments to reduce existing coverage.
+enum class AlphaWritePolicy
+{
+    Preserve,
+    SourceOver,
+    Max,
+};
+
 enum class ShaderType
 {
     VERTEX,

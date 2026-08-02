@@ -500,39 +500,6 @@ const char* TargetKindName(WPSceneScriptTargetKind target_kind) {
     return "layer";
 }
 
-bool IsOpacityUniformName(std::string_view property_name) {
-    return property_name == "alpha" || property_name == "g_Alpha" ||
-           property_name == "g_UserAlpha";
-}
-
-bool IsOpacityRegistration(const WPSceneScriptRegistration& registration) {
-    if (registration.target_kind == WPSceneScriptTargetKind::Layer) {
-        return registration.property_name == "alpha";
-    }
-    if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
-        return IsOpacityUniformName(registration.property_name);
-    }
-    return false;
-}
-
-float ClampOpacityScalar(float opacity) {
-    if (! std::isfinite(opacity)) return 0.0f;
-    return std::clamp(opacity, 0.0f, 1.0f);
-}
-
-WPDynamicValue ClampOpacityRegistrationValue(const WPSceneScriptRegistration& registration,
-                                             const WPDynamicValue&            value) {
-    if (! IsOpacityRegistration(registration)) return value;
-
-    float opacity = 0.0f;
-    if (! value.tryGet(&opacity)) return value;
-
-    // Opacity registrations are shader alpha inputs with a normalized 0..1 output domain. Keep
-    // this clamp at the registration boundary so authored Bezier overshoot remains available to
-    // scale, origin, color, and other non-opacity animation targets.
-    return WPDynamicValue(ClampOpacityScalar(opacity));
-}
-
 LayerValueHint SceneValueType(std::string_view property_name) {
     if (property_name == "clearcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "ambientcolor") return { WPDynamicValue::Type::Float3, true };
@@ -1228,11 +1195,15 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "scripts\n"
         << "    // degrade to cheap no-ops instead of throwing on every render tick.\n"
         << "    return {\n"
+        << "      get duration() { return Number(__native.videoTextureCall(nodeId, 'duration')) || 0; },\n"
+        << "      get rate() { return Number(__native.videoTextureCall(nodeId, 'rate')) || 0; },\n"
+        << "      set rate(value) { __native.videoTextureCall(nodeId, 'rate', value); },\n"
         << "      play() { __native.videoTextureCall(nodeId, 'play'); },\n"
         << "      pause() { __native.videoTextureCall(nodeId, 'pause'); },\n"
         << "      stop() { __native.videoTextureCall(nodeId, 'stop'); },\n"
         << "      setCurrentTime(value) { __native.videoTextureCall(nodeId, 'setCurrentTime', "
            "value); },\n"
+        << "      getCurrentTime() { return Number(__native.videoTextureCall(nodeId, 'getCurrentTime')) || 0; },\n"
         << "      isPlaying() { return !!__native.videoTextureCall(nodeId, 'isPlaying'); }\n"
         << "    };\n"
         << "  }\n"
@@ -5755,18 +5726,27 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
     if (property_name == "bloom") {
         bool enabled = false;
         if (! value.tryGet(&enabled)) return false;
+        const bool topology_changed = opaque->scene->bloom.enabled != enabled;
         opaque->scene->bloom.enabled = enabled;
-        // Scene-level Bloom follows the same stable-topology contract as authored image effects:
-        // the pass stays in the render graph and the user toggle only changes a uniform. Rebuilding
-        // the graph here would recreate Vulkan passes/framebuffers and make the highlight switch
-        // noticeably heavier than ordinary post-process visibility changes.
-        if (!update_scene_bloom_uniform("u_enabled", ShaderValue(enabled ? 1.0f : 0.0f))) {
-            LOG_INFO("SceneGeneralApply: property='bloom' value=%s bloom-node=missing",
-                     enabled ? "true" : "false");
-            return true;
+        update_scene_bloom_uniform("u_enabled", ShaderValue(enabled ? 1.0f : 0.0f));
+
+        if (topology_changed) {
+            // The official renderer uses the scene Bloom bit to include or exclude the whole
+            // post-process, rather than drawing neutral black through the disabled chain. Preserve
+            // parsed shader nodes for a future enable, but rebuild graph topology so disabled Bloom
+            // has no per-frame GPU cost. Private Bloom targets are retired only after the old graph
+            // releases its pass descriptors; enabling again cancels any not-yet-drained retirement.
+            opaque->scene->renderGraphDirty = true;
+            opaque->scene->renderGraphTopologyDirty = true;
+            for (const auto& output : opaque->scene->bloom.outputs) {
+                if (output.empty() || output == SpecTex_Default) continue;
+                if (enabled) {
+                    opaque->scene->pendingRenderTargetReleaseKeys.erase(output);
+                } else {
+                    opaque->scene->pendingRenderTargetReleaseKeys.insert(output);
+                }
+            }
         }
-        LOG_INFO("SceneGeneralApply: property='bloom' value=%s topology-dirty=false",
-                 enabled ? "true" : "false");
         return true;
     }
     if (property_name == "bloomtint") {
@@ -6084,7 +6064,11 @@ std::optional<WPDynamicValue> ReadRegistrationValue(const WPSceneScriptHost::Opa
 bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
                             const WPSceneScriptRegistration& registration,
                             const WPDynamicValue&            value) {
-    const auto runtime_value = ClampOpacityRegistrationValue(registration, value);
+    // Layer alpha is also script state. Beat scripts may intentionally animate through values above
+    // one (for example 0..2) and read that value back on the next frame to decide when the attack
+    // phase has completed. The UNORM render target performs the eventual output saturation; clamping
+    // here traps such scripts below their authored maximum and leaves the layer permanently active.
+    const auto& runtime_value = value;
     const auto current = ReadRegistrationValue(opaque, registration);
     const bool is_text_registration =
         registration.target_kind == WPSceneScriptTargetKind::Layer &&
@@ -7483,7 +7467,8 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
 
     const bool command_requires_video_decoder =
         command == "play" || command == "pause" || command == "stop" ||
-        command == "setCurrentTime";
+        command == "setCurrentTime" || command == "getCurrentTime" ||
+        command == "duration" || command == "rate";
     if (command_requires_video_decoder &&
         opaque->scene->deferredRuntimeImageLayerIds.count(node_id) != 0) {
         // Some Wallpaper Engine intro layers intentionally start hidden, then call
@@ -7503,12 +7488,68 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
 
     auto* node = FindNodeById(opaque, node_id);
     if (node == nullptr) {
-        return command == "isPlaying" ? JS_NewBool(context, false) : JS_UNDEFINED;
+        if (command == "isPlaying") return JS_NewBool(context, false);
+        if (command == "getCurrentTime" || command == "duration" || command == "rate") {
+            return JS_NewFloat64(context, command == "rate" ? 1.0 : 0.0);
+        }
+        return JS_UNDEFINED;
     }
 
     const auto keys = ResolveVideoTextureKeysForNode(opaque, node);
     if (keys.empty()) {
-        return command == "isPlaying" ? JS_NewBool(context, false) : JS_UNDEFINED;
+        if (command == "isPlaying") return JS_NewBool(context, false);
+        if (command == "getCurrentTime" || command == "duration" || command == "rate") {
+            return JS_NewFloat64(context, command == "rate" ? 1.0 : 0.0);
+        }
+        return JS_UNDEFINED;
+    }
+
+    if (command == "getCurrentTime" || command == "duration") {
+        double value = 0.0;
+        for (const auto& key : keys) {
+            opaque->scene->videoTextureRuntimeStateRequests.insert(key);
+            const auto state_it = opaque->scene->videoTextureRuntimeStates.find(key);
+            if (state_it == opaque->scene->videoTextureRuntimeStates.end()) continue;
+            value = std::max(value,
+                             command == "duration" ? state_it->second.duration
+                                                   : state_it->second.currentTime);
+        }
+        return JS_NewFloat64(context, value);
+    }
+
+    if (command == "rate") {
+        if (argc >= 3) {
+            double rate = 1.0;
+            if (JS_ToFloat64(context, &rate, argv[2]) != 0 || !std::isfinite(rate)) {
+                LOG_ERROR("SceneVideoTextureRateRequest: layer=%d invalid rate argument", node_id);
+                return JS_UNDEFINED;
+            }
+            const double normalized_rate = std::max(0.0, rate);
+            for (const auto& key : keys) {
+                const auto current_it = opaque->scene->videoTextureRates.find(key);
+                if (current_it != opaque->scene->videoTextureRates.end() &&
+                    std::abs(current_it->second - normalized_rate) <= 0.000001) {
+                    continue;
+                }
+                opaque->scene->videoTextureRates[key] = normalized_rate;
+            }
+            return JS_UNDEFINED;
+        }
+
+        double rate = 1.0;
+        for (const auto& key : keys) {
+            if (auto desired_it = opaque->scene->videoTextureRates.find(key);
+                desired_it != opaque->scene->videoTextureRates.end()) {
+                rate = desired_it->second;
+                break;
+            }
+            if (auto state_it = opaque->scene->videoTextureRuntimeStates.find(key);
+                state_it != opaque->scene->videoTextureRuntimeStates.end()) {
+                rate = state_it->second.rate;
+                break;
+            }
+        }
+        return JS_NewFloat64(context, rate);
     }
 
     if (command == "play" || command == "pause" || command == "stop") {
@@ -7547,11 +7588,12 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
         // owns the concrete decoder has been prepared.
         const double clamped_seconds = std::max(0.0, seconds);
         for (const auto& key : keys) {
+            const auto pending_it = opaque->scene->videoTextureSeekRequests.find(key);
+            if (pending_it != opaque->scene->videoTextureSeekRequests.end() &&
+                std::abs(pending_it->second - clamped_seconds) <= 0.000001) {
+                continue;
+            }
             opaque->scene->videoTextureSeekRequests[key] = clamped_seconds;
-            LOG_INFO("SceneVideoTextureSeekRequest: layer=%d texture='%s' seconds=%.3f",
-                     node_id,
-                     key.c_str(),
-                     clamped_seconds);
         }
         return JS_UNDEFINED;
     }
@@ -7559,6 +7601,12 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     if (command == "isPlaying") {
         bool any_playing = false;
         for (const auto& key : keys) {
+            opaque->scene->videoTextureRuntimeStateRequests.insert(key);
+            if (auto state_it = opaque->scene->videoTextureRuntimeStates.find(key);
+                state_it != opaque->scene->videoTextureRuntimeStates.end()) {
+                any_playing = any_playing || state_it->second.isPlaying;
+                continue;
+            }
             if (opaque->scene->videoTextureStopped.count(key) != 0) continue;
             const auto paused_it = opaque->scene->videoTexturePaused.find(key);
             const bool paused =
@@ -8131,20 +8179,37 @@ void UpdateAudioBufferBindings(WPSceneScriptHost::Opaque* opaque) {
         return;
     }
 
-    JSContext* context = opaque->runtime.context;
-    for (auto& binding : opaque->audio_buffers) {
+    struct CachedSpectrum {
         std::vector<float> left;
         std::vector<float> right;
         std::vector<float> average;
-        if (! GetExternalAudioBufferValues(opaque, binding.resolution, &left, &right, &average)) {
-            if (opaque->scene == nullptr || opaque->scene->soundManager == nullptr)
-                continue;
-            opaque->scene->soundManager->GetSpectrum(binding.resolution, &left, &right, &average);
+    };
+
+    JSContext*                                  context = opaque->runtime.context;
+    std::unordered_map<uint32_t, CachedSpectrum> spectra_by_resolution;
+    for (auto& binding : opaque->audio_buffers) {
+        auto [spectrum_it, inserted] = spectra_by_resolution.try_emplace(binding.resolution);
+        auto& spectrum = spectrum_it->second;
+        if (inserted &&
+            ! GetExternalAudioBufferValues(opaque,
+                                           binding.resolution,
+                                           &spectrum.left,
+                                           &spectrum.right,
+                                           &spectrum.average)) {
+            if (opaque->scene != nullptr && opaque->scene->soundManager != nullptr) {
+                opaque->scene->soundManager->GetSpectrum(binding.resolution,
+                                                         &spectrum.left,
+                                                         &spectrum.right,
+                                                         &spectrum.average);
+            }
         }
 
-        UpdateJSFloat32Array(context, binding.left, left);
-        UpdateJSFloat32Array(context, binding.right, right);
-        UpdateJSFloat32Array(context, binding.average, average);
+        // Audio buffers are registered per script instance, but every registration with the same
+        // resolution observes the same frame-global spectrum. Cache that resampling result once
+        // so audio-reactive wallpapers do not repeat the normalization work for every text layer.
+        UpdateJSFloat32Array(context, binding.left, spectrum.left);
+        UpdateJSFloat32Array(context, binding.right, spectrum.right);
+        UpdateJSFloat32Array(context, binding.average, spectrum.average);
     }
 }
 
@@ -8158,8 +8223,7 @@ bool ApplyPropertyAnimationInstance(WPSceneScriptHost::Opaque* opaque,
                                                      animation.registration.value_type);
     if (! raw_value.has_value()) return false;
 
-    const auto value = ClampOpacityRegistrationValue(animation.registration, *raw_value);
-    return ApplyRegistrationValue(opaque, animation.registration, value);
+    return ApplyRegistrationValue(opaque, animation.registration, *raw_value);
 }
 
 void UpdatePropertyAnimations(WPSceneScriptHost::Opaque* opaque, double frame_time) {

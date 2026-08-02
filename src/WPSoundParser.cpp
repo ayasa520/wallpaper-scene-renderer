@@ -136,10 +136,6 @@ public:
             return;
         }
 
-        LOG_INFO("SceneSoundSwitch: path='%s' channels=%u sample-rate=%u",
-                 path.c_str(),
-                 m_desc.channels,
-                 m_desc.sampleRate);
     }
     uint32_t LoopIndex() {
         if (m_config.mode == PlaybackMode::Random) {
