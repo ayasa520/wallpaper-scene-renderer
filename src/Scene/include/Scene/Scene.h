@@ -233,6 +233,16 @@ public:
     // entry, and let the Vulkan render thread erase each request only after the matching decoder
     // has accepted it.
     std::unordered_map<std::string, double> videoTextureSeekRequests;
+    // Playback rate is a persistent IVideoTexture property. QuickJS writes the desired value here,
+    // and the Vulkan render thread applies it to the matching GStreamer entries before polling the
+    // next decoded frame.
+    std::unordered_map<std::string, double> videoTextureRates;
+    // Decoder timing belongs to GStreamer, while scripts execute before the render-thread poll.
+    // Publish a coherent previous-frame snapshot instead of exposing pipeline objects across the
+    // script/render boundary. Only requested keys are queried so unrelated video wallpapers pay no
+    // synchronous position/duration query cost.
+    std::unordered_map<std::string, VideoTextureRuntimeState> videoTextureRuntimeStates;
+    std::unordered_set<std::string> videoTextureRuntimeStateRequests;
 
     std::string scene_id { "unknown_id" };
 

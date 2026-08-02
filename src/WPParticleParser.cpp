@@ -1,6 +1,7 @@
 #include "WPParticleParser.hpp"
 #include "Particle/ParticleEmitter.h"
 #include "Particle/ParticleModify.h"
+#include "Particle/ParticleParallelExecutor.h"
 #include "Particle/ParticleSystem.h"
 #include <random>
 #include <memory>
@@ -675,15 +676,28 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
             double     speed = Random::get(tur.speedmin, tur.speedmax);
 
             return [=](const ParticleInfo& info) {
-                for (auto& p : info.particles) {
-                    Vector3d pos = PM::GetPos(p).cast<double>();
-                    pos.x() += phase + tur.timescale * info.time;
-                    Vector3d result = speed * algorism::CurlNoise(pos * tur.scale * 2).normalized();
-                    for (usize i = 0; i < 3; i++) {
-                        if (tur.mask[i] == 0) result[i] = 0;
+                // Turbulence is an independent field evaluation for every live particle. Large
+                // authored systems routinely contain tens of thousands of particles, so executing
+                // this operator serially makes the render thread spend an entire frame budget in
+                // CurlNoise alone. The shared executor partitions one immutable ParticleInfo span
+                // into disjoint ranges; each worker mutates only its own particles and the render
+                // thread waits before the next operator observes the updated velocities.
+                ParticleParallelExecutor::Instance().ParallelFor(
+                    info.particles.size(), [&](size_t begin, size_t end) {
+                    for (size_t particle_index = begin; particle_index < end; particle_index++) {
+                        auto& p = info.particles[particle_index];
+                        if (! PM::LifetimeOk(p)) continue;
+
+                        Vector3d pos = PM::GetPos(p).cast<double>();
+                        pos.x() += phase + tur.timescale * info.time;
+                        Vector3d result =
+                            speed * algorism::CurlNoise(pos * tur.scale * 2).normalized();
+                        for (usize i = 0; i < 3; i++) {
+                            if (tur.mask[i] == 0) result[i] = 0;
+                        }
+                        PM::Accelerate(p, result, info.time_pass);
                     }
-                    PM::Accelerate(p, result, info.time_pass);
-                }
+                });
             };
         } else if (name == "vortex") {
             Vortex v = Vortex::ReadFromJson(wpj);

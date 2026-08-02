@@ -13,6 +13,13 @@ enum class VideoTexturePlaybackState {
     Stopped,
 };
 
+struct VideoTextureRuntimeState {
+    double   currentTime { 0.0 };
+    double   duration { 0.0 };
+    double   rate { 1.0 };
+    bool     isPlaying { false };
+};
+
 struct SceneTexture {
     std::string     url;
     TextureSample   sample;

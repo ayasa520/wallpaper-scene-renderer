@@ -29,7 +29,7 @@ struct SceneImageEffectNode {
     std::string camera_override;
     bool        use_active_camera_for_parallax { false };
     bool        clear_before_draw { false };
-    bool        force_alpha_write { false };
+    AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
     // Some effect chains end with a synthetic layer-surface writer. Animated puppet images with
     // authored effects are the important case: intermediate shaders run as fullscreen private
     // passes, then the final synthetic material samples that result through the puppet mesh so
@@ -130,6 +130,7 @@ public:
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
     SceneNode&  FinalNode() const { return *m_final_node; }
     SourcePolicy SourceContributionPolicy() const { return m_source_policy; }
+    FinalOutputPolicy DeclaredFinalOutputPolicy() const { return m_final_output_policy; }
     bool        HasFinalComposite() const;
     bool        ShouldRunFinalComposite() const;
     bool        PublishesPrivateFinalComposite() const {
@@ -141,6 +142,11 @@ public:
     void        SetFinalCompositeSource(std::string source);
     void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
     void        SetSourceContributionPolicy(SourcePolicy policy) { m_source_policy = policy; }
+    void        SetFinalOutputPolicy(FinalOutputPolicy policy) { m_final_output_policy = policy; }
+    void        SetCopyBackground(bool copy_background) { m_copy_background = copy_background; }
+    AlphaWritePolicy CompositionChildAlphaWritePolicy() const {
+        return m_copy_background ? AlphaWritePolicy::Preserve : AlphaWritePolicy::Max;
+    }
     void        SetHiddenFinalCompositePolicy(HiddenFinalCompositePolicy policy) {
         // Hidden final effects have two valid source contracts. Ordinary images/text preserve the
         // pre-effect source when an effect is disabled. Source-less passthrough/compose helpers must
@@ -159,7 +165,8 @@ public:
                        std::string_view final_output,
                        bool keep_final_output_private = false,
                        const Eigen::Affine3f* resolved_world_affine = nullptr,
-                       FinalOutputPolicy final_output_policy = FinalOutputPolicy::AuthoredWriter);
+                       FinalOutputPolicy final_output_policy =
+                           FinalOutputPolicy::PrivateAuthoredThenComposite);
 
 private:
     struct FinalCompositeState {
@@ -204,6 +211,8 @@ private:
     // a shader such as godrays_combine into a tiny world-space quad and makes the rays disappear.
     bool m_fullscreen { false };
     SourcePolicy m_source_policy { SourcePolicy::OwnerNode };
+    FinalOutputPolicy m_final_output_policy { FinalOutputPolicy::PrivateAuthoredThenComposite };
+    bool m_copy_background { false };
     //    std::vector<float> m_size;
     std::unique_ptr<SceneMesh> m_source_mesh;
     std::unique_ptr<SceneMesh> m_final_mesh;
@@ -216,7 +225,7 @@ private:
     bool                       m_resolved_output_follows_world { true };
     bool                       m_resolved_output_mesh_follows_final_mesh { true };
     FinalCompositeState        m_final_composite;
-    BlendMode                  m_final_blend;
+    BlendMode                  m_final_blend { BlendMode::Normal };
 
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
 

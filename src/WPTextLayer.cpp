@@ -2576,6 +2576,7 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     ReadLiteralOrDynamicValue(json, "text", &text);
     ReadLiteralOrDynamicValue(json, "font", &font);
     ReadLiteralOrDynamicValue(json, "color", &color);
+    GET_JSON_NAME_VALUE_NOWARN(json, "colorBlendMode", colorBlendMode);
     ReadLiteralOrDynamicValue(json, "backgroundcolor", &backgroundcolor);
     ReadLiteralOrDynamicValue(json, "backgroundbrightness", &backgroundbrightness);
     ReadLiteralOrDynamicValue(json, "alpha", &alpha);
@@ -2678,10 +2679,8 @@ std::optional<WPDynamicValue> wallpaper::ReadTextLayerProperty(const TextLayerRu
         result = WPDynamicValue(object.maxwidth);
     }
 
-    // Property reads sit on the per-frame script hot path. Logging every successful read made
-    // unchanged Clock/Date/Day scripts emit thousands of lines per minute and could dominate the
-    // minute-rollover cost we are trying to measure. Keep diagnostics on mutations/layout/resource
-    // events instead, where they describe real renderer work rather than ordinary value polling.
+    // Property reads sit on the per-frame script hot path. Keep that path silent and reserve
+    // diagnostics for mutations, layout changes, and resource failures that represent real work.
     return result;
 }
 

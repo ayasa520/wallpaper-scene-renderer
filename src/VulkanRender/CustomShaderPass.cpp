@@ -112,7 +112,7 @@ CustomShaderPass::CustomShaderPass(const Desc& desc) {
     m_desc.should_execute      = desc.should_execute;
     m_desc.textures            = desc.textures;
     m_desc.output              = desc.output;
-    m_desc.force_alpha_write   = desc.force_alpha_write;
+    m_desc.alpha_write_policy  = desc.alpha_write_policy;
     m_desc.premultiplied_source_blend = desc.premultiplied_source_blend;
     m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.camera_override     = desc.camera_override;
@@ -144,10 +144,9 @@ bool CustomShaderPass::canReuseForResidency(const VulkanPass& next_pass) const {
            m_desc.depth_test == next->m_desc.depth_test &&
            m_desc.depth_write == next->m_desc.depth_write &&
            m_desc.clear_depth == next->m_desc.clear_depth &&
-           // Forced alpha changes the prepared pipeline's color write mask and alpha blend factors.
-           // Reusing a pass across that boundary would keep the old alpha contract alive even after
-           // the render graph reroutes a composition child into a transparent source target.
-           m_desc.force_alpha_write == next->m_desc.force_alpha_write &&
+           // Alpha policy changes the prepared pipeline's color write mask, blend operation, and
+           // factors. Reusing a pass across that boundary would keep stale composition coverage.
+           m_desc.alpha_write_policy == next->m_desc.alpha_write_policy &&
            m_desc.premultiplied_source_blend ==
                next->m_desc.premultiplied_source_blend &&
            m_desc.clear_before_draw == next->m_desc.clear_before_draw &&
@@ -174,7 +173,7 @@ void CustomShaderPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.should_execute = next->m_desc.should_execute;
     m_desc.textures       = next->m_desc.textures;
     m_desc.output         = next->m_desc.output;
-    m_desc.force_alpha_write = next->m_desc.force_alpha_write;
+    m_desc.alpha_write_policy = next->m_desc.alpha_write_policy;
     m_desc.premultiplied_source_blend = next->m_desc.premultiplied_source_blend;
     m_desc.clear_before_draw = next->m_desc.clear_before_draw;
     m_desc.camera_override = next->m_desc.camera_override;
@@ -426,7 +425,7 @@ wallpaper::SceneCullMode ResolveModelCullMode(wallpaper::SceneCullMode mode,
 
 bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
                                   std::string_view                camera_name,
-                                  bool                             force_alpha_write) {
+                                  wallpaper::AlphaWritePolicy      alpha_write_policy) {
     const bool is_model_pass = material.modelRenderState.has_value();
     // Model shaders may output non-opaque alpha for their own material math even when the authored
     // object is visually opaque. Allowing that alpha into `_rt_default` makes FinPass present a
@@ -434,11 +433,10 @@ bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
     // translucent model materials, but preserve the target alpha just like global 2D passes.
     if (is_model_pass) return false;
 
-    // Only neutral publisher passes may opt in to camera-less alpha writes. Authored effect shaders
-    // such as auto_sway can legally output alpha=1 for helper regions; letting those shaders write
-    // alpha directly into a parent composition source turns the source into a dark matte instead of
-    // the resolved child texture.
-    if (force_alpha_write) return true;
+    // Explicit compositor policies opt in to camera-less alpha writes. Authored effect shaders such
+    // as auto_sway otherwise retain the historical camera-derived mask because their helper regions
+    // can legally output alpha=1 without representing final layer coverage.
+    if (alpha_write_policy != wallpaper::AlphaWritePolicy::Preserve) return true;
 
     return ! (camera_name.empty() || wallpaper::sstart_with(camera_name, "global"));
 }
@@ -449,17 +447,28 @@ std::string_view EffectiveCustomShaderCamera(
     return desc.node != nullptr ? std::string_view(desc.node->Camera()) : std::string_view {};
 }
 
-void PreservePublisherAlpha(bool             source_over_alpha,
-                                      bool             writes_alpha,
-                                      VkPipelineColorBlendAttachmentState& blend_state) {
-    if (! source_over_alpha || ! writes_alpha || ! blend_state.blendEnable) {
+void ApplyAlphaWritePolicy(wallpaper::AlphaWritePolicy                policy,
+                           bool                                       writes_alpha,
+                           VkPipelineColorBlendAttachmentState&       blend_state) {
+    if (!writes_alpha || policy == wallpaper::AlphaWritePolicy::Preserve) return;
+
+    // Alpha coverage is independent from the authored RGB equation. SourceOver publishes a
+    // resolved private silhouette, while Max matches Wallpaper Engine's copybackground=false
+    // attachment state: later transparent fragments may expand coverage but never reduce coverage
+    // already written by an earlier attachment.
+    if (!blend_state.blendEnable) {
+        blend_state.blendEnable = true;
+        blend_state.colorBlendOp = VK_BLEND_OP_ADD;
+        blend_state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blend_state.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    }
+    blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    if (policy == wallpaper::AlphaWritePolicy::Max) {
+        blend_state.alphaBlendOp = VK_BLEND_OP_MAX;
+        blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         return;
     }
-
-    // Neutral publisher passes are the last step that places a resolved private effect texture into
-    // a composition source. Keep their RGB blend authored, but compose alpha as source-over coverage
-    // so the parent effect receives the child's real silhouette.
-    blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_state.alphaBlendOp = VK_BLEND_OP_ADD;
     blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 }
 
@@ -479,27 +488,6 @@ void ApplyPremultipliedSourceBlend(
         blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     }
-}
-
-void LogForcedAlphaPolicy(const wallpaper::vulkan::CustomShaderPass::Desc& desc,
-                          const wallpaper::SceneMaterial&                  material,
-                          std::string_view                                 camera_name,
-                          bool                                             writes_alpha,
-                          VkColorComponentFlags                            color_mask) {
-    if (! desc.force_alpha_write) return;
-
-    LOG_INFO("CustomShaderForceAlphaPolicy: layer=%d node='%s' camera='%.*s' material='%s' "
-             "output='%s' writes-alpha=%s color-mask=0x%x blend=%d premultiplied-source=%s",
-             desc.layer_id,
-             desc.node != nullptr ? desc.node->Name().c_str() : "",
-             static_cast<int>(camera_name.size()),
-             camera_name.data(),
-             material.name.c_str(),
-             desc.output.c_str(),
-             writes_alpha ? "true" : "false",
-             static_cast<unsigned>(color_mask),
-             static_cast<int>(material.blenmode),
-             desc.premultiplied_source_blend ? "true" : "false");
 }
 
 void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
@@ -583,7 +571,8 @@ CustomShaderRenderState BuildCustomShaderRenderState(
     VkColorComponentFlags   color_mask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
     const auto camera_name = EffectiveCustomShaderCamera(desc);
-    const bool writes_alpha = ShouldWriteCustomShaderAlpha(material, camera_name, desc.force_alpha_write);
+    const bool writes_alpha =
+        ShouldWriteCustomShaderAlpha(material, camera_name, desc.alpha_write_policy);
 
     if (writes_alpha) color_mask |= VK_COLOR_COMPONENT_A_BIT;
     state.color_blend.colorWriteMask = color_mask;
@@ -591,13 +580,12 @@ CustomShaderRenderState BuildCustomShaderRenderState(
     const auto blend_mode = material.blenmode;
     SetBlend(blend_mode, state.color_blend);
     ApplyPremultipliedSourceBlend(desc, writes_alpha, state.color_blend);
-    PreservePublisherAlpha(desc.force_alpha_write, writes_alpha, state.color_blend);
+    ApplyAlphaWritePolicy(desc.alpha_write_policy, writes_alpha, state.color_blend);
     desc.blending = state.color_blend.blendEnable;
 
     SetAttachmentLoadOp(blend_mode, state.color_load_op);
     ApplyModelPassDesc(material, desc, state.color_load_op);
     ApplyExplicitClearPolicy(desc, material, state.color_load_op);
-    LogForcedAlphaPolicy(desc, material, camera_name, writes_alpha, color_mask);
     return state;
 }
 
@@ -1206,9 +1194,8 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         auto* shader_updater = scene.shaderValueUpdater.get();
         auto& sprites        = m_desc.sprites_map;
         auto& vk_textures    = m_desc.vk_textures;
-        // The update lambda still needs the live material pointer to write authored uniforms after
-        // the one-off audio diagnostics are removed; keep that dependency explicit in the capture
-        // list instead of rediscovering the material through the scene node at execution time.
+        // Keep the material dependency explicit in the capture list because the updater writes the
+        // authored uniforms directly and should not rediscover the material through the scene node.
         auto* material = mesh.Material();
 
         // Keep Star-River-style dynamic mesh uploads separate from general pass updates. Only the

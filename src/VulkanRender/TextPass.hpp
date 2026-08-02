@@ -31,6 +31,7 @@ public:
         int32_t     layer_id { 0 };
         bool        execute_when_hidden { false };
         std::string output;
+        AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
 
         ImageParameters          vk_output;
         vvk::Framebuffer         framebuffer;

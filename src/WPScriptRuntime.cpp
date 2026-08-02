@@ -436,7 +436,7 @@ std::string BuildWrappedScript(std::string_view script_source) {
             << "    PLAYBACK_OTHER: 3\n"
             << "  }));\n"
             << "  const __makeNoopAnimation = () => ({ play() {}, stop() {}, pause() {}, isPlaying() { return false; }, getFrame() { return 0; }, setFrame() {}, join() {}, addEndedCallback() {} });\n"
-            << "  const __makeNoopVideoTexture = () => ({ play() {}, pause() {}, stop() {}, setCurrentTime() {}, isPlaying() { return false; } });\n"
+            << "  const __makeNoopVideoTexture = () => ({ duration: 0, rate: 1, play() {}, pause() {}, stop() {}, setCurrentTime() {}, getCurrentTime() { return 0; }, isPlaying() { return false; } });\n"
             << "  const __makeIdentityTransformMatrix = () => ({ m: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] });\n"
             << "  const WEMath = (globalThis.WEMath && typeof globalThis.WEMath === 'object')\n"
             << "    ? globalThis.WEMath\n"

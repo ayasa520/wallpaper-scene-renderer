@@ -17,6 +17,7 @@ public:
 
     void Run();
     void Stop();
+    void RequestFrame();
 
     u16    RequiredFps() const;
     bool   Running() const;
@@ -39,7 +40,11 @@ private:
     u16                                    m_req_fps;
     std::atomic<std::chrono::microseconds> m_frametime;
     std::atomic<std::chrono::microseconds> m_ideatime;
-    std::atomic<i32>                       m_frame_busy_count;
+    // A frame request remains outstanding from the moment it is posted until the render thread
+    // finishes that draw. Keeping a single global gate here lets periodic ticks, startup draws,
+    // and explicit producer requests share the same latest-frame scheduling contract instead of
+    // building a FIFO queue of stale frames ahead of pointer input.
+    std::atomic<bool>                      m_frame_outstanding { false };
 
     ThreadTimer m_timer;
 

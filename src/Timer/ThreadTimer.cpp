@@ -16,16 +16,20 @@ void ThreadTimer::Start() {
     std::unique_lock<std::mutex> lock(m_op_mutex);
 
     if (Running()) return;
+    // Publish the running state before the worker starts. Starting the thread first allowed it to
+    // observe the default false value and exit before Start() stored true, making frame scheduling
+    // dependent on an avoidable launch race.
+    m_running = true;
     m_timer_thread = std::thread([this]() {
         while (Running()) {
             {
                 std::unique_lock<std::mutex> lock(m_cond_mutex);
-                m_condition.wait_for(lock, m_interval.load());
+                m_condition.wait_for(lock, m_interval.load(), [this]() { return ! Running(); });
             }
+            if (! Running()) break;
             if (m_callback) m_callback();
         }
     });
-    m_running      = true;
 }
 
 void ThreadTimer::Stop() {

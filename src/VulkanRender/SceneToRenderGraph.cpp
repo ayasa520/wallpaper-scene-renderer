@@ -188,7 +188,7 @@ struct OrderedRenderGraphChild {
 };
 
 struct NodePassOptions {
-    bool        force_alpha_write { false };
+    AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
     bool        clear_before_draw { false };
     std::string camera_override;
     bool        use_active_camera_for_parallax { false };
@@ -201,6 +201,9 @@ struct TraversalRoute {
     std::optional<Eigen::Matrix4d> model;
     bool                           compose_source { false };
     std::string                    compose_source_camera;
+    AlphaWritePolicy               compose_source_alpha_write_policy {
+        AlphaWritePolicy::Preserve
+    };
     bool                           premultiplied_source_blend { false };
 };
 
@@ -313,9 +316,7 @@ static std::string_view OwnerNodeSourceFallbackReasonName(
     return "unknown";
 }
 
-static bool OwnerNodeSourceFallbackSamplesFramebuffer(
-    SceneNode* node, OwnerNodeSourceFallbackReason reason) {
-    if (reason != OwnerNodeSourceFallbackReason::EmptyProxyDependencySource) return false;
+static bool NodeMaterialSamplesFramebuffer(SceneNode* node) {
     if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr) {
         return false;
     }
@@ -331,6 +332,7 @@ struct EffectSourceRoutingDecision {
     };
     bool        owner_node_source_fallback { false };
     bool        owner_node_source_fallback_samples_framebuffer { false };
+    bool        owner_node_samples_framebuffer { false };
     bool        owner_node_contributes_to_effect_source { false };
     bool        proxy_children_contribute_to_effect_source { false };
     std::string active_compose_source_camera;
@@ -355,7 +357,8 @@ static EffectSourceRoutingDecision ResolveEffectSourceRouting(SceneNode* node,
     decision.owner_node_source_fallback =
         decision.owner_node_fallback_reason != OwnerNodeSourceFallbackReason::None;
     decision.owner_node_source_fallback_samples_framebuffer =
-        OwnerNodeSourceFallbackSamplesFramebuffer(node, decision.owner_node_fallback_reason);
+        decision.owner_node_source_fallback && NodeMaterialSamplesFramebuffer(node);
+    decision.owner_node_samples_framebuffer = NodeMaterialSamplesFramebuffer(node);
     decision.owner_node_contributes_to_effect_source =
         EffectSourceUsesOwnerNode(imgeff) || decision.owner_node_source_fallback;
     decision.proxy_children_contribute_to_effect_source = EffectSourceUsesProxyChildren(imgeff);
@@ -390,23 +393,26 @@ static NodePassOptions BuildOwnerSourcePassOptions(
     // these side effects grouped so future route types can extend the pass contract without adding
     // another cluster of loosely related booleans inside ToGraphPass().
     //
-    // - Composition source routes write child layers into a parent-local source target, so they need
-    //   alpha writes and sometimes a source-camera projection override.
-    // - Empty dependency compose layers sample the live framebuffer through their owner material, so
-    //   their uniforms must be evaluated against the active camera while the pass still writes its
-    //   private offscreen target.
+    // - Composition source routes write child layers into a parent-local source target. Their alpha
+    //   policy comes from the parent composition layer's copybackground contract.
+    // - Any owner material that samples the live framebuffer must evaluate world geometry against
+    //   the active scene camera even though the pass writes a private source target. The
+    //   composelayer vertex shader separately turns authored texture coordinates into the fullscreen
+    //   output quad, so using the private effect camera for both roles creates the cursor-following
+    //   rectangular region seen in incorrect implementations.
     // - Private effect source targets are cleared only at the seed step; clearing later authored
     //   effect passes would erase intermediate waterwaves/foliagesway/opacity results.
     return NodePassOptions {
-        .force_alpha_write = route.compose_source,
+        .alpha_write_policy = route.compose_source
+            ? route.compose_source_alpha_write_policy
+            : AlphaWritePolicy::Preserve,
         .clear_before_draw = clear_private_effect_source,
         .camera_override = source_route.use_compose_camera_override
             ? source_route.active_compose_source_camera
             : std::string(),
         .use_active_camera_for_parallax = source_route.use_compose_camera_override,
         .premultiplied_source_blend = route.premultiplied_source_blend,
-        .use_active_camera_for_uniforms =
-            source_route.owner_node_source_fallback_samples_framebuffer,
+        .use_active_camera_for_uniforms = source_route.owner_node_samples_framebuffer,
     };
 }
 
@@ -525,7 +531,9 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
             pdesc.should_execute      = should_execute;
             pdesc.output     = output_key;
-            pdesc.force_alpha_write = output_key != SpecTex_Default && options.force_alpha_write;
+            pdesc.alpha_write_policy = output_key != SpecTex_Default
+                ? options.alpha_write_policy
+                : AlphaWritePolicy::Preserve;
             pdesc.premultiplied_source_blend = options.premultiplied_source_blend;
             pdesc.clear_before_draw = output_key != SpecTex_Default && options.clear_before_draw;
             pdesc.camera_override = options.camera_override;
@@ -607,7 +615,8 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
         });
 }
 
-static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra) {
+static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
+                            AlphaWritePolicy alpha_write_policy) {
     auto& rgraph = *extra.rgraph;
     auto& scene  = *extra.scene;
 
@@ -620,7 +629,7 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
     rgraph.addPass<vulkan::TextPass>(
         pass_name,
         rg::PassNode::Type::Text,
-        [node, output_key, imgId, &scene, &extra](
+        [node, output_key, imgId, alpha_write_policy, &scene, &extra](
             rg::RenderGraphBuilder& builder, vulkan::TextPass::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
             // Text is now emitted as its own render-graph pass. It shares the same constrained
@@ -633,6 +642,9 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
             pdesc.layer_id = imgId;
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
             pdesc.output = output_key;
+            pdesc.alpha_write_policy = output_key != SpecTex_Default
+                ? alpha_write_policy
+                : AlphaWritePolicy::Preserve;
 
             auto* output_node =
                 builder.createTexNode(rg::TexNode::Desc { .name = output_key,
@@ -767,7 +779,11 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     // text pass directly from that primitive, keeping the render graph aligned with the same
     // authoritative text object that parser and runtime updates mutate.
     if (node != nullptr && node->Text() != nullptr) {
-        AddTextNodePass(node, output, imgId, extra);
+        const auto text_alpha_write_policy =
+            imgeff == nullptr && route.compose_source
+                ? route.compose_source_alpha_write_policy
+                : AlphaWritePolicy::Preserve;
+        AddTextNodePass(node, output, imgId, extra, text_alpha_write_policy);
     }
 
     if (node != nullptr) {
@@ -797,7 +813,9 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                                 .model = std::optional<Eigen::Matrix4d> { resolved_route_model },
                                 .compose_source = route.compose_source,
                                 .compose_source_camera =
-                                    source_route.active_compose_source_camera });
+                                    source_route.active_compose_source_camera,
+                                .compose_source_alpha_write_policy =
+                                    route.compose_source_alpha_write_policy });
             }
         }
     }
@@ -868,6 +886,12 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             const std::string child_compose_source_camera =
                 child_compose_source_route ? source_route.active_compose_source_camera
                                            : std::string();
+            const AlphaWritePolicy child_compose_source_alpha_write_policy =
+                route.compose_source
+                    ? route.compose_source_alpha_write_policy
+                    : (child_compose_source_route && imgeff != nullptr
+                           ? imgeff->CompositionChildAlphaWritePolicy()
+                           : AlphaWritePolicy::Preserve);
             ToGraphPass(child.node,
                         output,
                         NodeLayerId(scene, child.node),
@@ -877,7 +901,9 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                             .routed_node = child.proxy,
                             .model = BuildChildRouteModel(node, child.node, child.proxy, route.model),
                             .compose_source = child_compose_source_route,
-                            .compose_source_camera = child_compose_source_camera });
+                            .compose_source_camera = child_compose_source_camera,
+                            .compose_source_alpha_write_policy =
+                                child_compose_source_alpha_write_policy });
         }
     }
 
@@ -893,10 +919,16 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             Eigen::Affine3f(resolved_route_model.cast<float>());
         const bool keep_final_output_private =
             ShouldKeepEffectFinalOutputPrivate(extra, node, imgId, inherited_output);
+        // Publication policy is authored by the parsed render topology, not inferred from a shader
+        // name. Ordinary image/text layers keep the complete authored chain private and publish it
+        // through the neutral layer-surface pass. A DIRECTDRAW shape explicitly declares its final
+        // authored shader as the visible writer. Composition-source routing always overrides that
+        // declaration because the child result must remain sampleable before it is placed into the
+        // parent source target.
         const auto final_output_policy =
             route.compose_source
                 ? SceneImageEffectLayer::FinalOutputPolicy::PrivateAuthoredThenComposite
-                : SceneImageEffectLayer::FinalOutputPolicy::AuthoredWriter;
+                : imgeff->DeclaredFinalOutputPolicy();
         LOG_INFO("SceneRenderGraphEffectResolve: layer=%d name='%s' inherited-output='%.*s' "
                  "effect-output='%.*s' offscreen-dependency=%s visible=%s local-visible=%s "
                  "routed=%s keep-final-private=%s compose-source-route=%s compose-camera='%s'",
@@ -952,7 +984,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                             extra,
                             effect_visible_gate,
                             NodePassOptions {
-                                .force_alpha_write = effect_node.force_alpha_write,
+                                .alpha_write_policy = effect_node.alpha_write_policy,
                                 .clear_before_draw = effect_node.clear_before_draw,
                                 .camera_override = effect_node.camera_override,
                                 .use_active_camera_for_parallax =
@@ -993,6 +1025,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                             .model = std::optional<Eigen::Matrix4d> { resolved_route_model },
                             .compose_source = route.compose_source,
                             .compose_source_camera = source_route.active_compose_source_camera,
+                            .compose_source_alpha_write_policy =
+                                route.compose_source_alpha_write_policy,
                             .premultiplied_source_blend =
                                 imgeff->FinalCompositeSamplesPremultipliedSource() });
         }
@@ -1014,7 +1048,9 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                         .routed_node = true,
                         .model = BuildChildRouteModel(node, child.node, true, route.model),
                         .compose_source = route.compose_source,
-                        .compose_source_camera = source_route.active_compose_source_camera });
+                        .compose_source_camera = source_route.active_compose_source_camera,
+                        .compose_source_alpha_write_policy =
+                            route.compose_source_alpha_write_policy });
     }
 }
 
@@ -1069,11 +1105,14 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
                                             .type = rg::TexNode::TexType::Temp });
     }
 
-    if (!scene.bloom.nodes.empty()) {
-        // Scene Bloom is authored in `general`, so it belongs after the complete layer traversal.
-        // Wallpaper Engine implements it as an ordered post-process chain. Binding each synthetic
-        // node with its explicit output target preserves the quarter/eighth render-target feedback
-        // contract, while the first pass still uses `u_enabled` to make runtime toggles cheap.
+    if (scene.bloom.enabled && !scene.bloom.nodes.empty()) {
+        // Wallpaper Engine treats `general.bloom` as the execution switch for the complete Bloom
+        // chain. Authored strength and threshold values remain stored while the switch is off, but
+        // they do not make the post-process execute. Keeping disabled Bloom out of the graph avoids
+        // three private blur targets, one full-frame feedback copy, and four GPU passes while still
+        // retaining the parsed nodes for a later topology rebuild when a runtime binding enables it.
+        // Scene Bloom is authored in `general`, so an enabled chain belongs after the complete layer
+        // traversal, with each synthetic node bound to its explicit quarter/eighth output target.
         if (scene.bloom.nodes.size() != scene.bloom.outputs.size()) {
             LOG_ERROR("SceneBloomGraphBind: pass/output mismatch passes=%zu outputs=%zu",
                       scene.bloom.nodes.size(),
@@ -1098,7 +1137,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
                 AddNodePass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra);
             }
         }
-    } else if (scene.bloom.node != nullptr) {
+    } else if (scene.bloom.enabled && scene.bloom.node != nullptr) {
         // This fallback is intentionally retained for older parsed scene objects that may still
         // populate only the legacy single-node field before a full reparse has occurred.
         LOG_INFO("SceneBloomGraphBind: legacy-output='%s' enabled=%s strength=%.3f threshold=%.3f",
