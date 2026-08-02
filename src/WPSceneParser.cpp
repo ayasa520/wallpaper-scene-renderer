@@ -1341,6 +1341,26 @@ bool IsMaterialRuntimeRenderTarget(const Scene* scene, const std::string& name) 
     return scene != nullptr && scene->renderTargets.count(name) != 0;
 }
 
+void RegisterSceneTextureFromHeader(Scene& scene, const std::string& name,
+                                    const ImageHeader& header) {
+    if (scene.textures.count(name) != 0) return;
+
+    SceneTexture texture;
+    texture.sample    = header.sample;
+    texture.url       = name;
+    texture.format    = header.format;
+    texture.isVideo   = header.isVideoTexture;
+    texture.width     = header.width;
+    texture.height    = header.height;
+    texture.mapWidth  = header.mapWidth;
+    texture.mapHeight = header.mapHeight;
+    if (header.isSprite) {
+        texture.isSprite   = true;
+        texture.spriteAnim = header.spriteAnim;
+    }
+    scene.textures[name] = std::move(texture);
+}
+
 bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, SceneNode* pNode,
                   SceneMaterial* pMaterial, WPShaderValueData* pSvData,
                   const UserPropertyMap* user_properties = nullptr,
@@ -1498,22 +1518,7 @@ bool LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                 resolution = { texh.mapWidth, texh.mapHeight, texh.mapWidth, texh.mapHeight };
             }
 
-            if (pScene->textures.count(name) == 0) {
-                SceneTexture stex;
-                stex.sample    = texh.sample;
-                stex.url       = name;
-                stex.format    = texh.format;
-                stex.isVideo   = texh.isVideoTexture;
-                stex.width     = texh.width;
-                stex.height    = texh.height;
-                stex.mapWidth  = texh.mapWidth;
-                stex.mapHeight = texh.mapHeight;
-                if (texh.isSprite) {
-                    stex.isSprite   = texh.isSprite;
-                    stex.spriteAnim = texh.spriteAnim;
-                }
-                pScene->textures[name] = stex;
-            }
+            RegisterSceneTextureFromHeader(*pScene, name, texh);
             if ((pScene->textures.at(name)).isSprite) {
                 material.hasSprite = true;
                 const auto& f1     = texh.spriteAnim.GetCurFrame();
@@ -4121,6 +4126,17 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                    (puppet->puppet == nullptr || puppet->puppet->bones.empty())) {
             LOG_ERROR("puppet has no bones: %s", wpimgobj.puppet.c_str());
             puppet = nullptr;
+        }
+    }
+    if (puppet != nullptr) {
+        // Puppet clipping masks are independent imported textures referenced by MDLV0022+
+        // metadata rather than by the visible material JSON. Register them with the same scene
+        // texture contract as authored material slots so deferred visibility preparation can stage
+        // their bytes before the masked mesh becomes executable.
+        for (const auto& mask : puppet->masks) {
+            if (context.scene->textures.count(mask.material) != 0) continue;
+            const auto& header = context.scene->imageParser->ParseHeader(mask.material);
+            RegisterSceneTextureFromHeader(*context.scene, mask.material, header);
         }
     }
     const bool hasAnimatedPuppetMesh =

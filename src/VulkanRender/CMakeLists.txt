@@ -5,6 +5,11 @@ STATIC
 ClearPass.cpp
 CopyPass.cpp
 CustomShaderPass.cpp
+ShaderDrawCore.cpp
+MaskedDrawAttachmentCache.cpp
+MaskedDrawRenderer.cpp
+MaskedDrawShaderContract.cpp
+MaskedMeshPass.cpp
 FinPass.cpp
 PrePass.cpp
 SceneToRenderGraph.cpp

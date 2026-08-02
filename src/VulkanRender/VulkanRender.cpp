@@ -421,6 +421,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
         image.handle.abandon();
     }
     m_rendering_resources.model_depth_images.clear();
+    m_rendering_resources.masked_draw_attachments.abandon();
     if (m_rendering_resources.pipeline_cache) {
         m_rendering_resources.pipeline_cache->abandon();
     }
@@ -474,6 +475,7 @@ void VulkanRender::Impl::destroy() {
         }
         m_rendering_resources.pipeline_cache.reset();
         m_rendering_resources.model_depth_images.clear();
+        m_rendering_resources.masked_draw_attachments.clear();
         m_vertex_buf->destroy();
         m_dyn_buf->destroy();
 
@@ -1090,6 +1092,7 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     // full graph rebuilds keeps 3D model depth opt-in and avoids stale depth attachments surviving
     // after scene topology or render-target ownership changes.
     m_rendering_resources.model_depth_images.clear();
+    m_rendering_resources.masked_draw_attachments.clear();
 
     m_vertex_buf->destroy();
     m_dyn_buf->destroy();

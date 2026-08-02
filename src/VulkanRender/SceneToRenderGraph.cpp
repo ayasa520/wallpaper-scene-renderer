@@ -104,7 +104,7 @@ static TexNode::Desc createTexDesc(std::string path, const Scene* scene = nullpt
 }
 } // namespace wallpaper::rg
 
-static void CheckAndSetSprite(Scene& scene, vulkan::CustomShaderPass::Desc& desc,
+static void CheckAndSetSprite(Scene& scene, vulkan::ShaderDrawRequest& desc,
                               std::span<const std::string> texs) {
     for (usize i = 0; i < texs.size(); i++) {
         auto& tex = texs[i];
@@ -130,10 +130,18 @@ static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::st
 }
 
 struct DelayLinkInfo {
+    using BindTexture = void (*)(rg::Pass&, u32, std::string_view);
+
     rg::NodeID id;
     rg::NodeID link_id;
     i32        tex_index;
+    BindTexture bind_texture { nullptr };
 };
+
+template <typename PassT>
+void BindShaderDrawTexture(rg::Pass& pass, u32 index, std::string_view texture_key) {
+    static_cast<PassT&>(pass).setDescTex(index, texture_key);
+}
 
 struct ExtraInfo {
     Map<size_t, rg::TexNode*>  id_link_map {};
@@ -491,9 +499,9 @@ static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode
     return children;
 }
 
-static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
-                        std::function<bool()> should_execute = {},
-                        NodePassOptions options = {}) {
+template <typename PassT>
+static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
+                            std::function<bool()> should_execute, NodePassOptions options) {
     auto& rgraph = *extra.rgraph;
     auto& scene  = *extra.scene;
 
@@ -514,13 +522,13 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
         extra.model_depth_outputs_seen.insert(output_key).second;
 
     std::string passName = material->name;
-    rgraph.addPass<vulkan::CustomShaderPass>(
+    rgraph.addPass<PassT>(
         passName,
         rg::PassNode::Type::CustomShader,
         [material, node, output_key, imgId, &rgraph, &scene, &extra,
          clear_model_depth, options = std::move(options),
          should_execute = std::move(should_execute)](
-            rg::RenderGraphBuilder& builder, vulkan::CustomShaderPass::Desc& pdesc) {
+            rg::RenderGraphBuilder& builder, typename PassT::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
             // Passing the live scene into the prepared pass lets resource refreshes resolve current
             // render-target dependencies directly, which is what keeps first-class text bridges and
@@ -573,8 +581,12 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                     continue;
                 } else if (IsSpecLinkTex(url)) {
                     auto id = ParseLinkTex(url);
-                    extra.link_info.push_back(
-                        DelayLinkInfo { .id = pass.ID(), .link_id = id, .tex_index = (i32)i });
+                    extra.link_info.push_back(DelayLinkInfo {
+                        .id           = pass.ID(),
+                        .link_id      = id,
+                        .tex_index    = (i32)i,
+                        .bind_texture = &BindShaderDrawTexture<PassT>,
+                    });
                     pdesc.textures.emplace_back("");
                     continue;
                 } else {
@@ -602,6 +614,19 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                 pdesc.textures.emplace_back(input->key());
             }
 
+            // Mask textures belong to the mesh draw plan rather than to the visible material. The
+            // selected masked pass declares them as ordinary imported reads, while an empty plan
+            // leaves the regular CustomShaderPass with no mask-related graph resources at all.
+            for (const auto& group : node->Mesh()->MaskedDraw().groups) {
+                rg::TexNode::Desc desc {
+                    .name = group.maskTexture,
+                    .key  = group.maskTexture,
+                    .type = rg::TexNode::TexType::Imported,
+                };
+                auto* input = builder.createTexNode(desc);
+                builder.read(input);
+            }
+
             rg::TexNode* output_node { nullptr };
             output_node =
                 builder.createTexNode(rg::TexNode::Desc { .name = output_key,
@@ -613,6 +638,26 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                 extra.id_link_map[(usize)imgId] = output_node;
             }
         });
+}
+
+static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
+                        std::function<bool()> should_execute = {},
+                        NodePassOptions options = {}) {
+    if (node != nullptr && node->Mesh() != nullptr && ! node->Mesh()->MaskedDraw().empty()) {
+        AddNodePassImpl<vulkan::MaskedMeshPass>(node,
+                                                output,
+                                                imgId,
+                                                extra,
+                                                std::move(should_execute),
+                                                std::move(options));
+        return;
+    }
+    AddNodePassImpl<vulkan::CustomShaderPass>(node,
+                                              output,
+                                              imgId,
+                                              extra,
+                                              std::move(should_execute),
+                                              std::move(options));
 }
 
 static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
@@ -1081,8 +1126,6 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
         }
         rgraph->afterBuild(
             info.id, [&rgraph, &extra, &info](rg::RenderGraphBuilder& builder, rg::Pass& rgpass) {
-                auto& pass = static_cast<vulkan::CustomShaderPass&>(rgpass);
-
                 auto* link_tex_node = extra.id_link_map.at(info.link_id);
                 auto  copy_desc     = link_tex_node->genDesc();
                 copy_desc.key       = GenLinkTex((idx)info.link_id);
@@ -1090,7 +1133,9 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
 
                 auto new_in = rg::addCopyPass(*rgraph, link_tex_node, &copy_desc);
                 builder.read(new_in);
-                pass.setDescTex((u32)info.tex_index, new_in->key());
+                if (info.bind_texture != nullptr) {
+                    info.bind_texture(rgpass, (u32)info.tex_index, new_in->key());
+                }
                 return true;
             });
     }
