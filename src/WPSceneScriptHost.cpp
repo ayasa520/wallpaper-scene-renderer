@@ -5552,10 +5552,12 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
         if (opaque != nullptr && layer_id != 0) {
             if (auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
                 text_layer->object.parallaxDepth = parallax;
+                text_layer->object.parallaxDepthAuthored = true;
             }
         }
         if (auto* data = GetNodeData(opaque, node)) {
             data->parallaxDepth = parallax;
+            data->parallaxDepthAuthored = true;
             return true;
         }
     }

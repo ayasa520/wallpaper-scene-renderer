@@ -11,6 +11,7 @@
 #include "WPMaterial.h"
 #include "WPPuppet.hpp"
 #include "wpscene/WPEffect.h"
+#include "wpscene/WPParallaxDepth.hpp"
 
 namespace wallpaper
 {
@@ -40,10 +41,11 @@ public:
     std::array<float, 3>       scale { 1.0f, 1.0f, 1.0f };
     std::array<float, 3>       angles { 0.0f, 0.0f, 0.0f };
     std::array<float, 2>       size { 2.0f, 2.0f };
-    std::array<float, 2>       parallaxDepth { 0.0f, 0.0f };
-    // Scene JSON omits parallaxDepth for many ordinary image layers, while explicit "0 0" is an
-    // authored choice to pin the layer. Keeping this bit separate lets the parser repair omitted
-    // root-layer parallax without accidentally moving layers that the wallpaper author set to zero.
+    // Fullscreen image layers never parse a scene transform, so they remain screen-space. Every
+    // other image resolves the scene default in FromJson before reading the field.
+    std::array<float, 2>       parallaxDepth { kScreenSpaceParallaxDepth };
+    // Presence distinguishes an omitted default from an explicitly authored value, including zero.
+    // The parser uses that distinction to inherit parent parallax for child layers.
     bool                       parallaxDepthAuthored { false };
     std::array<float, 3>       color { 1.0f, 1.0f, 1.0f };
     int32_t                    colorBlendMode { 0 };

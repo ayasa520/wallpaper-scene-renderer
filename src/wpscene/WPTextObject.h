@@ -9,6 +9,7 @@
 
 #include "WPUserProperties.hpp"
 #include "wpscene/WPEffect.h"
+#include "wpscene/WPParallaxDepth.hpp"
 
 namespace wallpaper
 {
@@ -28,7 +29,8 @@ struct WPTextObject {
     std::array<float, 3>       scale { 1.0f, 1.0f, 1.0f };
     std::array<float, 3>       angles { 0.0f, 0.0f, 0.0f };
     std::array<float, 2>       size { 0.0f, 0.0f };
-    std::array<float, 2>       parallaxDepth { 0.0f, 0.0f };
+    std::array<float, 2>       parallaxDepth { kDefaultParallaxDepth };
+    bool                       parallaxDepthAuthored { false };
     std::array<float, 3>       color { 1.0f, 1.0f, 1.0f };
     int32_t                    colorBlendMode { 0 };
     std::array<float, 3>       backgroundcolor { 0.0f, 0.0f, 0.0f };

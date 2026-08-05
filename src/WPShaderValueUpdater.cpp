@@ -27,7 +27,8 @@ using namespace Eigen;
 namespace
 {
 constexpr float kDefaultMouseCoord = 0.5f;
-constexpr double kParallaxSettleRatio = std::log(100.0);
+constexpr double kParallaxDelayRange = 3.0;
+constexpr double kParallaxResponseRate = 10.0;
 constexpr std::array<uint32_t, 3> kAudioSpectrumResolutions { 16, 32, 64 };
 constexpr std::array<const char*, 3> kAudioSpectrumLeftUniforms {
     "g_AudioSpectrum16Left",
@@ -221,8 +222,12 @@ void WPShaderValueUpdater::FrameBegin() {
     }
 
     const double frameTime = std::max(m_scene->frameTime, 0.0);
-    const double t =
-        1.0 - std::exp(-(frameTime * kParallaxSettleRatio) / static_cast<double>(m_parallax.delay));
+    // Wallpaper Engine maps the authored 0..3 delay setting to a response rate instead of
+    // treating it as a settling duration. Keep that curve intact: scene authors tune the slider
+    // against this exact relationship, and the per-frame clamp preserves the native fast path.
+    const double responseRate =
+        kParallaxResponseRate * (1.0 - static_cast<double>(m_parallax.delay) / kParallaxDelayRange);
+    const double t = std::min(1.0, responseRate * frameTime);
     m_mousePosLast     = previousMousePos;
     m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
                                       (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
