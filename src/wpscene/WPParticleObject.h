@@ -8,6 +8,7 @@
 #include <optional>
 #include "Utils/BitFlags.hpp"
 #include "Core/Literals.hpp"
+#include "wpscene/WPParallaxDepth.hpp"
 
 namespace wallpaper
 {
@@ -165,7 +166,8 @@ public:
     std::array<float, 3>     origin { 0.0f, 0.0f, 0.0f };
     std::array<float, 3>     scale { 1.0f, 1.0f, 1.0f };
     std::array<float, 3>     angles { 0.0f, 0.0f, 0.0f };
-    std::array<float, 2>     parallaxDepth { 0.0f, 0.0f };
+    std::array<float, 2>     parallaxDepth { kDefaultParallaxDepth };
+    bool                     parallaxDepthAuthored { false };
     bool                     visible { true };
     VisibleBinding           visible_binding;
     int32_t                  parent { 0 };

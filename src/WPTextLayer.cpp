@@ -2571,6 +2571,7 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     GET_JSON_NAME_VALUE_NOWARN(json, "origin", origin);
     GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
     GET_JSON_NAME_VALUE_NOWARN(json, "angles", angles);
+    parallaxDepthAuthored = json.contains("parallaxDepth") && ! json.at("parallaxDepth").is_null();
     GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
     GET_JSON_NAME_VALUE_NOWARN(json, "size", size);
     ReadLiteralOrDynamicValue(json, "text", &text);

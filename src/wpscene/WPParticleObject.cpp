@@ -227,6 +227,7 @@ bool WPParticleObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     GET_JSON_NAME_VALUE(json, "origin", origin);
     GET_JSON_NAME_VALUE(json, "angles", angles);
     GET_JSON_NAME_VALUE(json, "scale", scale);
+    parallaxDepthAuthored = json.contains("parallaxDepth") && ! json.at("parallaxDepth").is_null();
     GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
 
     if (json.contains("instanceoverride") && ! json.at("instanceoverride").is_null()) {

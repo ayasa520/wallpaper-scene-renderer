@@ -94,6 +94,10 @@ struct WPNodeTransformBinding {
 
 struct WPShaderValueData {
     std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
+    // An omitted scene field and an explicit "1 1" have the same numeric value but different
+    // child-layer semantics: omitted depth inherits the parent contract, while explicit depth is
+    // independent. Internal renderer nodes default to authored.
+    bool                 parallaxDepthAuthored { true };
     // index + name
     std::vector<std::pair<usize, std::string>> renderTargets;
 
@@ -102,18 +106,18 @@ struct WPShaderValueData {
     WPNodeTransformBinding transform_binding {};
     SceneNode*            effect_projection_node { nullptr };
     SceneMesh*            effect_projection_mesh { nullptr };
-    // Some repaired Wallpaper Engine container nodes must provide the canonical mouse-parallax
-    // offset for their authored children without translating their own final offscreen composite.
-    // Moving that full render-target quad exposes rectangular background seams when the target
-    // contains cleared/filtered pixels around the character, while child nodes still need to anchor
-    // to the exact same parallax source to remain synchronized.
+    // The scene transform already carries the required displacement for these nodes, or they are
+    // private effect sources. Keep their parallax anchor for dependents without adding a second
+    // local model offset.
     bool                  suppress_model_parallax { false };
 
     void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
 
     void SetParallaxContract(const std::array<float, 2>& depth, SceneNode* anchor = nullptr,
-                             bool suppress_own_model_parallax = false) {
+                             bool suppress_own_model_parallax = false,
+                             bool depth_authored = true) {
         parallaxDepth           = depth;
+        parallaxDepthAuthored   = depth_authored;
         parallax_anchor         = anchor;
         suppress_model_parallax = suppress_own_model_parallax;
     }
@@ -127,7 +131,10 @@ struct WPShaderValueData {
 
     void CopyParallaxContractFrom(const WPShaderValueData& source) {
         SetParallaxContract(
-            source.parallaxDepth, source.parallax_anchor, source.suppress_model_parallax);
+            source.parallaxDepth,
+            source.parallax_anchor,
+            source.suppress_model_parallax,
+            source.parallaxDepthAuthored);
     }
 
     void InheritParentTransform(SceneNode* parent, bool inherit_parent_parallax = true) {
