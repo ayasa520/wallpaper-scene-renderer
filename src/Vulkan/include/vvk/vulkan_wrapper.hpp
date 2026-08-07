@@ -499,7 +499,8 @@ class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
 public:
     static VkResult Create(Device&, VkPhysicalDevice physical_device,
                            Span<const VkDeviceQueueCreateInfo> queues_ci,
-                           Span<const char*> enabled_extensions, const void* next,
+                           Span<const char*> enabled_extensions,
+                           const VkPhysicalDeviceFeatures* enabled_features, const void* next,
                            DeviceDispatch& dispatch);
 
     Queue GetQueue(uint32_t family_index) const noexcept;

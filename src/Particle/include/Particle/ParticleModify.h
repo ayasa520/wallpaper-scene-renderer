@@ -3,6 +3,8 @@
 #include "Particle.h"
 
 #include <Eigen/Dense>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace wallpaper
@@ -141,10 +143,83 @@ inline void InitAlpha(Particle& p, double a) {
     p.alpha      = a;
     p.init.alpha = a;
 }
-inline void InitColor(Particle& p, double r, double g, double b) {
-    Eigen::Vector3d c { r, g, b };
-    p.color      = c.cast<float>();
-    p.init.color = p.color;
+inline Eigen::Vector3f ParticleRgbToHsv(const Eigen::Vector3f& rgb) {
+    constexpr float kColorDeltaEpsilon = 0.00001f;
+
+    const float maximum = rgb.maxCoeff();
+    const float minimum = rgb.minCoeff();
+    const float delta   = maximum - minimum;
+
+    Eigen::Vector3f hsv { 0.0f, 0.0f, maximum };
+    if (delta < kColorDeltaEpsilon || maximum <= 0.0f) return hsv;
+
+    hsv.y() = delta / maximum;
+    if (rgb.x() >= maximum) {
+        hsv.x() = (rgb.y() - rgb.z()) / delta;
+    } else if (rgb.y() >= maximum) {
+        hsv.x() = ((rgb.z() - rgb.x()) / delta) + 2.0f;
+    } else {
+        hsv.x() = ((rgb.x() - rgb.y()) / delta) + 4.0f;
+    }
+    hsv.x() /= 6.0f;
+    if (hsv.x() < 0.0f) hsv.x() += 1.0f;
+    return hsv;
+}
+
+inline Eigen::Vector3f ParticleHsvToRgb(const Eigen::Vector3f& hsv) {
+    const float hue_sector = hsv.x() * 6.0f;
+    const float chroma     = hsv.z() * hsv.y();
+    const float secondary  = chroma * (1.0f - std::abs(std::fmod(hue_sector, 2.0f) - 1.0f));
+    const float match      = hsv.z() - chroma;
+
+    Eigen::Vector3f rgb;
+    if (hue_sector < 1.0f) {
+        rgb = { chroma, secondary, 0.0f };
+    } else if (hue_sector < 2.0f) {
+        rgb = { secondary, chroma, 0.0f };
+    } else if (hue_sector < 3.0f) {
+        rgb = { 0.0f, chroma, secondary };
+    } else if (hue_sector < 4.0f) {
+        rgb = { 0.0f, secondary, chroma };
+    } else if (hue_sector < 5.0f) {
+        rgb = { secondary, 0.0f, chroma };
+    } else {
+        rgb = { chroma, 0.0f, secondary };
+    }
+    return rgb.array() + match;
+}
+
+inline Eigen::Vector3f ShiftAuthoredParticleColor(const Eigen::Vector3f& authored,
+                                                   const Eigen::Vector3f& hsv_delta) {
+    Eigen::Vector3f hsv = ParticleRgbToHsv(authored);
+    hsv.x() += hsv_delta.x();
+    hsv.x() -= std::floor(hsv.x());
+    hsv.y() = std::clamp(hsv.y() + hsv_delta.y(), 0.0f, 1.0f);
+    hsv.z() = std::clamp(hsv.z() + hsv_delta.z(), 0.0f, 1.0f);
+    return ParticleHsvToRgb(hsv);
+}
+
+inline Eigen::Vector3f ResolveParticleColorOverride(const Particle& p,
+                                                    const Eigen::Vector3f& color) {
+    if (!p.authoredColorRandom.active) return color;
+
+    // The particle compiler derives its reference color from the RGB midpoint of the authored
+    // colorrandom range. The current layer color and that reference are converted to HSV; their
+    // delta is added to each endpoint independently, with hue wrapping and saturation/value
+    // clamping. Wallpaper Engine then performs the particle's random interpolation in RGB space.
+    const Eigen::Vector3f hsv_delta =
+        ParticleRgbToHsv(color) - p.authoredColorRandom.referenceHsv;
+    const Eigen::Vector3f minimum = ShiftAuthoredParticleColor(
+        p.authoredColorRandom.minimum, hsv_delta);
+    const Eigen::Vector3f maximum = ShiftAuthoredParticleColor(
+        p.authoredColorRandom.maximum, hsv_delta);
+    return minimum + (maximum - minimum) * p.authoredColorRandom.interpolation;
+}
+
+inline void InitColorOverride(Particle& p, const Eigen::Vector3f& color) {
+    const Eigen::Vector3f resolved = ResolveParticleColorOverride(p, color);
+    p.color                         = resolved;
+    p.init.color                    = resolved;
 }
 
 inline void InitVelocity(Particle& p, const Eigen::Vector3d& v) { p.velocity = v.cast<float>(); }
@@ -174,8 +249,14 @@ inline void MutiplyInitSize(Particle& p, double m) {
     p.size *= m;
     p.init.size = p.size;
 }
-inline void MutiplyInitColor(Particle& p, double r, double g, double b) {
-    MutiplyColor(p, { r, g, b });
+inline void InitColorRandom(Particle& p, const Eigen::Vector3f& minimum,
+                            const Eigen::Vector3f& maximum, float interpolation) {
+    p.authoredColorRandom.minimum       = minimum;
+    p.authoredColorRandom.maximum       = maximum;
+    p.authoredColorRandom.referenceHsv  = ParticleRgbToHsv((minimum + maximum) * 0.5f);
+    p.authoredColorRandom.interpolation = std::clamp(interpolation, 0.0f, 1.0f);
+    p.authoredColorRandom.active        = true;
+    p.color      = minimum + (maximum - minimum) * p.authoredColorRandom.interpolation;
     p.init.color = p.color;
 }
 

@@ -1,26 +1,20 @@
 #include "ParticleEmitter.h"
 #include "ParticleModify.h"
 #include "Utils/Algorism.h"
-#include "Utils/Logging.h"
-#include "Utils/Algorism.h"
 #include "Core/Random.hpp"
 
 #include <Eigen/src/Core/Matrix.h>
 #include <random>
-#include <array>
 #include <tuple>
 
 using namespace wallpaper;
 
-typedef std::function<Particle()> GenParticleOp;
-typedef std::function<Particle()> SpwanOp;
-
 namespace
 {
 
-inline std::tuple<u32, bool> FindLastParticle(std::span<const Particle> ps, u32 last) {
-    for (u32 i = last; i < ps.size(); i++) {
-        if (! ParticleModify::LifetimeOk(ps[i])) return { i, true };
+inline std::tuple<u32, bool> FindDeadParticle(std::span<const Particle> particles, u32 start) {
+    for (u32 i = start; i < particles.size(); i++) {
+        if (! ParticleModify::LifetimeOk(particles[i])) return { i, true };
     }
     return { 0, false };
 }
@@ -34,47 +28,37 @@ inline u32 GetEmitNum(double& timer, float speed) {
     return num;
 }
 
-inline u32 Emitt(std::vector<Particle>& particles, u32 num, u32 maxcount, bool sort,
-                 SpwanOp Spwan) {
-    u32  lastPartcle = 0;
-    bool has_dead    = true;
-    u32  i           = 0;
+template<typename SpawnOp>
+void EmitParticles(std::vector<Particle>& particles, u32 num, u32 maxcount,
+                   uint64_t& next_spawn_sequence, SpawnOp&& spawn_particle) {
+    u32  next_search_index = 0;
+    bool has_dead          = true;
 
-    for (i = 0; i < num; i++) {
+    for (u32 i = 0; i < num; i++) {
         if (has_dead) {
-            auto [r1, r2] = FindLastParticle(particles, lastPartcle);
-            lastPartcle   = r1;
-            has_dead      = r2;
+            auto [dead_index, found] = FindDeadParticle(particles, next_search_index);
+            next_search_index        = dead_index;
+            has_dead                 = found;
         }
-        if (has_dead) {
-            particles[lastPartcle] = Spwan();
+        if (! has_dead && maxcount == particles.size()) break;
 
+        Particle spawned      = spawn_particle();
+        spawned.spawnSequence = next_spawn_sequence++;
+        if (has_dead) {
+            particles[next_search_index] = std::move(spawned);
         } else {
-            if (maxcount == particles.size()) break;
-            particles.push_back(Spwan());
+            particles.push_back(std::move(spawned));
         }
     }
-
-    if (sort) {
-        // old << new << dead
-        std::stable_sort(particles.begin(), particles.end(), [](const auto& a, const auto& b) {
-            bool l_a = ParticleModify::LifetimeOk(a);
-            bool l_b = ParticleModify::LifetimeOk(b);
-
-            return (l_a && ! l_b) ||
-                   (l_a && l_b && ! ParticleModify::IsNew(a) && ParticleModify::IsNew(b));
-        });
-    }
-
-    return i + 1;
 }
 
-inline Particle Spwan(GenParticleOp gen, std::vector<ParticleInitOp>& inis,
-                      const ParticleInitInfo& info) {
-    auto particle = gen();
+template<typename GenerateOp>
+Particle SpawnParticle(GenerateOp&& generate, std::vector<ParticleInitOp>& initializers,
+                       const ParticleInitInfo& info) {
+    auto particle = generate();
     // Cherry_Blossoms_2.json relies on all initializers for one spawned particle seeing the same
     // control-point snapshot and sequence slot; otherwise the five cursor petals drift into noise.
-    for (auto& el : inis) el(particle, info);
+    for (auto& initializer : initializers) initializer(particle, info);
     return particle;
 }
 
@@ -94,13 +78,14 @@ inline void ApplySign(Eigen::Vector3d& p, int32_t x, int32_t y, int32_t z) noexc
 ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
     double timer { 0.0f };
     // Keep a per-emitter sequence counter so mapsequencearoundcontrolpoint repeats the authored
-    // five slots even when particles are recycled or sorted by the trail renderer.
+    // five slots independently of reusable particle storage indices.
     uint64_t sequence { 0 };
     return [a, timer, sequence](std::vector<Particle>&       ps,
                                 std::vector<ParticleInitOp>& inis,
                                 std::span<const ParticleControlpoint> controlpoints,
                                 u32                          maxcount,
-                                double                       timepass) mutable {
+                                double                       timepass,
+                                uint64_t&                    next_spawn_sequence) mutable {
         timer += timepass;
         auto GenBox = [&]() {
             Eigen::Vector3d pos;
@@ -122,12 +107,12 @@ ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
         u32 emit_num = GetEmitNum(timer, a.emitSpeed);
         emit_num     = a.one_per_frame ? 1 : emit_num;
         emit_num     = a.instantaneous > 0 && ps.empty() ? a.instantaneous : emit_num;
-        Emitt(ps, emit_num, maxcount, a.sort, [&]() {
+        EmitParticles(ps, emit_num, maxcount, next_spawn_sequence, [&]() {
             ParticleInitInfo init_info;
             init_info.duration      = 1.0f / a.emitSpeed;
             init_info.controlpoints = controlpoints;
             init_info.sequence      = sequence++;
-            return Spwan(GenBox, inis, init_info);
+            return SpawnParticle(GenBox, inis, init_info);
         });
     };
 }
@@ -143,7 +128,8 @@ ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs
                                 std::vector<ParticleInitOp>& inis,
                                 std::span<const ParticleControlpoint> controlpoints,
                                 u32                          maxcount,
-                                double                       timepass) mutable {
+                                double                       timepass,
+                                uint64_t&                    next_spawn_sequence) mutable {
         timer += timepass;
         auto GenSphere = [&]() {
             auto   p = Particle();
@@ -170,12 +156,12 @@ ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs
         u32 emit_num = GetEmitNum(timer, a.emitSpeed);
         emit_num     = a.one_per_frame ? 1 : emit_num;
         emit_num     = a.instantaneous > 0 && ps.empty() ? a.instantaneous : emit_num;
-        Emitt(ps, emit_num, maxcount, a.sort, [&]() {
+        EmitParticles(ps, emit_num, maxcount, next_spawn_sequence, [&]() {
             ParticleInitInfo init_info;
             init_info.duration      = 1.0f / a.emitSpeed;
             init_info.controlpoints = controlpoints;
             init_info.sequence      = sequence++;
-            return Spwan(GenSphere, inis, init_info);
+            return SpawnParticle(GenSphere, inis, init_info);
         });
     };
 }

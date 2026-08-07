@@ -60,6 +60,19 @@ void PopulateTextureBindingsFromReflection(wallpaper::vulkan::ShaderDrawData& de
     }
 }
 
+// Mesh primitive and index presence are the complete input-assembly contract. Warmup and real
+// preparation must derive the same value so their pipeline keys match the pipeline actually used.
+VkPrimitiveTopology ToTopology(const wallpaper::SceneMesh& mesh) {
+    switch (mesh.Primitive()) {
+    case wallpaper::MeshPrimitive::POINT: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case wallpaper::MeshPrimitive::TRIANGLE:
+        return mesh.IndexCount() > 0 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                                     : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    }
+    assert(false);
+    return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
 std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent) {
     // Model depth is allocated only for opt-in 3D model passes. The existing 2D render-target cache
     // remains color-only, while separate model chunk passes can still behave like one depth-tested
@@ -1065,8 +1078,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             ",output=" + m_desc.output + "]";
         pipeline.addDescriptorSetInfo(spanone { descriptor_info })
             .setColorBlendStates(spanone { render_state.color_blend })
-            .setTopology(m_desc.index_buf ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
-                                          : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+            .setTopology(ToTopology(mesh))
             .addInputBindingDescription(bind_descriptions)
             .addInputAttributeDescription(attr_descriptions);
         for (auto& spv : spvs) pipeline.addStage(std::move(spv));
@@ -1502,8 +1514,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
         attachment);
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
         .setColorBlendStates(spanone { render_state.color_blend })
-        .setTopology(mesh.IndexCount() > 0 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
-                                           : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+        .setTopology(ToTopology(mesh))
         .addInputBindingDescription(bind_descriptions)
         .addInputAttributeDescription(attr_descriptions);
     for (auto& spv : spvs) pipeline.addStage(std::move(spv));

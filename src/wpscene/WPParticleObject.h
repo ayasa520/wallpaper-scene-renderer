@@ -47,6 +47,7 @@ public:
     float       length { 0.05f };
     float       maxlength { 10.0f };
     float       subdivision { 3.0f };
+    i32         segments { 4 };
 };
 
 class Initializer {

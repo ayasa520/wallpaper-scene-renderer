@@ -1,9 +1,11 @@
 #include "WPParticleRawGener.h"
 
-#include <cstring>
-#include <cmath>
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
+#include <limits>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include "Core/Literals.hpp"
@@ -16,118 +18,362 @@
 using namespace wallpaper;
 using namespace Eigen;
 
-struct WPGOption {
-    bool thick_format { false };
-    bool geometry_shader { false };
-};
-
 namespace
 {
-inline void AssignVertexTimes(std::span<float> dst, std::span<const float> src, uint num) noexcept {
-    const uint dst_one_size = dst.size() / num;
-    for (uint i = 0; i < num; i++) {
-        std::copy(src.begin(), src.end(), dst.begin() + i * dst_one_size);
+const char* ParticleRendererName(ParticleRendererKind renderer) noexcept {
+    switch (renderer) {
+    case ParticleRendererKind::Sprite: return "sprite";
+    case ParticleRendererKind::SpriteTrail: return "spritetrail";
+    case ParticleRendererKind::Rope: return "rope";
+    case ParticleRendererKind::RopeTrail: return "ropetrail";
     }
+    return "unknown";
 }
 
-inline void AssignVertex(std::span<float> dst, std::span<const float> src, uint num) noexcept {
-    const uint dst_one_size = dst.size() / num;
-    const uint src_one_size = src.size() / num;
-    for (uint i = 0; i < num; i++) {
-        std::copy_n(src.begin() + i * src_one_size, src_one_size, dst.begin() + i * dst_one_size);
+const char* ParticleExpansionName(ParticleExpansionMode expansion) noexcept {
+    switch (expansion) {
+    case ParticleExpansionMode::GeometryPoint: return "GeometryPoint";
+    case ParticleExpansionMode::IndexedQuad: return "IndexedQuad";
     }
+    return "unknown";
 }
 
-inline Vector3f CatmullRom(const Vector3f& p0, const Vector3f& p1, const Vector3f& p2,
-                           const Vector3f& p3, float t) noexcept {
-    const float t2 = t * t;
-    const float t3 = t2 * t;
-    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t +
-                   (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
-                   (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+struct ParticleRenderDiagnostics {
+    std::string_view object_name;
+    std::string_view material_name;
+    const char*      renderer_name;
+    const char*      expansion_name;
+};
+
+struct ParticleVertexLayout {
+    struct Attribute {
+        usize offset;
+        usize width;
+    };
+
+    usize                       stride { 0 };
+    wallpaper::Map<std::string, Attribute> attributes;
+};
+
+std::optional<ParticleVertexLayout> ResolveParticleVertexLayout(const SceneVertexArray& vertices,
+                                                                 const ParticleRenderDiagnostics& diagnostics) {
+    ParticleVertexLayout layout;
+    for (const auto& attribute : vertices.Attributes()) {
+        const usize width = SceneVertexArray::TypeCount(attribute.type);
+        layout.attributes[attribute.name] = ParticleVertexLayout::Attribute {
+            .offset = layout.stride,
+            .width  = width,
+        };
+        layout.stride += SceneVertexArray::RealAttributeSize(attribute);
+    }
+    if (layout.stride == 0 || layout.stride != vertices.OneSize()) {
+        LOG_ERROR("particle vertex layout invalid object='%.*s' material='%.*s' renderer=%s "
+                  "expansion=%s stride=%zu expected=%zu",
+                  static_cast<int>(diagnostics.object_name.size()),
+                  diagnostics.object_name.data(),
+                  static_cast<int>(diagnostics.material_name.size()),
+                  diagnostics.material_name.data(),
+                  diagnostics.renderer_name,
+                  diagnostics.expansion_name,
+                  layout.stride,
+                  vertices.OneSize());
+        return std::nullopt;
+    }
+    return layout;
 }
 
-inline float LerpFloat(float start, float end, float t) noexcept {
-    return start + (end - start) * t;
+class ParticleVertexWriter {
+public:
+    ParticleVertexWriter(SceneVertexArray& vertices, ParticleVertexLayout layout,
+                         ParticleRenderDiagnostics diagnostics)
+        : vertices_(vertices),
+          layout_(std::move(layout)),
+          diagnostics_(diagnostics),
+          storage_(layout_.stride, 0.0f),
+          vertex_capacity_(vertices.OneSize() == 0
+                               ? 0
+                               : vertices.CapacitySize() / vertices.OneSize()) {}
+
+    void BeginVertex() {
+        std::fill(storage_.begin(), storage_.end(), 0.0f);
+    }
+
+    bool Write(std::string_view name, std::span<const float> values) {
+        const auto attribute = layout_.attributes.find(name);
+        const usize expected_width = attribute == layout_.attributes.end()
+            ? 0
+            : attribute->second.width;
+        const usize offset = attribute == layout_.attributes.end()
+            ? storage_.size()
+            : attribute->second.offset;
+        if (attribute == layout_.attributes.end() || values.size() != expected_width ||
+            offset + values.size() > storage_.size()) {
+            LOG_ERROR("particle vertex attribute mismatch object='%.*s' material='%.*s' "
+                      "renderer=%s expansion=%s attribute='%.*s' values=%zu expected=%zu "
+                      "stride=%zu",
+                      static_cast<int>(diagnostics_.object_name.size()),
+                      diagnostics_.object_name.data(),
+                      static_cast<int>(diagnostics_.material_name.size()),
+                      diagnostics_.material_name.data(),
+                      diagnostics_.renderer_name,
+                      diagnostics_.expansion_name,
+                      static_cast<int>(name.size()),
+                      name.data(),
+                      values.size(),
+                      expected_width,
+                      layout_.stride);
+            return false;
+        }
+        std::copy(values.begin(), values.end(), storage_.begin() + offset);
+        return true;
+    }
+
+    template<size_t N>
+    bool Write(std::string_view name, const std::array<float, N>& values) {
+        return Write(name, std::span<const float>(values));
+    }
+
+    bool EnsureCapacity(size_t additional_vertices, std::string_view operation) const {
+        if (next_vertex_ <= vertex_capacity_ &&
+            additional_vertices <= vertex_capacity_ - next_vertex_) {
+            return true;
+        }
+        LOG_ERROR("particle vertex capacity exceeded object='%.*s' material='%.*s' renderer=%s "
+                  "expansion=%s operation='%.*s' written=%zu requested=%zu capacity=%zu",
+                  static_cast<int>(diagnostics_.object_name.size()),
+                  diagnostics_.object_name.data(),
+                  static_cast<int>(diagnostics_.material_name.size()),
+                  diagnostics_.material_name.data(),
+                  diagnostics_.renderer_name,
+                  diagnostics_.expansion_name,
+                  static_cast<int>(operation.size()),
+                  operation.data(),
+                  next_vertex_,
+                  additional_vertices,
+                  vertex_capacity_);
+        return false;
+    }
+
+    bool Commit() {
+        if (! vertices_.SetVertexs(next_vertex_, storage_)) {
+            LOG_ERROR("particle vertex commit failed object='%.*s' material='%.*s' renderer=%s "
+                      "expansion=%s vertex=%zu capacity=%zu",
+                      static_cast<int>(diagnostics_.object_name.size()),
+                      diagnostics_.object_name.data(),
+                      static_cast<int>(diagnostics_.material_name.size()),
+                      diagnostics_.material_name.data(),
+                      diagnostics_.renderer_name,
+                      diagnostics_.expansion_name,
+                      next_vertex_,
+                      vertex_capacity_);
+            return false;
+        }
+        next_vertex_++;
+        return true;
+    }
+
+    size_t Written() const noexcept { return next_vertex_; }
+    const ParticleRenderDiagnostics& Diagnostics() const noexcept { return diagnostics_; }
+
+private:
+    SceneVertexArray&          vertices_;
+    ParticleVertexLayout       layout_;
+    ParticleRenderDiagnostics diagnostics_;
+    std::vector<float>         storage_;
+    size_t                     vertex_capacity_ { 0 };
+    size_t                     next_vertex_ { 0 };
+};
+
+Eigen::Vector3f RenderParticlePosition(const ParticleInstance& instance,
+                                       const Eigen::Vector3f& position) {
+    return instance.GetBoundedData().pos + position;
 }
 
-inline std::array<float, 4> LerpColor(const Particle& start, const Particle& end, float t) noexcept {
-    return {
-        LerpFloat(start.color[0], end.color[0], t),
-        LerpFloat(start.color[1], end.color[1], t),
-        LerpFloat(start.color[2], end.color[2], t),
-        LerpFloat(start.alpha, end.alpha, t),
+template<typename Fn>
+bool ForEachLiveParticle(std::span<const std::unique_ptr<ParticleInstance>> instances, Fn&& fn) {
+    for (const auto& instance : instances) {
+        if (instance->IsNoLiveParticle()) continue;
+        for (const auto& particle : instance->Particles()) {
+            if (! ParticleModify::LifetimeOk(particle)) continue;
+            if (! fn(*instance, particle)) return false;
+        }
+    }
+    return true;
+}
+
+size_t CountLiveParticles(std::span<const std::unique_ptr<ParticleInstance>> instances) {
+    size_t live_particle_count { 0 };
+    for (const auto& instance : instances) {
+        if (instance->IsNoLiveParticle()) continue;
+        const auto particles = instance->Particles();
+        live_particle_count += static_cast<size_t>(std::count_if(
+            particles.begin(), particles.end(), [](const Particle& p) {
+                return ParticleModify::LifetimeOk(p);
+            }));
+    }
+    return live_particle_count;
+}
+
+struct SpriteParticleRenderData {
+    Eigen::Vector3f     position;
+    std::array<float, 4> color;
+    std::array<float, 4> velocity_lifetime;
+};
+
+SpriteParticleRenderData PrepareSpriteParticleData(const ParticleInstance& instance,
+                                                   const Particle& particle,
+                                                   const ParticleRawGenSpecOp& specOp) {
+    float animation_lifetime = particle.lifetime;
+    specOp(particle, { &animation_lifetime });
+    const auto& render_velocity = ParticleModify::GetRenderVelocity(particle);
+    return SpriteParticleRenderData {
+        .position = RenderParticlePosition(instance, particle.position),
+        .color = { particle.color[0], particle.color[1], particle.color[2], particle.alpha },
+        .velocity_lifetime = { render_velocity[0],
+                               render_velocity[1],
+                               render_velocity[2],
+                               animation_lifetime },
     };
 }
 
-inline usize GenParticleData(std::span<const std::unique_ptr<ParticleInstance>> instances,
-                             const ParticleRawGenSpecOp& specOp, WPGOption opt,
-                             SceneVertexArray& sv) noexcept {
-    std::array<float, 32 * 4> storage;
-
-    float* data = storage.data();
-
-    const auto one_size   = sv.OneSize();
-    const auto totle_size = 4 * one_size;
-    usize      i { 0 };
-    for (const auto& inst : instances) {
-        if (inst->IsNoLiveParticle()) continue;
-
-        for (const auto& p : inst->Particles()) {
-            if (! ParticleModify::LifetimeOk(p)) {
-                continue;
-            }
-
-            float lifetime = p.lifetime;
-            specOp(p, { &lifetime });
-
-            auto  pos  = inst->GetBoundedData().pos + p.position;
-            float size = p.size / 2.0f;
-
-            usize offset = 0;
-
-            // pos
-            AssignVertexTimes(
-                { data + offset, totle_size }, std::array { pos[0], pos[1], pos[2] }, 4);
-            offset += 4;
-            // TexCoordVec4
-            float      rz = p.rotation[2];
-            std::array t { 0.0f, 1.0f, rz, size, 1.0f, 1.0f, rz, size,
-                           1.0f, 0.0f, rz, size, 0.0f, 0.0f, rz, size };
-            AssignVertex({ data + offset, totle_size }, t, 4);
-            offset += 4;
-
-            // color
-            AssignVertexTimes({ data + offset, totle_size },
-                              std::array { p.color[0], p.color[1], p.color[2], p.alpha },
-                              4);
-            offset += 4;
-
-            if (opt.thick_format) {
-                const auto& render_velocity = ParticleModify::GetRenderVelocity(p);
-                // Cherry_Blossoms_2.json uses spritetrail/genericparticle, where this attribute is
-                // the visual trail axis. Prefer a mapsequence-supplied render axis when present so
-                // random petal facing does not perturb the physics velocity that draws the star.
-                AssignVertexTimes(
-                    { data + offset, totle_size },
-                    std::array { render_velocity[0], render_velocity[1], render_velocity[2], lifetime },
-                    4);
-                offset += 4;
-            }
-            // TexCoordC2
-            AssignVertexTimes(
-                { data + offset, totle_size }, std::array { p.rotation[0], p.rotation[1] }, 4);
-
-            sv.SetVertexs((i++) * 4, { data, totle_size });
-        }
+bool WriteSpriteCommonAttributes(ParticleVertexWriter& writer,
+                                 const SpriteParticleRenderData& data, bool thick_format) {
+    if (! writer.Write(
+            WE_IN_POSITION,
+            std::array { data.position[0], data.position[1], data.position[2] }) ||
+        ! writer.Write(WE_IN_COLOR, data.color)) {
+        return false;
     }
-    return i;
+    return ! thick_format || writer.Write(WE_IN_TEXCOORDVEC4C1, data.velocity_lifetime);
 }
 
-inline size_t GenRopeParticleData(std::span<const Particle>   particles,
-                                  const Eigen::Vector3f&      instance_offset,
-                                  const ParticleRawGenSpecOp& specOp, WPGOption opt,
-                                  SceneVertexArray& sv, size_t base_index) {
+bool GenParticlePointData(std::span<const std::unique_ptr<ParticleInstance>> instances,
+                          const ParticleRawGenSpecOp& specOp, bool thick_format,
+                          ParticleVertexWriter& writer) {
+    if (! writer.EnsureCapacity(CountLiveParticles(instances), "sprite-point")) return false;
+
+    return ForEachLiveParticle(instances, [&](const ParticleInstance& instance,
+                                               const Particle& particle) {
+        const auto data = PrepareSpriteParticleData(instance, particle, specOp);
+        writer.BeginVertex();
+        // Point-expanded materials receive simulation rotation and size directly; their geometry
+        // stage creates the four authored corners after the vertex shader has run once.
+        return WriteSpriteCommonAttributes(writer, data, thick_format) &&
+            writer.Write(WE_IN_TEXCOORDVEC4,
+                         std::array { particle.rotation[0],
+                                      particle.rotation[1],
+                                      particle.rotation[2],
+                                      particle.size / 2.0f }) &&
+            writer.Commit();
+    });
+}
+
+bool GenParticleQuadData(std::span<const std::unique_ptr<ParticleInstance>> instances,
+                         const ParticleRawGenSpecOp& specOp, bool thick_format,
+                         ParticleVertexWriter& writer) {
+    constexpr std::array<std::array<float, 2>, 4> kCorners {
+        std::array { 0.0f, 1.0f },
+        std::array { 1.0f, 1.0f },
+        std::array { 1.0f, 0.0f },
+        std::array { 0.0f, 0.0f },
+    };
+
+    const size_t live_particle_count = CountLiveParticles(instances);
+    constexpr size_t kVerticesPerParticle = kCorners.size();
+    if (live_particle_count > std::numeric_limits<size_t>::max() / kVerticesPerParticle) {
+        const auto& diagnostics = writer.Diagnostics();
+        LOG_ERROR("particle quad vertex count overflow object='%.*s' material='%.*s' "
+                  "renderer=%s expansion=%s particles=%zu",
+                  static_cast<int>(diagnostics.object_name.size()),
+                  diagnostics.object_name.data(),
+                  static_cast<int>(diagnostics.material_name.size()),
+                  diagnostics.material_name.data(),
+                  diagnostics.renderer_name,
+                  diagnostics.expansion_name,
+                  live_particle_count);
+        return false;
+    }
+    const size_t required_vertices = live_particle_count * kVerticesPerParticle;
+    if (! writer.EnsureCapacity(required_vertices, "sprite-indexed-quad")) return false;
+
+    return ForEachLiveParticle(instances, [&](const ParticleInstance& instance,
+                                               const Particle& particle) {
+        const auto data = PrepareSpriteParticleData(instance, particle, specOp);
+
+        // A non-GS particle shader receives four invocations with identical simulation data. Only
+        // the authored corner changes, and the rotation pair remains in TexCoordC2 exactly as the
+        // original vertex shader declares it.
+        for (const auto& corner : kCorners) {
+            writer.BeginVertex();
+            if (! WriteSpriteCommonAttributes(writer, data, thick_format) ||
+                ! writer.Write(WE_IN_TEXCOORDVEC4,
+                               std::array { corner[0],
+                                            corner[1],
+                                            particle.rotation[2],
+                                            particle.size / 2.0f }) ||
+                ! writer.Write(WE_IN_TEXCOORDC2,
+                               std::array { particle.rotation[0], particle.rotation[1] }) ||
+                ! writer.Commit()) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
+class ParticleQuadIndexWriter {
+public:
+    ParticleQuadIndexWriter(SceneIndexArray& indices, ParticleRenderDiagnostics diagnostics)
+        : indices_(indices), diagnostics_(diagnostics) {}
+
+    bool SetQuadCount(size_t quad_count) {
+        constexpr size_t kIndicesPerQuad = 6;
+        constexpr size_t kVerticesPerQuad = 4;
+        constexpr size_t kMaxQuadCount =
+            (static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1) /
+            kVerticesPerQuad;
+        const size_t capacity = indices_.PackedUint16CapacityCount() / kIndicesPerQuad;
+        if (quad_count > kMaxQuadCount || quad_count > capacity) {
+            LOG_ERROR("particle quad index capacity exceeded object='%.*s' material='%.*s' "
+                      "renderer=%s expansion=%s requested=%zu capacity=%zu uint16-limit=%zu",
+                      static_cast<int>(diagnostics_.object_name.size()),
+                      diagnostics_.object_name.data(),
+                      static_cast<int>(diagnostics_.material_name.size()),
+                      diagnostics_.material_name.data(),
+                      diagnostics_.renderer_name,
+                      diagnostics_.expansion_name,
+                      quad_count,
+                      capacity,
+                      kMaxQuadCount);
+            return false;
+        }
+
+        const size_t initialized_quad_count =
+            indices_.PackedUint16DataCount() / kIndicesPerQuad;
+        for (size_t quad = initialized_quad_count; quad < quad_count; quad++) {
+            const uint16_t base = static_cast<uint16_t>(quad * kVerticesPerQuad);
+            const std::array<uint16_t, kIndicesPerQuad> values {
+                base,
+                static_cast<uint16_t>(base + 1),
+                static_cast<uint16_t>(base + 3),
+                static_cast<uint16_t>(base + 1),
+                static_cast<uint16_t>(base + 2),
+                static_cast<uint16_t>(base + 3),
+            };
+            indices_.AssignHalf(quad * kIndicesPerQuad, values);
+        }
+
+        indices_.SetPackedUint16RenderDataCount(quad_count * kIndicesPerQuad);
+        return true;
+    }
+
+private:
+    SceneIndexArray&          indices_;
+    ParticleRenderDiagnostics diagnostics_;
+};
+
+bool GenRopeParticleData(const ParticleInstance& instance, bool thick_format,
+                         ParticleVertexWriter& writer) {
     /*
     attribute vec4 a_PositionVec4;
     attribute vec4 a_TexCoordVec4;
@@ -136,10 +382,8 @@ inline size_t GenRopeParticleData(std::span<const Particle>   particles,
     #if THICKFORMAT
     attribute vec4 a_TexCoordVec4C2;
     attribute vec4 a_TexCoordVec4C3;
-    attribute vec2 a_TexCoordC4;
     #else
     attribute vec3 a_TexCoordVec3C2;
-    attribute vec2 a_TexCoordC3;
     #endif
 
     attribute vec4 a_Color;
@@ -147,16 +391,7 @@ inline size_t GenRopeParticleData(std::span<const Particle>   particles,
     #define in_ParticleTrailLength (a_TexCoordVec4.w)
     #define in_ParticleTrailPosition (a_TexCoordVec4C1.w)
     */
-    std::array<float, 32 * 4> storage;
-    float*                    data = storage.data();
-
-    const auto one_size   = sv.OneSize();
-    const auto totle_size = one_size * 4;
-    const auto subdivisions =
-        std::max(1u,
-                 static_cast<uint32_t>(std::lround(std::max(
-                     1.0f, sv.GetFloatOption(WE_PRENDER_ROPE_SUBDIVISION)))));
-
+    const auto particles = instance.Particles();
     std::vector<const Particle*> live_particles;
     live_particles.reserve(particles.size());
     for (const auto& particle : particles) {
@@ -164,159 +399,292 @@ inline size_t GenRopeParticleData(std::span<const Particle>   particles,
             live_particles.push_back(&particle);
         }
     }
-    if (live_particles.size() < 2) return 0;
+    if (live_particles.size() < 2) return true;
+    std::sort(live_particles.begin(), live_particles.end(), [](const auto* lhs, const auto* rhs) {
+        return lhs->spawnSequence < rhs->spawnSequence;
+    });
 
-    const uint32_t alive_count       = static_cast<uint32_t>(live_particles.size());
-    const uint32_t num_segments      = alive_count - 1;
-    const uint32_t total_points      = num_segments * subdivisions + 1;
-    const uint32_t total_subsegments = total_points - 1;
-    const float    trail_length      = static_cast<float>(total_subsegments) + 1.0f;
+    const size_t alive_count  = live_particles.size();
+    const size_t num_segments = alive_count - 1;
+    const float  trail_length = static_cast<float>(alive_count);
+    if (! writer.EnsureCapacity(num_segments, "rope-current-chain")) return false;
 
-    std::vector<Vector3f>             spline_positions(total_points, Vector3f::Zero());
-    std::vector<float>                spline_sizes(total_points, 0.0f);
-    std::vector<std::array<float, 4>> spline_colors(total_points, { 1.0f, 1.0f, 1.0f, 1.0f });
-
-    for (uint32_t i = 0; i < num_segments; i++) {
+    for (size_t i = 0; i < num_segments; i++) {
         const auto& p0_src = i > 0 ? *live_particles[i - 1] : *live_particles[i];
         const auto& p1_src = *live_particles[i];
         const auto& p2_src = *live_particles[i + 1];
         const auto& p3_src = i + 2 < alive_count ? *live_particles[i + 2] : *live_particles[i + 1];
 
-        const Vector3f p0 = instance_offset + p0_src.position;
-        const Vector3f p1 = instance_offset + p1_src.position;
-        const Vector3f p2 = instance_offset + p2_src.position;
-        const Vector3f p3 = instance_offset + p3_src.position;
+        const Vector3f p0 = RenderParticlePosition(instance, p0_src.position);
+        const Vector3f p1 = RenderParticlePosition(instance, p1_src.position);
+        const Vector3f p2 = RenderParticlePosition(instance, p2_src.position);
+        const Vector3f p3 = RenderParticlePosition(instance, p3_src.position);
 
-        for (uint32_t k = 0; k < subdivisions; k++) {
-            const float    t   = static_cast<float>(k) / static_cast<float>(subdivisions);
-            const uint32_t idx = i * subdivisions + k;
-            spline_positions[idx] = CatmullRom(p0, p1, p2, p3, t);
-            spline_sizes[idx]     = LerpFloat(p1_src.size / 2.0f, p2_src.size / 2.0f, t);
-            spline_colors[idx]    = LerpColor(p1_src, p2_src, t);
+        /*
+         * A rope segment is submitted as one point primitive.  The stock Wallpaper Engine
+         * vertex and geometry shaders consume the four adjacent particle positions directly:
+         * p0/p3 provide the Bezier tangents, while p1/p2 are the segment endpoints.  Keeping
+         * this exact input contract moves ribbon expansion, interpolation, and subdivision into
+         * genericropeparticle.geom; the CPU only uploads adjacent current particle positions and
+         * never synthesizes ribbon vertices.
+         */
+        writer.BeginVertex();
+        if (! writer.Write(
+                WE_IN_POSITIONVEC4,
+                std::array { p1[0], p1[1], p1[2], p1_src.size / 2.0f }) ||
+            ! writer.Write(
+                WE_IN_TEXCOORDVEC4,
+                std::array { p2[0], p2[1], p2[2], trail_length }) ||
+            ! writer.Write(
+                WE_IN_TEXCOORDVEC4C1,
+                std::array { p0[0], p0[1], p0[2], static_cast<float>(i) })) {
+            return false;
+        }
+        if (thick_format) {
+            if (! writer.Write(
+                    WE_IN_TEXCOORDVEC4C2,
+                    std::array { p3[0], p3[1], p3[2], p2_src.size / 2.0f }) ||
+                ! writer.Write(
+                    WE_IN_TEXCOORDVEC4C3,
+                    std::array { p2_src.color[0], p2_src.color[1], p2_src.color[2],
+                                 p2_src.alpha })) {
+                return false;
+            }
+        } else if (! writer.Write(
+                       WE_IN_TEXCOORDVEC3C2,
+                       std::array { p3[0], p3[1], p3[2] })) {
+            return false;
+        }
+        if (! writer.Write(
+                WE_IN_COLOR,
+                std::array { p1_src.color[0], p1_src.color[1], p1_src.color[2], p1_src.alpha }) ||
+            ! writer.Commit()) {
+            return false;
         }
     }
 
-    const auto& last_particle = *live_particles.back();
-    spline_positions[total_points - 1] = instance_offset + last_particle.position;
-    spline_sizes[total_points - 1]     = last_particle.size / 2.0f;
-    spline_colors[total_points - 1]    = {
-        last_particle.color[0],
-        last_particle.color[1],
-        last_particle.color[2],
-        last_particle.alpha,
+    return true;
+}
+
+bool GenRopeTrailSegments(const ParticleInstance& instance, const Particle& particle,
+                          const ParticleTrail& trail, bool thick_format,
+                          ParticleVertexWriter& writer) {
+    const size_t trail_length = trail.Length();
+    if (trail_length == 0) return true;
+
+    if (! writer.EnsureCapacity(trail_length, "rope-history")) return false;
+
+    const float size = particle.size / 2.0f;
+    const auto point = [&](size_t point_index) {
+        if (point_index == 0) return RenderParticlePosition(instance, particle.position);
+        return RenderParticlePosition(instance, trail.At(trail_length - point_index));
     };
 
-    for (uint32_t s = 0; s < total_subsegments; s++) {
-        const auto& start_pos   = spline_positions[s];
-        const auto& end_pos     = spline_positions[s + 1];
-        const auto& prev_pos    = s > 0 ? spline_positions[s - 1] : start_pos;
-        const auto& after_pos   = s + 2 < total_points ? spline_positions[s + 2] : end_pos;
-        const float size_start  = spline_sizes[s];
-        const float size_end    = spline_sizes[s + 1];
-        const auto& color_start = spline_colors[s];
-        const auto& color_end   = spline_colors[s + 1];
+    // Each live head emits a fixed number of point primitives. Segment zero starts at the current
+    // operator-complete head position, while following points walk newest-to-oldest history.
+    for (size_t sample_index = 0; sample_index < trail_length; sample_index++) {
+        const Vector3f start = point(sample_index);
+        const Vector3f end   = point(sample_index + 1);
+        const Vector3f before = point(sample_index == 0 ? 0 : sample_index - 1);
+        const Vector3f after  = point(std::min(sample_index + 2, trail_length));
 
-        std::size_t offset = 0;
-
-        AssignVertexTimes({ data + offset, totle_size },
-                          std::array { start_pos[0], start_pos[1], start_pos[2], size_start },
-                          4);
-        offset += 4;
-        AssignVertexTimes(
-            { data + offset, totle_size },
-            std::array { end_pos[0], end_pos[1], end_pos[2], trail_length },
-            4);
-        offset += 4;
-        AssignVertexTimes({ data + offset, totle_size },
-                          std::array { prev_pos[0], prev_pos[1], prev_pos[2], static_cast<float>(s) },
-                          4);
-        offset += 4;
-
-        if (opt.thick_format) {
-            AssignVertexTimes(
-                { data + offset, totle_size },
-                std::array { after_pos[0], after_pos[1], after_pos[2], size_end },
-                4);
-            offset += 4;
-            AssignVertexTimes({ data + offset, totle_size },
-                              std::array { color_end[0], color_end[1], color_end[2], color_end[3] },
-                              4);
-            offset += 4;
-            std::array t { 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-            AssignVertex({ data + offset, totle_size }, t, 4);
-            offset += 4;
-        } else {
-            AssignVertexTimes(
-                { data + offset, totle_size }, std::array { after_pos[0], after_pos[1], after_pos[2] }, 4);
-            offset += 4;
-            std::array t { 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-            AssignVertex({ data + offset, totle_size }, t, 4);
-            offset += 4;
+        writer.BeginVertex();
+        if (! writer.Write(
+                WE_IN_POSITIONVEC4,
+                std::array { start[0], start[1], start[2], size }) ||
+            ! writer.Write(
+                WE_IN_TEXCOORDVEC4,
+                std::array { end[0], end[1], end[2],
+                             static_cast<float>(trail.sample_count) }) ||
+            ! writer.Write(
+                WE_IN_TEXCOORDVEC4C1,
+                std::array { before[0], before[1], before[2],
+                             static_cast<float>(sample_index) })) {
+            return false;
         }
-
-        AssignVertexTimes({ data + offset, totle_size },
-                          std::array { color_start[0], color_start[1], color_start[2], color_start[3] },
-                          4);
-
-        if (! sv.SetVertexs((base_index + s) * 4, { data, totle_size })) {
-            return s;
+        if (thick_format) {
+            if (! writer.Write(
+                    WE_IN_TEXCOORDVEC4C2,
+                    std::array { after[0], after[1], after[2], size }) ||
+                ! writer.Write(
+                    WE_IN_TEXCOORDVEC4C3,
+                    std::array { particle.color[0], particle.color[1], particle.color[2],
+                                 particle.alpha })) {
+                return false;
+            }
+        } else if (! writer.Write(
+                       WE_IN_TEXCOORDVEC3C2,
+                       std::array { after[0], after[1], after[2] })) {
+            return false;
+        }
+        if (! writer.Write(
+                WE_IN_COLOR,
+                std::array { particle.color[0], particle.color[1], particle.color[2],
+                             particle.alpha }) ||
+            ! writer.Commit()) {
+            return false;
         }
     }
-
-    return total_subsegments;
+    return true;
 }
 
-inline void updateIndexArray(uint16_t index, size_t count, SceneIndexArray& iarray) noexcept {
-    constexpr size_t single_size = 6;
-    const uint16_t   cv          = index * 4;
+bool GenRopeTrailData(std::span<const std::unique_ptr<ParticleInstance>> instances,
+                      bool thick_format, ParticleVertexWriter& writer) {
+    for (size_t instance_index = 0; instance_index < instances.size(); instance_index++) {
+        const auto& instance = *instances[instance_index];
+        if (instance.IsNoLiveParticle()) continue;
+        const auto particles = instance.Particles();
+        const auto trails    = instance.Trails();
+        if (particles.size() != trails.size()) {
+            const auto& diagnostics = writer.Diagnostics();
+            LOG_ERROR("particle trail slot invariant violated object='%.*s' material='%.*s' "
+                      "renderer=%s expansion=%s instance=%zu particles=%zu trails=%zu",
+                      static_cast<int>(diagnostics.object_name.size()),
+                      diagnostics.object_name.data(),
+                      static_cast<int>(diagnostics.material_name.size()),
+                      diagnostics.material_name.data(),
+                      diagnostics.renderer_name,
+                      diagnostics.expansion_name,
+                      instance_index,
+                      particles.size(),
+                      trails.size());
+            return false;
+        }
+        for (size_t slot = 0; slot < particles.size(); slot++) {
+            if (! ParticleModify::LifetimeOk(particles[slot])) continue;
+            if (! GenRopeTrailSegments(instance,
+                                       particles[slot],
+                                       trails[slot],
+                                       thick_format,
+                                       writer)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
-    std::array<uint16_t, single_size> single;
-    // 0 1 3
-    // 1 2 3
-    single[0] = cv;
-    single[1] = cv + 1;
-    single[2] = cv + 3;
-    single[3] = cv + 1;
-    single[4] = cv + 2;
-    single[5] = cv + 3;
-    // every particle
-    for (uint16_t i = index; i < count; i++) {
-        iarray.AssignHalf(i * single_size, single);
-        for (auto& x : single) x += 4;
+void ResetParticleOutput(SceneMesh& mesh) noexcept {
+    if (mesh.VertexCount() > 0) mesh.GetVertexArray(0).ResetSize();
+    if (mesh.IndexCount() > 0) {
+        mesh.GetIndexArray(0).SetPackedUint16RenderDataCount(0);
     }
 }
+
+bool ValidateParticleMeshContract(const SceneMesh& mesh, const ParticleRenderPlan& plan,
+                                  const ParticleRenderDiagnostics& diagnostics) {
+    const bool shader_selection_valid =
+        plan.IsRope() == (plan.shader_selection == ParticleShaderSelection::StockRope);
+    const bool expansion_valid =
+        ! plan.IsRope() || plan.expansion == ParticleExpansionMode::GeometryPoint;
+    const MeshPrimitive expected_primitive =
+        plan.IsRope() || plan.expansion == ParticleExpansionMode::GeometryPoint
+        ? MeshPrimitive::POINT
+        : MeshPrimitive::TRIANGLE;
+    const size_t expected_index_count =
+        ! plan.IsRope() && plan.expansion == ParticleExpansionMode::IndexedQuad ? 1 : 0;
+
+    if (shader_selection_valid && expansion_valid && mesh.VertexCount() == 1 &&
+        mesh.Primitive() == expected_primitive && mesh.IndexCount() == expected_index_count) {
+        return true;
+    }
+
+    LOG_ERROR("particle render plan mismatch object='%.*s' material='%.*s' renderer=%s "
+              "expansion=%s primitive=%u expected-primitive=%u vertices=%zu indices=%zu "
+              "expected-indices=%zu shader-selection=%s",
+              static_cast<int>(diagnostics.object_name.size()),
+              diagnostics.object_name.data(),
+              static_cast<int>(diagnostics.material_name.size()),
+              diagnostics.material_name.data(),
+              diagnostics.renderer_name,
+              diagnostics.expansion_name,
+              static_cast<unsigned>(mesh.Primitive()),
+              static_cast<unsigned>(expected_primitive),
+              mesh.VertexCount(),
+              mesh.IndexCount(),
+              expected_index_count,
+              plan.shader_selection == ParticleShaderSelection::Authored ? "Authored"
+                                                                          : "StockRope");
+    return false;
+}
+
 } // namespace
 
 void WPParticleRawGener::GenGLData(std::span<const std::unique_ptr<ParticleInstance>> instances,
-                                   SceneMesh& mesh, ParticleRawGenSpecOp& specOp) {
+                                   SceneMesh& mesh, ParticleRawGenSpecOp& specOp,
+                                   const ParticleRenderPlan& plan,
+                                   std::string_view object_name) {
+    const auto* material = mesh.Material();
+    const std::string_view material_name = material != nullptr
+        ? std::string_view(material->name)
+        : std::string_view("(unbound-particle-material)");
+    const ParticleRenderDiagnostics diagnostics {
+        .object_name    = object_name,
+        .material_name  = material_name,
+        .renderer_name  = ParticleRendererName(plan.renderer),
+        .expansion_name = ParticleExpansionName(plan.expansion),
+    };
+
+    // Clear the complete live draw prefix before resolving this frame. Any layout, capacity, or
+    // topology error therefore leaves the dynamic mesh with an explicit zero draw count rather
+    // than exposing vertices or indices produced by an earlier frame.
+    ResetParticleOutput(mesh);
+    if (! ValidateParticleMeshContract(mesh, plan, diagnostics)) return;
+
     auto& sv = mesh.GetVertexArray(0);
-    auto& si = mesh.GetIndexArray(0);
+    const auto layout = ResolveParticleVertexLayout(sv, diagnostics);
+    if (! layout.has_value()) return;
+    ParticleVertexWriter writer(sv, std::move(*layout), diagnostics);
 
-    WPGOption opt;
-
-    opt.thick_format = sv.GetOption(WE_CB_THICK_FORMAT);
-
-    usize particle_num { 0 };
-
-    if (sv.GetOption(WE_PRENDER_ROPE)) {
-        for (const auto& inst : instances) {
-            if (inst->IsNoLiveParticle()) continue;
-            particle_num += GenRopeParticleData(inst->Particles(),
-                                                inst->GetBoundedData().pos,
-                                                specOp,
-                                                opt,
-                                                sv,
-                                                particle_num);
+    bool generated { true };
+    switch (plan.renderer) {
+    case ParticleRendererKind::Sprite:
+    case ParticleRendererKind::SpriteTrail:
+        generated = plan.expansion == ParticleExpansionMode::GeometryPoint
+            ? GenParticlePointData(instances, specOp, plan.thick_format, writer)
+            : GenParticleQuadData(instances, specOp, plan.thick_format, writer);
+        break;
+    case ParticleRendererKind::Rope:
+        for (size_t instance_index = 0; instance_index < instances.size(); instance_index++) {
+            const auto& instance = instances[instance_index];
+            if (instance->IsNoLiveParticle()) continue;
+            if (! GenRopeParticleData(*instance, plan.thick_format, writer)) {
+                generated = false;
+                break;
+            }
         }
-    } else {
-        particle_num += GenParticleData(instances, specOp, opt, sv);
+        break;
+    case ParticleRendererKind::RopeTrail:
+        generated = GenRopeTrailData(instances, plan.thick_format, writer);
+        break;
     }
 
-    // LOG_INFO("num: %d", particle_num);
-
-    u16 indexNum = (si.DataCount() * 2) / 6;
-    if (particle_num > indexNum) {
-        updateIndexArray(indexNum, particle_num, si);
+    if (! generated) {
+        ResetParticleOutput(mesh);
+        return;
     }
-    si.SetRenderDataCount(particle_num * 6 / 2);
+
+    if (plan.expansion == ParticleExpansionMode::IndexedQuad) {
+        constexpr size_t kVerticesPerQuad = 4;
+        if (writer.Written() % kVerticesPerQuad != 0) {
+            LOG_ERROR("particle quad vertex invariant violated object='%.*s' material='%.*s' "
+                      "renderer=%s expansion=%s vertices=%zu",
+                      static_cast<int>(diagnostics.object_name.size()),
+                      diagnostics.object_name.data(),
+                      static_cast<int>(diagnostics.material_name.size()),
+                      diagnostics.material_name.data(),
+                      diagnostics.renderer_name,
+                      diagnostics.expansion_name,
+                      writer.Written());
+            ResetParticleOutput(mesh);
+            return;
+        }
+
+        // Index activation happens only after all vertices have been generated successfully. This
+        // ordering keeps the indexed draw prefix and the vertex prefix transactional for the frame.
+        ParticleQuadIndexWriter index_writer(mesh.GetIndexArray(0), diagnostics);
+        if (! index_writer.SetQuadCount(writer.Written() / kVerticesPerQuad)) {
+            ResetParticleOutput(mesh);
+        }
+    }
 }

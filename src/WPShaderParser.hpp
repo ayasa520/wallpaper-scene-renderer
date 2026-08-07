@@ -48,6 +48,7 @@ struct WPShaderUnit {
     ShaderType         stage;
     std::string        src;
     WPPreprocessorInfo preprocess_info;
+    std::string        debug_name;
 };
 
 class WPShaderParser {

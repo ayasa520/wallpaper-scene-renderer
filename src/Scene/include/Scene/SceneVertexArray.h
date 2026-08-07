@@ -37,12 +37,11 @@ public:
 
     bool GetOption(std::string_view) const;
     void SetOption(std::string_view, bool);
-    float GetFloatOption(std::string_view) const;
-    void  SetFloatOption(std::string_view, float);
 
     const float* Data() const { return m_pData; }
     usize        DataSize() const { return m_size; }
     usize        DataSizeOf() const { return m_size * sizeof(float); }
+    void         ResetSize() noexcept { m_size = 0; }
     usize        VertexCount() const { return m_size / m_oneSize; }
     usize        CapacitySize() const { return m_capacity; }
     usize        CapacitySizeOf() const { return m_capacity * sizeof(float); }
@@ -63,8 +62,7 @@ private:
 
     std::vector<SceneVertexAttribute> m_attributes;
 
-    Map<std::string, bool>  m_options;
-    Map<std::string, float> m_float_options;
+    Map<std::string, bool> m_options;
 
     float* m_pData { nullptr };
     usize  m_oneSize { 0 };

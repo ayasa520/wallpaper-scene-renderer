@@ -33,6 +33,21 @@ public:
     }
     void SetRenderDataCount(usize val) noexcept { m_render_size = val; }
 
+    // Particle quad indices are packed into this uint32_t-owned storage and bound as uint16_t by
+    // CustomShaderPass. These accessors expose logical uint16_t counts so particle code does not
+    // duplicate the storage-word conversion or depend on SceneIndexArray's allocation unit.
+    usize PackedUint16DataCount() const noexcept {
+        return m_size * Unit_Byte_Size / sizeof(uint16_t);
+    }
+    usize PackedUint16CapacityCount() const noexcept {
+        return m_capacity * Unit_Byte_Size / sizeof(uint16_t);
+    }
+    void SetPackedUint16RenderDataCount(usize count) noexcept {
+        constexpr usize values_per_storage_unit = Unit_Byte_Size / sizeof(uint16_t);
+        m_render_size =
+            (count + values_per_storage_unit - 1) / values_per_storage_unit;
+    }
+
     usize CapacityCount() const { return m_capacity; }
     usize CapacitySizeof() const { return m_capacity * Unit_Byte_Size; }
 

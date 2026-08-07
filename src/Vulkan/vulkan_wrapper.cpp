@@ -300,7 +300,8 @@ DebugUtilsMessenger Instance::CreateDebugUtilsMessenger(
 }
 VkResult Device::Create(Device& device, VkPhysicalDevice physical_device,
                         Span<const VkDeviceQueueCreateInfo> queues_ci,
-                        Span<const char*> enabled_extensions, const void* next,
+                        Span<const char*> enabled_extensions,
+                        const VkPhysicalDeviceFeatures* enabled_features, const void* next,
                         DeviceDispatch& dld) {
     const VkDeviceCreateInfo ci {
         .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -312,7 +313,7 @@ VkResult Device::Create(Device& device, VkPhysicalDevice physical_device,
         .ppEnabledLayerNames     = nullptr,
         .enabledExtensionCount   = enabled_extensions.size(),
         .ppEnabledExtensionNames = enabled_extensions.data(),
-        .pEnabledFeatures        = nullptr,
+        .pEnabledFeatures        = enabled_features,
     };
     VkDevice vkdevice;
     LOG_INFO("VulkanDevice: vkCreateDevice physicalDevice=%p queueCreateInfos=%zu enabledExts=%zu",
