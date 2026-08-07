@@ -16,6 +16,7 @@
 #include <array>
 #include <charconv>
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -31,7 +32,9 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
-    "prepared-shader-v19-dxc-interface-sanitize\n"
+    // Geometry now shares the VS/FS structs directly and source normalization is token-aware.
+    // Prepared-source cache entries therefore belong to a new renderer ABI generation.
+    "prepared-shader-v21-dxc-shared-geometry-abi\n"
 };
 
 using namespace wallpaper;
@@ -651,11 +654,13 @@ inline std::string EmitCBufferStd140(const Map<std::string, std::string>& unifor
     return out;
 }
 
+inline bool IsPositionIODecl(const IODecl& decl) {
+    return decl.name == "gl_Position" || decl.name == "_ww_sv_position";
+}
+
 inline std::string EmitVSFSStruct(std::string_view name, std::vector<IODecl> decls,
                                   bool include_sv_position) {
-    decls.erase(std::remove_if(decls.begin(), decls.end(), [](const IODecl& decl) {
-                    return decl.name == "gl_Position" || decl.name == "_ww_sv_position";
-                }),
+    decls.erase(std::remove_if(decls.begin(), decls.end(), IsPositionIODecl),
                 decls.end());
     std::sort(decls.begin(), decls.end(), [](const IODecl& a, const IODecl& b) {
         return a.name < b.name;
@@ -674,6 +679,410 @@ inline std::string EmitVSFSStruct(std::string_view name, std::vector<IODecl> dec
     return out;
 }
 
+inline bool IsHlslIdentifierCharacter(char value) {
+    return std::isalnum(static_cast<unsigned char>(value)) || value == '_';
+}
+
+inline const char* DxcStageLogName(ShaderType stage);
+
+enum class HlslTokenKind {
+    Identifier,
+    Number,
+    Punctuation,
+};
+
+struct HlslToken {
+    HlslTokenKind kind;
+    size_t        begin;
+    size_t        end;
+};
+
+struct HlslTokens {
+    std::vector<HlslToken> tokens;
+    std::vector<size_t>    matching_delimiter;
+};
+
+inline bool IsHlslIdentifierStart(char value) {
+    return std::isalpha(static_cast<unsigned char>(value)) || value == '_';
+}
+
+inline std::string_view HlslTokenText(std::string_view source, const HlslToken& token) {
+    return source.substr(token.begin, token.end - token.begin);
+}
+
+inline bool HlslPunctuationIs(std::string_view source, const HlslToken& token, char value) {
+    return token.kind == HlslTokenKind::Punctuation && token.end == token.begin + 1 &&
+        source[token.begin] == value;
+}
+
+inline std::string HlslDiagnosticSnippet(std::string_view source, size_t offset) {
+    constexpr size_t radius = 96;
+    const size_t begin = offset > radius ? offset - radius : 0;
+    const size_t end   = std::min(source.size(), offset + radius);
+    std::string  snippet(source.substr(begin, end - begin));
+    std::replace(snippet.begin(), snippet.end(), '\n', ' ');
+    std::replace(snippet.begin(), snippet.end(), '\r', ' ');
+    return snippet;
+}
+
+inline void LogHlslAdapterError(std::string_view shader_name, ShaderType stage,
+                                std::string_view message, std::string_view source,
+                                size_t offset) {
+    const auto snippet = HlslDiagnosticSnippet(source, offset);
+    LOG_ERROR("DXC WE adapter failed shader='%.*s' stage=%s byte=%zu: %.*s; source='%s'",
+              static_cast<int>(shader_name.size()),
+              shader_name.data(),
+              DxcStageLogName(stage),
+              offset,
+              static_cast<int>(message.size()),
+              message.data(),
+              snippet.c_str());
+}
+
+inline bool TokenizeHlslForRewrite(std::string_view source, std::string_view shader_name,
+                                   ShaderType stage, HlslTokens& result) {
+    result = {};
+    struct Delimiter {
+        char   value;
+        size_t token_index;
+    };
+    std::vector<Delimiter> delimiters;
+    bool                   line_has_code { false };
+
+    const auto emit = [&](HlslTokenKind kind, size_t begin, size_t end) {
+        result.tokens.push_back(HlslToken { kind, begin, end });
+        result.matching_delimiter.push_back(std::numeric_limits<size_t>::max());
+    };
+    const auto fail = [&](std::string_view message, size_t offset) {
+        LogHlslAdapterError(shader_name, stage, message, source, offset);
+        return false;
+    };
+
+    size_t pos { 0 };
+    while (pos < source.size()) {
+        const char ch = source[pos];
+        if (ch == '\n' || ch == '\r') {
+            if (ch == '\r' && pos + 1 < source.size() && source[pos + 1] == '\n') pos++;
+            pos++;
+            line_has_code = false;
+            continue;
+        }
+        if (ch == ' ' || ch == '\t' || ch == '\f' || ch == '\v') {
+            pos++;
+            continue;
+        }
+        if (ch == '/' && pos + 1 < source.size() && source[pos + 1] == '/') {
+            pos += 2;
+            while (pos < source.size() && source[pos] != '\n' && source[pos] != '\r') pos++;
+            continue;
+        }
+        if (ch == '/' && pos + 1 < source.size() && source[pos + 1] == '*') {
+            const size_t comment_start = pos;
+            pos += 2;
+            bool closed { false };
+            while (pos + 1 < source.size()) {
+                if (source[pos] == '\n' || source[pos] == '\r') line_has_code = false;
+                if (source[pos] == '*' && source[pos + 1] == '/') {
+                    pos += 2;
+                    closed = true;
+                    break;
+                }
+                pos++;
+            }
+            if (! closed) return fail("unterminated block comment", comment_start);
+            continue;
+        }
+        if (ch == '#' && ! line_has_code) {
+            // Preprocessor directives are not HLSL statements. Skip the complete logical line,
+            // including backslash continuations, so delimiter-looking macro text is never parsed.
+            pos++;
+            while (pos < source.size()) {
+                if (source[pos] == '\n' || source[pos] == '\r') {
+                    size_t previous = pos;
+                    while (previous > 0 &&
+                           (source[previous - 1] == ' ' || source[previous - 1] == '\t')) {
+                        previous--;
+                    }
+                    const bool continued = previous > 0 && source[previous - 1] == '\\';
+                    if (source[pos] == '\r' && pos + 1 < source.size() &&
+                        source[pos + 1] == '\n') {
+                        pos++;
+                    }
+                    pos++;
+                    if (! continued) break;
+                    continue;
+                }
+                pos++;
+            }
+            line_has_code = false;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            const size_t literal_start = pos;
+            const char   quote         = ch;
+            bool         escaped { false };
+            bool         closed { false };
+            pos++;
+            while (pos < source.size()) {
+                const char current = source[pos++];
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (current == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (current == quote) {
+                    closed = true;
+                    break;
+                }
+                if (current == '\n' || current == '\r') {
+                    return fail("unterminated string or character literal", literal_start);
+                }
+            }
+            if (! closed) return fail("unterminated string or character literal", literal_start);
+            line_has_code = true;
+            continue;
+        }
+        if (IsHlslIdentifierStart(ch)) {
+            const size_t begin = pos++;
+            while (pos < source.size() && IsHlslIdentifierCharacter(source[pos])) pos++;
+            emit(HlslTokenKind::Identifier, begin, pos);
+            line_has_code = true;
+            continue;
+        }
+        if (std::isdigit(static_cast<unsigned char>(ch))) {
+            const size_t begin = pos++;
+            while (pos < source.size()) {
+                const char current = source[pos];
+                if (! IsHlslIdentifierCharacter(current) && current != '.') break;
+                pos++;
+            }
+            emit(HlslTokenKind::Number, begin, pos);
+            line_has_code = true;
+            continue;
+        }
+
+        const size_t token_index = result.tokens.size();
+        emit(HlslTokenKind::Punctuation, pos, pos + 1);
+        line_has_code = true;
+        if (ch == '(' || ch == '{' || ch == '[') {
+            delimiters.push_back(Delimiter { ch, token_index });
+        } else if (ch == ')' || ch == '}' || ch == ']') {
+            const char expected = ch == ')' ? '(' : (ch == '}' ? '{' : '[');
+            if (delimiters.empty() || delimiters.back().value != expected) {
+                return fail("mismatched closing delimiter", pos);
+            }
+            const size_t opening_index = delimiters.back().token_index;
+            delimiters.pop_back();
+            result.matching_delimiter[opening_index] = token_index;
+            result.matching_delimiter[token_index]   = opening_index;
+        }
+        pos++;
+    }
+
+    if (! delimiters.empty()) {
+        const auto& delimiter = delimiters.back();
+        return fail("unterminated delimiter", result.tokens[delimiter.token_index].begin);
+    }
+    return true;
+}
+
+inline bool IsHlslDeclarationKeyword(std::string_view token) {
+    return token == "return" || token == "if" || token == "else" || token == "for" ||
+        token == "while" || token == "do" || token == "switch" || token == "case" ||
+        token == "break" || token == "continue" || token == "discard" || token == "sizeof";
+}
+
+inline bool IsLikelyHlslLocalDeclaration(std::string_view source,
+                                         const std::vector<HlslToken>& tokens, size_t name_index) {
+    if (name_index == 0 || name_index + 1 >= tokens.size()) return false;
+    const auto& type_token = tokens[name_index - 1];
+    if (type_token.kind != HlslTokenKind::Identifier) return false;
+    const auto type_name = HlslTokenText(source, type_token);
+    if (IsHlslDeclarationKeyword(type_name)) return false;
+
+    const auto& next = tokens[name_index + 1];
+    return HlslPunctuationIs(source, next, '=') || HlslPunctuationIs(source, next, ';') ||
+        HlslPunctuationIs(source, next, ',') || HlslPunctuationIs(source, next, '[');
+}
+
+inline bool RenameHlslForLoopVariablesShadowedByTheLoopBody(std::string& source,
+                                                             std::string_view shader_name,
+                                                             ShaderType stage) {
+    HlslTokens parsed;
+    if (! TokenizeHlslForRewrite(source, shader_name, stage, parsed)) return false;
+
+    struct Replacement {
+        size_t      begin;
+        size_t      end;
+        std::string value;
+    };
+    std::vector<Replacement> replacements;
+    Set<std::string>         identifiers;
+    for (const auto& token : parsed.tokens) {
+        if (token.kind == HlslTokenKind::Identifier) {
+            identifiers.insert(std::string(HlslTokenText(source, token)));
+        }
+    }
+
+    size_t replacement_serial { 0 };
+    for (size_t i = 0; i + 4 < parsed.tokens.size(); i++) {
+        if (parsed.tokens[i].kind != HlslTokenKind::Identifier ||
+            HlslTokenText(source, parsed.tokens[i]) != "for" ||
+            ! HlslPunctuationIs(source, parsed.tokens[i + 1], '(')) {
+            continue;
+        }
+
+        const size_t header_end = parsed.matching_delimiter[i + 1];
+        if (header_end == std::numeric_limits<size_t>::max()) {
+            LogHlslAdapterError(shader_name,
+                                stage,
+                                "could not resolve for-loop header",
+                                source,
+                                parsed.tokens[i].begin);
+            return false;
+        }
+
+        size_t declaration_start = i + 2;
+        while (declaration_start < header_end &&
+               parsed.tokens[declaration_start].kind == HlslTokenKind::Identifier) {
+            const auto text = HlslTokenText(source, parsed.tokens[declaration_start]);
+            if (text != "const" && text != "static" && text != "precise" &&
+                text != "volatile") {
+                break;
+            }
+            declaration_start++;
+        }
+        if (declaration_start + 1 >= header_end ||
+            parsed.tokens[declaration_start].kind != HlslTokenKind::Identifier ||
+            HlslTokenText(source, parsed.tokens[declaration_start]) != "int" ||
+            parsed.tokens[declaration_start + 1].kind != HlslTokenKind::Identifier) {
+            i = header_end;
+            continue;
+        }
+
+        const auto loop_variable = HlslTokenText(source, parsed.tokens[declaration_start + 1]);
+        if (header_end + 1 >= parsed.tokens.size() ||
+            ! HlslPunctuationIs(source, parsed.tokens[header_end + 1], '{')) {
+            i = header_end;
+            continue;
+        }
+        const size_t body_start = header_end + 1;
+        const size_t body_end   = parsed.matching_delimiter[body_start];
+        if (body_end == std::numeric_limits<size_t>::max()) {
+            LogHlslAdapterError(shader_name,
+                                stage,
+                                "could not resolve for-loop body",
+                                source,
+                                parsed.tokens[body_start].begin);
+            return false;
+        }
+
+        bool shadowed { false };
+        for (size_t j = body_start + 1; j < body_end; j++) {
+            if (HlslPunctuationIs(source, parsed.tokens[j], '{') ||
+                HlslPunctuationIs(source, parsed.tokens[j], '(')) {
+                const size_t nested_end = parsed.matching_delimiter[j];
+                if (nested_end == std::numeric_limits<size_t>::max()) {
+                    LogHlslAdapterError(shader_name,
+                                        stage,
+                                        "could not resolve nested loop-body scope",
+                                        source,
+                                        parsed.tokens[j].begin);
+                    return false;
+                }
+                j = nested_end;
+                continue;
+            }
+            if (parsed.tokens[j].kind == HlslTokenKind::Identifier &&
+                HlslTokenText(source, parsed.tokens[j]) == loop_variable &&
+                IsLikelyHlslLocalDeclaration(source, parsed.tokens, j)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (! shadowed) {
+            i = header_end;
+            continue;
+        }
+
+        std::string replacement_name;
+        do {
+            replacement_name = "_ww_loop_" + std::string(loop_variable) + "_" +
+                std::to_string(replacement_serial++);
+        } while (identifiers.contains(replacement_name));
+        identifiers.insert(replacement_name);
+
+        // WE permits a loop index to share a name with a direct local declared by the loop body.
+        // DXC rejects that scope. Rename only identifier tokens in the header; body identifiers
+        // intentionally continue to resolve to the authored local declaration.
+        for (size_t j = declaration_start + 1; j < header_end; j++) {
+            if (parsed.tokens[j].kind == HlslTokenKind::Identifier &&
+                HlslTokenText(source, parsed.tokens[j]) == loop_variable) {
+                replacements.push_back(Replacement {
+                    parsed.tokens[j].begin,
+                    parsed.tokens[j].end,
+                    replacement_name,
+                });
+            }
+        }
+        i = header_end;
+    }
+
+    std::sort(replacements.begin(), replacements.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.begin > rhs.begin;
+    });
+    for (const auto& replacement : replacements) {
+        source.replace(replacement.begin, replacement.end - replacement.begin, replacement.value);
+    }
+    return true;
+}
+
+inline bool RewriteGSMain(std::string& source, std::string_view shader_name, ShaderType stage) {
+    HlslTokens parsed;
+    if (! TokenizeHlslForRewrite(source, shader_name, stage, parsed)) return false;
+
+    std::optional<std::pair<size_t, size_t>> candidate;
+    for (size_t i = 0; i + 4 < parsed.tokens.size(); i++) {
+        if (parsed.tokens[i].kind != HlslTokenKind::Identifier ||
+            HlslTokenText(source, parsed.tokens[i]) != "void" ||
+            parsed.tokens[i + 1].kind != HlslTokenKind::Identifier ||
+            HlslTokenText(source, parsed.tokens[i + 1]) != "main" ||
+            ! HlslPunctuationIs(source, parsed.tokens[i + 2], '(')) {
+            continue;
+        }
+        const size_t close = parsed.matching_delimiter[i + 2];
+        if (close == i + 3 && close + 1 < parsed.tokens.size() &&
+            HlslPunctuationIs(source, parsed.tokens[close + 1], '{')) {
+            if (candidate.has_value()) {
+                LogHlslAdapterError(shader_name,
+                                    stage,
+                                    "found multiple geometry void main() definitions",
+                                    source,
+                                    candidate->first);
+                return false;
+            }
+            candidate = std::pair { parsed.tokens[i].begin, parsed.tokens[close].end };
+        }
+    }
+    if (! candidate.has_value()) {
+        LogHlslAdapterError(shader_name,
+                            stage,
+                            "could not find geometry void main()",
+                            source,
+                            0);
+        return false;
+    }
+
+    constexpr std::string_view replacement {
+        "void main_gs(point WW_VSOut IN[1], inout TriangleStream<WW_PSIn> OUT)"
+    };
+    source.replace(candidate->first, candidate->second - candidate->first, replacement);
+    return true;
+}
+
 struct DxcSynthOutput {
     std::string pre;
     std::string post;
@@ -684,10 +1093,7 @@ inline DxcSynthOutput SynthesizeDxcEntry(ShaderType stage, std::vector<IODecl> a
     DxcSynthOutput output;
 
     auto drop_position = [](std::vector<IODecl>& decls) {
-        decls.erase(std::remove_if(decls.begin(), decls.end(), [](const IODecl& decl) {
-                        return decl.name == "gl_Position" || decl.name == "_ww_sv_position";
-                    }),
-                    decls.end());
+        decls.erase(std::remove_if(decls.begin(), decls.end(), IsPositionIODecl), decls.end());
     };
     drop_position(attrs);
     drop_position(varyings);
@@ -1058,8 +1464,16 @@ float    _ww_mul(float4 a, float4 b) { return dot(a, b); }
         out += "static float4 gl_FragCoord;\n";
         out += "static float4 glOutColor;\n";
         out += "#define gl_FragColor glOutColor\n";
+    } else if (stage == ShaderType::GEOMETRY) {
+        // Stock WE geometry sources address the position builtin through struct members. Alias
+        // those authored names to the member shared by the generated VS/GS/FS interface.
+        out += "#define gl_Position _ww_sv_position\n";
+        out += "#define VS_OUTPUT WW_VSOut\n";
+        out += "#define PS_INPUT WW_PSIn\n";
     }
-    out += "#define main shader_main\n";
+    if (stage == ShaderType::VERTEX || stage == ShaderType::FRAGMENT) {
+        out += "#define main shader_main\n";
+    }
 
     for (const auto& combo : combos) {
         std::string name(combo.first);
@@ -1101,9 +1515,9 @@ inline std::string SanitizeBrokenPreprocessorDirectives(const std::string& src,
 inline const char* DxcDebugNameForStage(ShaderType stage);
 inline const char* DxcStageLogName(ShaderType stage);
 
-inline std::string PreprocessDxcWeSource(const std::string& src, ShaderType stage,
-                                         const Combos& combos,
-                                         WPPreprocessorInfo& process_info) {
+inline bool PreprocessDxcWeSource(const std::string& src, ShaderType stage, const Combos& combos,
+                                  WPPreprocessorInfo& process_info,
+                                  std::string_view debug_name, std::string& preprocessed) {
     std::string source = SanitizeBrokenPreprocessorDirectives(src, stage);
     source             = CommentOutRequireDirectives(source);
 
@@ -1116,16 +1530,23 @@ inline std::string PreprocessDxcWeSource(const std::string& src, ShaderType stag
     vulkan::ShaderCompOpt opt;
     opt.target_env = vulkan::ShaderTargetEnv::VULKAN_1_1;
 
-    std::string preprocessed;
     if (! vulkan::PreprocessShaderSourceWithDxc(
-            with_prologue, opt, preprocessed, DxcDebugNameForStage(stage))) {
-        LOG_ERROR("DXC preprocessing failed for %s shader; keeping unpreprocessed source for diagnostics",
+            with_prologue,
+            opt,
+            preprocessed,
+            debug_name.empty() ? DxcDebugNameForStage(stage) : debug_name)) {
+        LOG_ERROR("DXC preprocessing failed shader='%.*s' stage=%s",
+                  static_cast<int>(debug_name.size()),
+                  debug_name.data(),
                   DxcStageLogName(stage));
-        preprocessed = std::move(with_prologue);
+        return false;
+    }
+    if (! RenameHlslForLoopVariablesShadowedByTheLoopBody(preprocessed, debug_name, stage)) {
+        return false;
     }
 
     RecordDxcPreprocessorInfo(preprocessed, stage, process_info);
-    return preprocessed;
+    return true;
 }
 
 inline std::string CommentOutRequireDirectives(const std::string& src) {
@@ -1948,24 +2369,149 @@ inline void SavePreparedShaderUnits(std::span<const WPShaderUnit> units, fs::IBi
     }
 }
 
-inline void AddUniqueIODecl(std::vector<IODecl>& decls, Set<std::string>& seen,
-                            const IODecl& decl) {
-    if (decl.name == "gl_Position" || decl.name == "_ww_sv_position") return;
-    if (! seen.insert(decl.name).second) return;
-    decls.push_back(decl);
+inline std::string FormatIODecl(const IODecl& decl) {
+    const char* storage = "varying";
+    if (decl.storage == 'a') storage = "attribute";
+    if (decl.storage == 'i') storage = "in";
+    if (decl.storage == 'o') storage = "out";
+    return std::string(storage) + " " + decl.type + " " + decl.name + decl.array + ";";
 }
 
-inline void AddUniqueIODeclFromLine(std::vector<IODecl>& decls, Set<std::string>& seen,
-                                    const std::string& line) {
-    if (auto decl = ParseIODecl(line); decl.has_value()) {
-        AddUniqueIODecl(decls, seen, *decl);
+inline std::string NormalizeIOArray(std::string_view array) {
+    std::string normalized;
+    normalized.reserve(array.size());
+    for (const char ch : array) {
+        if (! std::isspace(static_cast<unsigned char>(ch))) normalized.push_back(ch);
     }
+    return normalized;
 }
 
-inline std::string FinalprocessDxcWeSource(const WPShaderUnit& unit,
-                                           const WPPreprocessorInfo* pre,
-                                           const WPPreprocessorInfo* next,
-                                           const Map<std::string, std::string>& uniforms_union) {
+struct MergedIODecl {
+    IODecl     decl;
+    ShaderType stage;
+    bool       producer;
+};
+
+inline bool MergeIODecl(std::vector<MergedIODecl>& merged, const IODecl& incoming,
+                        ShaderType incoming_stage, bool incoming_is_producer,
+                        bool allow_producer_type_coercion, std::string_view shader_name) {
+    if (IsPositionIODecl(incoming)) return true;
+    auto existing = std::find_if(merged.begin(), merged.end(), [&](const auto& candidate) {
+        return candidate.decl.name == incoming.name;
+    });
+    if (existing == merged.end()) {
+        merged.push_back(MergedIODecl { incoming, incoming_stage, incoming_is_producer });
+        return true;
+    }
+
+    const bool same_type = ToHLSLType(existing->decl.type) == ToHLSLType(incoming.type);
+    const bool same_array = NormalizeIOArray(existing->decl.array) ==
+        NormalizeIOArray(incoming.array);
+    if (same_type && same_array) {
+        if (incoming_is_producer && ! existing->producer) {
+            *existing = MergedIODecl { incoming, incoming_stage, true };
+        }
+        return true;
+    }
+
+    const MergedIODecl incoming_tagged { incoming, incoming_stage, incoming_is_producer };
+    if (! same_array || ! allow_producer_type_coercion ||
+        existing->producer == incoming_is_producer) {
+        LOG_ERROR("DXC WE shader '%.*s' has incompatible I/O '%s' first_stage=%s "
+                  "second_stage=%s first='%s' second='%s'",
+                  static_cast<int>(shader_name.size()),
+                  shader_name.data(),
+                  incoming.name.c_str(),
+                  DxcStageLogName(existing->stage),
+                  DxcStageLogName(incoming_stage),
+                  FormatIODecl(existing->decl).c_str(),
+                  FormatIODecl(incoming).c_str());
+        return false;
+    }
+
+    const MergedIODecl& producer = existing->producer ? *existing : incoming_tagged;
+    const MergedIODecl& consumer = existing->producer ? incoming_tagged : *existing;
+    LOG_INFO("DXC WE shader '%.*s' applies producer-owned I/O coercion '%s' producer_stage=%s "
+             "consumer_stage=%s producer='%s' consumer='%s'",
+             static_cast<int>(shader_name.size()),
+             shader_name.data(),
+             incoming.name.c_str(),
+             DxcStageLogName(producer.stage),
+             DxcStageLogName(consumer.stage),
+             FormatIODecl(producer.decl).c_str(),
+             FormatIODecl(consumer.decl).c_str());
+    if (incoming_is_producer) {
+        *existing = MergedIODecl { incoming, incoming_stage, true };
+    }
+    return true;
+}
+
+inline bool BuildStageInterface(std::span<const IODecl> producer_decls,
+                                ShaderType producer_stage,
+                                std::span<const IODecl> consumer_decls,
+                                ShaderType consumer_stage,
+                                bool allow_producer_type_coercion,
+                                std::string_view shader_name,
+                                std::vector<IODecl>& result) {
+    std::vector<MergedIODecl> merged;
+    merged.reserve(producer_decls.size() + consumer_decls.size());
+    const auto merge_decls = [&](std::span<const IODecl> declarations, ShaderType stage,
+                                 bool producer) {
+        for (const auto& decl : declarations) {
+            if (! MergeIODecl(merged,
+                              decl,
+                              stage,
+                              producer,
+                              allow_producer_type_coercion,
+                              shader_name)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (! merge_decls(producer_decls, producer_stage, true) ||
+        ! merge_decls(consumer_decls, consumer_stage, false)) {
+        return false;
+    }
+    result.clear();
+    result.reserve(merged.size());
+    for (auto& decl : merged) result.push_back(std::move(decl.decl));
+    return true;
+}
+
+inline bool CollectIODecls(const Map<std::string, std::string>* declarations,
+                           std::string_view shader_name, ShaderType stage,
+                           std::vector<IODecl>& result) {
+    result.clear();
+    if (declarations == nullptr) return true;
+    result.reserve(declarations->size());
+    for (const auto& [name, line] : *declarations) {
+        auto decl = ParseIODecl(line);
+        if (! decl.has_value()) {
+            LOG_ERROR("DXC WE shader '%.*s' could not parse recorded %s I/O '%s': '%s'",
+                      static_cast<int>(shader_name.size()),
+                      shader_name.data(),
+                      DxcStageLogName(stage),
+                      name.c_str(),
+                      line.c_str());
+            return false;
+        }
+        result.push_back(std::move(*decl));
+    }
+    return true;
+}
+
+inline std::string_view ShaderUnitDebugName(const WPShaderUnit& unit) {
+    return unit.debug_name.empty() ? std::string_view(DxcDebugNameForStage(unit.stage))
+                                   : std::string_view(unit.debug_name);
+}
+
+inline bool FinalprocessDxcWeSource(const WPShaderUnit& unit,
+                                    const WPShaderUnit* pre,
+                                    const WPShaderUnit* next,
+                                    const Map<std::string, std::string>& uniforms_union,
+                                    std::string& finalized) {
+    const auto shader_name = ShaderUnitDebugName(unit);
     auto [io_decls, without_io]      = ScanAndStripIO(unit.src);
     auto [samplers, without_samplers] = ScanAndStripSamplers(without_io);
     auto body                        = StripUniforms(without_samplers);
@@ -1979,41 +2525,91 @@ inline std::string FinalprocessDxcWeSource(const WPShaderUnit& unit,
     }
 
     std::vector<IODecl> attrs;
-    std::vector<IODecl> varyings;
-    Set<std::string>    seen_attrs;
-    Set<std::string>    seen_varyings;
-
-    // Wallpaper Engine shaders are authored as stage snippets, not complete HLSL entry points.
-    // The producer stage owns the cross-stage varying type when declarations disagree (for
-    // example a vertex shader writes `varying vec2 v_TexCoord` while the fragment shader declares
-    // `varying vec4 v_TexCoord` and only reads `.xy`). This mirrors the existing renderer
-    // behavior without carrying the GLSL-era expression transform chain into the DXC path.
-    if (unit.stage == ShaderType::FRAGMENT && pre != nullptr) {
-        for (const auto& [name, line] : pre->output) {
-            (void)name;
-            AddUniqueIODeclFromLine(varyings, seen_varyings, line);
-        }
-    }
-
+    std::vector<IODecl> own_inputs;
+    std::vector<IODecl> own_outputs;
     for (const auto& decl : io_decls) {
-        if (decl.storage == 'a') {
-            AddUniqueIODecl(attrs, seen_attrs, decl);
-        } else {
-            AddUniqueIODecl(varyings, seen_varyings, decl);
+        if (unit.stage == ShaderType::VERTEX) {
+            if (decl.storage == 'a') attrs.push_back(decl);
+            else own_outputs.push_back(decl);
+        } else if (unit.stage == ShaderType::FRAGMENT) {
+            own_inputs.push_back(decl);
+        } else if (decl.storage == 'i') {
+            own_inputs.push_back(decl);
+        } else if (decl.storage == 'o') {
+            own_outputs.push_back(decl);
         }
     }
 
-    if (unit.stage != ShaderType::FRAGMENT && next != nullptr) {
-        for (const auto& [name, line] : next->input) {
-            (void)name;
-            AddUniqueIODeclFromLine(varyings, seen_varyings, line);
-        }
+    std::vector<IODecl> previous_outputs;
+    std::vector<IODecl> next_inputs;
+    if (! CollectIODecls(pre != nullptr ? &pre->preprocess_info.output : nullptr,
+                         shader_name,
+                         pre != nullptr ? pre->stage : unit.stage,
+                         previous_outputs) ||
+        ! CollectIODecls(next != nullptr ? &next->preprocess_info.input : nullptr,
+                         shader_name,
+                         next != nullptr ? next->stage : unit.stage,
+                         next_inputs)) {
+        return false;
     }
-
-    auto synth = SynthesizeDxcEntry(unit.stage, attrs, varyings);
 
     std::string generated;
-    generated += synth.pre;
+    DxcSynthOutput synth;
+    if (unit.stage == ShaderType::GEOMETRY) {
+        std::vector<IODecl> geometry_inputs;
+        std::vector<IODecl> geometry_outputs;
+        if (! BuildStageInterface(previous_outputs,
+                                  pre != nullptr ? pre->stage : ShaderType::VERTEX,
+                                  own_inputs,
+                                  ShaderType::GEOMETRY,
+                                  true,
+                                  shader_name,
+                                  geometry_inputs) ||
+            ! BuildStageInterface(own_outputs,
+                                  ShaderType::GEOMETRY,
+                                  next_inputs,
+                                  next != nullptr ? next->stage : ShaderType::FRAGMENT,
+                                  true,
+                                  shader_name,
+                                  geometry_outputs)) {
+            return false;
+        }
+        generated += "\n// === auto-generated WE geometry interfaces ===\n";
+        generated += EmitVSFSStruct("WW_VSOut", std::move(geometry_inputs), true);
+        generated += EmitVSFSStruct("WW_PSIn", std::move(geometry_outputs), true);
+        if (! RewriteGSMain(body, shader_name, unit.stage)) return false;
+    } else {
+        std::vector<IODecl> canonical_attrs;
+        std::vector<IODecl> varyings;
+        if (! BuildStageInterface(attrs,
+                                  unit.stage,
+                                  {},
+                                  unit.stage,
+                                  false,
+                                  shader_name,
+                                  canonical_attrs)) {
+            return false;
+        }
+        const bool interface_ok = unit.stage == ShaderType::VERTEX
+            ? BuildStageInterface(own_outputs,
+                                  ShaderType::VERTEX,
+                                  next_inputs,
+                                  next != nullptr ? next->stage : ShaderType::FRAGMENT,
+                                  true,
+                                  shader_name,
+                                  varyings)
+            : BuildStageInterface(previous_outputs,
+                                  pre != nullptr ? pre->stage : ShaderType::VERTEX,
+                                  own_inputs,
+                                  ShaderType::FRAGMENT,
+                                  true,
+                                  shader_name,
+                                  varyings);
+        if (! interface_ok) return false;
+        synth = SynthesizeDxcEntry(unit.stage, std::move(canonical_attrs), std::move(varyings));
+        generated += synth.pre;
+    }
+
     if (! uniforms_union.empty()) {
         generated += "\n// === auto-generated WE uniform block ===\n";
         generated += EmitCBufferStd140(uniforms_union);
@@ -2029,18 +2625,31 @@ inline std::string FinalprocessDxcWeSource(const WPShaderUnit& unit,
     // authored shaders.
     const bool inserted_generated_block = ReplaceAll(body, SHADER_PLACEHOLD, generated);
     if (! inserted_generated_block) {
-        LOG_ERROR("DXC WE finalization could not find shader splice marker for %s shader",
+        LOG_ERROR("DXC WE finalization could not find shader splice marker shader='%.*s' stage=%s",
+                  static_cast<int>(shader_name.size()),
+                  shader_name.data(),
                   DxcStageLogName(unit.stage));
+        return false;
     }
-    return body + synth.post;
+    finalized = unit.stage == ShaderType::GEOMETRY ? std::move(body) : body + synth.post;
+    return true;
 }
 
-inline void PrepareShaderUnitsForDxc(std::span<WPShaderUnit> units,
+inline bool PrepareShaderUnitsForDxc(std::span<WPShaderUnit> units,
                                      WPShaderInfo* shader_info,
                                      std::span<const WPShaderTexInfo> texinfos) {
     for (auto& unit : units) {
         unit.src = ApplyScreenSpaceTextureSampleYFlip(unit.src, texinfos);
-        unit.src = PreprocessDxcWeSource(unit.src, unit.stage, shader_info->combos, unit.preprocess_info);
+        std::string preprocessed;
+        if (! PreprocessDxcWeSource(unit.src,
+                                    unit.stage,
+                                    shader_info->combos,
+                                    unit.preprocess_info,
+                                    ShaderUnitDebugName(unit),
+                                    preprocessed)) {
+            return false;
+        }
+        unit.src = std::move(preprocessed);
     }
 
     Map<std::string, std::string> uniforms_union;
@@ -2052,11 +2661,16 @@ inline void PrepareShaderUnitsForDxc(std::span<WPShaderUnit> units,
 
     for (usize i = 0; i < units.size(); i++) {
         auto&               unit      = units[i];
-        WPPreprocessorInfo* pre_info  = i >= 1 ? &units[i - 1].preprocess_info : nullptr;
-        WPPreprocessorInfo* post_info = i + 1 < units.size() ? &units[i + 1].preprocess_info
-                                                             : nullptr;
-        unit.src = FinalprocessDxcWeSource(unit, pre_info, post_info, uniforms_union);
+        const WPShaderUnit* pre_info  = i >= 1 ? &units[i - 1] : nullptr;
+        const WPShaderUnit* post_info = i + 1 < units.size() ? &units[i + 1] : nullptr;
+        std::string finalized;
+        if (! FinalprocessDxcWeSource(
+                unit, pre_info, post_info, uniforms_union, finalized)) {
+            return false;
+        }
+        unit.src = std::move(finalized);
     }
+    return true;
 }
 
 inline const char* DxcEntryPointForStage(ShaderType stage) {
@@ -2134,7 +2748,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
             vunit.src             = unit.src;
             vunit.stage           = unit.stage;
             vunit.source_language = vulkan::ShaderSourceLanguage::HLSL;
-            vunit.debug_name      = DxcDebugNameForStage(unit.stage);
+            vunit.debug_name      = std::string(ShaderUnitDebugName(unit));
             vunit.entry_point     = DxcEntryPointForStage(unit.stage);
         }
 
@@ -2169,7 +2783,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
                 return false;
             }
         } else {
-            PrepareShaderUnitsForDxc(units, shader_info, texs);
+            if (! PrepareShaderUnitsForDxc(units, shader_info, texs)) return false;
             if (auto cache_file = vfs.OpenW(prepared_cache_file_path); cache_file) {
                 ::SavePreparedShaderUnits(units, *cache_file);
             }
@@ -2197,7 +2811,7 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
         return true;
 
     } else {
-        PrepareShaderUnitsForDxc(units, shader_info, texs);
+        if (! PrepareShaderUnitsForDxc(units, shader_info, texs)) return false;
         return compile(units, codes);
     }
 }

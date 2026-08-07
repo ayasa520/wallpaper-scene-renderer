@@ -43,7 +43,8 @@ using ParticleOperatorOp = std::function<void(const ParticleInfo&)>;
 
 using ParticleEmittOp =
     std::function<void(std::vector<Particle>&, std::vector<ParticleInitOp>&,
-                       std::span<const ParticleControlpoint>, uint32_t maxcount, double timepass)>;
+                       std::span<const ParticleControlpoint>, uint32_t maxcount, double timepass,
+                       uint64_t& next_spawn_sequence)>;
 
 struct ParticleBoxEmitterArgs {
     std::array<float, 3> directions;
@@ -53,7 +54,6 @@ struct ParticleBoxEmitterArgs {
     std::array<float, 3> orgin;
     i32                  controlpoint { 0 };
     bool                 one_per_frame;
-    bool                 sort;
     u32                  instantaneous;
     float                minSpeed;
     float                maxSpeed;
@@ -70,7 +70,6 @@ struct ParticleSphereEmitterArgs {
     i32                    controlpoint { 0 };
     std::array<int32_t, 3> sign;
     bool                   one_per_frame;
-    bool                   sort;
     u32                    instantaneous;
     float                  minSpeed;
     float                  maxSpeed;

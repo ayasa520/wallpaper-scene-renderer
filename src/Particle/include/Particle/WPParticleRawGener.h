@@ -5,13 +5,11 @@
 namespace wallpaper
 {
 
-class WPParticleRawGener : public IParticleRawGener {
+class WPParticleRawGener final : public IParticleRawGener {
 public:
-    WPParticleRawGener() {};
-    virtual ~WPParticleRawGener() {};
-
-    virtual void GenGLData(std::span<const std::unique_ptr<ParticleInstance>>, SceneMesh&,
-                           ParticleRawGenSpecOp&);
+    void GenGLData(std::span<const std::unique_ptr<ParticleInstance>>, SceneMesh&,
+                   ParticleRawGenSpecOp&, const ParticleRenderPlan&,
+                   std::string_view object_name) override;
 };
 
 } // namespace wallpaper

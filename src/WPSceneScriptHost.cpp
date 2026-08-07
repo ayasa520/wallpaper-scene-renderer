@@ -2218,6 +2218,36 @@ std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost:
     return std::nullopt;
 }
 
+void LogInvalidParticlePropertyValue(const char* property_kind, int32_t layer_id,
+                                     std::string_view property_name,
+                                     const WPDynamicValue& value) {
+    LOG_ERROR("SceneParticle%sApply: layer=%d property='%.*s' invalid-value=%s",
+              property_kind,
+              layer_id,
+              static_cast<int>(property_name.size()),
+              property_name.data(),
+              value.describe().c_str());
+}
+
+template<typename Apply>
+bool ApplyParticleSubsystemValue(Scene& scene, int32_t layer_id, Apply&& apply) {
+    const auto particle_it = scene.objectRuntimeParticleSubsystems.find(layer_id);
+    if (particle_it == scene.objectRuntimeParticleSubsystems.end()) {
+        // Deferred particle layers intentionally have no live subsystem. Their current property
+        // snapshot is consumed when visibility materializes the layer, so accepting the write here
+        // keeps the script-facing property contract identical before and after materialization.
+        return scene.deferredRuntimeParticleLayerIds.count(layer_id) != 0;
+    }
+
+    bool applied = false;
+    for (auto* subsystem : particle_it->second) {
+        if (subsystem == nullptr) continue;
+        apply(*subsystem);
+        applied = true;
+    }
+    return applied;
+}
+
 bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                                 std::string_view property_name, const WPDynamicValue& value) {
     if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name) &&
@@ -2226,145 +2256,38 @@ bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer
         return false;
     }
 
-    const auto particle_it = opaque->scene->objectRuntimeParticleSubsystems.find(layer_id);
+    auto& scene = *opaque->scene;
 
     if (IsParticleColorProperty(property_name)) {
         const auto color = NormalizeParticleColorValue(property_name, value);
-        if (!color.has_value()) {
-            LOG_ERROR("SceneParticleColorApply: layer=%d property='%.*s' invalid-value=%s",
-                      layer_id,
-                      static_cast<int>(property_name.size()),
-                      property_name.data(),
-                      value.describe().c_str());
+        if (! color.has_value()) {
+            LogInvalidParticlePropertyValue("Color", layer_id, property_name, value);
             return false;
         }
-
-        if (particle_it == opaque->scene->objectRuntimeParticleSubsystems.end()) {
-            if (opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) != 0) {
-                // Hidden runtime-controlled particle layers do not allocate their ParticleSubSystem
-                // until visibility turns true. Accept the color edit now; deferred materialization
-                // will parse the same instanceoverride property against the latest user-property
-                // snapshot.
-                LOG_INFO("SceneParticleColorDeferred: layer=%d property='%.*s' "
-                         "color=[%.3f, %.3f, %.3f]",
-                         layer_id,
-                         static_cast<int>(property_name.size()),
-                         property_name.data(),
-                         (*color)[0],
-                         (*color)[1],
-                         (*color)[2]);
-                return true;
-            }
-            return false;
-        }
-
-        std::size_t target_count = 0;
-        for (auto* subsystem : particle_it->second) {
-            if (subsystem == nullptr) continue;
-            subsystem->SetRuntimeColorOverride(*color);
-            target_count++;
-        }
-
-        if (target_count == 0) return false;
-
-        LOG_INFO("SceneParticleColorApply: layer=%d property='%.*s' color=[%.3f, %.3f, %.3f] "
-                 "subsystem-targets=%zu",
-                 layer_id,
-                 static_cast<int>(property_name.size()),
-                 property_name.data(),
-                 (*color)[0],
-                 (*color)[1],
-                 (*color)[2],
-                 target_count);
-        return true;
+        return ApplyParticleSubsystemValue(scene, layer_id, [&](ParticleSubSystem& subsystem) {
+            subsystem.SetRuntimeColorOverride(*color);
+        });
     }
 
     if (IsParticleRateProperty(property_name)) {
         const auto rate = NormalizeParticleRateValue(value);
-        if (!rate.has_value()) {
-            LOG_ERROR("SceneParticleRateApply: layer=%d property='%.*s' invalid-value=%s",
-                      layer_id,
-                      static_cast<int>(property_name.size()),
-                      property_name.data(),
-                      value.describe().c_str());
+        if (! rate.has_value()) {
+            LogInvalidParticlePropertyValue("Rate", layer_id, property_name, value);
             return false;
         }
-
-        if (particle_it == opaque->scene->objectRuntimeParticleSubsystems.end()) {
-            if (opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) != 0) {
-                // A deferred particle layer has no live subsystem yet. Accept the script value so
-                // hidden layers do not fail their update loop; once visibility materializes the
-                // subsystem, the next script tick will write the same clock multiplier to it.
-                LOG_INFO("SceneParticleRateDeferred: layer=%d property='%.*s' rate=%.3f",
-                         layer_id,
-                         static_cast<int>(property_name.size()),
-                         property_name.data(),
-                         *rate);
-                return true;
-            }
-            return false;
-        }
-
-        std::size_t target_count = 0;
-        for (auto* subsystem : particle_it->second) {
-            if (subsystem == nullptr) continue;
-            subsystem->SetRuntimeRateOverride(*rate);
-            target_count++;
-        }
-
-        if (target_count == 0) return false;
-        // Audio-reactive particle rate scripts commonly return a value every frame. Keep the
-        // successful hot path silent so real diagnostics such as invalid values or deferred-layer
-        // materialization remain visible without flooding the log or perturbing frame pacing.
-        return true;
-    }
-
-    if (particle_it == opaque->scene->objectRuntimeParticleSubsystems.end() &&
-        opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) == 0) {
-        return false;
+        return ApplyParticleSubsystemValue(scene, layer_id, [&](ParticleSubSystem& subsystem) {
+            subsystem.SetRuntimeRateOverride(*rate);
+        });
     }
 
     const auto size = NormalizeParticleSizeValue(value);
-    if (!size.has_value()) {
-        LOG_ERROR("SceneParticleSizeApply: layer=%d property='%.*s' invalid-value=%s",
-                  layer_id,
-                  static_cast<int>(property_name.size()),
-                  property_name.data(),
-                  value.describe().c_str());
+    if (! size.has_value()) {
+        LogInvalidParticlePropertyValue("Size", layer_id, property_name, value);
         return false;
     }
-
-    if (particle_it == opaque->scene->objectRuntimeParticleSubsystems.end()) {
-        if (opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) != 0) {
-            // Size shares the same deferred contract as color: a hidden logical particle has no
-            // ParticleSubSystem yet, so the next materialization pass must pick up the latest
-            // user-property value from the stored scene JSON.
-            LOG_INFO("SceneParticleSizeDeferred: layer=%d property='%.*s' size=%.3f",
-                     layer_id,
-                     static_cast<int>(property_name.size()),
-                     property_name.data(),
-                     *size);
-            return true;
-        }
-        return false;
-    }
-
-    std::size_t target_count = 0;
-    for (auto* subsystem : particle_it->second) {
-        if (subsystem == nullptr) continue;
-        subsystem->SetRuntimeSizeOverride(*size);
-        target_count++;
-    }
-
-    if (target_count == 0) return false;
-
-    LOG_INFO("SceneParticleSizeApply: layer=%d property='%.*s' size=%.3f subsystem-targets=%zu",
-             layer_id,
-             static_cast<int>(property_name.size()),
-             property_name.data(),
-             *size,
-             target_count);
-    return true;
+    return ApplyParticleSubsystemValue(scene, layer_id, [&](ParticleSubSystem& subsystem) {
+        subsystem.SetRuntimeSizeOverride(*size);
+    });
 }
 
 bool GetExternalAudioBufferValues(WPSceneScriptHost::Opaque* opaque, uint32_t resolution,
@@ -2758,7 +2681,6 @@ bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque,
     // A resource refresh cannot add that missing pass, so the first false->true visibility toggle
     // must force a topology rebuild before the layer can become visible on screen.
     opaque->scene->MarkRenderGraphTopologyDirty();
-    LOG_INFO("DeferredRuntimeParticleRealize: materialized layer=%d topology-dirty=true", layer_id);
     return true;
 }
 

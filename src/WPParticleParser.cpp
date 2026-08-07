@@ -47,13 +47,14 @@ inline uint64_t MapSequenceSlotCount(float authored_count) {
     return rounded <= 0 ? 1 : static_cast<uint64_t>(rounded);
 }
 
-inline void Color(Particle& p, const std::array<float, 3> min, const std::array<float, 3> max) {
-    double               random = Random::get(0.0, 1.0);
-    std::array<float, 3> result;
-    for (int32_t i = 0; i < 3; i++) {
-        result[i] = (float)algorism::lerp(random, min[i], max[i]);
-    }
-    PM::InitColor(p, result[0], result[1], result[2]);
+inline Eigen::Vector3f DecodeParticleColorEndpoint(
+    const std::array<float, 3>& encoded_color) {
+    // Wallpaper Engine serializes colorrandom endpoints as RGB byte triplets while the particle
+    // simulation and shaders consume normalized RGB values.
+    constexpr float kByteToNormalized = 1.0f / 255.0f;
+    return { encoded_color[0] * kByteToNormalized,
+             encoded_color[1] * kByteToNormalized,
+             encoded_color[2] * kByteToNormalized };
 }
 
 inline Vector3d GenRandomVec3(const std::array<float, 3>& min, const std::array<float, 3>& max) {
@@ -138,13 +139,6 @@ struct MapSequenceAroundControlPoint {
     }
 };
 
-template<std::size_t N>
-std::array<float, N> mapVertex(const std::array<float, N>& v, float (*oper)(float)) {
-    std::array<float, N> result;
-    std::transform(v.begin(), v.end(), result.begin(), oper);
-    return result;
-};
-
 ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
     using namespace std::placeholders;
     do {
@@ -157,16 +151,13 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             r.min = { 0.0f, 0.0f, 0.0f };
             r.max = { 255.0f, 255.0f, 255.0f };
             VecRandom::ReadFromJson(wpj, r);
-
-            return [=](Particle& p, const ParticleInitInfo&) {
-                Color(p,
-                      mapVertex(r.min,
-                                [](float x) {
-                                    return x / 255.0f;
-                                }),
-                      mapVertex(r.max, [](float x) {
-                          return x / 255.0f;
-                      }));
+            const auto min_color = DecodeParticleColorEndpoint(r.min);
+            const auto max_color = DecodeParticleColorEndpoint(r.max);
+            return [min_color, max_color](Particle& p, const ParticleInitInfo&) {
+                // A single random value selects a point on the authored RGB gradient and is retained
+                // so later instanceoverride color edits can transform the endpoints first.
+                PM::InitColorRandom(
+                    p, min_color, max_color, static_cast<float>(Random::get(0.0, 1.0)));
             };
         } else if (name == "lifetimerandom") {
             SingleRandom r = { 0.0f, 1.0f };
@@ -302,10 +293,10 @@ ParticleInitOp WPParticleParser::genOverrideInitOp(const wpscene::ParticleInstan
         PM::MutiplyInitSize(p, over.size);
         PM::MutiplyVelocity(p, over.speed);
         if (over.overColor) {
-            PM::InitColor(
-                p, over.color[0] / 255.0f, over.color[1] / 255.0f, over.color[2] / 255.0f);
+            PM::InitColorOverride(p, DecodeParticleColorEndpoint(over.color));
         } else if (over.overColorn) {
-            PM::InitColor(p, over.colorn[0], over.colorn[1], over.colorn[2]);
+            PM::InitColorOverride(
+                p, Eigen::Vector3f { over.colorn[0], over.colorn[1], over.colorn[2] });
         }
     };
 }
@@ -778,7 +769,7 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
     };
 }
 
-ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe, bool sort) {
+ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe) {
     if (wpe.name == "boxrandom") {
         ParticleBoxEmitterArgs box;
         box.emitSpeed     = wpe.rate;
@@ -791,7 +782,6 @@ ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe
         box.instantaneous = wpe.instantaneous;
         box.minSpeed      = wpe.speedmin;
         box.maxSpeed      = wpe.speedmax;
-        box.sort          = sort;
         return ParticleBoxEmitterArgs::MakeEmittOp(box);
     } else if (wpe.name == "sphererandom") {
         ParticleSphereEmitterArgs sphere;
@@ -806,10 +796,9 @@ ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe
         sphere.instantaneous = wpe.instantaneous;
         sphere.minSpeed      = wpe.speedmin;
         sphere.maxSpeed      = wpe.speedmax;
-        sphere.sort          = sort;
         return ParticleSphereEmitterArgs::MakeEmittOp(sphere);
     } else
         return [](std::vector<Particle>&, std::vector<ParticleInitOp>&,
-                  std::span<const ParticleControlpoint>, uint32_t, double) {
+                  std::span<const ParticleControlpoint>, uint32_t, double, uint64_t&) {
         };
 }

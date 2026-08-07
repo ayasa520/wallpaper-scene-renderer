@@ -61,6 +61,10 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, std::span<const Extension> exts, 
             }
         }
     }
+    if (! gpu.GetFeatures().geometryShader) {
+        LOG_INFO("reject vulkan device \"%s\": missing geometryShader feature", gpu_props.deviceName);
+        return false;
+    }
     return true;
 }
 
@@ -163,10 +167,19 @@ bool Device::Create(Instance& inst,
              extent.height,
              exts.size(),
              tested_exts_c.size());
+    const auto supported_features = inst.gpu().GetFeatures();
+    if (! supported_features.geometryShader) {
+        LOG_ERROR("cannot create vulkan device '%s': required geometryShader feature is unavailable",
+                  gpu_props.deviceName);
+        return false;
+    }
+    VkPhysicalDeviceFeatures enabled_features {};
+    enabled_features.geometryShader = VK_TRUE;
     VVK_CHECK_BOOL_RE(vvk::Device::Create(device.m_device,
                                           *device.m_gpu,
                                           device.ChooseDeviceQueue(*inst.surface()),
                                           tested_exts_c,
+                                          &enabled_features,
                                           nullptr,
                                           device.dld));
     LOG_INFO("VulkanDevice: create device success gpu='%s' graphicsFamily=%u presentFamily=%u deviceHandle=%p",

@@ -2,8 +2,10 @@
 #include <span>
 #include <memory>
 #include <functional>
+#include <string_view>
 
 #include "Particle/Particle.h"
+#include "Particle/ParticleRenderPlan.h"
 #include "Scene/SceneMesh.h"
 
 namespace wallpaper
@@ -20,6 +22,7 @@ public:
     virtual ~IParticleRawGener() = default;
 
     virtual void GenGLData(std::span<const std::unique_ptr<ParticleInstance>>, SceneMesh&,
-                           ParticleRawGenSpecOp&) = 0;
+                           ParticleRawGenSpecOp&, const ParticleRenderPlan&,
+                           std::string_view object_name) = 0;
 };
 } // namespace wallpaper

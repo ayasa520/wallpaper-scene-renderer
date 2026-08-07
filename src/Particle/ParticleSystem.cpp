@@ -15,12 +15,6 @@ using namespace wallpaper;
 
 namespace
 {
-struct ParticleSystemStats {
-    size_t subsystem_count { 0 };
-    size_t instance_count { 0 };
-    size_t particle_count { 0 };
-};
-
 constexpr float kRuntimeSizeEpsilon = 0.000001f;
 constexpr double kControlPointTransformDeterminantEpsilon = 0.000000001;
 
@@ -39,11 +33,42 @@ Eigen::Vector3d TransformPoint(const Eigen::Matrix4d& transform, const Eigen::Ve
 }
 } // namespace
 
+void ParticleTrail::Reset() noexcept {
+    head              = 0;
+    sample_count      = 0;
+    previous_position = Eigen::Vector3f::Zero();
+}
+
+void ParticleTrail::Initialize(const Eigen::Vector3f& position) noexcept {
+    Reset();
+    if (positions.empty()) return;
+    std::fill(positions.begin(), positions.end(), position);
+    sample_count      = 1;
+    previous_position = position;
+}
+
+void ParticleTrail::Push(const Eigen::Vector3f& position) noexcept {
+    if (positions.empty()) return;
+    head            = static_cast<uint16_t>((static_cast<size_t>(head) + 1) % positions.size());
+    positions[head] = position;
+    sample_count    = static_cast<uint16_t>(
+        std::min(static_cast<size_t>(sample_count) + 1, positions.size()));
+}
+
+Eigen::Vector3f ParticleTrail::At(size_t logical_index) const noexcept {
+    const size_t length = Length();
+    if (logical_index >= length) return Eigen::Vector3f::Zero();
+    const size_t capacity = positions.size();
+    const size_t oldest   = (static_cast<size_t>(head) + capacity + 1 - length) % capacity;
+    return positions[(oldest + logical_index) % capacity];
+}
+
 void ParticleInstance::Refresh() {
     SetDeath(false);
     SetNoLiveParticle(false);
     GetBoundedData() = {};
     ParticlesVec().clear();
+    TrailsVec().clear();
 }
 
 bool ParticleInstance::IsDeath() const { return m_is_death; }
@@ -54,6 +79,8 @@ void ParticleInstance::SetNoLiveParticle(bool v) { m_no_live_particle = v; };
 
 std::span<const Particle> ParticleInstance::Particles() const { return m_particles; };
 std::vector<Particle>&    ParticleInstance::ParticlesVec() { return m_particles; };
+std::span<const ParticleTrail> ParticleInstance::Trails() const { return m_trails; };
+std::vector<ParticleTrail>&    ParticleInstance::TrailsVec() { return m_trails; };
 
 ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() { return m_bounded_data; }
 const ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() const {
@@ -63,13 +90,22 @@ const ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() const {
 ParticleSubSystem::ParticleSubSystem(ParticleSystem& p, std::shared_ptr<SceneMesh> sm,
                                      uint32_t maxcount, double rate, u32 maxcount_instance,
                                      double probability, SpawnType type,
-                                     ParticleRawGenSpecOp specOp)
+                                     ParticleRenderPlan render_plan,
+                                     ParticleRawGenSpecOp specOp, uint16_t trail_length,
+                                     double trail_duration,
+                                     std::function<void(float)> trail_uniform_update)
     : m_sys(p),
-      m_mesh(sm),
+      m_mesh(std::move(sm)),
+      m_genSpecOp(std::move(specOp)),
+      m_render_plan(render_plan),
       m_maxcount(maxcount),
       m_rate(rate),
-      m_genSpecOp(specOp),
       m_time(0),
+      m_trail_length(trail_length),
+      m_trail_sample_interval(trail_length == 0
+                                  ? 0.0
+                                  : trail_duration / static_cast<double>(trail_length)),
+      m_trail_uniform_update(std::move(trail_uniform_update)),
       m_maxcount_instance(maxcount_instance),
       m_probability(probability),
       m_spawn_type(type) {};
@@ -97,9 +133,8 @@ void ParticleSubSystem::ApplyRuntimeColorOverrideToParticle(Particle& particle) 
     if (!m_runtime_color_override.has_value()) return;
 
     const auto& color = *m_runtime_color_override;
-    const Eigen::Vector3f particle_color { color[0], color[1], color[2] };
-    particle.init.color = particle_color;
-    particle.color      = particle_color;
+    ParticleModify::InitColorOverride(
+        particle, Eigen::Vector3f { color[0], color[1], color[2] });
 }
 
 void ParticleSubSystem::ApplyRuntimeColorOverrideToInstances() {
@@ -113,11 +148,12 @@ void ParticleSubSystem::ApplyRuntimeColorOverrideToInstances() {
 
 void ParticleSubSystem::SetRuntimeColorOverride(const std::array<float, 3>& color) {
     m_runtime_color_override = color;
-    // Live user-property color edits must affect particles that have already been emitted. This is
-    // intentionally scoped to the layer's own particle subsystem: nested child particle assets keep
-    // their authored initializers, including colorrandom. Wallpaper Engine's composition layers can
-    // then color-grade the combined result with their parent effects instead of receiving a flat
-    // white child trail from a root-layer colorn override.
+    // Re-evaluate existing particles from their preserved colorrandom endpoints. This is the same
+    // HSV reference-delta operation used during cold initialization and therefore preserves the
+    // authored gradient during live property edits.
+    // Keep this update local to the subsystem. ParseParticleObj() clears color flags for nested
+    // particle assets because their authored colorrandom ranges are independent; recursively
+    // forwarding the live scene-layer color would erase that boundary again on the next edit.
     ApplyRuntimeColorOverrideToInstances();
     if (m_mesh) m_mesh->SetDirty();
 }
@@ -289,21 +325,82 @@ void ParticleSubSystem::AddChild(std::unique_ptr<ParticleSubSystem>&& child) {
     m_children.emplace_back(std::move(child));
 }
 
-void ParticleSubSystem::CollectStats(size_t* subsystem_count,
-                                     size_t* instance_count,
-                                     size_t* particle_count) const {
-    if (subsystem_count != nullptr) (*subsystem_count)++;
+void ParticleSubSystem::SynchronizeTrailSlots(ParticleInstance& instance) {
+    if (m_trail_length == 0) return;
+    auto& particles = instance.ParticlesVec();
+    auto& trails    = instance.TrailsVec();
+    trails.resize(particles.size());
+    for (auto& trail : trails) {
+        if (trail.positions.size() == m_trail_length) continue;
+        trail.positions.assign(m_trail_length, Eigen::Vector3f::Zero());
+        trail.Reset();
+    }
+}
 
-    if (instance_count != nullptr || particle_count != nullptr) {
-        for (const auto& instance : m_instances) {
-            if (!instance) continue;
-            if (instance_count != nullptr) (*instance_count)++;
-            if (particle_count != nullptr) (*particle_count) += instance->Particles().size();
+void ParticleSubSystem::SampleTrailHistory(double frame_time) {
+    if (m_trail_length == 0) return;
+
+    const double delta = std::max(0.0, frame_time);
+    size_t       sample_steps { 0 };
+    double       remainder { 0.0 };
+    if (m_trail_sample_interval > 0.0) {
+        const double elapsed = m_trail_sample_accumulator + delta;
+        const double total_steps = std::floor(elapsed / m_trail_sample_interval);
+        remainder = elapsed - total_steps * m_trail_sample_interval;
+        if (remainder < 0.0) remainder = 0.0;
+        if (remainder >= m_trail_sample_interval) {
+            remainder = std::fmod(remainder, m_trail_sample_interval);
         }
+        m_trail_sample_accumulator = remainder;
+        sample_steps = total_steps >= static_cast<double>(m_trail_length)
+            ? m_trail_length
+            : static_cast<size_t>(total_steps);
+        if (m_trail_uniform_update) {
+            m_trail_uniform_update(static_cast<float>(
+                std::clamp(remainder / m_trail_sample_interval, 0.0, 1.0)));
+        }
+    } else {
+        sample_steps = 1;
+        if (m_trail_uniform_update) m_trail_uniform_update(1.0f);
     }
 
-    for (const auto& child : m_children) {
-        if (child) child->CollectStats(subsystem_count, instance_count, particle_count);
+    // History is sampled only after every particle operator has finished. Positions remain in
+    // simulation space; the bounded event anchor is applied once by the extraction helper.
+    for (auto& instance_ptr : m_instances) {
+        auto& instance  = *instance_ptr;
+        auto& particles = instance.ParticlesVec();
+        auto& trails    = instance.TrailsVec();
+        if (trails.size() != particles.size()) {
+            LOG_ERROR("particle trail slot invariant violated particles=%zu trails=%zu",
+                      particles.size(),
+                      trails.size());
+            return;
+        }
+        for (size_t index = 0; index < particles.size(); index++) {
+            const auto& particle = particles[index];
+            if (! ParticleModify::LifetimeOk(particle)) continue;
+
+            auto& trail = trails[index];
+            if (trail.Length() == 0) {
+                // Initialize the fixed ring from the operator-complete head on its first sample
+                // pass. The topology is fully degenerate for the first extracted frame instead of
+                // drawing back to the spawn position before the authored movement operator ran.
+                trail.Initialize(particle.position);
+                continue;
+            }
+
+            const Eigen::Vector3f previous = trail.previous_position;
+            for (size_t sample = 0; sample < sample_steps; sample++) {
+                const double age = remainder +
+                    static_cast<double>(sample_steps - sample - 1) * m_trail_sample_interval;
+                const double amount = delta > 0.0
+                    ? std::clamp((delta - age) / delta, 0.0, 1.0)
+                    : 1.0;
+                trail.Push(previous +
+                           (particle.position - previous) * static_cast<float>(amount));
+            }
+            trail.previous_position = particle.position;
+        }
     }
 }
 
@@ -378,14 +475,17 @@ void ParticleSubSystem::Emitt() {
         // clear when death if follow
         if (inst->IsDeath() && m_spawn_type == SpawnType::EVENT_FOLLOW) {
             inst->ParticlesVec().clear();
+            inst->TrailsVec().clear();
         }
 
         if (! inst->IsDeath()) {
             for (auto& emittOp : m_emiters) {
                 emittOp(inst->ParticlesVec(), m_initializers, m_controlpoints, m_maxcount,
-                        particleTime);
+                        particleTime, m_next_spawn_sequence);
             }
         }
+
+        SynchronizeTrailSlots(*inst);
 
         // event_death is always death after emitop
         if (m_spawn_type == SpawnType::EVENT_DEATH) inst->SetDeath(true);
@@ -403,6 +503,10 @@ void ParticleSubSystem::Emitt() {
             i++;
 
             if (ParticleModify::IsNew(p)) {
+                if (m_trail_length != 0) {
+                    auto& trail = inst->TrailsVec()[static_cast<size_t>(i)];
+                    trail.Reset();
+                }
                 // new spawn
                 for (auto& child : m_children) {
                     if (child->Type() == SpawnType::EVENT_FOLLOW ||
@@ -410,6 +514,7 @@ void ParticleSubSystem::Emitt() {
                         spawn_inst(*inst, *child, i);
                 }
                 ApplyRuntimeSizeOverrideToNewParticle(p);
+                ApplyRuntimeColorOverrideToParticle(p);
             }
 
             ParticleModify::MarkOld(p);
@@ -418,10 +523,6 @@ void ParticleSubSystem::Emitt() {
             }
             ParticleModify::Reset(p);
             ParticleModify::ChangeLifetime(p, -particleTime);
-            // Reset() restores particle color from its initializer snapshot every frame. Re-apply
-            // the live instanceoverride color here so user-property color edits survive that reset
-            // and run before later particle operators mutate the rendered state.
-            ApplyRuntimeColorOverrideToParticle(p);
 
             if (! ParticleModify::LifetimeOk(p)) {
                 // new dead
@@ -440,9 +541,14 @@ void ParticleSubSystem::Emitt() {
         });
     }
 
+    SampleTrailHistory(frameTime);
+
     m_mesh->SetDirty();
 
-    m_sys.gener->GenGLData(m_instances, *m_mesh, m_genSpecOp);
+    const std::string_view object_name = m_node != nullptr
+        ? std::string_view(m_node->Name())
+        : std::string_view("(unbound-particle-object)");
+    m_sys.gener->GenGLData(m_instances, *m_mesh, m_genSpecOp, m_render_plan, object_name);
 
     for (auto& child : m_children) {
         child->Emitt();
