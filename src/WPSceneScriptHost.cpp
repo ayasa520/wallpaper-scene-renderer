@@ -3344,20 +3344,19 @@ std::vector<SceneNode*> CollectPuppetLayerNodes(const WPSceneScriptHost::Opaque*
     std::vector<SceneNode*> result;
     if (opaque == nullptr || node == nullptr || opaque->scene == nullptr) return result;
 
-    std::unordered_set<SceneNode*> seen;
-    auto                           add_if_puppet = [&](SceneNode* candidate) {
-        if (candidate == nullptr || seen.count(candidate) != 0) return;
+    std::unordered_set<const void*> seen_runtimes;
+    auto                            add_if_puppet = [&](SceneNode* candidate) {
+        if (candidate == nullptr) return;
         if (const auto* data = GetNodeData(opaque, candidate);
             data != nullptr && data->puppet_layer.hasPuppet()) {
-            seen.insert(candidate);
+            if (!seen_runtimes.insert(data->puppet_layer.RuntimeIdentity()).second) return;
             result.push_back(candidate);
         }
     };
 
-    // Effect-backed puppet layers are represented by several runtime nodes: the authored/world
-    // node keeps layer identity for scripts, while one or more effect-pass nodes hold the puppet
-    // instance that is actually rendered. Runtime animation-layer edits must be broadcast to every
-    // copy so a live user-property toggle matches a cold parse with the same property value.
+    // Effect-backed puppet layers are represented by several runtime nodes, but those consumers now
+    // share one WPPuppetLayer pose owner. Return one representative node per runtime identity so a
+    // script mutation is applied once and every pass observes the same revision/snapshot.
     add_if_puppet(node);
 
     int32_t layer_id = FindOwningLayerId(opaque, node);

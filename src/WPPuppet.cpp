@@ -81,8 +81,8 @@ void WPPuppet::prepared() {
 
 std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
                                                     double         time) noexcept {
-    double global_blend = puppet_layer.m_global_blend;
-    double total_blend = puppet_layer.m_total_blend;
+    auto&  runtime      = puppet_layer.Runtime();
+    double global_blend = runtime.global_blend;
 
     puppet_layer.updateInterpolation(time);
 
@@ -101,7 +101,7 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
 
         // double cur_blend { 0.0f };
 
-        for (auto& layer : puppet_layer.m_layers) {
+        for (auto& layer : runtime.layers) {
             auto& alayer = layer.anim_layer;
             if (layer.anim == nullptr || ! alayer.visible) continue;
             assert(i < layer.anim->bframes_array.size());
@@ -140,8 +140,8 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         affine.pretranslate(trans);
         affine.rotate(quat.slerp(global_blend, ident).cast<float>());
         affine.scale(scale);
-        if (i < puppet_layer.m_bone_overrides.size() && puppet_layer.m_bone_overrides[i].enabled) {
-            affine = puppet_layer.m_bone_overrides[i].local_transform;
+        if (i < runtime.bone_overrides.size() && runtime.bone_overrides[i].enabled) {
+            affine = runtime.bone_overrides[i].local_transform;
         }
         affine = parent * affine;
         m_bone_model_affines[i] = affine;
@@ -222,16 +222,21 @@ WPPuppet::Animation::getInterpolationInfo(double* cur_time) const {
 }
 
 void WPPuppetLayer::prepared(std::span<AnimationLayer> alayers) {
-    m_layers.resize(alayers.size());
-    m_bone_overrides.assign(m_puppet != nullptr ? m_puppet->bones.size() : 0, BoneOverride {});
-    m_cached_skinning     = {};
-    m_cached_frame_serial = std::numeric_limits<uint64_t>::max();
+    auto& runtime = Runtime();
+    runtime.layers.resize(alayers.size());
+    runtime.bone_overrides.assign(runtime.puppet != nullptr ? runtime.puppet->bones.size() : 0,
+                                  BoneOverride {});
+    runtime.cached_skinning     = {};
+    runtime.cached_frame_serial = std::numeric_limits<uint64_t>::max();
+    runtime.pose_revision       = 0;
+    runtime.domain              = PuppetPoseDomain::AuthoredEnvelope;
 
-    if (m_puppet == nullptr) return;
+    if (runtime.puppet == nullptr) return;
 
     std::transform(
-        alayers.rbegin(), alayers.rend(), m_layers.rbegin(), [this](const auto& layer) {
-            const auto& anims = m_puppet->anims;
+        alayers.rbegin(), alayers.rend(), runtime.layers.rbegin(),
+        [&runtime](const auto& layer) {
+            const auto& anims = runtime.puppet->anims;
 
             auto it = std::find_if(anims.begin(), anims.end(), [&layer](auto& a) {
                 return layer.id == a.id;
@@ -261,23 +266,24 @@ void WPPuppetLayer::RefreshBlendState() noexcept {
     // Animation-layer visibility and blend are mutable user/script properties. Rebuilding the
     // normalized weights from the current runtime layer state keeps the base pose available when a
     // previously full-weight animation is disabled, which is what Wallpaper Engine expects.
-    m_global_blend = 1.0;
-    m_total_blend  = 0.0;
+    auto& runtime       = Runtime();
+    runtime.global_blend = 1.0;
+    runtime.total_blend  = 0.0;
 
-    for (const auto& layer : m_layers) {
+    for (const auto& layer : runtime.layers) {
         if (layer.anim != nullptr && layer.anim_layer.visible) {
-            m_total_blend += layer.anim_layer.blend;
+            runtime.total_blend += layer.anim_layer.blend;
         }
     }
 
     double remaining_blend = 1.0;
-    for (auto layer_it = m_layers.rbegin(); layer_it != m_layers.rend(); ++layer_it) {
+    for (auto layer_it = runtime.layers.rbegin(); layer_it != runtime.layers.rend(); ++layer_it) {
         auto& layer = *layer_it;
         layer.blend = 0.0;
         if (layer.anim == nullptr || !layer.anim_layer.visible) continue;
 
-        if (m_total_blend > 1.0) {
-            layer.blend = layer.anim_layer.blend / m_total_blend;
+        if (runtime.total_blend > 1.0) {
+            layer.blend = layer.anim_layer.blend / runtime.total_blend;
             remaining_blend = 0.0;
         } else {
             layer.blend = remaining_blend * layer.anim_layer.blend;
@@ -286,30 +292,44 @@ void WPPuppetLayer::RefreshBlendState() noexcept {
         }
     }
 
-    m_global_blend = remaining_blend;
+    runtime.global_blend = remaining_blend;
     // The skinning matrices depend directly on the rebuilt blend weights, so cached bone matrices
     // must be invalidated even if the frame serial has not advanced yet.
-    m_cached_skinning     = {};
-    m_cached_frame_serial = std::numeric_limits<uint64_t>::max();
+    runtime.cached_skinning     = {};
+    runtime.cached_frame_serial = std::numeric_limits<uint64_t>::max();
+    runtime.pose_revision++;
 }
 
 std::span<const Eigen::Affine3f> WPPuppetLayer::genFrame(double time) noexcept {
-    m_cached_skinning = m_puppet->genFrame(*this, time);
-    return m_cached_skinning;
+    auto& runtime = Runtime();
+    runtime.cached_skinning = runtime.puppet->genFrame(*this, time);
+    return runtime.cached_skinning;
 }
 
-std::span<const Eigen::Affine3f> WPPuppetLayer::AdvanceIfNeeded(double time,
-                                                                uint64_t frame_serial) noexcept {
-    if (!m_puppet) return {};
-    if (m_cached_frame_serial != frame_serial) {
-        m_cached_skinning     = m_puppet->genFrame(*this, time);
-        m_cached_frame_serial = frame_serial;
+PuppetPoseSnapshot WPPuppetLayer::AdvanceIfNeeded(double time,
+                                                  uint64_t frame_serial) noexcept {
+    auto& runtime = Runtime();
+    if (!runtime.puppet) return {};
+    if (runtime.cached_frame_serial != frame_serial) {
+        runtime.cached_skinning     = runtime.puppet->genFrame(*this, time);
+        runtime.cached_frame_serial = frame_serial;
+        runtime.pose_revision++;
     }
-    return m_cached_skinning;
+    return PoseSnapshot();
+}
+
+PuppetPoseSnapshot WPPuppetLayer::PoseSnapshot() const noexcept {
+    const auto& runtime = Runtime();
+    return PuppetPoseSnapshot {
+        .skinning = runtime.cached_skinning,
+        .domain = runtime.domain,
+        .revision = runtime.pose_revision,
+        .frame_serial = runtime.cached_frame_serial,
+    };
 }
 
 void WPPuppetLayer::updateInterpolation(double time) noexcept {
-    for (auto& layer : m_layers) {
+    for (auto& layer : Runtime().layers) {
         if (layer) {
             double current_time = layer.anim_layer.cur_time;
             if (layer.anim_layer.playing) {
@@ -334,33 +354,59 @@ void WPPuppetLayer::updateInterpolation(double time) noexcept {
 }
 
 const WPPuppetLayer::AnimationLayer* WPPuppetLayer::AnimationLayerState(usize index) const noexcept {
-    if (index >= m_layers.size()) return nullptr;
-    return std::addressof(m_layers[index].anim_layer);
+    const auto& layers = Runtime().layers;
+    if (index >= layers.size()) return nullptr;
+    return std::addressof(layers[index].anim_layer);
 }
 
 WPPuppetLayer::AnimationLayer* WPPuppetLayer::AnimationLayerState(usize index) noexcept {
-    if (index >= m_layers.size()) return nullptr;
-    return std::addressof(m_layers[index].anim_layer);
+    auto& layers = Runtime().layers;
+    if (index >= layers.size()) return nullptr;
+    return std::addressof(layers[index].anim_layer);
 }
 
 const WPPuppet::Animation* WPPuppetLayer::AnimationDefinition(usize index) const noexcept {
-    if (index >= m_layers.size()) return nullptr;
-    return m_layers[index].anim;
+    const auto& layers = Runtime().layers;
+    if (index >= layers.size()) return nullptr;
+    return layers[index].anim;
 }
 
 bool WPPuppetLayer::SetLocalBoneTransform(usize index, const Eigen::Affine3f& transform) noexcept {
-    if (!m_puppet || index >= m_puppet->bones.size()) return false;
-    if (index >= m_bone_overrides.size()) {
-        m_bone_overrides.resize(m_puppet->bones.size());
+    auto& runtime = Runtime();
+    if (!runtime.puppet || index >= runtime.puppet->bones.size()) return false;
+    if (index >= runtime.bone_overrides.size()) {
+        runtime.bone_overrides.resize(runtime.puppet->bones.size());
     }
 
-    m_bone_overrides[index].enabled = true;
-    m_bone_overrides[index].local_transform = transform;
-    m_cached_skinning = {};
-    m_cached_frame_serial = std::numeric_limits<uint64_t>::max();
+    runtime.bone_overrides[index].enabled = true;
+    runtime.bone_overrides[index].local_transform = transform;
+    MarkRuntimePoseMutation();
     return true;
 }
 
-WPPuppetLayer::WPPuppetLayer(std::shared_ptr<WPPuppet> pup): m_puppet(pup) {}
-WPPuppetLayer::WPPuppetLayer()  = default;
+void WPPuppetLayer::MarkRuntimePoseMutation() noexcept {
+    auto& runtime = Runtime();
+    runtime.domain = PuppetPoseDomain::RuntimeMutable;
+    runtime.pose_revision++;
+    runtime.cached_skinning = {};
+    runtime.cached_frame_serial = std::numeric_limits<uint64_t>::max();
+}
+
+PuppetPoseDomain WPPuppetLayer::PoseDomain() const noexcept {
+    return Runtime().domain;
+}
+
+uint64_t WPPuppetLayer::PoseRevision() const noexcept {
+    return Runtime().pose_revision;
+}
+
+const void* WPPuppetLayer::RuntimeIdentity() const noexcept {
+    return m_runtime.get();
+}
+
+WPPuppetLayer::WPPuppetLayer(std::shared_ptr<WPPuppet> pup)
+    : m_runtime(std::make_shared<RuntimeState>()) {
+    m_runtime->puppet = std::move(pup);
+}
+WPPuppetLayer::WPPuppetLayer(): m_runtime(std::make_shared<RuntimeState>()) {}
 WPPuppetLayer::~WPPuppetLayer() = default;

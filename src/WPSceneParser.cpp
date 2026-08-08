@@ -1709,17 +1709,17 @@ struct ImageEffectCameraClipRange {
     float far_clip { 1.0f };
 };
 
-Eigen::AlignedBox3f TransformBounds(const Eigen::Vector3f& bounds_min,
-                                    const Eigen::Vector3f& bounds_max,
-                                    const Eigen::Affine3f& transform) {
-    Eigen::AlignedBox3f result;
+PuppetBounds3D TransformPuppetBounds(const PuppetBounds3D& bounds,
+                                     const Eigen::Affine3f& transform) {
+    PuppetBounds3D result;
+    if (!bounds.IsFiniteAndOrdered()) return result;
     for (int x = 0; x < 2; x++) {
         for (int y = 0; y < 2; y++) {
             for (int z = 0; z < 2; z++) {
-                result.extend(transform * Eigen::Vector3f {
-                    x == 0 ? bounds_min.x() : bounds_max.x(),
-                    y == 0 ? bounds_min.y() : bounds_max.y(),
-                    z == 0 ? bounds_min.z() : bounds_max.z(),
+                result.Include(transform * Eigen::Vector3f {
+                    x == 0 ? bounds.min.x() : bounds.max.x(),
+                    y == 0 ? bounds.min.y() : bounds.max.y(),
+                    z == 0 ? bounds.min.z() : bounds.max.z(),
                 });
             }
         }
@@ -1742,34 +1742,26 @@ PuppetSurfaceProjection BuildPuppetSurfaceProjection(
     projection.render_density = std::max(
         effect_source_size[0] / std::max(image.size[0], 1.0f),
         effect_source_size[1] / std::max(image.size[1], 1.0f));
+    projection.asset_bounds = mdl.asset_bounds;
+    projection.authored_pose_bounds = mdl.authored_pose_bounds.IsFiniteAndOrdered()
+                                          ? mdl.authored_pose_bounds
+                                          : mdl.asset_bounds;
 
-    const Eigen::Vector3f raw_min(mdl.puppet_bounds_min.data());
-    const Eigen::Vector3f raw_max(mdl.puppet_bounds_max.data());
-    const Eigen::Vector3f animated_min(
-        (mdl.puppet_animated_bounds_valid ? mdl.puppet_animated_bounds_min
-                                          : mdl.puppet_bounds_min).data());
-    const Eigen::Vector3f animated_max(
-        (mdl.puppet_animated_bounds_valid ? mdl.puppet_animated_bounds_max
-                                          : mdl.puppet_bounds_max).data());
-    const auto transformed_raw = TransformBounds(raw_min, raw_max, projection.geometry_transform);
-    const auto transformed_animated =
-        TransformBounds(animated_min, animated_max, projection.geometry_transform);
-    projection.raw_bounds_min = transformed_raw.min();
-    projection.raw_bounds_max = transformed_raw.max();
-    projection.animated_bounds_min = transformed_animated.min();
-    projection.animated_bounds_max = transformed_animated.max();
-
-    const Eigen::Vector3f authored_min {
+    PuppetBounds3D authored_surface = TransformPuppetBounds(
+        projection.authored_pose_bounds, projection.geometry_transform);
+    authored_surface.Include(Eigen::Vector3f {
         -image.size[0] * 0.5f, -image.size[1] * 0.5f, 0.0f
-    };
-    const Eigen::Vector3f authored_max {
+    });
+    authored_surface.Include(Eigen::Vector3f {
         image.size[0] * 0.5f, image.size[1] * 0.5f, 0.0f
-    };
-    constexpr float kProjectionPrecisionMargin = 1.0f;
-    projection.camera_bounds_min = authored_min.cwiseMin(projection.animated_bounds_min) -
-                                   Eigen::Vector3f::Constant(kProjectionPrecisionMargin);
-    projection.camera_bounds_max = authored_max.cwiseMax(projection.animated_bounds_max) +
-                                   Eigen::Vector3f::Constant(kProjectionPrecisionMargin);
+    });
+    // One physical target pixel protects raster-edge precision while keeping the guard tied to the
+    // actual render density. The resulting surface remains immutable for authored animation.
+    const float guard = 1.0f / std::max(projection.render_density,
+                                        std::numeric_limits<float>::epsilon());
+    projection.surface_bounds = authored_surface;
+    projection.surface_bounds.min -= Eigen::Vector3f::Constant(guard);
+    projection.surface_bounds.max += Eigen::Vector3f::Constant(guard);
     return projection;
 }
 
@@ -2129,6 +2121,7 @@ struct EffectWriterTransformContract {
     std::array<float, 2>       parallax_depth { 0.0f, 0.0f };
     bool                       parallax_depth_authored { true };
     SceneImageEffectLayer*     projection_layer { nullptr };
+    bool                       binds_puppet_surface { false };
     ParentTransformContract    parent_transform {};
     bool suppress_own_model_parallax { false };
 };
@@ -2142,9 +2135,12 @@ void ApplyEffectWriterTransformContract(ParseContext& context,
                              contract.parallax_depth_authored);
 
     if (contract.projection_layer != nullptr) {
-        data.SetEffectProjection(contract.projection_layer,
-                                 &contract.projection_layer->FinalNode(),
-                                 &contract.projection_layer->FinalMesh());
+        data.SetEffectTextureProjection(&contract.projection_layer->FinalNode(),
+                                        &contract.projection_layer->FinalMesh());
+        if (contract.binds_puppet_surface) {
+            data.SetPuppetSurface(contract.projection_layer,
+                                  &contract.projection_layer->FinalMesh());
+        }
     }
 
     ApplyParentTransformContract(context, contract.parent_transform, data);
@@ -2235,6 +2231,7 @@ EffectWriterTransformContract BuildImageEffectMaterialContract(
     contract.parallax_depth          = ImageObjectParallaxDepth(image);
     contract.parallax_depth_authored = image.parallaxDepthAuthored;
     contract.projection_layer        = &effect_layer;
+    contract.binds_puppet_surface    = private_layer_surface_writer;
 
     if (private_layer_surface_writer) {
         // An animated puppet surface writer rasterizes the skinned mesh through the layer-local
@@ -4291,6 +4288,11 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     WPShaderValueData worldNodeData;
     TextureSample     source_sampler;
     std::string       primary_source_texture;
+    WPPuppetLayer     shared_puppet_pose;
+    if (hasAnimatedPuppetMesh) {
+        shared_puppet_pose = WPPuppetLayer(puppet->puppet);
+        shared_puppet_pose.prepared(wpimgobj.puppet_layers);
+    }
 
     ShaderValueMap baseConstSvs = context.global_base_uniforms;
     const float    initial_alpha = ClampParserOpacityScalar(wpimgobj.alpha);
@@ -4365,8 +4367,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 puppet_effect.materials.push_back(std::move(puppet_mat));
                 wpimgobj.effects.push_back(std::move(puppet_effect));
             } else {
-                svData.puppet_layer = WPPuppetLayer(puppet->puppet);
-                svData.puppet_layer.prepared(wpimgobj.puppet_layers);
+                svData.puppet_layer = shared_puppet_pose;
                 WPMdlParser::GenPuppetMesh(mesh, *puppet);
             }
         } else if (hasStaticImageMesh) {
@@ -4422,8 +4423,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         context, wpimgobj.material, shaderInfo, spImgNode.get(), wpimgobj.id, wpimgobj.name);
 
     if (hasAnimatedPuppetMesh) {
-        svData.puppet_layer = WPPuppetLayer(puppet->puppet);
-        svData.puppet_layer.prepared(wpimgobj.puppet_layers);
+        svData.puppet_layer = shared_puppet_pose;
     }
 
     ConfigureBoneAttachment(context,
@@ -4534,7 +4534,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             }
             scene.cameras.at(nodeAddr)->AttatchImgEffect(imgEffectLayer);
         }
-        if (hasAnimatedPuppetMesh && puppet->puppet_bounds_valid) {
+        if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
             const std::string puppet_surface_camera = nodeAddr + "__puppet_surface_camera";
             const std::string puppet_surface_target =
                 "_rt_puppet_surface_" + nodeAddr;
@@ -4553,10 +4553,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     1, 1, effect_camera_clip.near_clip, effect_camera_clip.far_clip);
                 scene.cameras.at(puppet_surface_camera)->AttatchNode(context.effect_camera_node);
                 scene.cameras.at(puppet_surface_camera)->SetOrthographicViewRect(
-                    projection->camera_bounds_min.x(),
-                    projection->camera_bounds_max.x(),
-                    projection->camera_bounds_min.y(),
-                    projection->camera_bounds_max.y());
+                    projection->surface_bounds.min.x(),
+                    projection->surface_bounds.max.x(),
+                    projection->surface_bounds.min.y(),
+                    projection->surface_bounds.max.y());
                 scene.objectRuntimeCameraNames[wpimgobj.id].push_back(puppet_surface_camera);
 
                 scene.renderTargets[puppet_surface_target] = SceneRenderTarget {
@@ -4568,32 +4568,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     .sample = source_sampler,
                 };
                 scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(puppet_surface_target);
-                LOG_INFO("ScenePuppetProjection: layer=%d name='%s' raw-bounds=[%.3f %.3f %.3f]-"
-                         "[%.3f %.3f %.3f] animated-bounds=[%.3f %.3f %.3f]-"
-                         "[%.3f %.3f %.3f] camera-view-rect=[%.3f %.3f %.3f %.3f] "
-                         "target-extent=[%d %d] geometry-transform-translation=[%.3f %.3f %.3f] "
-                         "source-to-layer=[%.6f %.6f %.6f %.6f] target='%s' camera='%s'",
-                         wpimgobj.id,
-                         wpimgobj.name.c_str(),
-                         projection->raw_bounds_min.x(), projection->raw_bounds_min.y(),
-                         projection->raw_bounds_min.z(), projection->raw_bounds_max.x(),
-                         projection->raw_bounds_max.y(), projection->raw_bounds_max.z(),
-                         projection->animated_bounds_min.x(),
-                         projection->animated_bounds_min.y(),
-                         projection->animated_bounds_min.z(),
-                         projection->animated_bounds_max.x(),
-                         projection->animated_bounds_max.y(),
-                         projection->animated_bounds_max.z(),
-                         projection->camera_bounds_min.x(), projection->camera_bounds_max.x(),
-                         projection->camera_bounds_min.y(), projection->camera_bounds_max.y(),
-                         projection->target_extent[0], projection->target_extent[1],
-                         projection->geometry_transform.translation().x(),
-                         projection->geometry_transform.translation().y(),
-                         projection->geometry_transform.translation().z(),
-                         projection->source_to_layer.x(), projection->source_to_layer.y(),
-                         projection->source_to_layer.z(), projection->source_to_layer.w(),
-                         puppet_surface_target.c_str(),
-                         puppet_surface_camera.c_str());
             }
         }
         // set renderTarget for ping-pong operate
@@ -4838,8 +4812,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                                          hasAnimatedPuppetMesh && wpmat.use_puppet),
                         svData);
                     if (hasAnimatedPuppetMesh && wpmat.use_puppet) {
-                        svData.puppet_layer = WPPuppetLayer(puppet->puppet);
-                        svData.puppet_layer.prepared(wpimgobj.puppet_layers);
+                        svData.puppet_layer = shared_puppet_pose;
                     }
                 }
                 const auto authored_textures = material.textures;

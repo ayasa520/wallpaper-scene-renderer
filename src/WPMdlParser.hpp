@@ -36,6 +36,7 @@ struct WPMdl {
     i32 mdla { 1 };
     MeshKind kind { MeshKind::Unknown };
 
+    std::string source_path;
     std::string mat_json_file;
     struct StaticVertex {
         // Static Wallpaper Engine model chunks use one canonical runtime layout here:
@@ -70,12 +71,11 @@ struct WPMdl {
     };
     std::vector<Vertex>                  vertexs;
     std::vector<std::array<uint16_t, 3>> indices;
-    std::array<float, 3> puppet_bounds_min { 0.0f, 0.0f, 0.0f };
-    std::array<float, 3> puppet_bounds_max { 0.0f, 0.0f, 0.0f };
-    std::array<float, 3> puppet_animated_bounds_min { 0.0f, 0.0f, 0.0f };
-    std::array<float, 3> puppet_animated_bounds_max { 0.0f, 0.0f, 0.0f };
-    bool puppet_bounds_valid { false };
-    bool puppet_animated_bounds_valid { false };
+    // Vertex positions are stored in the MDL asset's puppet-local coordinate space.
+    PuppetBounds3D asset_bounds;
+    // Immutable union of the authored animation envelopes, also in puppet-local coordinates.
+    // Runtime pose observation is intentionally not written back into this parsed asset contract.
+    PuppetBounds3D authored_pose_bounds;
 
     struct Part {
         uint32_t id { 0 };

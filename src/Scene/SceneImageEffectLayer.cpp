@@ -7,6 +7,9 @@
 #include "Core/StringHelper.hpp"
 #include "Utils/Logging.h"
 
+#include <algorithm>
+#include <limits>
+
 using namespace wallpaper;
 
 namespace
@@ -74,10 +77,10 @@ EffectOutputDiagnosticRoles ResolveEffectOutputDiagnosticRoles(
 
 std::shared_ptr<SceneMesh> BuildPuppetPublicationMesh(const PuppetSurfaceProjection& projection) {
     auto mesh = std::make_shared<SceneMesh>(true);
-    const float left = projection.camera_bounds_min.x();
-    const float right = projection.camera_bounds_max.x();
-    const float bottom = projection.camera_bounds_min.y();
-    const float top = projection.camera_bounds_max.y();
+    const float left = projection.surface_bounds.min.x();
+    const float right = projection.surface_bounds.max.x();
+    const float bottom = projection.surface_bounds.min.y();
+    const float top = projection.surface_bounds.max.y();
     const std::array<float, 12> positions {
         left, bottom, 0.0f, left, top, 0.0f, right, bottom, 0.0f, right, top, 0.0f,
     };
@@ -93,24 +96,81 @@ std::shared_ptr<SceneMesh> BuildPuppetPublicationMesh(const PuppetSurfaceProject
     return mesh;
 }
 
+PuppetBounds3D TransformPuppetBounds(const PuppetBounds3D& bounds,
+                                     const Eigen::Affine3f& transform) {
+    PuppetBounds3D result;
+    if (!bounds.IsFiniteAndOrdered()) return result;
+    for (int x = 0; x < 2; x++) {
+        for (int y = 0; y < 2; y++) {
+            for (int z = 0; z < 2; z++) {
+                result.Include(transform * Eigen::Vector3f {
+                    x == 0 ? bounds.min.x() : bounds.max.x(),
+                    y == 0 ? bounds.min.y() : bounds.max.y(),
+                    z == 0 ? bounds.min.z() : bounds.max.z(),
+                });
+            }
+        }
+    }
+    return result;
+}
+
+PuppetBounds3D ComputeSkinnedPuppetBounds(const SceneMesh& mesh,
+                                          std::span<const Eigen::Affine3f> skinning) {
+    PuppetBounds3D bounds;
+    if (mesh.VertexCount() == 0 || skinning.empty()) return bounds;
+
+    const auto& vertex_array = mesh.GetVertexArray(0);
+    const auto offsets = vertex_array.GetAttrOffsetMap();
+    const auto position_it = offsets.find(std::string(WE_IN_POSITION));
+    const auto indices_it = offsets.find(std::string(WE_IN_BLENDINDICES));
+    const auto weights_it = offsets.find(std::string(WE_IN_BLENDWEIGHTS));
+    if (position_it == offsets.end() || indices_it == offsets.end() ||
+        weights_it == offsets.end() || vertex_array.Data() == nullptr) {
+        return bounds;
+    }
+
+    const usize stride = vertex_array.OneSize();
+    const usize position_offset = position_it->second.offset / sizeof(float);
+    const usize indices_offset = indices_it->second.offset / sizeof(float);
+    const usize weights_offset = weights_it->second.offset / sizeof(float);
+    const float* data = vertex_array.Data();
+    for (usize vertex_index = 0; vertex_index < vertex_array.VertexCount(); vertex_index++) {
+        const usize base = vertex_index * stride;
+        const Eigen::Vector3f bind_position(data + base + position_offset);
+        const auto* blend_indices = reinterpret_cast<const uint32_t*>(data + base + indices_offset);
+        const float* blend_weights = data + base + weights_offset;
+        Eigen::Vector3f skinned = Eigen::Vector3f::Zero();
+        float total_weight = 0.0f;
+        for (usize influence = 0; influence < 4; influence++) {
+            const float weight = blend_weights[influence];
+            if (weight <= 0.0f || blend_indices[influence] >= skinning.size()) continue;
+            skinned += weight * (skinning[blend_indices[influence]] * bind_position);
+            total_weight += weight;
+        }
+        bounds.Include(total_weight > 0.0f ? skinned : bind_position);
+    }
+    return bounds;
+}
+
 void UpdatePuppetProjectionDerivedValues(PuppetSurfaceProjection& projection) {
-    const float authored_width = std::max(projection.authored_layer_size.x(), 1e-3f);
-    const float authored_height = std::max(projection.authored_layer_size.y(), 1e-3f);
-    const float camera_width = std::max(projection.camera_bounds_max.x() -
-                                            projection.camera_bounds_min.x(),
-                                        1e-3f);
-    const float camera_height = std::max(projection.camera_bounds_max.y() -
-                                             projection.camera_bounds_min.y(),
-                                         1e-3f);
+    const float minimum_extent = std::numeric_limits<float>::epsilon();
+    const float authored_width = std::max(projection.authored_layer_size.x(), minimum_extent);
+    const float authored_height = std::max(projection.authored_layer_size.y(), minimum_extent);
+    const float camera_width = std::max(projection.surface_bounds.max.x() -
+                                            projection.surface_bounds.min.x(),
+                                        minimum_extent);
+    const float camera_height = std::max(projection.surface_bounds.max.y() -
+                                             projection.surface_bounds.min.y(),
+                                         minimum_extent);
     const float authored_left = -authored_width * 0.5f;
     const float authored_top = authored_height * 0.5f;
     projection.source_to_layer = Eigen::Vector4f {
-        (authored_left - projection.camera_bounds_min.x()) / camera_width,
-        (projection.camera_bounds_max.y() - authored_top) / camera_height,
+        (authored_left - projection.surface_bounds.min.x()) / camera_width,
+        (projection.surface_bounds.max.y() - authored_top) / camera_height,
         authored_width / camera_width,
         authored_height / camera_height,
     };
-    const float density = std::max(projection.render_density, 1e-3f);
+    const float density = std::max(projection.render_density, minimum_extent);
     projection.target_extent = {
         std::max(1, static_cast<int32_t>(std::ceil(camera_width * density))),
         std::max(1, static_cast<int32_t>(std::ceil(camera_height * density))),
@@ -151,102 +211,94 @@ SceneImageEffectLayer::ResolveFinalOutputCapability(bool dependency_route) const
 }
 
 void SceneImageEffectLayer::SetPuppetSurfaceProjection(PuppetSurfaceProjection projection) {
+    if (!projection.asset_bounds.IsFiniteAndOrdered() ||
+        !projection.authored_pose_bounds.IsFiniteAndOrdered() ||
+        !projection.surface_bounds.IsFiniteAndOrdered()) {
+        LOG_ERROR("ScenePuppetProjectionInit: layer=%d has invalid asset/authored/surface bounds",
+                  m_worldNode != nullptr ? m_worldNode->ID() : -1);
+        return;
+    }
     UpdatePuppetProjectionDerivedValues(projection);
+    projection.surface_revision = 1;
+    projection.camera_revision = projection.surface_revision;
+    projection.target_revision = projection.surface_revision;
+    projection.publication_mesh_revision = projection.surface_revision;
     m_puppet_surface_projection = std::move(projection);
 }
 
-bool SceneImageEffectLayer::UpdatePuppetSurfaceBounds(Scene& scene,
-                                                      const Eigen::Vector3f& bounds_min,
-                                                      const Eigen::Vector3f& bounds_max,
-                                                      uint64_t frame_serial) {
-    auto* projection = GetPuppetSurfaceProjection();
-    if (projection == nullptr) return false;
+bool SceneImageEffectLayer::PreparePuppetSurface(Scene& scene, const SceneMesh& skinned_mesh,
+                                                 const PuppetPoseSnapshot& pose,
+                                                 uint64_t frame_serial) {
+    if (!m_puppet_surface_projection.has_value() ||
+        pose.domain != PuppetPoseDomain::RuntimeMutable) {
+        return false;
+    }
+    auto& projection = *m_puppet_surface_projection;
+    if (projection.last_bounds_frame_serial == frame_serial &&
+        projection.last_pose_revision == pose.revision) {
+        return false;
+    }
 
-    const Eigen::Vector3f old_min = projection->camera_bounds_min;
-    const Eigen::Vector3f old_max = projection->camera_bounds_max;
-    // Keep a small deterministic precision envelope around runtime overrides. It absorbs a single
-    // floating-point skinning excursion without changing the authored camera for every frame.
-    constexpr float kProjectionPrecisionMargin = 1.0f;
-    constexpr float kProjectionChangeEpsilon = 0.001f;
+    projection.last_bounds_frame_serial = frame_serial;
+    projection.last_pose_revision = pose.revision;
+    const PuppetBounds3D observed = ComputeSkinnedPuppetBounds(skinned_mesh, pose.skinning);
+    if (!observed.IsFiniteAndOrdered()) {
+        LOG_ERROR("ScenePuppetSurfacePrepare: layer=%d frame=%llu revision=%llu produced invalid "
+                  "runtime bounds",
+                  m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                  static_cast<unsigned long long>(frame_serial),
+                  static_cast<unsigned long long>(pose.revision));
+        return false;
+    }
+    projection.observed_runtime_bounds = observed;
+
+    const PuppetBounds3D transformed = TransformPuppetBounds(observed,
+                                                              projection.geometry_transform);
+    const float guard = 1.0f / std::max(projection.render_density,
+                                        std::numeric_limits<float>::epsilon());
+    const Eigen::Vector3f guarded_min = transformed.min - Eigen::Vector3f::Constant(guard);
+    const Eigen::Vector3f guarded_max = transformed.max + Eigen::Vector3f::Constant(guard);
     const std::array<bool, 6> exceeded_axes {
-        bounds_min.x() - kProjectionPrecisionMargin < old_min.x() - kProjectionChangeEpsilon,
-        bounds_max.x() + kProjectionPrecisionMargin > old_max.x() + kProjectionChangeEpsilon,
-        bounds_min.y() - kProjectionPrecisionMargin < old_min.y() - kProjectionChangeEpsilon,
-        bounds_max.y() + kProjectionPrecisionMargin > old_max.y() + kProjectionChangeEpsilon,
-        bounds_min.z() - kProjectionPrecisionMargin < old_min.z() - kProjectionChangeEpsilon,
-        bounds_max.z() + kProjectionPrecisionMargin > old_max.z() + kProjectionChangeEpsilon,
+        guarded_min.x() < projection.surface_bounds.min.x(),
+        guarded_max.x() > projection.surface_bounds.max.x(),
+        guarded_min.y() < projection.surface_bounds.min.y(),
+        guarded_max.y() > projection.surface_bounds.max.y(),
+        guarded_min.z() < projection.surface_bounds.min.z(),
+        guarded_max.z() > projection.surface_bounds.max.z(),
     };
-    const auto next_min = Eigen::Vector3f {
-        std::min(old_min.x(), bounds_min.x() - kProjectionPrecisionMargin),
-        std::min(old_min.y(), bounds_min.y() - kProjectionPrecisionMargin),
-        std::min(old_min.z(), bounds_min.z() - kProjectionPrecisionMargin),
-    };
-    const auto next_max = Eigen::Vector3f {
-        std::max(old_max.x(), bounds_max.x() + kProjectionPrecisionMargin),
-        std::max(old_max.y(), bounds_max.y() + kProjectionPrecisionMargin),
-        std::max(old_max.z(), bounds_max.z() + kProjectionPrecisionMargin),
-    };
-    const bool changed = (next_min - old_min).cwiseAbs().maxCoeff() > kProjectionChangeEpsilon ||
-                         (next_max - old_max).cwiseAbs().maxCoeff() > kProjectionChangeEpsilon;
-    if (!changed) return false;
+    if (std::none_of(exceeded_axes.begin(), exceeded_axes.end(), [](bool exceeded) {
+            return exceeded;
+        })) {
+        return false;
+    }
 
-    // Runtime bone overrides become part of the layer's animation envelope once observed. Keeping
-    // the expanded envelope next to the camera contract makes subsequent diagnostics truthful: the
-    // camera is no longer described as covering only authored frames after a script has moved a
-    // bone outside them.
-    projection->animated_bounds_min =
-        projection->animated_bounds_min.cwiseMin(bounds_min);
-    projection->animated_bounds_max =
-        projection->animated_bounds_max.cwiseMax(bounds_max);
-    projection->camera_bounds_min = next_min;
-    projection->camera_bounds_max = next_max;
-    projection->contract_exceeded = true;
-    UpdatePuppetProjectionDerivedValues(*projection);
+    const std::array<int32_t, 2> old_extent = projection.target_extent;
+    projection.surface_bounds.min = projection.surface_bounds.min.cwiseMin(guarded_min);
+    projection.surface_bounds.max = projection.surface_bounds.max.cwiseMax(guarded_max);
+    projection.contract_exceeded = true;
+    projection.surface_revision++;
+    UpdatePuppetProjectionDerivedValues(projection);
+    projection.camera_revision = projection.surface_revision;
+    projection.target_revision = projection.surface_revision;
+    projection.publication_mesh_revision = projection.surface_revision;
 
-    auto camera_it = scene.cameras.find(projection->camera_name);
+    auto camera_it = scene.cameras.find(projection.camera_name);
     if (camera_it != scene.cameras.end() && camera_it->second != nullptr) {
-        camera_it->second->SetOrthographicViewRect(projection->camera_bounds_min.x(),
-                                                   projection->camera_bounds_max.x(),
-                                                   projection->camera_bounds_min.y(),
-                                                   projection->camera_bounds_max.y());
+        camera_it->second->SetOrthographicViewRect(projection.surface_bounds.min.x(),
+                                                   projection.surface_bounds.max.x(),
+                                                   projection.surface_bounds.min.y(),
+                                                   projection.surface_bounds.max.y());
     }
-    auto target_it = scene.renderTargets.find(projection->target_name);
+    const bool extent_changed = old_extent != projection.target_extent;
+    auto target_it = scene.renderTargets.find(projection.target_name);
     if (target_it != scene.renderTargets.end()) {
-        target_it->second.width = projection->target_extent[0];
-        target_it->second.height = projection->target_extent[1];
-        target_it->second.mapWidth = projection->target_extent[0];
-        target_it->second.mapHeight = projection->target_extent[1];
-        scene.MarkRenderTargetResourcesDirty(projection->target_name);
+        target_it->second.width = projection.target_extent[0];
+        target_it->second.height = projection.target_extent[1];
+        target_it->second.mapWidth = projection.target_extent[0];
+        target_it->second.mapHeight = projection.target_extent[1];
+        if (extent_changed) scene.MarkRenderTargetResourcesDirty(projection.target_name);
     }
 
-    constexpr std::array<std::string_view, 6> kAxisNames {
-        "min-x", "max-x", "min-y", "max-y", "min-z", "max-z"
-    };
-    std::string exceeded_axis_names;
-    for (size_t axis = 0; axis < exceeded_axes.size(); axis++) {
-        if (!exceeded_axes[axis]) continue;
-        if (!exceeded_axis_names.empty()) exceeded_axis_names += ',';
-        exceeded_axis_names += kAxisNames[axis];
-    }
-
-    LOG_INFO("ScenePuppetProjectionRecompute: layer=%d frame=%llu raw-bounds=[%.3f %.3f %.3f]-"
-             "[%.3f %.3f %.3f] animated-bounds=[%.3f %.3f %.3f]-[%.3f %.3f %.3f] "
-             "camera-view-rect=[%.3f %.3f %.3f %.3f] target-extent=[%d %d] "
-             "source-to-layer=[%.6f %.6f %.6f %.6f] exceeded=true exceeded-axes='%s'",
-             m_worldNode != nullptr ? m_worldNode->ID() : -1,
-             static_cast<unsigned long long>(frame_serial),
-             projection->raw_bounds_min.x(), projection->raw_bounds_min.y(),
-             projection->raw_bounds_min.z(), projection->raw_bounds_max.x(),
-             projection->raw_bounds_max.y(), projection->raw_bounds_max.z(),
-             projection->animated_bounds_min.x(), projection->animated_bounds_min.y(),
-             projection->animated_bounds_min.z(), projection->animated_bounds_max.x(),
-             projection->animated_bounds_max.y(), projection->animated_bounds_max.z(),
-             projection->camera_bounds_min.x(), projection->camera_bounds_max.x(),
-             projection->camera_bounds_min.y(), projection->camera_bounds_max.y(),
-             projection->target_extent[0], projection->target_extent[1],
-             projection->source_to_layer.x(), projection->source_to_layer.y(),
-             projection->source_to_layer.z(), projection->source_to_layer.w(),
-             exceeded_axis_names.c_str());
     SyncResolvedOutputMesh();
     return true;
 }
