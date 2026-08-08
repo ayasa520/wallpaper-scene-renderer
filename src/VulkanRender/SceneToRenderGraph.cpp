@@ -970,13 +970,31 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         // authored shader as the visible writer. Composition-source routing always overrides that
         // declaration because the child result must remain sampleable before it is placed into the
         // parent source target.
-        const auto final_output_policy =
-            route.compose_source
-                ? SceneImageEffectLayer::FinalOutputPolicy::PrivateAuthoredThenComposite
-                : imgeff->DeclaredFinalOutputPolicy();
+        const bool dependency_route = route.compose_source || keep_final_output_private;
+        const auto final_output_capability =
+            imgeff->ResolveFinalOutputCapability(dependency_route);
+        const std::string_view layer_surface_camera =
+            !imgeff->LayerSurfaceCamera().empty()
+                ? std::string_view(imgeff->LayerSurfaceCamera())
+                : (node != nullptr ? std::string_view(node->Camera()) : std::string_view());
+        const auto private_target_it = scene.renderTargets.find(imgeff->FirstTarget());
+        const auto final_target_it = scene.renderTargets.find(std::string(inherited_output));
+        const SceneRenderTarget* private_target =
+            private_target_it != scene.renderTargets.end() ? &private_target_it->second : nullptr;
+        const SceneRenderTarget* final_target =
+            final_target_it != scene.renderTargets.end() ? &final_target_it->second : nullptr;
+        const TextureSample private_sample =
+            private_target != nullptr ? private_target->sample : TextureSample {};
+        const TextureSample final_sample =
+            final_target != nullptr ? final_target->sample : TextureSample {};
         LOG_INFO("SceneRenderGraphEffectResolve: layer=%d name='%s' inherited-output='%.*s' "
                  "effect-output='%.*s' offscreen-dependency=%s visible=%s local-visible=%s "
-                 "routed=%s keep-final-private=%s compose-source-route=%s compose-camera='%s'",
+                 "routed=%s keep-final-private=%s compose-source-route=%s compose-camera='%s' "
+                 "capability=%.*s layer-surface-camera='%.*s' private-target='%s' "
+                 "private-target-size=[%d %d] "
+                 "private-sampler=[wrap-s=%.*s wrap-t=%.*s mag=%.*s min=%.*s] "
+                 "final-target='%.*s' final-target-size=[%d %d] "
+                 "final-sampler=[wrap-s=%.*s wrap-t=%.*s mag=%.*s min=%.*s]",
                  NodeLayerId(scene, node),
                  node != nullptr ? node->Name().c_str() : "",
                  static_cast<int>(inherited_output.size()),
@@ -989,14 +1007,41 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                  route.routed_node ? "true" : "false",
                  keep_final_output_private ? "true" : "false",
                  route.compose_source ? "true" : "false",
-                 source_route.active_compose_source_camera.c_str());
+                 source_route.active_compose_source_camera.c_str(),
+                 static_cast<int>(FinalOutputCapabilityName(final_output_capability).size()),
+                 FinalOutputCapabilityName(final_output_capability).data(),
+                 static_cast<int>(layer_surface_camera.size()),
+                 layer_surface_camera.data(),
+                 imgeff->FirstTarget().c_str(),
+                 private_target != nullptr ? private_target->width : 0,
+                 private_target != nullptr ? private_target->height : 0,
+                 static_cast<int>(TextureWrapName(private_sample.wrapS).size()),
+                 TextureWrapName(private_sample.wrapS).data(),
+                 static_cast<int>(TextureWrapName(private_sample.wrapT).size()),
+                 TextureWrapName(private_sample.wrapT).data(),
+                 static_cast<int>(TextureFilterName(private_sample.magFilter).size()),
+                 TextureFilterName(private_sample.magFilter).data(),
+                 static_cast<int>(TextureFilterName(private_sample.minFilter).size()),
+                 TextureFilterName(private_sample.minFilter).data(),
+                 static_cast<int>(inherited_output.size()),
+                 inherited_output.data(),
+                 final_target != nullptr ? final_target->width : 0,
+                 final_target != nullptr ? final_target->height : 0,
+                 static_cast<int>(TextureWrapName(final_sample.wrapS).size()),
+                 TextureWrapName(final_sample.wrapS).data(),
+                 static_cast<int>(TextureWrapName(final_sample.wrapT).size()),
+                 TextureWrapName(final_sample.wrapT).data(),
+                 static_cast<int>(TextureFilterName(final_sample.magFilter).size()),
+                 TextureFilterName(final_sample.magFilter).data(),
+                 static_cast<int>(TextureFilterName(final_sample.minFilter).size()),
+                 TextureFilterName(final_sample.minFilter).data());
         imgeff->ResolveEffect(scene.default_effect_mesh,
                               "effect",
-                              node != nullptr ? std::string_view(node->Camera()) : std::string_view(),
+                              layer_surface_camera,
                               inherited_output,
                               keep_final_output_private,
                               &resolved_effect_world_affine,
-                              final_output_policy);
+                              final_output_capability);
 
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
             auto& eff     = imgeff->GetEffect(i);

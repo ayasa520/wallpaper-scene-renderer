@@ -38,9 +38,16 @@ struct TextLayoutResult {
     std::array<float, 2> glyph_display_size { 0.0f, 0.0f };
     std::array<float, 2> glyph_source_size { 0.0f, 0.0f };
     std::array<float, 2> glyph_offset { 0.0f, 0.0f };
+    std::array<float, 4> glyph_source_crop { 0.0f, 0.0f, 0.0f, 0.0f };
     std::array<float, 2> visible_display_size { 0.0f, 0.0f };
     std::array<float, 2> visible_source_size { 0.0f, 0.0f };
     std::array<float, 2> visible_display_offset { 0.0f, 0.0f };
+
+    // These values describe independent renderer contracts. Point-size conversion changes
+    // authored glyph geometry, while backing density only changes atlas resolution; neither object
+    // scale nor the scene camera is folded into either value.
+    float point_size_authoring_units { 0.0f };
+    float backing_density { 1.0f };
 
     std::vector<TextGlyphAtlasPage> glyph_pages;
     std::vector<TextGlyphRun>       glyph_runs;
@@ -58,12 +65,20 @@ struct TextBridgeRenderTarget {
 };
 
 struct TextSourceBridge {
-    bool                 enabled { false };
     std::string          camera_name;
     std::string          pingpong_a;
     std::string          pingpong_b;
     std::array<float, 2> source_size { 0.0f, 0.0f };
     std::vector<TextBridgeRenderTarget> render_targets;
+};
+
+struct TextLayerRenderContract {
+    bool has_materialized_authored_effects { false };
+    bool uses_shader_color_blend_bridge { false };
+
+    [[nodiscard]] bool RequiresBridge() const {
+        return has_materialized_authored_effects || uses_shader_color_blend_bridge;
+    }
 };
 
 class SceneTextPrimitive {
@@ -79,6 +94,7 @@ public:
     // meshes, material data, and optional bridge metadata all live here so parser, runtime, and
     // render graph consume one final representation instead of synthetic image-layer sidecars.
     wpscene::WPTextObject object;
+    TextLayerRenderContract render_contract;
     TextLayoutResult      layout;
     TextSourceBridge      bridge;
     std::shared_ptr<SceneMesh> background_mesh;

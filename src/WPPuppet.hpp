@@ -39,7 +39,13 @@ public:
     struct Attachment {
         std::string     name;
         uint32_t        bone_index { 0xFFFFFFFFu };
+        // Raw MDAT payload. Despite looking like an absolute affine matrix, this transform is
+        // authored relative to `bone_index`; it is neither puppet-model space nor world space.
         Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
+        // Immutable runtime copy of the same bone-local locator. The complete attachment transform
+        // is currentBoneModel * bind_transform * childLocal. Do not remove the bind bone chain with
+        // inverse(bindBoneModel): doing so moves every locator attached to a non-root bone.
+        Eigen::Affine3f bind_transform { Eigen::Affine3f::Identity() };
     };
     struct BoneFrame {
         Eigen::Vector3f position;

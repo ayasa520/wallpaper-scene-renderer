@@ -54,14 +54,16 @@ enum class TextureCacheStreamingState
 };
 
 struct TextureKey {
-    i32           width;
-    i32           height;
-    TexUsage      usage;
-    TextureFormat format;
-    TextureSample sample;
+    i32           width { 0 };
+    i32           height { 0 };
+    TexUsage      usage { TexUsage::COLOR };
+    TextureFormat format { TextureFormat::RGBA8 };
+    TextureSample sample {};
     uint          mipmap_level { 1 };
 
     static TexHash HashValue(const TextureKey&);
+
+    bool operator==(const TextureKey&) const = default;
 };
 
 class TextureCache : NoCopy, NoMove {
@@ -126,7 +128,8 @@ private:
         idx                index { 0 };
         bool               share_ready { false };
         bool               persist { false };
-        TexHash            content_hash;
+        TextureKey         content_key;
+        TexHash            content_hash { 0 };
         VmaImageParameters image;
         Set<std::string>   query_keys;
     };

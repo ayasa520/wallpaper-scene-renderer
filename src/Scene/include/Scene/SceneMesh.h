@@ -6,6 +6,7 @@
 #include <climits>
 #include <atomic>
 #include <string>
+#include <Eigen/Geometry>
 
 #include "SceneVertexArray.h"
 #include "SceneIndexArray.h"
@@ -60,6 +61,13 @@ public:
 	const SceneIndexArray& GetIndexArray(const std::size_t index) const { return m_data->indexArrays[index]; }	
 	const MaskedDrawPlan& MaskedDraw() const { return m_data->maskedDraw; }
 	const SkinningInfo& Skinning() const { return m_data->skinning; }
+	// Geometry transforms are the mesh-side coordinate contract. They are applied by the uniform
+	// updater to every matrix path (including masked ranges) without mutating imported vertex bytes.
+	const Eigen::Affine3f& GeometryTransform() const { return m_data->geometry_transform; }
+	void SetGeometryTransform(const Eigen::Affine3f& transform) {
+		m_data->geometry_transform = transform;
+		SetDirty();
+	}
 
 	SceneVertexArray& GetVertexArray(const std::size_t index) { return m_data->vertexArrays[index]; }
 	SceneIndexArray& GetIndexArray(const std::size_t index) { return m_data->indexArrays[index]; }	
@@ -95,6 +103,7 @@ private:
 		std::vector<SceneIndexArray> indexArrays;
 		MaskedDrawPlan maskedDraw;
 		SkinningInfo skinning;
+		Eigen::Affine3f geometry_transform { Eigen::Affine3f::Identity() };
 	};
 
 	uint32_t m_id { std::numeric_limits<uint32_t>::max() };

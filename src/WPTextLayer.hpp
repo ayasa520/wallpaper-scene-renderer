@@ -45,10 +45,13 @@ struct TextRasterLayoutResult {
     std::array<float, 2>   glyph_display_size { 0.0f, 0.0f };
     std::array<float, 2>   glyph_source_size { 0.0f, 0.0f };
     std::array<float, 2>   glyph_offset { 0.0f, 0.0f };
+    std::array<float, 4>   glyph_source_crop { 0.0f, 0.0f, 0.0f, 0.0f };
     // `display_offset` records where cropped glyph bounds sit inside the authored logical box.
     // Node placement keeps the pivot on `logical_size`; glyph/final-output meshes consume resolved
     // local centers derived from this crop delta and the authored alignment/origin.
     std::array<float, 2>   display_offset { 0.0f, 0.0f };
+    float                  point_size_authoring_units { 0.0f };
+    float                  backing_density { 1.0f };
     // The new renderer keeps glyph raster data in atlas pages and stores per-glyph quads separately
     // from the logical layer box. Runtime updates can now rebuild only the page meshes/materials
     // instead of reusing a monolithic full-text image quad.
@@ -63,6 +66,7 @@ struct TextLayerRuntimeState {
     // canonical geometry source instead of carrying duplicated layout metrics in parallel.
     wpscene::WPTextObject object;
     std::shared_ptr<SceneTextPrimitive> primitive;
+    TextLayerRenderContract render_contract;
     // Property application happens before scene synchronization. Keeping the last applied
     // alignment lets runtime updates compute "previous geometry" from the live primitive even
     // after the authored object has already been mutated to its next state.
@@ -101,16 +105,16 @@ bool ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
 bool SyncTextLayerSceneMaterials(Scene& scene, int32_t layer_id);
 bool RasterizeTextPrimitiveLayout(fs::VFS&                 vfs,
                                   wpscene::WPTextObject&   object,
+                                  const TextLayerRenderContract& render_contract,
                                   const std::string&       texture_key,
                                   double                   render_scale,
-                                  double                   authoring_scale,
                                   TextRasterLayoutResult*  out_image,
                                   std::string*             out_error = nullptr);
 bool BuildSceneTextPrimitive(fs::VFS&                         vfs,
                              wpscene::WPTextObject&           object,
+                             const TextLayerRenderContract&   render_contract,
                              uint32_t                         texture_version,
                              double                           render_scale,
-                             double                           authoring_scale,
                              std::shared_ptr<SceneTextPrimitive>* out_primitive,
                              std::string*                     out_error = nullptr);
 void RebuildTextPrimitiveVisibleMesh(SceneMesh* mesh, const SceneTextPrimitive& primitive);

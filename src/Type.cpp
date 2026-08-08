@@ -32,3 +32,19 @@ std::string wallpaper::ToString(const TextureFormat& format) {
     default: LOG_ERROR("Not valied tex format: %d", (int)format); return "";
     }
 }
+
+std::string_view wallpaper::TextureWrapName(TextureWrap wrap) {
+    switch (wrap) {
+    case TextureWrap::CLAMP_TO_EDGE: return "clamp-to-edge";
+    case TextureWrap::REPEAT: return "repeat";
+    }
+    return "unknown";
+}
+
+std::string_view wallpaper::TextureFilterName(TextureFilter filter) {
+    switch (filter) {
+    case TextureFilter::LINEAR: return "linear";
+    case TextureFilter::NEAREST: return "nearest";
+    }
+    return "unknown";
+}

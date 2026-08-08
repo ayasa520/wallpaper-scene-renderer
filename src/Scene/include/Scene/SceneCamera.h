@@ -53,6 +53,16 @@ public:
                          const Eigen::Vector3d& center,
                          const Eigen::Vector3d& up);
     void ClearExplicitView() { m_hasExplicitView = false; }
+    // Orthographic cameras normally derive a symmetric rectangle from width/height. Puppet
+    // surfaces need an authored, asymmetric envelope because animation can extend beyond one edge
+    // of the layer. Store that rectangle explicitly so the private raster and publication mesh use
+    // exactly the same projection contract.
+    void SetOrthographicViewRect(double left, double right, double bottom, double top);
+    void ClearOrthographicViewRect() { m_hasExplicitOrthoRect = false; }
+    bool HasOrthographicViewRect() const { return m_hasExplicitOrthoRect; }
+    Eigen::Vector4d OrthographicViewRect() const {
+        return { m_orthoLeft, m_orthoRight, m_orthoBottom, m_orthoTop };
+    }
 
     void  AttatchImgEffect(std::shared_ptr<SceneImageEffectLayer> eff) { m_imgEffect = eff; }
     bool  HasImgEffect() const { return (bool)m_imgEffect; }
@@ -78,6 +88,11 @@ public:
         m_explicitEye = cam.m_explicitEye;
         m_explicitCenter = cam.m_explicitCenter;
         m_explicitUp = cam.m_explicitUp;
+        m_hasExplicitOrthoRect = cam.m_hasExplicitOrthoRect;
+        m_orthoLeft = cam.m_orthoLeft;
+        m_orthoRight = cam.m_orthoRight;
+        m_orthoBottom = cam.m_orthoBottom;
+        m_orthoTop = cam.m_orthoTop;
     }
 
 private:
@@ -94,6 +109,11 @@ private:
     Eigen::Vector3d m_explicitEye { Eigen::Vector3d::Zero() };
     Eigen::Vector3d m_explicitCenter { -Eigen::Vector3d::UnitZ() };
     Eigen::Vector3d m_explicitUp { Eigen::Vector3d::UnitY() };
+    bool   m_hasExplicitOrthoRect { false };
+    double m_orthoLeft { -0.5 };
+    double m_orthoRight { 0.5 };
+    double m_orthoBottom { -0.5 };
+    double m_orthoTop { 0.5 };
 
     Eigen::Matrix4d m_viewMat { Eigen::Matrix4d::Identity() };
     Eigen::Matrix4d m_viewProjectionMat { Eigen::Matrix4d::Identity() };

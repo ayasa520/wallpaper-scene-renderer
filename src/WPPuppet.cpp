@@ -43,6 +43,38 @@ void WPPuppet::prepared() {
         }
     }
 
+    for (auto& attachment : attachments) {
+        if (attachment.bone_index >= combined_tran.size()) {
+            LOG_ERROR("puppet attachment '%s' has invalid bone index %u",
+                      attachment.name.c_str(),
+                      attachment.bone_index);
+            attachment.bind_transform = Affine3f::Identity();
+            continue;
+        }
+        // MDAT stores the locator matrix in the owning bone's local space. Runtime attachment
+        // evaluation already starts from the current model-space bone frame, so the stable bind
+        // contract is currentBoneModel * authoredBoneLocal * childLocal. Converting the authored
+        // matrix through inverse(bindBoneModel) here changes that local locator into an unrelated
+        // space and displaces every attachment on non-root bones; keep the parsed matrix intact.
+        attachment.bind_transform = attachment.transform;
+
+        const auto& bind_bone_model = combined_tran[attachment.bone_index];
+        const auto  bind_model      = bind_bone_model * attachment.bind_transform;
+        LOG_INFO("ScenePuppetAttachmentBind: name='%s' bone=%u bone-local=[%.3f %.3f %.3f] "
+                 "bind-bone-model=[%.3f %.3f %.3f] bind-model=[%.3f %.3f %.3f]",
+                 attachment.name.c_str(),
+                 attachment.bone_index,
+                 attachment.bind_transform.translation().x(),
+                 attachment.bind_transform.translation().y(),
+                 attachment.bind_transform.translation().z(),
+                 bind_bone_model.translation().x(),
+                 bind_bone_model.translation().y(),
+                 bind_bone_model.translation().z(),
+                 bind_model.translation().x(),
+                 bind_model.translation().y(),
+                 bind_model.translation().z());
+    }
+
     m_final_affines.resize(bones.size());
     m_bone_model_affines.resize(bones.size());
 }

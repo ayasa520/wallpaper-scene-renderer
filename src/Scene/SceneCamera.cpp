@@ -67,12 +67,33 @@ void SceneCamera::CalculateViewProjectionMatrix() {
 	if(m_perspective) {
 		m_viewProjectionMat = Perspective(Radians(m_fov), m_aspect, m_nearClip, m_farClip) * m_viewMat;
 	} else {
-		double left = -m_width/2.0f;
-		double right = m_width/2.0f;
-		double bottom = -m_height/2.0f;
-		double up = m_height/2.0f;
+		double left = m_hasExplicitOrthoRect ? m_orthoLeft : -m_width/2.0f;
+		double right = m_hasExplicitOrthoRect ? m_orthoRight : m_width/2.0f;
+		double bottom = m_hasExplicitOrthoRect ? m_orthoBottom : -m_height/2.0f;
+		double up = m_hasExplicitOrthoRect ? m_orthoTop : m_height/2.0f;
 		m_viewProjectionMat = Ortho(left, right, bottom, up, m_nearClip, m_farClip) * m_viewMat;
 	}
+}
+
+void SceneCamera::SetOrthographicViewRect(double left, double right, double bottom, double top) {
+	if (m_perspective) {
+		LOG_ERROR("cannot set orthographic view rect on perspective camera");
+		return;
+	}
+	if (!(right > left) || !(top > bottom)) {
+		LOG_ERROR("invalid orthographic view rect left=%f right=%f bottom=%f top=%f",
+		          left, right, bottom, top);
+		return;
+	}
+	m_orthoLeft = left;
+	m_orthoRight = right;
+	m_orthoBottom = bottom;
+	m_orthoTop = top;
+	m_width = right - left;
+	m_height = top - bottom;
+	m_aspect = m_height > 0.0 ? m_width / m_height : 1.0;
+	m_hasExplicitOrthoRect = true;
+	Update();
 }
 
 void SceneCamera::Update() {

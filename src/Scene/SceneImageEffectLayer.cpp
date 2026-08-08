@@ -1,5 +1,7 @@
 #include "SceneImageEffectLayer.h"
 #include "SceneNode.h"
+#include "Scene.h"
+#include "SceneMesh.h"
 
 #include "SpecTexs.hpp"
 #include "Core/StringHelper.hpp"
@@ -34,6 +36,89 @@ std::string_view ResolveTemplateOrCurrent(const std::string& authored_value,
 }
 } // namespace
 
+std::string_view wallpaper::FinalOutputCapabilityName(FinalOutputCapability capability) {
+    switch (capability) {
+    case FinalOutputCapability::PrivateDependency: return "private-dependency";
+    case FinalOutputCapability::PrivatePuppetSurface: return "private-puppet-surface";
+    case FinalOutputCapability::SceneAuthoredWriter: return "scene-authored-writer";
+    case FinalOutputCapability::PrivateThenPublish: return "private-then-publish";
+    }
+    return "unknown";
+}
+
+namespace
+{
+struct EffectOutputDiagnosticRoles {
+    std::string_view authored_writer;
+    std::string_view publication_writer;
+    std::string_view private_parallax_owner;
+    std::string_view publication_parallax_owner;
+    uint32_t         parallax_application_count { 1 };
+};
+
+EffectOutputDiagnosticRoles ResolveEffectOutputDiagnosticRoles(
+    FinalOutputCapability capability,
+    bool keep_authored_final_private,
+    bool has_authored_final_output) {
+    if (!has_authored_final_output) {
+        return { "none", "neutral-composite", "none", "neutral-composite", 1 };
+    }
+    if (!keep_authored_final_private) {
+        return { "scene-authored-final", "authored-final", "none", "authored-final", 1 };
+    }
+    if (capability == FinalOutputCapability::PrivatePuppetSurface) {
+        return { "private-puppet-surface", "neutral-composite", "none", "neutral-composite", 1 };
+    }
+    return { "private-authored-final", "neutral-composite", "none", "neutral-composite", 1 };
+}
+
+std::shared_ptr<SceneMesh> BuildPuppetPublicationMesh(const PuppetSurfaceProjection& projection) {
+    auto mesh = std::make_shared<SceneMesh>(true);
+    const float left = projection.camera_bounds_min.x();
+    const float right = projection.camera_bounds_max.x();
+    const float bottom = projection.camera_bounds_min.y();
+    const float top = projection.camera_bounds_max.y();
+    const std::array<float, 12> positions {
+        left, bottom, 0.0f, left, top, 0.0f, right, bottom, 0.0f, right, top, 0.0f,
+    };
+    const std::array<float, 8> texcoords { 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+    SceneVertexArray vertex(
+        { { std::string(WE_IN_POSITION), VertexType::FLOAT3 },
+          { std::string(WE_IN_TEXCOORD), VertexType::FLOAT2 } },
+        4);
+    vertex.SetVertex(WE_IN_POSITION, positions);
+    vertex.SetVertex(WE_IN_TEXCOORD, texcoords);
+    mesh->AddVertexArray(std::move(vertex));
+    mesh->SetDirty();
+    return mesh;
+}
+
+void UpdatePuppetProjectionDerivedValues(PuppetSurfaceProjection& projection) {
+    const float authored_width = std::max(projection.authored_layer_size.x(), 1e-3f);
+    const float authored_height = std::max(projection.authored_layer_size.y(), 1e-3f);
+    const float camera_width = std::max(projection.camera_bounds_max.x() -
+                                            projection.camera_bounds_min.x(),
+                                        1e-3f);
+    const float camera_height = std::max(projection.camera_bounds_max.y() -
+                                             projection.camera_bounds_min.y(),
+                                         1e-3f);
+    const float authored_left = -authored_width * 0.5f;
+    const float authored_top = authored_height * 0.5f;
+    projection.source_to_layer = Eigen::Vector4f {
+        (authored_left - projection.camera_bounds_min.x()) / camera_width,
+        (projection.camera_bounds_max.y() - authored_top) / camera_height,
+        authored_width / camera_width,
+        authored_height / camera_height,
+    };
+    const float density = std::max(projection.render_density, 1e-3f);
+    projection.target_extent = {
+        std::max(1, static_cast<int32_t>(std::ceil(camera_width * density))),
+        std::max(1, static_cast<int32_t>(std::ceil(camera_height * density))),
+    };
+    projection.publication_mesh = BuildPuppetPublicationMesh(projection);
+}
+} // namespace
+
 // The width and height parameters remain in the public constructor to preserve the existing parser
 // call contract; effect geometry is copied from the resolved source/final meshes during
 // ResolveEffect(), so the constructor only records the world node and ping-pong target names.
@@ -46,6 +131,125 @@ SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float /*w*/, float
       m_source_mesh(std::make_unique<SceneMesh>()),
       m_final_mesh(std::make_unique<SceneMesh>()),
       m_final_node(std::make_unique<SceneNode>()) {};
+
+FinalOutputCapability
+SceneImageEffectLayer::ResolveFinalOutputCapability(bool dependency_route) const {
+    // The order is intentional: a dependency must remain sampleable, and a puppet surface must
+    // remain private until its neutral publisher applies scene-space transforms. Runtime/source-less
+    // visibility is next because a direct writer can leave stale framebuffer contents when skipped.
+    if (dependency_route || m_final_output_capability == FinalOutputCapability::PrivateDependency) {
+        return FinalOutputCapability::PrivateDependency;
+    }
+    if (m_final_output_capability == FinalOutputCapability::PrivatePuppetSurface) {
+        return FinalOutputCapability::PrivatePuppetSurface;
+    }
+    if (HasRuntimeVisibilityContract() ||
+        m_final_composite.hidden_policy == HiddenFinalCompositePolicy::SuppressOutput) {
+        return FinalOutputCapability::PrivateThenPublish;
+    }
+    return m_final_output_capability;
+}
+
+void SceneImageEffectLayer::SetPuppetSurfaceProjection(PuppetSurfaceProjection projection) {
+    UpdatePuppetProjectionDerivedValues(projection);
+    m_puppet_surface_projection = std::move(projection);
+}
+
+bool SceneImageEffectLayer::UpdatePuppetSurfaceBounds(Scene& scene,
+                                                      const Eigen::Vector3f& bounds_min,
+                                                      const Eigen::Vector3f& bounds_max,
+                                                      uint64_t frame_serial) {
+    auto* projection = GetPuppetSurfaceProjection();
+    if (projection == nullptr) return false;
+
+    const Eigen::Vector3f old_min = projection->camera_bounds_min;
+    const Eigen::Vector3f old_max = projection->camera_bounds_max;
+    // Keep a small deterministic precision envelope around runtime overrides. It absorbs a single
+    // floating-point skinning excursion without changing the authored camera for every frame.
+    constexpr float kProjectionPrecisionMargin = 1.0f;
+    constexpr float kProjectionChangeEpsilon = 0.001f;
+    const std::array<bool, 6> exceeded_axes {
+        bounds_min.x() - kProjectionPrecisionMargin < old_min.x() - kProjectionChangeEpsilon,
+        bounds_max.x() + kProjectionPrecisionMargin > old_max.x() + kProjectionChangeEpsilon,
+        bounds_min.y() - kProjectionPrecisionMargin < old_min.y() - kProjectionChangeEpsilon,
+        bounds_max.y() + kProjectionPrecisionMargin > old_max.y() + kProjectionChangeEpsilon,
+        bounds_min.z() - kProjectionPrecisionMargin < old_min.z() - kProjectionChangeEpsilon,
+        bounds_max.z() + kProjectionPrecisionMargin > old_max.z() + kProjectionChangeEpsilon,
+    };
+    const auto next_min = Eigen::Vector3f {
+        std::min(old_min.x(), bounds_min.x() - kProjectionPrecisionMargin),
+        std::min(old_min.y(), bounds_min.y() - kProjectionPrecisionMargin),
+        std::min(old_min.z(), bounds_min.z() - kProjectionPrecisionMargin),
+    };
+    const auto next_max = Eigen::Vector3f {
+        std::max(old_max.x(), bounds_max.x() + kProjectionPrecisionMargin),
+        std::max(old_max.y(), bounds_max.y() + kProjectionPrecisionMargin),
+        std::max(old_max.z(), bounds_max.z() + kProjectionPrecisionMargin),
+    };
+    const bool changed = (next_min - old_min).cwiseAbs().maxCoeff() > kProjectionChangeEpsilon ||
+                         (next_max - old_max).cwiseAbs().maxCoeff() > kProjectionChangeEpsilon;
+    if (!changed) return false;
+
+    // Runtime bone overrides become part of the layer's animation envelope once observed. Keeping
+    // the expanded envelope next to the camera contract makes subsequent diagnostics truthful: the
+    // camera is no longer described as covering only authored frames after a script has moved a
+    // bone outside them.
+    projection->animated_bounds_min =
+        projection->animated_bounds_min.cwiseMin(bounds_min);
+    projection->animated_bounds_max =
+        projection->animated_bounds_max.cwiseMax(bounds_max);
+    projection->camera_bounds_min = next_min;
+    projection->camera_bounds_max = next_max;
+    projection->contract_exceeded = true;
+    UpdatePuppetProjectionDerivedValues(*projection);
+
+    auto camera_it = scene.cameras.find(projection->camera_name);
+    if (camera_it != scene.cameras.end() && camera_it->second != nullptr) {
+        camera_it->second->SetOrthographicViewRect(projection->camera_bounds_min.x(),
+                                                   projection->camera_bounds_max.x(),
+                                                   projection->camera_bounds_min.y(),
+                                                   projection->camera_bounds_max.y());
+    }
+    auto target_it = scene.renderTargets.find(projection->target_name);
+    if (target_it != scene.renderTargets.end()) {
+        target_it->second.width = projection->target_extent[0];
+        target_it->second.height = projection->target_extent[1];
+        target_it->second.mapWidth = projection->target_extent[0];
+        target_it->second.mapHeight = projection->target_extent[1];
+        scene.MarkRenderTargetResourcesDirty(projection->target_name);
+    }
+
+    constexpr std::array<std::string_view, 6> kAxisNames {
+        "min-x", "max-x", "min-y", "max-y", "min-z", "max-z"
+    };
+    std::string exceeded_axis_names;
+    for (size_t axis = 0; axis < exceeded_axes.size(); axis++) {
+        if (!exceeded_axes[axis]) continue;
+        if (!exceeded_axis_names.empty()) exceeded_axis_names += ',';
+        exceeded_axis_names += kAxisNames[axis];
+    }
+
+    LOG_INFO("ScenePuppetProjectionRecompute: layer=%d frame=%llu raw-bounds=[%.3f %.3f %.3f]-"
+             "[%.3f %.3f %.3f] animated-bounds=[%.3f %.3f %.3f]-[%.3f %.3f %.3f] "
+             "camera-view-rect=[%.3f %.3f %.3f %.3f] target-extent=[%d %d] "
+             "source-to-layer=[%.6f %.6f %.6f %.6f] exceeded=true exceeded-axes='%s'",
+             m_worldNode != nullptr ? m_worldNode->ID() : -1,
+             static_cast<unsigned long long>(frame_serial),
+             projection->raw_bounds_min.x(), projection->raw_bounds_min.y(),
+             projection->raw_bounds_min.z(), projection->raw_bounds_max.x(),
+             projection->raw_bounds_max.y(), projection->raw_bounds_max.z(),
+             projection->animated_bounds_min.x(), projection->animated_bounds_min.y(),
+             projection->animated_bounds_min.z(), projection->animated_bounds_max.x(),
+             projection->animated_bounds_max.y(), projection->animated_bounds_max.z(),
+             projection->camera_bounds_min.x(), projection->camera_bounds_max.x(),
+             projection->camera_bounds_min.y(), projection->camera_bounds_max.y(),
+             projection->target_extent[0], projection->target_extent[1],
+             projection->source_to_layer.x(), projection->source_to_layer.y(),
+             projection->source_to_layer.z(), projection->source_to_layer.w(),
+             exceeded_axis_names.c_str());
+    SyncResolvedOutputMesh();
+    return true;
+}
 
 void SceneImageEffect::SetIdentity(int32_t owner_layer_id, int32_t effect_id,
                                    uint32_t effect_index, std::string effect_name) {
@@ -178,9 +382,18 @@ void SceneImageEffectLayer::SyncResolvedOutputMesh() {
         // as the source-less helper publisher. Keep that mesh synchronized as well; otherwise a
         // runtime text/image resize could fix the authored path while leaving this publisher with
         // stale geometry.
-        m_final_node->Mesh()->ChangeMeshDataFrom(m_final_composite.uses_source_mesh
-                                                     ? *m_source_mesh
-                                                     : *m_final_mesh);
+        const SceneMesh* publication_mesh = nullptr;
+        if (m_final_composite.uses_source_mesh && m_puppet_surface_projection.has_value() &&
+            m_puppet_surface_projection->publication_mesh != nullptr) {
+            publication_mesh = m_puppet_surface_projection->publication_mesh.get();
+        } else if (m_final_composite.uses_source_mesh) {
+            publication_mesh = m_source_mesh.get();
+        } else {
+            publication_mesh = m_final_mesh.get();
+        }
+        if (publication_mesh != nullptr) {
+            m_final_node->Mesh()->ChangeMeshDataFrom(*publication_mesh);
+        }
         m_final_node->Mesh()->SetDirty();
     }
 }
@@ -289,14 +502,14 @@ SceneImageEffectLayer::ResolveFinalOutputDecision(
     SceneImageEffectNode* fallback_last_output,
     std::string_view layer_surface_cam,
     bool keep_final_output_private,
-    FinalOutputPolicy final_output_policy) {
+    FinalOutputCapability output_capability) {
     FinalOutputResolveDecision decision;
 
     const bool source_less_final_output =
         m_final_composite.hidden_policy == HiddenFinalCompositePolicy::SuppressOutput &&
         m_final_composite.output_effect != nullptr;
-    const bool publish_private_final_composite =
-        final_output_policy == FinalOutputPolicy::PrivateAuthoredThenComposite;
+    const bool publish_private_final_composite = keep_final_output_private ||
+        output_capability != FinalOutputCapability::SceneAuthoredWriter;
     decision.keep_authored_final_private =
         keep_final_output_private || source_less_final_output || publish_private_final_composite;
 
@@ -304,7 +517,8 @@ SceneImageEffectLayer::ResolveFinalOutputDecision(
         source_less_final_output && !keep_final_output_private;
     m_final_composite.publishes_private_output = publish_private_final_composite;
     decision.private_final_uses_layer_surface =
-        publish_private_final_composite && fallback_last_output != nullptr &&
+        m_final_output_capability == FinalOutputCapability::PrivatePuppetSurface &&
+        fallback_last_output != nullptr &&
         fallback_last_output->private_final_output_uses_layer_surface && !m_fullscreen &&
         !layer_surface_cam.empty();
     m_final_composite.uses_source_mesh = decision.private_final_uses_layer_surface;
@@ -353,8 +567,16 @@ void SceneImageEffectLayer::ResolveFinalCompositeNode(
     SyncResolvedNodeForRoute(resolved_world_affine);
     material.blenmode = m_final_blend;
     m_final_node->SetCamera(std::string());
-    mesh.ChangeMeshDataFrom(m_final_composite.uses_source_mesh ? *m_source_mesh
-                                                               : *m_final_mesh);
+    const SceneMesh* publication_mesh = nullptr;
+    if (m_final_composite.uses_source_mesh && m_puppet_surface_projection.has_value() &&
+        m_puppet_surface_projection->publication_mesh != nullptr) {
+        publication_mesh = m_puppet_surface_projection->publication_mesh.get();
+    } else if (m_final_composite.uses_source_mesh) {
+        publication_mesh = m_source_mesh.get();
+    } else {
+        publication_mesh = m_final_mesh.get();
+    }
+    if (publication_mesh != nullptr) mesh.ChangeMeshDataFrom(*publication_mesh);
     LOG_INFO("SceneEffectFinalCompositeResolve: layer=%d name='%s' fullscreen=false "
              "camera='' output='%s' source='%s' blend=%d publish=%s "
              "publish-private=%s source-mesh=%s policy=%d",
@@ -455,13 +677,20 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
         // cleared target deterministic without making transparent fragments erase earlier
         // fragments from the same draw.
         material.blenmode = m_final_blend;
+        if (m_puppet_surface_projection.has_value() &&
+            !m_puppet_surface_projection->target_name.empty()) {
+            // The skinned layer surface owns a target distinct from the effect ping-pong chain.
+            // Intermediate effects retain the authored source resolution and UV domain, while this
+            // final raster alone expands to the animation envelope. Auxiliary puppet textures and
+            // masks therefore keep their authored UVs unchanged.
+            final_output_node.output = m_puppet_surface_projection->target_name;
+        }
         final_output_node.sceneNode->SetCamera(std::string());
         final_output_node.camera_override = std::string(layer_surface_cam);
         final_output_node.use_active_camera_for_parallax = false;
         final_output_node.alpha_write_policy = AlphaWritePolicy::SourceOver;
-        // The private layer-surface writer may target the same ping-pong texture that was used
-        // as the initial card source. Clear it before drawing the puppet mesh so unskinned card
-        // pixels cannot survive around mesh holes or transparent regions.
+        // The private layer-surface target is freshly cleared before the skinned draw so coverage
+        // outside the current pose never survives from an earlier animation frame.
         final_output_node.clear_before_draw = true;
         final_output_node.sceneNode->CopyTrans(default_node);
         mesh.ChangeMeshDataFrom(*m_final_mesh);
@@ -504,7 +733,7 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
                                           std::string_view final_output,
                                           bool keep_final_output_private,
                                           const Eigen::Affine3f* resolved_world_affine,
-                                          FinalOutputPolicy final_output_policy) {
+                                          FinalOutputCapability output_capability) {
     std::string_view ppong_a = m_pingpong_a, ppong_b = m_pingpong_b;
     auto             default_node = SceneNode();
 
@@ -519,13 +748,63 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
     const auto final_decision = ResolveFinalOutputDecision(fallback_last_output,
                                                            layer_surface_cam,
                                                            keep_final_output_private,
-                                                           final_output_policy);
+                                                           output_capability);
+
+    std::string_view final_composite_source = ppong_a;
+    if (final_decision.private_final_uses_layer_surface &&
+        m_puppet_surface_projection.has_value() &&
+        !m_puppet_surface_projection->target_name.empty()) {
+        final_composite_source = m_puppet_surface_projection->target_name;
+    }
+
+    const auto diagnostic_roles = ResolveEffectOutputDiagnosticRoles(
+        output_capability,
+        final_decision.keep_authored_final_private,
+        fallback_last_output != nullptr);
+    const std::string_view authored_output_target =
+        fallback_last_output != nullptr ? std::string_view(fallback_last_output->output)
+                                        : std::string_view {};
+    LOG_INFO("SceneEffectOutputContract: layer=%d name='%s' declared-capability=%.*s "
+             "resolved-capability=%.*s authored-writer-role='%.*s' "
+             "publication-writer-role='%.*s' effect-camera='%.*s' "
+             "layer-surface-camera='%.*s' authored-output-target='%.*s' "
+             "publication-source='%.*s' final-output-target='%.*s' "
+             "private-parallax-owner='%.*s' publication-parallax-owner='%.*s' "
+             "parallax-application-count=%u keep-authored-final-private=%s "
+             "copybackground=%s",
+             m_worldNode != nullptr ? m_worldNode->ID() : -1,
+             m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+             static_cast<int>(FinalOutputCapabilityName(m_final_output_capability).size()),
+             FinalOutputCapabilityName(m_final_output_capability).data(),
+             static_cast<int>(FinalOutputCapabilityName(output_capability).size()),
+             FinalOutputCapabilityName(output_capability).data(),
+             static_cast<int>(diagnostic_roles.authored_writer.size()),
+             diagnostic_roles.authored_writer.data(),
+             static_cast<int>(diagnostic_roles.publication_writer.size()),
+             diagnostic_roles.publication_writer.data(),
+             static_cast<int>(effect_cam.size()),
+             effect_cam.data(),
+             static_cast<int>(layer_surface_cam.size()),
+             layer_surface_cam.data(),
+             static_cast<int>(authored_output_target.size()),
+             authored_output_target.data(),
+             static_cast<int>(final_composite_source.size()),
+             final_composite_source.data(),
+             static_cast<int>(final_output.size()),
+             final_output.data(),
+             static_cast<int>(diagnostic_roles.private_parallax_owner.size()),
+             diagnostic_roles.private_parallax_owner.data(),
+             static_cast<int>(diagnostic_roles.publication_parallax_owner.size()),
+             diagnostic_roles.publication_parallax_owner.data(),
+             diagnostic_roles.parallax_application_count,
+             final_decision.keep_authored_final_private ? "true" : "false",
+             m_copy_background ? "true" : "false");
 
     ResolveFinalCompositeNode(default_mesh,
                               default_node,
                               effect_cam,
                               final_output,
-                              ppong_a,
+                              final_composite_source,
                               resolved_world_affine);
 
     if (fallback_last_output == nullptr) return;

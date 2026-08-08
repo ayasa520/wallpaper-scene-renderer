@@ -592,6 +592,95 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
              mdl.masks.size());
     return true;
 }
+
+struct PuppetBoundsAccumulator {
+    Eigen::Vector3f min { Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity()) };
+    Eigen::Vector3f max { Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity()) };
+    bool valid { false };
+
+    void Include(const Eigen::Vector3f& point) {
+        if (!point.allFinite()) return;
+        min = min.cwiseMin(point);
+        max = max.cwiseMax(point);
+        valid = true;
+    }
+};
+
+Eigen::Vector3f SkinPuppetVertex(const WPMdl::Vertex& vertex,
+                                std::span<const Eigen::Affine3f> skinning) {
+    const Eigen::Vector3f bind_position(vertex.position.data());
+    Eigen::Vector3f result = Eigen::Vector3f::Zero();
+    float total_weight = 0.0f;
+    for (size_t influence = 0; influence < vertex.weight.size(); influence++) {
+        const float weight = vertex.weight[influence];
+        const uint32_t bone_index = vertex.blend_indices[influence];
+        if (weight <= 0.0f || bone_index >= skinning.size()) continue;
+        result += weight * (skinning[bone_index] * bind_position);
+        total_weight += weight;
+    }
+    return total_weight > 0.0f ? result : bind_position;
+}
+
+bool AnimationHasCompleteFrames(const WPPuppet& puppet, const WPPuppet::Animation& animation) {
+    if (animation.length <= 0 || animation.bframes_array.size() < puppet.bones.size()) return false;
+    return std::all_of(animation.bframes_array.begin(),
+                       animation.bframes_array.begin() + puppet.bones.size(),
+                       [](const auto& frames) { return !frames.frames.empty(); });
+}
+
+void ComputePuppetAnimationBounds(WPMdl& mdl) {
+    PuppetBoundsAccumulator raw_bounds;
+    for (const auto& vertex : mdl.vertexs) {
+        raw_bounds.Include(Eigen::Vector3f(vertex.position.data()));
+    }
+    if (!raw_bounds.valid) return;
+
+    mdl.puppet_bounds_min = { raw_bounds.min.x(), raw_bounds.min.y(), raw_bounds.min.z() };
+    mdl.puppet_bounds_max = { raw_bounds.max.x(), raw_bounds.max.y(), raw_bounds.max.z() };
+    mdl.puppet_bounds_valid = true;
+
+    PuppetBoundsAccumulator animated_bounds = raw_bounds;
+    if (mdl.puppet != nullptr) {
+        for (const auto& animation : mdl.puppet->anims) {
+            if (!AnimationHasCompleteFrames(*mdl.puppet, animation)) {
+                LOG_ERROR("puppet animation %d ('%s') has incomplete bone frames; envelope skipped",
+                          animation.id,
+                          animation.name.c_str());
+                continue;
+            }
+
+            std::vector<WPPuppetLayer::AnimationLayer> layers {
+                WPPuppetLayer::AnimationLayer {
+                    .id = animation.id,
+                    .rate = 1.0,
+                    .blend = 1.0,
+                    .visible = true,
+                    .playing = true,
+                },
+            };
+            WPPuppetLayer layer(mdl.puppet);
+            layer.prepared(layers);
+            if (auto* runtime_layer = layer.AnimationLayerState(0)) {
+                runtime_layer->playing = true;
+            }
+            for (int32_t frame = 0; frame < animation.length; frame++) {
+                const double step = frame == 0 ? 0.0 : animation.frame_time;
+                const auto skinning = layer.genFrame(step);
+                for (const auto& vertex : mdl.vertexs) {
+                    animated_bounds.Include(SkinPuppetVertex(vertex, skinning));
+                }
+            }
+        }
+    }
+
+    mdl.puppet_animated_bounds_min = {
+        animated_bounds.min.x(), animated_bounds.min.y(), animated_bounds.min.z()
+    };
+    mdl.puppet_animated_bounds_max = {
+        animated_bounds.max.x(), animated_bounds.max.y(), animated_bounds.max.z()
+    };
+    mdl.puppet_animated_bounds_valid = animated_bounds.valid;
+}
 } // namespace
 
 // bytes * size
@@ -916,6 +1005,9 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
                     WPPuppet::Attachment attachment;
                     attachment.bone_index = f.ReadUint16();
                     attachment.name       = f.ReadStr();
+                    // The 64-byte MDAT affine is expressed in the selected bone's local space. It
+                    // must remain byte-for-byte in that coordinate system until WPPuppet combines
+                    // it with the current animated bone model transform at runtime.
                     for (auto col : attachment.transform.matrix().colwise()) {
                         for (auto& x : col) x = f.ReadFloat();
                     }
@@ -1012,6 +1104,7 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     }
     
     mdl.puppet->prepared();
+    ComputePuppetAnimationBounds(mdl);
 
     LOG_INFO("read puppet: mdlv: %d, nmdls: %d, mdla: %d, bones: %d, anims: %d",
              mdl.mdlv,

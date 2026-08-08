@@ -1,4 +1,5 @@
 #include "PrePass.hpp"
+#include "PassCommon.hpp"
 #include "Scene/Scene.h"
 #include "Resource.hpp"
 
@@ -12,19 +13,6 @@ bool PrePass::referencesRenderTarget(std::string_view render_target) const {
     // unless the default framebuffer-sized target itself was the resource that changed.
     return m_desc.result == render_target;
 }
-
-namespace
-{
-TextureKey ToTexKey(wallpaper::SceneRenderTarget rt) {
-    return TextureKey {
-        .width  = rt.width,
-        .height = rt.height,
-        .usage  = {},
-        .format = wallpaper::TextureFormat::RGBA8,
-        .sample = rt.sample,
-    };
-}
-} // namespace
 
 void PrePass::prepare(Scene& scene, const Device& device, RenderingResources&) {
     {

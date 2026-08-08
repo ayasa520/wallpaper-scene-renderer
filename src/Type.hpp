@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 
 namespace wallpaper
 {
@@ -76,6 +77,14 @@ enum class AlphaWritePolicy
     Max,
 };
 
+enum class FinalOutputCapability
+{
+    PrivateDependency,
+    PrivatePuppetSurface,
+    SceneAuthoredWriter,
+    PrivateThenPublish,
+};
+
 enum class ShaderType
 {
     VERTEX,
@@ -113,11 +122,16 @@ enum class TextureFilter
     NEAREST
 };
 
+std::string_view TextureWrapName(TextureWrap wrap);
+std::string_view TextureFilterName(TextureFilter filter);
+
 struct TextureSample {
     TextureWrap   wrapS { TextureWrap::REPEAT };
     TextureWrap   wrapT { TextureWrap::REPEAT };
     TextureFilter magFilter { TextureFilter::NEAREST };
     TextureFilter minFilter { TextureFilter::NEAREST };
+
+    bool operator==(const TextureSample&) const = default;
 };
 
 enum class VertexType

@@ -61,22 +61,6 @@ using namespace Eigen;
 
 std::string getAddr(void* p) { return std::to_string(reinterpret_cast<intptr_t>(p)); }
 
-double ResolveSceneTextAuthoringScale(i32 ortho_w, i32 ortho_h) {
-    const wpscene::WPSceneGeneral default_general;
-    const double default_width =
-        static_cast<double>(std::max(1, default_general.orthogonalprojection.width));
-    const double default_height =
-        static_cast<double>(std::max(1, default_general.orthogonalprojection.height));
-    const double scene_width = static_cast<double>(std::max(1, ortho_w));
-    const double scene_height = static_cast<double>(std::max(1, ortho_h));
-
-    // Wallpaper Engine text point sizes are authored in the editor's logical text-pixel contract,
-    // while scene coordinates can be larger than the editor's default canvas. Keep this conversion
-    // in the parser, next to the scene projection data, so WPTextLayer only consumes a semantic
-    // authoring scale and never has to know about scene.json projection defaults or desktop scale.
-    return std::max(1.0, std::min(scene_width / default_width, scene_height / default_height));
-}
-
 uint32_t HashParticleFrameFloat(uint32_t seed, float value) {
     uint32_t bits { 0 };
     std::memcpy(&bits, &value, sizeof(bits));
@@ -661,6 +645,32 @@ constexpr std::string_view kSyntheticDirectDrawShapeTextureName {
 
 bool UsesShaderColorBlendMode(int32_t color_blend_mode) {
     return color_blend_mode >= 1 && color_blend_mode <= 30;
+}
+
+struct FinalShaderCapabilityEntry {
+    std::string_view shader;
+    FinalOutputCapability capability;
+};
+
+constexpr std::array<FinalShaderCapabilityEntry, 1> kFinalShaderCapabilities {{
+    // Scroll evaluates UV/time in the authored layer projection. Running its visible raster in a
+    // source-sized private target quantizes repeated pixel art before the layer is scaled to the
+    // display. The capability is attached to the shader contract itself, never to a wallpaper,
+    // texture name, or nearest-sampler heuristic.
+    { "effects/scroll", FinalOutputCapability::SceneAuthoredWriter },
+}};
+
+FinalOutputCapability ResolveFinalShaderCapability(std::string_view shader) {
+    const auto it = std::find_if(kFinalShaderCapabilities.begin(),
+                                 kFinalShaderCapabilities.end(),
+                                 [shader](const auto& entry) { return entry.shader == shader; });
+    return it == kFinalShaderCapabilities.end()
+        ? FinalOutputCapability::PrivateThenPublish
+        : it->capability;
+}
+
+bool IsCurrentEffectWriterTarget(std::string_view target) {
+    return target == SpecTex_Default || sstart_with(target, WE_EFFECT_PPONG_PREFIX_B);
 }
 
 BlendMode ResolveObjectFinalBlend(BlendMode authored_blend, int32_t color_blend_mode) {
@@ -1692,6 +1702,84 @@ struct ImageEffectCameraClipRange {
     float far_clip { 1.0f };
 };
 
+Eigen::AlignedBox3f TransformBounds(const Eigen::Vector3f& bounds_min,
+                                    const Eigen::Vector3f& bounds_max,
+                                    const Eigen::Affine3f& transform) {
+    Eigen::AlignedBox3f result;
+    for (int x = 0; x < 2; x++) {
+        for (int y = 0; y < 2; y++) {
+            for (int z = 0; z < 2; z++) {
+                result.extend(transform * Eigen::Vector3f {
+                    x == 0 ? bounds_min.x() : bounds_max.x(),
+                    y == 0 ? bounds_min.y() : bounds_max.y(),
+                    z == 0 ? bounds_min.z() : bounds_max.z(),
+                });
+            }
+        }
+    }
+    return result;
+}
+
+PuppetSurfaceProjection BuildPuppetSurfaceProjection(
+    const wpscene::WPImageObject& image,
+    const WPMdl& mdl,
+    const SceneMesh& puppet_mesh,
+    std::string camera_name,
+    std::string target_name,
+    const std::array<float, 2>& effect_source_size) {
+    PuppetSurfaceProjection projection;
+    projection.authored_layer_size = { image.size[0], image.size[1] };
+    projection.geometry_transform = puppet_mesh.GeometryTransform();
+    projection.camera_name = std::move(camera_name);
+    projection.target_name = std::move(target_name);
+    projection.render_density = std::max(
+        effect_source_size[0] / std::max(image.size[0], 1.0f),
+        effect_source_size[1] / std::max(image.size[1], 1.0f));
+
+    const Eigen::Vector3f raw_min(mdl.puppet_bounds_min.data());
+    const Eigen::Vector3f raw_max(mdl.puppet_bounds_max.data());
+    const Eigen::Vector3f animated_min(
+        (mdl.puppet_animated_bounds_valid ? mdl.puppet_animated_bounds_min
+                                          : mdl.puppet_bounds_min).data());
+    const Eigen::Vector3f animated_max(
+        (mdl.puppet_animated_bounds_valid ? mdl.puppet_animated_bounds_max
+                                          : mdl.puppet_bounds_max).data());
+    const auto transformed_raw = TransformBounds(raw_min, raw_max, projection.geometry_transform);
+    const auto transformed_animated =
+        TransformBounds(animated_min, animated_max, projection.geometry_transform);
+    projection.raw_bounds_min = transformed_raw.min();
+    projection.raw_bounds_max = transformed_raw.max();
+    projection.animated_bounds_min = transformed_animated.min();
+    projection.animated_bounds_max = transformed_animated.max();
+
+    const Eigen::Vector3f authored_min {
+        -image.size[0] * 0.5f, -image.size[1] * 0.5f, 0.0f
+    };
+    const Eigen::Vector3f authored_max {
+        image.size[0] * 0.5f, image.size[1] * 0.5f, 0.0f
+    };
+    constexpr float kProjectionPrecisionMargin = 1.0f;
+    projection.camera_bounds_min = authored_min.cwiseMin(projection.animated_bounds_min) -
+                                   Eigen::Vector3f::Constant(kProjectionPrecisionMargin);
+    projection.camera_bounds_max = authored_max.cwiseMax(projection.animated_bounds_max) +
+                                   Eigen::Vector3f::Constant(kProjectionPrecisionMargin);
+    return projection;
+}
+
+TextureSample ResolvePrimaryMaterialSampler(const Scene& scene, const SceneMaterial& material) {
+    if (material.textures.empty() || material.textures.front().empty()) return {};
+    const auto& texture_name = material.textures.front();
+    if (const auto texture_it = scene.textures.find(texture_name);
+        texture_it != scene.textures.end()) {
+        return texture_it->second.sample;
+    }
+    if (const auto target_it = scene.renderTargets.find(texture_name);
+        target_it != scene.renderTargets.end()) {
+        return target_it->second.sample;
+    }
+    return {};
+}
+
 ImageEffectCameraClipRange ResolveImageEffectCameraClipRange(bool has_animated_puppet_mesh) {
     if (! has_animated_puppet_mesh) return {};
 
@@ -1851,7 +1939,7 @@ std::optional<AttachmentBinding> ResolveAttachmentBinding(const ParseContext& co
     if (const auto* named_attachment = puppet.FindAttachment(attachment)) {
         return AttachmentBinding {
             .bone_index = named_attachment->bone_index,
-            .transform  = named_attachment->transform,
+            .transform  = named_attachment->bind_transform,
         };
     }
 
@@ -2047,7 +2135,8 @@ void ApplyEffectWriterTransformContract(ParseContext& context,
                              contract.parallax_depth_authored);
 
     if (contract.projection_layer != nullptr) {
-        data.SetEffectProjection(&contract.projection_layer->FinalNode(),
+        data.SetEffectProjection(contract.projection_layer,
+                                 &contract.projection_layer->FinalNode(),
                                  &contract.projection_layer->FinalMesh());
     }
 
@@ -2296,7 +2385,9 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
     context.scene->deferredRuntimeParticleLayerIds.insert(wppartobj.id);
 }
 
-void RegisterLogicalTextLayer(ParseContext& context, wpscene::WPTextObject& text_obj) {
+void RegisterLogicalTextLayer(ParseContext& context,
+                              wpscene::WPTextObject& text_obj,
+                              const TextLayerRenderContract& render_contract) {
     auto node  = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
                                              Vector3f(text_obj.scale.data()),
                                              Vector3f(text_obj.angles.data()),
@@ -2330,6 +2421,7 @@ void RegisterLogicalTextLayer(ParseContext& context, wpscene::WPTextObject& text
     context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
         .object            = text_obj,
         .primitive         = nullptr,
+        .render_contract   = render_contract,
         .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
     };
     RegisterLayerSceneState(
@@ -4190,6 +4282,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     SceneMaterial     material;
     WPShaderValueData svData;
     WPShaderValueData worldNodeData;
+    TextureSample     source_sampler;
+    std::string       primary_source_texture;
 
     ShaderValueMap baseConstSvs = context.global_base_uniforms;
     const float    initial_alpha = ClampParserOpacityScalar(wpimgobj.alpha);
@@ -4227,6 +4321,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         };
         LoadConstvalue(material, wpimgobj.material, shaderInfo);
         LoadUserShaderValue(material, wpimgobj.material, shaderInfo, context.user_properties);
+        source_sampler = ResolvePrimaryMaterialSampler(*context.scene, material);
+        if (!material.textures.empty()) primary_source_texture = material.textures.front();
     }
 
     // mesh
@@ -4337,6 +4433,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
 
     if (hasEffect) {
         auto& scene = *context.scene;
+        FinalOutputCapability final_shader_capability =
+            wpimgobj.config.finalOutputCapability;
         // currently use addr for unique
         std::string nodeAddr = getAddr(spImgNode.get());
         const auto  effect_camera_clip = ResolveImageEffectCameraClipRange(hasAnimatedPuppetMesh);
@@ -4406,10 +4504,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // active scene camera.
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalBlend(imgBlendMode);
-            imgEffectLayer->SetFinalOutputPolicy(
-                wpimgobj.config.authoredEffectIsFinalWriter
-                    ? SceneImageEffectLayer::FinalOutputPolicy::AuthoredWriter
-                    : SceneImageEffectLayer::FinalOutputPolicy::PrivateAuthoredThenComposite);
             imgEffectLayer->SetCopyBackground(wpimgobj.copybackground);
             const auto source_policy = ResolveImageEffectSourcePolicy(isCompose, wpimgobj);
             imgEffectLayer->SetSourceContributionPolicy(source_policy);
@@ -4433,6 +4527,68 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             }
             scene.cameras.at(nodeAddr)->AttatchImgEffect(imgEffectLayer);
         }
+        if (hasAnimatedPuppetMesh && puppet->puppet_bounds_valid) {
+            const std::string puppet_surface_camera = nodeAddr + "__puppet_surface_camera";
+            const std::string puppet_surface_target =
+                "_rt_puppet_surface_" + nodeAddr;
+            imgEffectLayer->SetPuppetSurfaceProjection(BuildPuppetSurfaceProjection(
+                wpimgobj,
+                *puppet,
+                effct_final_mesh,
+                puppet_surface_camera,
+                puppet_surface_target,
+                effect_source_size));
+            imgEffectLayer->SetLayerSurfaceCamera(puppet_surface_camera);
+
+            const auto* projection = imgEffectLayer->GetPuppetSurfaceProjection();
+            if (projection != nullptr) {
+                scene.cameras[puppet_surface_camera] = std::make_shared<SceneCamera>(
+                    1, 1, effect_camera_clip.near_clip, effect_camera_clip.far_clip);
+                scene.cameras.at(puppet_surface_camera)->AttatchNode(context.effect_camera_node);
+                scene.cameras.at(puppet_surface_camera)->SetOrthographicViewRect(
+                    projection->camera_bounds_min.x(),
+                    projection->camera_bounds_max.x(),
+                    projection->camera_bounds_min.y(),
+                    projection->camera_bounds_max.y());
+                scene.objectRuntimeCameraNames[wpimgobj.id].push_back(puppet_surface_camera);
+
+                scene.renderTargets[puppet_surface_target] = SceneRenderTarget {
+                    .width = projection->target_extent[0],
+                    .height = projection->target_extent[1],
+                    .mapWidth = projection->target_extent[0],
+                    .mapHeight = projection->target_extent[1],
+                    .allowReuse = true,
+                    .sample = source_sampler,
+                };
+                scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(puppet_surface_target);
+                LOG_INFO("ScenePuppetProjection: layer=%d name='%s' raw-bounds=[%.3f %.3f %.3f]-"
+                         "[%.3f %.3f %.3f] animated-bounds=[%.3f %.3f %.3f]-"
+                         "[%.3f %.3f %.3f] camera-view-rect=[%.3f %.3f %.3f %.3f] "
+                         "target-extent=[%d %d] geometry-transform-translation=[%.3f %.3f %.3f] "
+                         "source-to-layer=[%.6f %.6f %.6f %.6f] target='%s' camera='%s'",
+                         wpimgobj.id,
+                         wpimgobj.name.c_str(),
+                         projection->raw_bounds_min.x(), projection->raw_bounds_min.y(),
+                         projection->raw_bounds_min.z(), projection->raw_bounds_max.x(),
+                         projection->raw_bounds_max.y(), projection->raw_bounds_max.z(),
+                         projection->animated_bounds_min.x(),
+                         projection->animated_bounds_min.y(),
+                         projection->animated_bounds_min.z(),
+                         projection->animated_bounds_max.x(),
+                         projection->animated_bounds_max.y(),
+                         projection->animated_bounds_max.z(),
+                         projection->camera_bounds_min.x(), projection->camera_bounds_max.x(),
+                         projection->camera_bounds_min.y(), projection->camera_bounds_max.y(),
+                         projection->target_extent[0], projection->target_extent[1],
+                         projection->geometry_transform.translation().x(),
+                         projection->geometry_transform.translation().y(),
+                         projection->geometry_transform.translation().z(),
+                         projection->source_to_layer.x(), projection->source_to_layer.y(),
+                         projection->source_to_layer.z(), projection->source_to_layer.w(),
+                         puppet_surface_target.c_str(),
+                         puppet_surface_camera.c_str());
+            }
+        }
         // set renderTarget for ping-pong operate
         {
             scene.renderTargets[effect_ppong_a] = {
@@ -4441,11 +4597,21 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 .mapWidth   = (uint16_t)effect_source_size[0],
                 .mapHeight  = (uint16_t)effect_source_size[1],
                 .allowReuse = true,
+                .sample     = source_sampler,
             };
             if (effect_source_screen_bound) {
                 scene.renderTargets[effect_ppong_a].bind = { .enable = true, .screen = true };
             }
             scene.renderTargets[effect_ppong_b] = scene.renderTargets.at(effect_ppong_a);
+            // Intermediate effect output is a separate sampling contract. Point-preserving source
+            // passes read ping-pong A with the authored source sampler; generic downstream filters
+            // read ping-pong B linearly unless their own FBO contract says otherwise.
+            scene.renderTargets[effect_ppong_b].sample = TextureSample {
+                .wrapS = TextureWrap::CLAMP_TO_EDGE,
+                .wrapT = TextureWrap::CLAMP_TO_EDGE,
+                .magFilter = TextureFilter::LINEAR,
+                .minFilter = TextureFilter::LINEAR,
+            };
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_a);
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_b);
             if (wpimgobj.effectSourceScreenBound) {
@@ -4648,6 +4814,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     break;
                 }
 
+                if (IsCurrentEffectWriterTarget(matOutRT)) {
+                    final_shader_capability = ResolveFinalShaderCapability(wpmat.shader);
+                }
+
                 // load glname from alias and load to constvalue
                 LoadConstvalue(material, wpmat, wpEffShaderInfo);
                 LoadUserShaderValue(material, wpmat, wpEffShaderInfo, context.user_properties);
@@ -4697,6 +4867,105 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 LOG_ERROR("effect \'%s\' failed to load", wpeffobj.name.c_str());
             }
         }
+
+        // Capability priority is structural. Dependency sources must remain private, animated
+        // puppets must keep their private skinned surface, and only then may the last authored
+        // shader publish directly in scene space.
+        if (is_offscreen_dependency_source) {
+            imgEffectLayer->SetFinalOutputCapability(
+                FinalOutputCapability::PrivateDependency);
+        } else if (hasAnimatedPuppetMesh) {
+            imgEffectLayer->SetFinalOutputCapability(
+                FinalOutputCapability::PrivatePuppetSurface);
+        } else if (wpimgobj.config.finalOutputCapability ==
+                   FinalOutputCapability::SceneAuthoredWriter) {
+            imgEffectLayer->SetFinalOutputCapability(
+                FinalOutputCapability::SceneAuthoredWriter);
+        } else {
+            imgEffectLayer->SetFinalOutputCapability(final_shader_capability);
+        }
+        LOG_INFO("SceneEffectOutputCapability: layer=%d name='%s' capability=%.*s "
+                 "dependency=%s puppet=%s source-policy=%.*s",
+                 wpimgobj.id,
+                 wpimgobj.name.c_str(),
+                 static_cast<int>(FinalOutputCapabilityName(
+                     imgEffectLayer->DeclaredFinalOutputCapability()).size()),
+                 FinalOutputCapabilityName(
+                     imgEffectLayer->DeclaredFinalOutputCapability()).data(),
+                 is_offscreen_dependency_source ? "true" : "false",
+                 hasAnimatedPuppetMesh ? "true" : "false",
+                 static_cast<int>(ImageEffectSourcePolicyName(
+                     imgEffectLayer->SourceContributionPolicy()).size()),
+                 ImageEffectSourcePolicyName(
+                     imgEffectLayer->SourceContributionPolicy()).data());
+
+        int32_t source_width = 0;
+        int32_t source_height = 0;
+        if (const auto source_texture_it = scene.textures.find(primary_source_texture);
+            source_texture_it != scene.textures.end()) {
+            source_width = source_texture_it->second.width;
+            source_height = source_texture_it->second.height;
+        } else if (const auto source_target_it = scene.renderTargets.find(primary_source_texture);
+                   source_target_it != scene.renderTargets.end()) {
+            source_width = source_target_it->second.ContentWidth();
+            source_height = source_target_it->second.ContentHeight();
+        }
+        const auto& pingpong_a = scene.renderTargets.at(effect_ppong_a);
+        const auto& pingpong_b = scene.renderTargets.at(effect_ppong_b);
+        const auto& display_target = scene.renderTargets.at(SpecTex_Default.data());
+        LOG_INFO("SceneEffectTextureContract: layer=%d name='%s' source='%s' "
+                 "source-size=[%d %d] authored-layer-size=[%.3f %.3f] "
+                 "source-sampler=[wrap-s=%.*s wrap-t=%.*s mag=%.*s min=%.*s] "
+                 "private-target-a='%s' private-target-a-size=[%d %d] "
+                 "intermediate-sampler-a=[wrap-s=%.*s wrap-t=%.*s mag=%.*s min=%.*s] "
+                 "private-target-b='%s' private-target-b-size=[%d %d] "
+                 "intermediate-sampler-b=[wrap-s=%.*s wrap-t=%.*s mag=%.*s min=%.*s] "
+                 "display-target='%.*s' display-target-size=[%d %d] output-policy=%.*s",
+                 wpimgobj.id,
+                 wpimgobj.name.c_str(),
+                 primary_source_texture.c_str(),
+                 source_width,
+                 source_height,
+                 wpimgobj.size[0],
+                 wpimgobj.size[1],
+                 static_cast<int>(TextureWrapName(source_sampler.wrapS).size()),
+                 TextureWrapName(source_sampler.wrapS).data(),
+                 static_cast<int>(TextureWrapName(source_sampler.wrapT).size()),
+                 TextureWrapName(source_sampler.wrapT).data(),
+                 static_cast<int>(TextureFilterName(source_sampler.magFilter).size()),
+                 TextureFilterName(source_sampler.magFilter).data(),
+                 static_cast<int>(TextureFilterName(source_sampler.minFilter).size()),
+                 TextureFilterName(source_sampler.minFilter).data(),
+                 effect_ppong_a.c_str(),
+                 pingpong_a.width,
+                 pingpong_a.height,
+                 static_cast<int>(TextureWrapName(pingpong_a.sample.wrapS).size()),
+                 TextureWrapName(pingpong_a.sample.wrapS).data(),
+                 static_cast<int>(TextureWrapName(pingpong_a.sample.wrapT).size()),
+                 TextureWrapName(pingpong_a.sample.wrapT).data(),
+                 static_cast<int>(TextureFilterName(pingpong_a.sample.magFilter).size()),
+                 TextureFilterName(pingpong_a.sample.magFilter).data(),
+                 static_cast<int>(TextureFilterName(pingpong_a.sample.minFilter).size()),
+                 TextureFilterName(pingpong_a.sample.minFilter).data(),
+                 effect_ppong_b.c_str(),
+                 pingpong_b.width,
+                 pingpong_b.height,
+                 static_cast<int>(TextureWrapName(pingpong_b.sample.wrapS).size()),
+                 TextureWrapName(pingpong_b.sample.wrapS).data(),
+                 static_cast<int>(TextureWrapName(pingpong_b.sample.wrapT).size()),
+                 TextureWrapName(pingpong_b.sample.wrapT).data(),
+                 static_cast<int>(TextureFilterName(pingpong_b.sample.magFilter).size()),
+                 TextureFilterName(pingpong_b.sample.magFilter).data(),
+                 static_cast<int>(TextureFilterName(pingpong_b.sample.minFilter).size()),
+                 TextureFilterName(pingpong_b.sample.minFilter).data(),
+                 static_cast<int>(SpecTex_Default.size()),
+                 SpecTex_Default.data(),
+                 display_target.width,
+                 display_target.height,
+                 static_cast<int>(FinalOutputCapabilityName(
+                     imgEffectLayer->DeclaredFinalOutputCapability()).size()),
+                 FinalOutputCapabilityName(
+                     imgEffectLayer->DeclaredFinalOutputCapability()).data());
     }
     if (uses_routed_parent) {
         if (hasEffect) {
@@ -4743,15 +5012,29 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
 
 void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     const auto* visibility_contract = FindLayerVisibilityContract(context, text_obj.id);
-    const bool  has_runtime_visibility_contract =
-        visibility_contract != nullptr && visibility_contract->requires_runtime_contract;
+    TextLayerRenderContract render_contract;
+    for (const auto& wp_effect : text_obj.effects) {
+        const auto effect_visibility =
+            BuildEffectVisibilityContract(wp_effect, context.user_properties);
+        if (!effect_visibility.can_prune_at_parse_time) {
+            render_contract.has_materialized_authored_effects = true;
+            break;
+        }
+    }
+    render_contract.uses_shader_color_blend_bridge =
+        UsesShaderColorBlendMode(text_obj.colorBlendMode);
+
+    // This immutable contract is resolved before either deferred or concrete materialization. Text
+    // rasterization, logical-box preservation, camera/target sizing, glyph placement, and final
+    // publication must all agree on the same bridge decision; consulting effects or blend mode again
+    // in any downstream path recreates the crop/offset mismatch this contract exists to prevent.
     if (ShouldDeferRuntimeLayerMaterialization(
             context, text_obj.id, text_obj.visible, visibility_contract, false)) {
         // Hidden dynamic text, including text hidden only by a runtime-controlled parent branch,
         // stays as a lightweight logical layer until first effective visibility. This keeps startup
         // cheap while preserving the same runtime target that scripts and user bindings will
         // materialize later through MaterializeDeferredTextLayer().
-        RegisterLogicalTextLayer(context, text_obj);
+        RegisterLogicalTextLayer(context, text_obj, render_contract);
         return;
     }
     if (! text_obj.visible) {
@@ -4763,23 +5046,16 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     if (! BuildSceneTextPrimitive(
             *context.vfs,
             text_obj,
+            render_contract,
             0,
             context.scene->textRenderScale,
-            context.scene->textAuthoringScale,
             &primitive,
             &error)) {
         LOG_ERROR("build text primitive '%s' failed: %s", text_obj.name.c_str(), error.c_str());
         return;
     }
 
-    int32_t text_effect_count = 0;
-    for (const auto& wp_effect : text_obj.effects) {
-        const auto effect_visibility =
-            BuildEffectVisibilityContract(wp_effect, context.user_properties);
-        if (! effect_visibility.can_prune_at_parse_time) text_effect_count++;
-    }
-    const bool has_shader_color_blend = UsesShaderColorBlendMode(text_obj.colorBlendMode);
-    const bool has_effect = text_effect_count > 0 || has_shader_color_blend;
+    const bool has_effect = render_contract.RequiresBridge();
     auto       spWorldNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
                                                          Vector3f(text_obj.scale.data()),
                                                          Vector3f(text_obj.angles.data()),
@@ -4804,7 +5080,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     if (has_effect) {
         auto&             scene       = *context.scene;
         const std::string camera_name = getAddr(spTextNode.get());
-        primitive->bridge.enabled     = true;
         primitive->bridge.camera_name = camera_name;
         primitive->bridge.pingpong_a  = WE_EFFECT_PPONG_PREFIX_A.data() + camera_name;
         primitive->bridge.pingpong_b  = WE_EFFECT_PPONG_PREFIX_B.data() + camera_name;
@@ -4860,6 +5135,44 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             scene.renderTargets.at(primitive->bridge.pingpong_a);
         scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_a);
         scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_b);
+        const auto source_size = primitive->VisibleSourceSize();
+        const auto& bridge_camera = *scene.cameras.at(camera_name);
+        const auto& bridge_target = scene.renderTargets.at(primitive->bridge.pingpong_a);
+        LOG_INFO("SceneTextBridgeContract: layer=%d name='%s' camera='%s' "
+                 "camera-size=[%.3f %.3f] target='%s' target-size=[%d %d] "
+                 "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
+                 "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
+                 "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
+                 "source-crop=[%.3f %.3f %.3f %.3f] "
+                 "final-mesh-bounds=[%.3f %.3f]-[%.3f %.3f]",
+                 text_obj.id,
+                 text_obj.name.c_str(),
+                 camera_name.c_str(),
+                 bridge_camera.Width(),
+                 bridge_camera.Height(),
+                 primitive->bridge.pingpong_a.c_str(),
+                 bridge_target.width,
+                 bridge_target.height,
+                 display_size[0],
+                 display_size[1],
+                 source_size[0],
+                 source_size[1],
+                 primitive->layout.glyph_display_size[0],
+                 primitive->layout.glyph_display_size[1],
+                 primitive->layout.glyph_source_size[0],
+                 primitive->layout.glyph_source_size[1],
+                 primitive->layout.glyph_offset[0],
+                 primitive->layout.glyph_offset[1],
+                 primitive->layout.visible_display_offset[0],
+                 primitive->layout.visible_display_offset[1],
+                 primitive->layout.glyph_source_crop[0],
+                 primitive->layout.glyph_source_crop[1],
+                 primitive->layout.glyph_source_crop[2],
+                 primitive->layout.glyph_source_crop[3],
+                 -display_size[0] * 0.5f,
+                 -display_size[1] * 0.5f,
+                 display_size[0] * 0.5f,
+                 display_size[1] * 0.5f);
         const auto finalCompositeTransformData = BuildEffectWriterTransformData(
             context, BuildTextEffectFinalCompositeContract(text_obj));
         ConfigureEffectFinalComposite(context,
@@ -5068,6 +5381,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
         .object            = text_obj,
         .primitive         = primitive,
+        .render_contract   = render_contract,
         .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
     };
 
@@ -5788,7 +6102,7 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
     image_obj.material         = std::move(transparent_source_material);
     image_obj.effects          = std::move(shape_obj.effects);
     image_obj.nopadding        = true;
-    image_obj.config.authoredEffectIsFinalWriter = true;
+    image_obj.config.finalOutputCapability = FinalOutputCapability::SceneAuthoredWriter;
 
     LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
              "visual-size=[%.3f, %.3f] visual-policy=%s effect-source-policy=%s "
@@ -7640,8 +7954,6 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     // This removes the guaranteed scene-load rerender that used to happen later on the
     // render thread just to rebuild the same text at a different device scale.
     context.scene->textRenderScale             = std::max(1.0, text_render_scale);
-    context.scene->textAuthoringScale          =
-        ResolveSceneTextAuthoringScale(context.ortho_w, context.ortho_h);
     context.scene->offscreenDependencyLayerIds = dependency_source_ids;
     if (user_properties) {
         context.scene->userProperties = *user_properties;

@@ -3478,7 +3478,7 @@ bool IsLogicalAncestor(const WPSceneScriptHost::Opaque* opaque, SceneNode* node,
 
 struct ScriptAttachmentBinding {
     uint32_t        bone_index { 0xFFFFFFFFu };
-    Eigen::Affine3f anchor_transform { Eigen::Affine3f::Identity() };
+    Eigen::Affine3f bind_transform { Eigen::Affine3f::Identity() };
     std::string     attachment_name;
 };
 
@@ -3493,7 +3493,7 @@ ResolveAttachmentBindingForScript(JSContext* context, JSValueConst value, const 
         if (index < puppet.attachments.size()) {
             return ScriptAttachmentBinding {
                 .bone_index       = puppet.attachments[index].bone_index,
-                .anchor_transform = puppet.attachments[index].transform,
+                .bind_transform   = puppet.attachments[index].bind_transform,
                 .attachment_name  = std::to_string(numeric),
             };
         }
@@ -3511,7 +3511,7 @@ ResolveAttachmentBindingForScript(JSContext* context, JSValueConst value, const 
     if (const auto* attachment = puppet.FindAttachment(name)) {
         return ScriptAttachmentBinding {
             .bone_index       = attachment->bone_index,
-            .anchor_transform = attachment->transform,
+            .bind_transform   = attachment->bind_transform,
             .attachment_name  = name,
         };
     }
@@ -3558,7 +3558,7 @@ bool RebindLayerParent(WPSceneScriptHost::Opaque* opaque, SceneNode* node, Scene
                                         new_parent,
                                         WPPuppet::Attachment {
                                             .bone_index = attachment_binding->bone_index,
-                                            .transform  = attachment_binding->anchor_transform,
+                                            .bind_transform = attachment_binding->bind_transform,
                                         });
         if (! attachment_world.has_value()) return false;
     }
@@ -3583,7 +3583,7 @@ bool RebindLayerParent(WPSceneScriptHost::Opaque* opaque, SceneNode* node, Scene
 
         data->AttachToBone(new_parent,
                            attachment_binding->bone_index,
-                           attachment_binding->anchor_transform,
+                           attachment_binding->bind_transform,
                            updated_local);
         scene_parent = nullptr;
     } else if (new_parent != nullptr) {
@@ -4206,7 +4206,8 @@ std::optional<Eigen::Matrix4d> GetAttachmentWorldTransform(const WPSceneScriptHo
     if (! bone_model.has_value()) return std::nullopt;
 
     node->UpdateTrans();
-    return node->ModelTrans() * ((*bone_model) * attachment.transform).matrix().cast<double>();
+    return node->ModelTrans() *
+        ((*bone_model) * attachment.bind_transform).matrix().cast<double>();
 }
 
 template<typename Visitor>
