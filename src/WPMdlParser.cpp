@@ -9,6 +9,8 @@
 #include "wpscene/WPMaterial.h"
 #include "WPShaderParser.hpp"
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 using namespace wallpaper;
 
@@ -593,19 +595,6 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
     return true;
 }
 
-struct PuppetBoundsAccumulator {
-    Eigen::Vector3f min { Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity()) };
-    Eigen::Vector3f max { Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity()) };
-    bool valid { false };
-
-    void Include(const Eigen::Vector3f& point) {
-        if (!point.allFinite()) return;
-        min = min.cwiseMin(point);
-        max = max.cwiseMax(point);
-        valid = true;
-    }
-};
-
 Eigen::Vector3f SkinPuppetVertex(const WPMdl::Vertex& vertex,
                                 std::span<const Eigen::Affine3f> skinning) {
     const Eigen::Vector3f bind_position(vertex.position.data());
@@ -625,61 +614,73 @@ bool AnimationHasCompleteFrames(const WPPuppet& puppet, const WPPuppet::Animatio
     if (animation.length <= 0 || animation.bframes_array.size() < puppet.bones.size()) return false;
     return std::all_of(animation.bframes_array.begin(),
                        animation.bframes_array.begin() + puppet.bones.size(),
-                       [](const auto& frames) { return !frames.frames.empty(); });
+                       [&animation](const auto& frames) {
+                           return frames.frames.size() >= static_cast<usize>(animation.length);
+                       });
+}
+
+PuppetBounds3D SampleAnimationBounds(const WPMdl& mdl,
+                                     const WPPuppet::Animation& animation) {
+    PuppetBounds3D sampled_bounds;
+    if (mdl.puppet == nullptr || !AnimationHasCompleteFrames(*mdl.puppet, animation)) {
+        return sampled_bounds;
+    }
+
+    std::vector<WPPuppetLayer::AnimationLayer> layers {
+        WPPuppetLayer::AnimationLayer {
+            .id = animation.id,
+            .rate = 1.0,
+            .blend = 1.0,
+            .visible = true,
+            .playing = false,
+        },
+    };
+    WPPuppetLayer layer(mdl.puppet);
+    layer.prepared(layers);
+    auto* runtime_layer = layer.AnimationLayerState(0);
+    if (runtime_layer == nullptr) return sampled_bounds;
+
+    // Every authored keyframe is sampled directly. Setting absolute clip time before genFrame()
+    // makes the envelope deterministic and independent from loop/mirror wrapping or call order.
+    for (int32_t frame = 0; frame < animation.length; frame++) {
+        runtime_layer->cur_time = animation.frame_time * static_cast<double>(frame);
+        const auto skinning = layer.genFrame(0.0);
+        for (const auto& vertex : mdl.vertexs) {
+            sampled_bounds.Include(SkinPuppetVertex(vertex, skinning));
+        }
+    }
+    return sampled_bounds;
 }
 
 void ComputePuppetAnimationBounds(WPMdl& mdl) {
-    PuppetBoundsAccumulator raw_bounds;
+    mdl.asset_bounds = {};
     for (const auto& vertex : mdl.vertexs) {
-        raw_bounds.Include(Eigen::Vector3f(vertex.position.data()));
+        mdl.asset_bounds.Include(Eigen::Vector3f(vertex.position.data()));
     }
-    if (!raw_bounds.valid) return;
+    if (!mdl.asset_bounds.IsFiniteAndOrdered()) return;
 
-    mdl.puppet_bounds_min = { raw_bounds.min.x(), raw_bounds.min.y(), raw_bounds.min.z() };
-    mdl.puppet_bounds_max = { raw_bounds.max.x(), raw_bounds.max.y(), raw_bounds.max.z() };
-    mdl.puppet_bounds_valid = true;
+    mdl.authored_pose_bounds = mdl.asset_bounds;
+    if (mdl.puppet == nullptr) return;
 
-    PuppetBoundsAccumulator animated_bounds = raw_bounds;
-    if (mdl.puppet != nullptr) {
-        for (const auto& animation : mdl.puppet->anims) {
-            if (!AnimationHasCompleteFrames(*mdl.puppet, animation)) {
-                LOG_ERROR("puppet animation %d ('%s') has incomplete bone frames; envelope skipped",
-                          animation.id,
-                          animation.name.c_str());
-                continue;
-            }
-
-            std::vector<WPPuppetLayer::AnimationLayer> layers {
-                WPPuppetLayer::AnimationLayer {
-                    .id = animation.id,
-                    .rate = 1.0,
-                    .blend = 1.0,
-                    .visible = true,
-                    .playing = true,
-                },
-            };
-            WPPuppetLayer layer(mdl.puppet);
-            layer.prepared(layers);
-            if (auto* runtime_layer = layer.AnimationLayerState(0)) {
-                runtime_layer->playing = true;
-            }
-            for (int32_t frame = 0; frame < animation.length; frame++) {
-                const double step = frame == 0 ? 0.0 : animation.frame_time;
-                const auto skinning = layer.genFrame(step);
-                for (const auto& vertex : mdl.vertexs) {
-                    animated_bounds.Include(SkinPuppetVertex(vertex, skinning));
-                }
-            }
+    for (auto& animation : mdl.puppet->anims) {
+        const PuppetBounds3D sampled_bounds = SampleAnimationBounds(mdl, animation);
+        if (!sampled_bounds.IsFiniteAndOrdered()) {
+            LOG_ERROR("ScenePuppetAuthoredEnvelope: mdl='%s' mdlv=%d mdla=%d animation=%d "
+                      "name='%s' incomplete bone frames; no deterministic sample envelope",
+                      mdl.source_path.c_str(),
+                      mdl.mdlv,
+                      mdl.mdla,
+                      animation.id,
+                      animation.name.c_str());
         }
-    }
 
-    mdl.puppet_animated_bounds_min = {
-        animated_bounds.min.x(), animated_bounds.min.y(), animated_bounds.min.z()
-    };
-    mdl.puppet_animated_bounds_max = {
-        animated_bounds.max.x(), animated_bounds.max.y(), animated_bounds.max.z()
-    };
-    mdl.puppet_animated_bounds_valid = animated_bounds.valid;
+        if (!animation.authored_pose_bounds.IsFiniteAndOrdered() &&
+            sampled_bounds.IsFiniteAndOrdered()) {
+            animation.authored_pose_bounds = sampled_bounds;
+            animation.authored_bounds_source = WPPuppet::AuthoredBoundsSource::SampledFrames;
+        }
+        mdl.authored_pose_bounds.Include(animation.authored_pose_bounds);
+    }
 }
 } // namespace
 
@@ -699,6 +700,331 @@ constexpr uint32_t static_image_singile_vertex          = 4 * (3 + 3 + 4 + 2);
 
 constexpr uint32_t singile_bone_frame = 4 * 9;
 
+namespace
+{
+idx MdlaReadEnd(const fs::MemBinaryStream& f, uint32_t declared_end) {
+    if (declared_end > 0 && declared_end <= static_cast<uint32_t>(f.Size())) {
+        return static_cast<idx>(declared_end);
+    }
+    return f.Size();
+}
+
+bool CanReadMdla(const fs::MemBinaryStream& f, uint64_t byte_count, uint32_t declared_end) {
+    const idx end = MdlaReadEnd(f, declared_end);
+    return f.Tell() >= 0 && byte_count <= static_cast<uint64_t>(end - f.Tell());
+}
+
+bool PeekUint8At(fs::MemBinaryStream& f, idx offset, uint8_t& value, uint32_t declared_end) {
+    const idx end = MdlaReadEnd(f, declared_end);
+    if (offset < 0 || offset + 1 > end) return false;
+    const idx saved = f.Tell();
+    f.SeekSet(offset);
+    value = f.ReadUint8();
+    f.SeekSet(saved);
+    return true;
+}
+
+bool PeekUint32At(fs::MemBinaryStream& f, idx offset, uint32_t& value,
+                  uint32_t declared_end) {
+    const idx end = MdlaReadEnd(f, declared_end);
+    if (offset < 0 || offset + 4 > end) return false;
+    const idx saved = f.Tell();
+    f.SeekSet(offset);
+    value = f.ReadUint32();
+    f.SeekSet(saved);
+    return true;
+}
+
+bool IsAnimTransMainSize(uint32_t byte_size, int32_t animation_length) {
+    if (animation_length < 0 || byte_size == 0 || byte_size % sizeof(float) != 0) return false;
+    const uint64_t samples = static_cast<uint64_t>(animation_length) + 1;
+    return byte_size == samples * singile_bone_frame || byte_size == samples * sizeof(float);
+}
+
+bool NextIsAnimTransMain(fs::MemBinaryStream& f, int32_t animation_length,
+                         uint32_t declared_end) {
+    uint32_t byte_size = 0;
+    return PeekUint32At(f, f.Tell(), byte_size, declared_end) &&
+           IsAnimTransMainSize(byte_size, animation_length);
+}
+
+bool NextAfterZeroIsAnimTransMain(fs::MemBinaryStream& f, int32_t animation_length,
+                                  uint32_t declared_end) {
+    const idx offset = f.Tell();
+    uint32_t zero = 0;
+    uint32_t byte_size = 0;
+    return PeekUint32At(f, offset, zero, declared_end) && zero == 0 &&
+           PeekUint32At(f, offset + 4, byte_size, declared_end) &&
+           IsAnimTransMainSize(byte_size, animation_length);
+}
+
+bool NextIsAnimBoneCurves(fs::MemBinaryStream& f, uint32_t declared_end) {
+    const idx offset = f.Tell();
+    uint8_t has_curves = 0;
+    if (!PeekUint8At(f, offset, has_curves, declared_end)) return false;
+    if (has_curves == 0) return true;
+    if (has_curves != 1) return false;
+
+    uint32_t zero = 0;
+    uint32_t byte_size = 0;
+    return PeekUint32At(f, offset + 1, zero, declared_end) && zero == 0 &&
+           PeekUint32At(f, offset + 5, byte_size, declared_end) &&
+           byte_size % sizeof(float) == 0;
+}
+
+bool NextIsAnimationRecordPadding(fs::MemBinaryStream& f, uint32_t declared_end) {
+    const idx offset = f.Tell();
+    if (declared_end == 0 || offset + 12 > static_cast<idx>(declared_end)) return false;
+    uint32_t zero = 0;
+    uint32_t next_id = 0;
+    uint32_t next_unk = 0;
+    return PeekUint32At(f, offset, zero, declared_end) && zero == 0 &&
+           PeekUint32At(f, offset + 4, next_id, declared_end) && next_id != 0 &&
+           PeekUint32At(f, offset + 8, next_unk, declared_end) && next_unk == 0;
+}
+
+bool ReadFloatPayload(fs::MemBinaryStream& f, uint32_t byte_size, uint32_t declared_end,
+                      std::vector<float>& values, std::string_view label,
+                      std::string_view path) {
+    if (byte_size % sizeof(float) != 0 || !CanReadMdla(f, byte_size, declared_end)) {
+        LOG_ERROR("MDLA %.*s payload has invalid byte size %u: %.*s",
+                  static_cast<int>(label.size()), label.data(), byte_size,
+                  static_cast<int>(path.size()), path.data());
+        return false;
+    }
+    values.resize(byte_size / sizeof(float));
+    for (auto& value : values) value = f.ReadFloat();
+    return true;
+}
+
+bool ParseAnimationBoneCurves(fs::MemBinaryStream& f,
+                              std::vector<WPPuppet::BoneFrameCurve>& curves,
+                              uint32_t bone_count, uint32_t declared_end,
+                              std::string_view label, std::string_view path) {
+    if (!CanReadMdla(f, 1, declared_end)) return false;
+    const uint8_t has_curves = f.ReadUint8();
+    if (has_curves == 0) return true;
+    if (has_curves != 1) {
+        LOG_ERROR("MDLA %.*s presence flag is %u, expected 0 or 1: %.*s",
+                  static_cast<int>(label.size()), label.data(), has_curves,
+                  static_cast<int>(path.size()), path.data());
+        return false;
+    }
+
+    curves.resize(bone_count);
+    for (uint32_t bone_index = 0; bone_index < bone_count; bone_index++) {
+        if (!CanReadMdla(f, 8, declared_end)) return false;
+        const uint32_t reserved = f.ReadUint32();
+        const uint32_t byte_size = f.ReadUint32();
+        if (reserved != 0) {
+            LOG_ERROR("MDLA %.*s bone %u reserved field is %u: %.*s",
+                      static_cast<int>(label.size()), label.data(), bone_index, reserved,
+                      static_cast<int>(path.size()), path.data());
+            return false;
+        }
+        if (!ReadFloatPayload(f, byte_size, declared_end, curves[bone_index].values,
+                              label, path)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ParseAnimationTransMainTrack(fs::MemBinaryStream& f, std::vector<float>& values,
+                                  int32_t animation_length, uint32_t declared_end,
+                                  std::string_view path) {
+    if (!CanReadMdla(f, 4, declared_end)) return false;
+    const uint32_t byte_size = f.ReadUint32();
+    if (!IsAnimTransMainSize(byte_size, animation_length)) {
+        LOG_ERROR("MDLA animation translation track has invalid byte size %u for length %d: %.*s",
+                  byte_size, animation_length, static_cast<int>(path.size()), path.data());
+        return false;
+    }
+    return ReadFloatPayload(f, byte_size, declared_end, values, "translation", path);
+}
+
+bool ParseAnimationRecord(fs::MemBinaryStream& f, WPPuppet::Animation& animation,
+                          int32_t mdla_version, uint32_t declared_end,
+                          std::string_view path) {
+    if (!CanReadMdla(f, 8, declared_end)) return false;
+    animation.id = f.ReadInt32();
+    animation.unk_after_id = f.ReadUint32();
+    if (animation.id <= 0 || animation.unk_after_id != 0) {
+        LOG_ERROR("MDLA animation header is invalid id=%d reserved=%u: %.*s",
+                  animation.id, animation.unk_after_id,
+                  static_cast<int>(path.size()), path.data());
+        return false;
+    }
+
+    animation.name = f.ReadStr();
+    if (animation.name.empty()) animation.name = f.ReadStr();
+    animation.mode = ToPlayMode(f.ReadStr());
+    animation.fps = f.ReadFloat();
+    animation.length = f.ReadInt32();
+    const int32_t animation_reserved = f.ReadInt32();
+    if (!std::isfinite(animation.fps) || animation.fps <= 0.0 || animation.length <= 0 ||
+        animation_reserved != 0) {
+        LOG_ERROR("MDLA animation metadata is invalid id=%d name='%s' fps=%.3f length=%d "
+                  "reserved=%d: %.*s",
+                  animation.id, animation.name.c_str(), animation.fps, animation.length,
+                  animation_reserved, static_cast<int>(path.size()), path.data());
+        return false;
+    }
+
+    if (!CanReadMdla(f, 4, declared_end)) return false;
+    const uint32_t bone_count = f.ReadUint32();
+    animation.bframes_array.resize(bone_count);
+    for (uint32_t bone_index = 0; bone_index < bone_count; bone_index++) {
+        if (!CanReadMdla(f, 8, declared_end)) return false;
+        const int32_t track_reserved = f.ReadInt32();
+        const uint32_t byte_size = f.ReadUint32();
+        if (track_reserved != 0 || byte_size % singile_bone_frame != 0 ||
+            !CanReadMdla(f, byte_size, declared_end)) {
+            LOG_ERROR("MDLA animation %d bone %u track is invalid reserved=%d bytes=%u: %.*s",
+                      animation.id, bone_index, track_reserved, byte_size,
+                      static_cast<int>(path.size()), path.data());
+            return false;
+        }
+        auto& frames = animation.bframes_array[bone_index].frames;
+        frames.resize(byte_size / singile_bone_frame);
+        for (auto& frame : frames) {
+            for (auto& value : frame.position) value = f.ReadFloat();
+            for (auto& value : frame.angle) value = f.ReadFloat();
+            for (auto& value : frame.scale) value = f.ReadFloat();
+        }
+    }
+
+    if (mdla_version >= 3) {
+        if (!CanReadMdla(f, 4, declared_end)) return false;
+        const uint32_t trans_flag = f.ReadUint32();
+        if (trans_flag == 1) {
+            auto& trans = animation.trans.emplace();
+            if (!CanReadMdla(f, 4, declared_end)) return false;
+            const uint32_t extra_size = f.ReadUint32();
+            if (extra_size > 0) {
+                if (!ReadFloatPayload(f, extra_size, declared_end, trans.extra_track,
+                                      "translation-extra", path) ||
+                    !CanReadMdla(f, 4, declared_end)) {
+                    return false;
+                }
+                const uint32_t extra_reserved = f.ReadUint32();
+                if (extra_reserved != 0) return false;
+            }
+            if (!CanReadMdla(f, 4, declared_end)) return false;
+            const uint32_t main_size = f.ReadUint32();
+            if (!ReadFloatPayload(f, main_size, declared_end, trans.main_track,
+                                  "translation-main", path)) {
+                return false;
+            }
+            if (extra_size > 0) {
+                if (!CanReadMdla(f, 4, declared_end) || f.ReadUint32() != 0) return false;
+            }
+        } else if (trans_flag == 0) {
+            if (NextIsAnimTransMain(f, animation.length, declared_end)) {
+                auto& trans = animation.trans.emplace();
+                if (!ParseAnimationTransMainTrack(f, trans.main_track, animation.length,
+                                                  declared_end, path)) {
+                    return false;
+                }
+                while (NextAfterZeroIsAnimTransMain(f, animation.length, declared_end)) {
+                    if (f.ReadUint32() != 0) return false;
+                    auto& tail = trans.tail_tracks.emplace_back();
+                    if (!ParseAnimationTransMainTrack(f, tail, animation.length,
+                                                      declared_end, path)) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            LOG_ERROR("MDLA animation %d translation flag is %u: %.*s",
+                      animation.id, trans_flag, static_cast<int>(path.size()), path.data());
+            return false;
+        }
+        if (!ParseAnimationBoneCurves(f, animation.blend_curves, bone_count, declared_end,
+                                      "blend-curves", path)) {
+            return false;
+        }
+    }
+
+    if (mdla_version >= 4) {
+        if (!CanReadMdla(f, 1, declared_end)) return false;
+        const uint8_t has_events = f.ReadUint8();
+        if (has_events > 1) return false;
+        if (has_events == 1) {
+            if (!CanReadMdla(f, 4, declared_end)) return false;
+            const uint32_t event_count = f.ReadUint32();
+            animation.v4_events.resize(event_count);
+            for (auto& event : animation.v4_events) {
+                if (!CanReadMdla(f, 12, declared_end)) return false;
+                event.time = f.ReadFloat();
+                event.flags = f.ReadUint32();
+                const uint32_t byte_size = f.ReadUint32();
+                if (!ReadFloatPayload(f, byte_size, declared_end, event.values,
+                                      "v4-event", path)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (mdla_version >= 5) {
+        if (!CanReadMdla(f, 6 * sizeof(float), declared_end)) return false;
+        PuppetBounds3D parsed_bounds;
+        parsed_bounds.valid = true;
+        for (auto& value : parsed_bounds.min) value = f.ReadFloat();
+        for (auto& value : parsed_bounds.max) value = f.ReadFloat();
+        if (!parsed_bounds.IsFiniteAndOrdered()) {
+            LOG_ERROR("MDLA animation %d name='%s' has invalid authored AABB "
+                      "[%.3f %.3f %.3f]-[%.3f %.3f %.3f]: %.*s",
+                      animation.id, animation.name.c_str(),
+                      parsed_bounds.min.x(), parsed_bounds.min.y(), parsed_bounds.min.z(),
+                      parsed_bounds.max.x(), parsed_bounds.max.y(), parsed_bounds.max.z(),
+                      static_cast<int>(path.size()), path.data());
+        } else {
+            animation.authored_pose_bounds = parsed_bounds;
+            animation.authored_bounds_source = WPPuppet::AuthoredBoundsSource::MdlaAabb;
+        }
+    }
+
+    if (mdla_version == 6 && NextIsAnimBoneCurves(f, declared_end)) {
+        if (!ParseAnimationBoneCurves(f, animation.scalar_curves, bone_count, declared_end,
+                                      "scalar-curves", path)) {
+            return false;
+        }
+    }
+
+    if (!CanReadMdla(f, 4, declared_end)) return false;
+    const uint32_t event_count = f.ReadUint32();
+    animation.events.resize(event_count);
+    for (auto& event : animation.events) {
+        if (!CanReadMdla(f, 4, declared_end)) return false;
+        event.time_value = f.ReadUint32();
+        event.event_json = f.ReadStr();
+        if (f.Tell() > MdlaReadEnd(f, declared_end)) return false;
+    }
+
+    if (NextIsAnimationRecordPadding(f, declared_end)) {
+        if (f.ReadUint32() != 0) return false;
+    }
+    return true;
+}
+
+bool ConsumeMdlaZeroPadding(fs::MemBinaryStream& f, uint32_t declared_end,
+                            std::string_view path) {
+    const idx end = MdlaReadEnd(f, declared_end);
+    while (f.Tell() < end) {
+        if (f.ReadUint8() != 0) {
+            LOG_ERROR("MDLA body contains non-zero trailing data at 0x%llx before end 0x%llx: %.*s",
+                      static_cast<unsigned long long>(f.Tell() - 1),
+                      static_cast<unsigned long long>(end),
+                      static_cast<int>(path.size()), path.data());
+            return false;
+        }
+    }
+    return f.Tell() == end;
+}
+} // namespace
+
 bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     auto str_path = std::string(path);
     auto pfile    = vfs.Open("/assets/" + str_path);
@@ -711,6 +1037,7 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
     auto& f      = memfile;
 
     mdl = WPMdl {};
+    mdl.source_path = str_path;
     mdl.mdlv = ReadMDLVesion(f);
     if (mdl.mdlv <= 0) {
         LOG_ERROR("static mdl version read failed: %s", str_path.c_str());
@@ -774,6 +1101,8 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     if (! pfile) return false;
     auto memfile  = fs::MemBinaryStream(*pfile);
     auto& f = memfile;
+
+    mdl.source_path = str_path;
 
     mdl.mdlv = ReadMDLVesion(f);
 
@@ -1021,85 +1350,26 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     if(mdType == "MDLA" && mdVersion.length() > 0){
         mdl.mdla = std::stoi(mdVersion);
         if (mdl.mdla != 0) {
-            uint end_size = f.ReadUint32();
-            (void)end_size;
+            if (mdl.mdla < 1 || mdl.mdla > 6) {
+                LOG_ERROR("unsupported MDLA version %d: %s", mdl.mdla, str_path.c_str());
+                return false;
+            }
+            const uint32_t declared_end = f.ReadUint32();
+            if (declared_end > static_cast<uint32_t>(f.Size()) ||
+                (declared_end > 0 && declared_end < static_cast<uint32_t>(f.Tell()))) {
+                LOG_ERROR("MDLA declared end 0x%x is outside file size 0x%llx: %s",
+                          declared_end,
+                          static_cast<unsigned long long>(f.Size()),
+                          str_path.c_str());
+                return false;
+            }
 
-            uint anim_num = f.ReadUint32();
+            const uint32_t anim_num = f.ReadUint32();
             anims.resize(anim_num);
             for (auto& anim : anims) {
-                // there can be a variable number of 32-bit 0s between animations
-                anim.id = 0;
-                while(anim.id == 0){
-                    if (f.Tell() >= f.Size()) {
-                        LOG_ERROR("unexpected EOF while reading animation id");
-                        return false;
-                    }
-                    const auto before = f.Tell();
-                    anim.id = f.ReadInt32();
-                    const auto after = f.Tell();
-                    if (after <= before) {
-                        LOG_ERROR("stream did not advance while reading animation id");
-                        return false;
-                    }
-                }
-    
-                if (anim.id <= 0) {
-                    LOG_ERROR("wrong anime id %d", anim.id);
-                    return false;
-                }
-                f.ReadInt32();
-                anim.name   = f.ReadStr();
-                if(anim.name.empty()){
-                    anim.name = f.ReadStr();
-                }
-                anim.mode   = ToPlayMode(f.ReadStr());
-                anim.fps    = f.ReadFloat();
-                anim.length = f.ReadInt32();
-                f.ReadInt32();
-
-                uint32_t b_num = f.ReadUint32();
-                anim.bframes_array.resize(b_num);
-                for (auto& bframes : anim.bframes_array) {
-                    f.ReadInt32();
-                    uint32_t byte_size = f.ReadUint32();
-                    uint32_t num       = byte_size / singile_bone_frame;
-                    if (byte_size % singile_bone_frame != 0) {
-                        LOG_ERROR("wrong bone frame size %d", byte_size);
-                        return false;
-                    }
-                    bframes.frames.resize(num);
-                    for (auto& frame : bframes.frames) {
-                        for (auto& v : frame.position) v = f.ReadFloat();
-                        for (auto& v : frame.angle) v = f.ReadFloat();
-                        for (auto& v : frame.scale) v = f.ReadFloat();
-                    }
-                }
-                
-                // in the alternative MDL format there are 2 empty bytes followed
-                // by a variable number of 32-bit 0s between animations. We'll read
-                // the two bytes now so that the cursor is aligned to read through the
-                // 32-bit 0s in the next iteration
-                if(alt_mdl_format)
-                {
-                    f.ReadUint8();
-                    f.ReadUint8();
-                    if (mdl.mdla >= 3)
-                        f.ReadUint8();
-                }
-                else if(mdl.mdla >= 3){
-                    // Newer MDLA variants insert an extra 8-bit zero between animations.
-                    // If we don't consume it here, subsequent animation ids are shifted by 8 bits.
-                    f.ReadUint8();
-                }
-                else{
-                    uint32_t unk_extra_uint = f.ReadUint32();
-                    for (uint i = 0; i < unk_extra_uint; i++) {
-                        f.ReadFloat();
-                        // data is like: {"$$hashKey":"object:2110","frame":1,"name":"random_anim"}
-                        std::string unk_extra = f.ReadStr();
-                    }
-                }
+                if (!ParseAnimationRecord(f, anim, mdl.mdla, declared_end, str_path)) return false;
             }
+            if (!ConsumeMdlaZeroPadding(f, declared_end, str_path)) return false;
         }
     }
     

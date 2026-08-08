@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 #include <vector>
 
 using namespace wallpaper;
@@ -48,61 +49,9 @@ struct MeshBounds2D {
     Vector2d halfExtent { Vector2d::Ones() };
 };
 
-struct MeshBounds3D {
-    bool valid { false };
-    Vector3f min { Vector3f::Zero() };
-    Vector3f max { Vector3f::Zero() };
-};
-
 Matrix4d ApplyMeshGeometryTransform(const Matrix4d& model, const SceneMesh* mesh) {
     if (mesh == nullptr) return model;
     return model * mesh->GeometryTransform().matrix().cast<double>();
-}
-
-MeshBounds3D ComputeSkinnedMeshBounds(const SceneMesh* mesh,
-                                      std::span<const Affine3f> skinning) {
-    if (mesh == nullptr || mesh->VertexCount() == 0 || skinning.empty()) return {};
-    const auto& vertex_array = mesh->GetVertexArray(0);
-    const auto offsets = vertex_array.GetAttrOffsetMap();
-    const auto position_it = offsets.find(std::string(WE_IN_POSITION));
-    const auto indices_it = offsets.find(std::string(WE_IN_BLENDINDICES));
-    const auto weights_it = offsets.find(std::string(WE_IN_BLENDWEIGHTS));
-    if (position_it == offsets.end() || indices_it == offsets.end() ||
-        weights_it == offsets.end() || vertex_array.Data() == nullptr) {
-        return {};
-    }
-
-    const usize stride = vertex_array.OneSize();
-    const usize position_offset = position_it->second.offset / sizeof(float);
-    const usize indices_offset = indices_it->second.offset / sizeof(float);
-    const usize weights_offset = weights_it->second.offset / sizeof(float);
-    const float* data = vertex_array.Data();
-    Vector3f bounds_min = Vector3f::Constant(std::numeric_limits<float>::infinity());
-    Vector3f bounds_max = Vector3f::Constant(-std::numeric_limits<float>::infinity());
-    bool valid = false;
-
-    for (usize vertex_index = 0; vertex_index < vertex_array.VertexCount(); vertex_index++) {
-        const usize base = vertex_index * stride;
-        const Vector3f bind_position(data + base + position_offset);
-        const auto* blend_indices = reinterpret_cast<const uint32_t*>(
-            data + base + indices_offset);
-        const float* blend_weights = data + base + weights_offset;
-        Vector3f skinned = Vector3f::Zero();
-        float total_weight = 0.0f;
-        for (usize influence = 0; influence < 4; influence++) {
-            const float weight = blend_weights[influence];
-            if (weight <= 0.0f || blend_indices[influence] >= skinning.size()) continue;
-            skinned += weight * (skinning[blend_indices[influence]] * bind_position);
-            total_weight += weight;
-        }
-        if (total_weight <= 0.0f) skinned = bind_position;
-        skinned = mesh->GeometryTransform() * skinned;
-        if (!skinned.allFinite()) continue;
-        bounds_min = bounds_min.cwiseMin(skinned);
-        bounds_max = bounds_max.cwiseMax(skinned);
-        valid = true;
-    }
-    return MeshBounds3D { .valid = valid, .min = bounds_min, .max = bounds_max };
 }
 
 float SanitizeMouseCoord(double value) {
@@ -252,7 +201,7 @@ std::string_view ResolveEffectiveNodeCameraName(const SceneNode* node) {
 
 } // namespace
 
-void WPShaderValueUpdater::FrameBegin() {
+void WPShaderValueUpdater::PrepareFrame() {
     m_puppet_frame_serial++;
     m_modelTransformCache.clear();
     m_parallaxOffsetCache.clear();
@@ -292,24 +241,41 @@ void WPShaderValueUpdater::FrameBegin() {
     AdvanceAllPuppets();
 }
 
+void WPShaderValueUpdater::FrameBegin() {}
+
 void WPShaderValueUpdater::AdvanceAllPuppets() {
     if (!m_scene) return;
     const double frame_time = m_scene->frameTime;
+    std::unordered_set<const void*> advanced_runtimes;
+    std::vector<SceneNode*> notification_nodes;
 
     for (auto& [addr, nodeData] : m_nodeDataMap) {
         if (!nodeData.puppet_layer.hasPuppet()) continue;
+        const void* runtime = nodeData.puppet_layer.RuntimeIdentity();
+        if (!advanced_runtimes.insert(runtime).second) continue;
         nodeData.puppet_layer.AdvanceIfNeeded(frame_time, m_puppet_frame_serial);
+        notification_nodes.push_back(static_cast<SceneNode*>(addr));
+    }
 
-        if (nodeData.transform_binding.IsBoneAttachment()) {
-            auto* parent = nodeData.transform_binding.parent;
-            if (parent != nullptr) {
-                auto parent_it = m_nodeDataMap.find(parent);
-                if (parent_it != m_nodeDataMap.end() &&
-                    parent_it->second.puppet_layer.hasPuppet()) {
-                    parent_it->second.puppet_layer.AdvanceIfNeeded(
-                        frame_time, m_puppet_frame_serial);
-                }
-            }
+    // Surface synchronization is a frame-preparation transaction. Every binding reads the pose
+    // snapshot cached above, while SceneImageEffectLayer deduplicates multiple consumers of the
+    // same private surface and owns all camera, target and publication-mesh changes.
+    for (auto& [addr, nodeData] : m_nodeDataMap) {
+        (void)addr;
+        if (!nodeData.puppet_layer.hasPuppet() || nodeData.puppet_surface.layer == nullptr ||
+            nodeData.puppet_surface.skinned_mesh == nullptr) {
+            continue;
+        }
+        nodeData.puppet_surface.layer->PreparePuppetSurface(
+            *m_scene,
+            *nodeData.puppet_surface.skinned_mesh,
+            nodeData.puppet_layer.PoseSnapshot(),
+            m_puppet_frame_serial);
+    }
+
+    if (m_scene->scriptHost != nullptr) {
+        for (auto* node : notification_nodes) {
+            m_scene->scriptHost->NotifyAnimationLayersAdvanced(node);
         }
     }
 }
@@ -534,19 +500,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             }
         }
         if (nodeData.puppet_layer.hasPuppet() && info.has_BONES) {
-            auto data = nodeData.puppet_layer.AdvanceIfNeeded(m_scene->frameTime, m_puppet_frame_serial);
-            if (nodeData.effect_projection_layer != nullptr &&
-                nodeData.effect_projection_mesh != nullptr && m_scene != nullptr) {
-                const auto bounds = ComputeSkinnedMeshBounds(pNode->Mesh(), data);
-                if (bounds.valid) {
-                    nodeData.effect_projection_layer->UpdatePuppetSurfaceBounds(
-                        *m_scene, bounds.min, bounds.max, m_puppet_frame_serial);
-                }
-            }
-            if (m_scene->scriptHost) {
-                m_scene->scriptHost->NotifyAnimationLayersAdvanced(pNode);
-            }
-            updateOp(G_BONES, ToDxcRowVectorSkinningUniform(data));
+            const auto pose = nodeData.puppet_layer.PoseSnapshot();
+            // PrepareFrame() is the sole pose-advance boundary. Uniform consumers only publish the
+            // immutable snapshot selected for this frame, so mask pre-passes, clipped main passes
+            // and effect writers cannot independently advance animation or mutate render topology.
+            assert(pose.frame_serial == m_puppet_frame_serial);
+            updateOp(G_BONES, ToDxcRowVectorSkinningUniform(pose.skinning));
         }
     }
 
@@ -612,10 +571,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             Matrix4d         projectionViewPro    = viewProTrans;
 
             const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
-            if (nodeDataPtr != nullptr && nodeDataPtr->effect_projection_node != nullptr &&
-                nodeDataPtr->effect_projection_mesh != nullptr && m_scene->activeCamera != nullptr) {
-                projectionNode = nodeDataPtr->effect_projection_node;
-                projectionMesh = nodeDataPtr->effect_projection_mesh;
+            if (nodeDataPtr != nullptr &&
+                nodeDataPtr->effect_texture_projection.node != nullptr &&
+                nodeDataPtr->effect_texture_projection.mesh != nullptr &&
+                m_scene->activeCamera != nullptr) {
+                projectionNode = nodeDataPtr->effect_texture_projection.node;
+                projectionMesh = nodeDataPtr->effect_texture_projection.mesh;
                 const_cast<SceneNode*>(projectionNode)->UpdateTrans();
                 projectionModelTrans = ApplyMeshGeometryTransform(
                     projectionNode->ModelTrans(), projectionMesh);
@@ -798,7 +759,9 @@ void WPShaderValueUpdater::ReplaceNodeReferences(SceneNode* old_node, SceneNode*
         (void)_;
         if (data.parallax_anchor == old_node) data.parallax_anchor = new_node;
         if (data.transform_binding.parent == old_node) data.transform_binding.parent = new_node;
-        if (data.effect_projection_node == old_node) data.effect_projection_node = new_node;
+        if (data.effect_texture_projection.node == old_node) {
+            data.effect_texture_projection.node = new_node;
+        }
     }
 
     // Deferred materialization destroys the hidden placeholder after the real layer node is built.

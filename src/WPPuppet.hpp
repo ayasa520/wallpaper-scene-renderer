@@ -1,8 +1,10 @@
 #pragma once
 #include <cstdint>
+#include <array>
 #include <vector>
 #include <string>
 #include <memory>
+#include <optional>
 #include <span>
 #include <limits>
 #include <Eigen/Geometry>
@@ -13,6 +15,50 @@ namespace wallpaper
 {
 
 class WPPuppetLayer;
+
+// Axis-aligned bounds used by every puppet contract. Individual fields that use this type must
+// state their coordinate space explicitly; keeping validity in the value prevents unrelated
+// parser, pose and surface code from inventing separate sentinel conventions.
+struct PuppetBounds3D {
+    Eigen::Vector3f min { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f max { Eigen::Vector3f::Zero() };
+    bool            valid { false };
+
+    bool IsFiniteAndOrdered() const noexcept {
+        return valid && min.allFinite() && max.allFinite() && (min.array() <= max.array()).all();
+    }
+
+    void Include(const Eigen::Vector3f& point) noexcept {
+        if (!point.allFinite()) return;
+        if (!valid) {
+            min = point;
+            max = point;
+            valid = true;
+            return;
+        }
+        min = min.cwiseMin(point);
+        max = max.cwiseMax(point);
+    }
+
+    void Include(const PuppetBounds3D& bounds) noexcept {
+        if (!bounds.IsFiniteAndOrdered()) return;
+        Include(bounds.min);
+        Include(bounds.max);
+    }
+};
+
+enum class PuppetPoseDomain
+{
+    AuthoredEnvelope,
+    RuntimeMutable,
+};
+
+struct PuppetPoseSnapshot {
+    std::span<const Eigen::Affine3f> skinning;
+    PuppetPoseDomain                  domain { PuppetPoseDomain::AuthoredEnvelope };
+    uint64_t                          revision { 0 };
+    uint64_t                          frame_serial { 0 };
+};
 
 class WPPuppet {
 public:
@@ -55,8 +101,32 @@ public:
         // prepared
         Eigen::Quaterniond quaternion;
     };
+    struct AnimTrans {
+        std::vector<float>              extra_track;
+        std::vector<float>              main_track;
+        std::vector<std::vector<float>> tail_tracks;
+    };
+    struct BoneFrameCurve {
+        std::vector<float> values;
+    };
+    struct AnimV4Event {
+        float              time { 0.0f };
+        uint32_t           flags { 0 };
+        std::vector<float> values;
+    };
+    struct AnimEvent {
+        uint32_t    time_value { 0 };
+        std::string event_json;
+    };
+    enum class AuthoredBoundsSource
+    {
+        None,
+        MdlaAabb,
+        SampledFrames,
+    };
     struct Animation {
-        i32         id;
+        i32         id { 0 };
+        u32         unk_after_id { 0 };
         double      fps;
         i32         length;
         PlayMode    mode;
@@ -66,6 +136,16 @@ public:
             std::vector<BoneFrame> frames;
         };
         std::vector<BoneFrames> bframes_array;
+
+        // Versioned MDLA payloads are retained in their semantic groups instead of being skipped
+        // as anonymous bytes. The animation AABB is already expressed in puppet-local coordinates.
+        std::optional<AnimTrans>        trans;
+        std::vector<BoneFrameCurve>     blend_curves;
+        std::vector<AnimV4Event>        v4_events;
+        PuppetBounds3D                  authored_pose_bounds;
+        AuthoredBoundsSource            authored_bounds_source { AuthoredBoundsSource::None };
+        std::vector<BoneFrameCurve>     scalar_curves;
+        std::vector<AnimEvent>          events;
 
         // prepared
         double max_time;
@@ -105,7 +185,7 @@ public:
     WPPuppetLayer(std::shared_ptr<WPPuppet>);
     ~WPPuppetLayer();
 
-    bool hasPuppet() const { return (bool)m_puppet; };
+    bool hasPuppet() const { return static_cast<bool>(Runtime().puppet); };
 
     struct AnimationLayer {
         i32    id { 0 };
@@ -127,14 +207,20 @@ public:
     void RefreshBlendState() noexcept;
 
     std::span<const Eigen::Affine3f> genFrame(double time) noexcept;
-    std::span<const Eigen::Affine3f> AdvanceIfNeeded(double time, uint64_t frame_serial) noexcept;
-    std::span<const Eigen::Affine3f> SkinningMatrices() const noexcept { return m_cached_skinning; }
-    const WPPuppet*                  Puppet() const noexcept { return m_puppet.get(); }
-    usize                            AnimationLayerCount() const noexcept { return m_layers.size(); }
+    PuppetPoseSnapshot AdvanceIfNeeded(double time, uint64_t frame_serial) noexcept;
+    PuppetPoseSnapshot PoseSnapshot() const noexcept;
+    std::span<const Eigen::Affine3f> SkinningMatrices() const noexcept {
+        return Runtime().cached_skinning;
+    }
+    const WPPuppet* Puppet() const noexcept { return Runtime().puppet.get(); }
+    usize AnimationLayerCount() const noexcept { return Runtime().layers.size(); }
     const AnimationLayer*            AnimationLayerState(usize index) const noexcept;
     AnimationLayer*                  AnimationLayerState(usize index) noexcept;
     const WPPuppet::Animation*       AnimationDefinition(usize index) const noexcept;
     bool SetLocalBoneTransform(usize index, const Eigen::Affine3f& transform) noexcept;
+    PuppetPoseDomain PoseDomain() const noexcept;
+    uint64_t PoseRevision() const noexcept;
+    const void* RuntimeIdentity() const noexcept;
 
     void updateInterpolation(double time) noexcept;
 
@@ -151,15 +237,23 @@ private:
         bool            enabled { false };
         Eigen::Affine3f local_transform { Eigen::Affine3f::Identity() };
     };
+    struct RuntimeState {
+        double                           global_blend { 1.0 };
+        double                           total_blend { 0.0 };
+        std::vector<Layer>               layers;
+        std::vector<BoneOverride>        bone_overrides;
+        std::shared_ptr<WPPuppet>        puppet;
+        std::span<const Eigen::Affine3f> cached_skinning {};
+        uint64_t cached_frame_serial { std::numeric_limits<uint64_t>::max() };
+        uint64_t pose_revision { 0 };
+        PuppetPoseDomain domain { PuppetPoseDomain::AuthoredEnvelope };
+    };
 
-    double m_global_blend { 1.0 };
-    double m_total_blend { 0.0 };
+    RuntimeState& Runtime() noexcept { return *m_runtime; }
+    const RuntimeState& Runtime() const noexcept { return *m_runtime; }
+    void MarkRuntimePoseMutation() noexcept;
 
-    std::vector<Layer>              m_layers;
-    std::vector<BoneOverride>       m_bone_overrides;
-    std::shared_ptr<WPPuppet>       m_puppet;
-    std::span<const Eigen::Affine3f> m_cached_skinning {};
-    uint64_t                        m_cached_frame_serial { std::numeric_limits<uint64_t>::max() };
+    std::shared_ptr<RuntimeState> m_runtime;
 };
 
 } // namespace wallpaper

@@ -474,6 +474,7 @@ private:
             // instead of letting the animation path snap the shared global camera back to the
             // project's native aspect until a later resize/fill-mode event repairs it.
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
+            m_scene->shaderValueUpdater->PrepareFrame();
             RefreshRenderGraphIfNeeded();
             m_render->refreshImportedTextures(*m_scene);
 

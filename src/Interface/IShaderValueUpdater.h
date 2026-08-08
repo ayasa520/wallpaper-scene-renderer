@@ -32,6 +32,9 @@ public:
     IShaderValueUpdater()          = default;
     virtual ~IShaderValueUpdater() = default;
 
+    // Resource-affecting pose/surface preparation must finish before render-graph refresh. The
+    // later FrameBegin hook remains the draw-phase boundary for uniform/cache consumers.
+    virtual void PrepareFrame()                                                    = 0;
     virtual void FrameBegin()                                                      = 0;
     virtual void InitUniforms(SceneNode*, const ExistsUniformOp&)                  = 0;
     virtual void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,

@@ -7,9 +7,11 @@
 #include <string_view>
 #include <array>
 #include <optional>
+#include <limits>
 #include <Eigen/Geometry>
 #include "Core/Literals.hpp"
 #include "Type.hpp"
+#include "WPPuppet.hpp"
 
 namespace wallpaper
 {
@@ -22,12 +24,15 @@ std::string_view FinalOutputCapabilityName(FinalOutputCapability capability);
 
 struct PuppetSurfaceProjection {
     Eigen::Vector2f authored_layer_size { Eigen::Vector2f::Zero() };
-    Eigen::Vector3f raw_bounds_min { Eigen::Vector3f::Zero() };
-    Eigen::Vector3f raw_bounds_max { Eigen::Vector3f::Zero() };
-    Eigen::Vector3f animated_bounds_min { Eigen::Vector3f::Zero() };
-    Eigen::Vector3f animated_bounds_max { Eigen::Vector3f::Zero() };
-    Eigen::Vector3f camera_bounds_min { Eigen::Vector3f::Zero() };
-    Eigen::Vector3f camera_bounds_max { Eigen::Vector3f::Zero() };
+    // Parsed immutable contracts in MDL puppet-local coordinates.
+    PuppetBounds3D asset_bounds;
+    PuppetBounds3D authored_pose_bounds;
+    // Latest external-pose observation in puppet-local coordinates. Authored animation never writes
+    // this field and therefore cannot mutate the projection contract after parsing.
+    PuppetBounds3D observed_runtime_bounds;
+    // Monotonically expanding camera/RT/publication envelope in scene-local coordinates after the
+    // mesh geometry transform has been applied.
+    PuppetBounds3D surface_bounds;
     Eigen::Affine3f geometry_transform { Eigen::Affine3f::Identity() };
     // [offset-x, offset-y, scale-x, scale-y] maps authored source coordinates into the private
     // surface.  Keeping this explicit avoids silently changing puppet UVs used by mask/material
@@ -39,6 +44,12 @@ struct PuppetSurfaceProjection {
     std::string target_name;
     std::shared_ptr<SceneMesh> publication_mesh;
     bool contract_exceeded { false };
+    uint64_t last_bounds_frame_serial { std::numeric_limits<uint64_t>::max() };
+    uint64_t last_pose_revision { 0 };
+    uint64_t surface_revision { 0 };
+    uint64_t camera_revision { 0 };
+    uint64_t target_revision { 0 };
+    uint64_t publication_mesh_revision { 0 };
 };
 
 struct SceneImageEffectNode {
@@ -179,15 +190,8 @@ public:
             ? std::addressof(*m_puppet_surface_projection)
             : nullptr;
     }
-    PuppetSurfaceProjection* GetPuppetSurfaceProjection() {
-        return m_puppet_surface_projection.has_value()
-            ? std::addressof(*m_puppet_surface_projection)
-            : nullptr;
-    }
-    bool UpdatePuppetSurfaceBounds(Scene& scene,
-                                   const Eigen::Vector3f& bounds_min,
-                                   const Eigen::Vector3f& bounds_max,
-                                   uint64_t frame_serial);
+    bool PreparePuppetSurface(Scene& scene, const SceneMesh& skinned_mesh,
+                              const PuppetPoseSnapshot& pose, uint64_t frame_serial);
     void        SetCopyBackground(bool copy_background) { m_copy_background = copy_background; }
     AlphaWritePolicy CompositionChildAlphaWritePolicy() const {
         return m_copy_background ? AlphaWritePolicy::Preserve : AlphaWritePolicy::Max;

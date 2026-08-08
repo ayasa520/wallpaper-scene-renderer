@@ -93,6 +93,16 @@ struct WPNodeTransformBinding {
     }
 };
 
+struct EffectTextureProjectionBinding {
+    SceneNode* node { nullptr };
+    SceneMesh* mesh { nullptr };
+};
+
+struct PuppetSurfaceBinding {
+    SceneImageEffectLayer* layer { nullptr };
+    SceneMesh*              skinned_mesh { nullptr };
+};
+
 struct WPShaderValueData {
     std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
     // An omitted scene field and an explicit "1 1" have the same numeric value but different
@@ -105,9 +115,8 @@ struct WPShaderValueData {
     WPPuppetLayer puppet_layer;
     SceneNode*     parallax_anchor { nullptr };
     WPNodeTransformBinding transform_binding {};
-    SceneNode*            effect_projection_node { nullptr };
-    SceneMesh*            effect_projection_mesh { nullptr };
-    SceneImageEffectLayer* effect_projection_layer { nullptr };
+    EffectTextureProjectionBinding effect_texture_projection {};
+    PuppetSurfaceBinding           puppet_surface {};
     // The scene transform already carries the required displacement for these nodes, or they are
     // private effect sources. Keep their parallax anchor for dependents without adding a second
     // local model offset.
@@ -124,12 +133,14 @@ struct WPShaderValueData {
         suppress_model_parallax = suppress_own_model_parallax;
     }
 
-    void SetEffectProjection(SceneImageEffectLayer* projection_layer,
-                             SceneNode* projection_node,
-                             SceneMesh* projection_mesh) {
-        effect_projection_layer = projection_layer;
-        effect_projection_node = projection_node;
-        effect_projection_mesh = projection_mesh;
+    void SetEffectTextureProjection(SceneNode* projection_node, SceneMesh* projection_mesh) {
+        effect_texture_projection.node = projection_node;
+        effect_texture_projection.mesh = projection_mesh;
+    }
+
+    void SetPuppetSurface(SceneImageEffectLayer* surface_layer, SceneMesh* skinned_mesh) {
+        puppet_surface.layer = surface_layer;
+        puppet_surface.skinned_mesh = skinned_mesh;
     }
 
     void SuppressOwnModelParallax() { suppress_model_parallax = true; }
@@ -184,6 +195,7 @@ public:
     WPShaderValueUpdater(Scene* scene): m_scene(scene) {}
     virtual ~WPShaderValueUpdater() {}
 
+    void PrepareFrame() override;
     void FrameBegin() override;
 
     void InitUniforms(SceneNode*, const ExistsUniformOp&) override;
