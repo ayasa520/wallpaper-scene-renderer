@@ -780,7 +780,9 @@ CreateVideoImage(const Device& device, uint32_t width, uint32_t height, const Te
             .pNext                   = nullptr,
             .magFilter               = ToVkType(sample.magFilter),
             .minFilter               = ToVkType(sample.minFilter),
-            .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            .mipmapMode              = sample.minFilter == TextureFilter::NEAREST
+                ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                : VK_SAMPLER_MIPMAP_MODE_LINEAR,
             .addressModeU            = ToVkType(sample.wrapS),
             .addressModeV            = ToVkType(sample.wrapT),
             .addressModeW            = ToVkType(sample.wrapT),
@@ -789,7 +791,9 @@ CreateVideoImage(const Device& device, uint32_t width, uint32_t height, const Te
             .compareEnable           = false,
             .compareOp               = VK_COMPARE_OP_NEVER,
             .minLod                  = 0.0f,
-            .maxLod                  = 1.0f,
+            // Video images expose exactly one mip level. Advertising another LOD lets minification
+            // select undefined data and is especially visible on point-sampled scene media.
+            .maxLod                  = 0.0f,
             .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
             .unnormalizedCoordinates = false,
         };

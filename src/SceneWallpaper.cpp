@@ -511,7 +511,8 @@ private:
             // Scene text arrives with authoring geometry already resolved by WPSceneParser. The
             // render thread records the active density for future runtime rerasterization, but it
             // must not rebuild parsed text just because the desktop scale changed: render scale
-            // controls atlas sharpness, while textAuthoringScale controls visible geometry.
+            // controls atlas sharpness, while the renderer's fixed pointsize conversion controls
+            // authored glyph geometry.
             m_scene->textRenderScale = std::max(1.0, m_render_scale);
             m_scene->scriptHost = std::make_unique<WPSceneScriptHost>(m_scene.get());
             for (const auto& registration : m_scene->bindingRegistrations) {

@@ -19,6 +19,7 @@ namespace wallpaper
 class Scene;
 class SceneNode;
 class SceneMesh;
+class SceneImageEffectLayer;
 
 struct WPUniformInfo {
     bool has_MI { false };
@@ -80,7 +81,7 @@ struct WPNodeTransformBinding {
     WPNodeTransformBindingMode mode { WPNodeTransformBindingMode::None };
     SceneNode*                 parent { nullptr };
     uint32_t                   bone_index { 0xFFFFFFFFu };
-    Eigen::Affine3f            anchor_transform { Eigen::Affine3f::Identity() };
+    Eigen::Affine3f            bind_transform { Eigen::Affine3f::Identity() };
     Eigen::Affine3f            local_transform { Eigen::Affine3f::Identity() };
 
     bool InheritsParentTransform() const {
@@ -106,6 +107,7 @@ struct WPShaderValueData {
     WPNodeTransformBinding transform_binding {};
     SceneNode*            effect_projection_node { nullptr };
     SceneMesh*            effect_projection_mesh { nullptr };
+    SceneImageEffectLayer* effect_projection_layer { nullptr };
     // The scene transform already carries the required displacement for these nodes, or they are
     // private effect sources. Keep their parallax anchor for dependents without adding a second
     // local model offset.
@@ -122,7 +124,10 @@ struct WPShaderValueData {
         suppress_model_parallax = suppress_own_model_parallax;
     }
 
-    void SetEffectProjection(SceneNode* projection_node, SceneMesh* projection_mesh) {
+    void SetEffectProjection(SceneImageEffectLayer* projection_layer,
+                             SceneNode* projection_node,
+                             SceneMesh* projection_mesh) {
+        effect_projection_layer = projection_layer;
         effect_projection_node = projection_node;
         effect_projection_mesh = projection_mesh;
     }
@@ -144,13 +149,13 @@ struct WPShaderValueData {
     }
 
     void AttachToBone(SceneNode* parent, uint32_t bone_index,
-                      const Eigen::Affine3f& anchor_transform,
+                      const Eigen::Affine3f& bind_transform,
                       const Eigen::Affine3f& local_transform) {
         parallax_anchor                    = parent;
         transform_binding.mode             = WPNodeTransformBindingMode::BoneAttachment;
         transform_binding.parent           = parent;
         transform_binding.bone_index       = bone_index;
-        transform_binding.anchor_transform = anchor_transform;
+        transform_binding.bind_transform   = bind_transform;
         transform_binding.local_transform  = local_transform;
     }
 

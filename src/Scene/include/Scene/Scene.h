@@ -274,7 +274,6 @@ public:
     float                cameraParallaxDelay { 0.0f };
     float                cameraParallaxMouseInfluence { 0.0f };
     double               textRenderScale { 1.0 };
-    double               textAuthoringScale { 1.0 };
 
     double elapsingTime { 0.0f }, frameTime { 0.0f };
     void   PassFrameTime(double t) {

@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "Type.hpp"
 #include "WPJson.hpp"
 #include "WPUserProperties.hpp"
 #include "WPMaterial.h"
@@ -27,12 +28,9 @@ class WPImageObject {
 public:
     struct Config {
         bool passthrough { false };
-        // Normal image/text effect chains resolve into private ping-pong targets and are published
-        // by the neutral layer-surface composite. Synthetic DIRECTDRAW shapes are different: their
-        // final authored shader generates the visible pixels and therefore remains the scene-space
-        // writer. Carry that semantic topology explicitly from shape materialization instead of
-        // recognizing individual wallpaper ids, layer names, or shader asset paths later.
-        bool authoredEffectIsFinalWriter { false };
+        FinalOutputCapability finalOutputCapability {
+            FinalOutputCapability::PrivateThenPublish
+        };
     };
     bool                       FromJson(const nlohmann::json&, fs::VFS&);
     int32_t                    id { 0 };

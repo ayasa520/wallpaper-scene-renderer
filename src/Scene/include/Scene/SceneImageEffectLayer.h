@@ -4,6 +4,9 @@
 #include <memory>
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <array>
+#include <optional>
 #include <Eigen/Geometry>
 #include "Core/Literals.hpp"
 #include "Type.hpp"
@@ -13,6 +16,30 @@ namespace wallpaper
 
 class SceneNode;
 class SceneMesh;
+class Scene;
+
+std::string_view FinalOutputCapabilityName(FinalOutputCapability capability);
+
+struct PuppetSurfaceProjection {
+    Eigen::Vector2f authored_layer_size { Eigen::Vector2f::Zero() };
+    Eigen::Vector3f raw_bounds_min { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f raw_bounds_max { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f animated_bounds_min { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f animated_bounds_max { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f camera_bounds_min { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f camera_bounds_max { Eigen::Vector3f::Zero() };
+    Eigen::Affine3f geometry_transform { Eigen::Affine3f::Identity() };
+    // [offset-x, offset-y, scale-x, scale-y] maps authored source coordinates into the private
+    // surface.  Keeping this explicit avoids silently changing puppet UVs used by mask/material
+    // samplers when the camera envelope is widened.
+    Eigen::Vector4f source_to_layer { Eigen::Vector4f(0.0f, 0.0f, 1.0f, 1.0f) };
+    std::array<int32_t, 2> target_extent { 1, 1 };
+    float render_density { 1.0f };
+    std::string camera_name;
+    std::string target_name;
+    std::shared_ptr<SceneMesh> publication_mesh;
+    bool contract_exceeded { false };
+};
 
 struct SceneImageEffectNode {
     // Authored effect passes use symbolic ping-pong targets. ResolveEffect() maps those symbols to
@@ -113,12 +140,6 @@ public:
         OwnerNodeAndProxyChildren,
         ProxyChildrenOnly,
     };
-    enum class FinalOutputPolicy
-    {
-        AuthoredWriter,
-        PrivateAuthoredThenComposite,
-    };
-
     SceneImageEffectLayer(SceneNode* node, float w, float h, std::string_view pingpong_a,
                           std::string_view pingpong_b);
 
@@ -130,7 +151,10 @@ public:
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
     SceneNode&  FinalNode() const { return *m_final_node; }
     SourcePolicy SourceContributionPolicy() const { return m_source_policy; }
-    FinalOutputPolicy DeclaredFinalOutputPolicy() const { return m_final_output_policy; }
+    FinalOutputCapability DeclaredFinalOutputCapability() const {
+        return m_final_output_capability;
+    }
+    FinalOutputCapability ResolveFinalOutputCapability(bool dependency_route) const;
     bool        HasFinalComposite() const;
     bool        ShouldRunFinalComposite() const;
     bool        PublishesPrivateFinalComposite() const {
@@ -142,7 +166,28 @@ public:
     void        SetFinalCompositeSource(std::string source);
     void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
     void        SetSourceContributionPolicy(SourcePolicy policy) { m_source_policy = policy; }
-    void        SetFinalOutputPolicy(FinalOutputPolicy policy) { m_final_output_policy = policy; }
+    void        SetFinalOutputCapability(FinalOutputCapability capability) {
+        m_final_output_capability = capability;
+    }
+    void        SetLayerSurfaceCamera(std::string camera_name) {
+        m_layer_surface_camera = std::move(camera_name);
+    }
+    const std::string& LayerSurfaceCamera() const { return m_layer_surface_camera; }
+    void SetPuppetSurfaceProjection(PuppetSurfaceProjection projection);
+    const PuppetSurfaceProjection* GetPuppetSurfaceProjection() const {
+        return m_puppet_surface_projection.has_value()
+            ? std::addressof(*m_puppet_surface_projection)
+            : nullptr;
+    }
+    PuppetSurfaceProjection* GetPuppetSurfaceProjection() {
+        return m_puppet_surface_projection.has_value()
+            ? std::addressof(*m_puppet_surface_projection)
+            : nullptr;
+    }
+    bool UpdatePuppetSurfaceBounds(Scene& scene,
+                                   const Eigen::Vector3f& bounds_min,
+                                   const Eigen::Vector3f& bounds_max,
+                                   uint64_t frame_serial);
     void        SetCopyBackground(bool copy_background) { m_copy_background = copy_background; }
     AlphaWritePolicy CompositionChildAlphaWritePolicy() const {
         return m_copy_background ? AlphaWritePolicy::Preserve : AlphaWritePolicy::Max;
@@ -165,8 +210,8 @@ public:
                        std::string_view final_output,
                        bool keep_final_output_private = false,
                        const Eigen::Affine3f* resolved_world_affine = nullptr,
-                       FinalOutputPolicy final_output_policy =
-                           FinalOutputPolicy::PrivateAuthoredThenComposite);
+                       FinalOutputCapability output_capability =
+                           FinalOutputCapability::PrivateThenPublish);
 
 private:
     struct FinalCompositeState {
@@ -211,7 +256,11 @@ private:
     // a shader such as godrays_combine into a tiny world-space quad and makes the rays disappear.
     bool m_fullscreen { false };
     SourcePolicy m_source_policy { SourcePolicy::OwnerNode };
-    FinalOutputPolicy m_final_output_policy { FinalOutputPolicy::PrivateAuthoredThenComposite };
+    FinalOutputCapability m_final_output_capability {
+        FinalOutputCapability::PrivateThenPublish
+    };
+    std::string m_layer_surface_camera;
+    std::optional<PuppetSurfaceProjection> m_puppet_surface_projection;
     bool m_copy_background { false };
     //    std::vector<float> m_size;
     std::unique_ptr<SceneMesh> m_source_mesh;
@@ -242,7 +291,7 @@ private:
         SceneImageEffectNode* fallback_last_output,
         std::string_view layer_surface_cam,
         bool keep_final_output_private,
-        FinalOutputPolicy final_output_policy);
+        FinalOutputCapability output_capability);
     void ResolveFinalCompositeNode(const SceneMesh& default_mesh,
                                    SceneNode& default_node,
                                    std::string_view effect_cam,

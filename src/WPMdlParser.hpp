@@ -70,6 +70,12 @@ struct WPMdl {
     };
     std::vector<Vertex>                  vertexs;
     std::vector<std::array<uint16_t, 3>> indices;
+    std::array<float, 3> puppet_bounds_min { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> puppet_bounds_max { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> puppet_animated_bounds_min { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> puppet_animated_bounds_max { 0.0f, 0.0f, 0.0f };
+    bool puppet_bounds_valid { false };
+    bool puppet_animated_bounds_valid { false };
 
     struct Part {
         uint32_t id { 0 };

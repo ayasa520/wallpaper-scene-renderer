@@ -206,9 +206,13 @@ std::optional<Affine3f> WPNodeTransformResolver::ResolveAttachmentLocalTransform
     const auto* parent_puppet = parent_data.puppet_layer.Puppet();
     if (parent_puppet == nullptr) return std::nullopt;
 
+    // MDAT attachment locators are bone-local. The multiplication order below is the coordinate
+    // contract: the current animated bone frame moves the authored locator, then the child keeps
+    // its own local origin/rotation/scale. Treating bind_transform as model space, or premultiplying
+    // it by inverse(bindBoneModel), double-converts the locator and breaks non-root attachment points.
     Affine3f local_transform =
         parent_puppet->BoneModelTransform(node_data.transform_binding.bone_index) *
-        node_data.transform_binding.anchor_transform * node_data.transform_binding.local_transform;
+        node_data.transform_binding.bind_transform * node_data.transform_binding.local_transform;
     ApplyResolvedParentDelta(parent_node, parent_data, local_transform);
     ApplyParentParallaxToAttachment(parent_node, parent_data, local_transform);
     m_attachment_transform_cache[node] = local_transform;

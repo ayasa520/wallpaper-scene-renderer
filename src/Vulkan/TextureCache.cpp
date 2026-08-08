@@ -95,21 +95,26 @@ std::vector<uint64_t> FilterSupportedDrmModifiers(const vvk::PhysicalDevice& gpu
 
 VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
     auto& sam = key.sample;
+    const float max_lod = key.mipmap_level > 0
+        ? static_cast<float>(key.mipmap_level - 1)
+        : 0.0f;
 
     VkSamplerCreateInfo sampler_info { .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                                        .pNext            = nullptr,
                                        .magFilter        = ToVkType(sam.magFilter),
                                        .minFilter        = (ToVkType(sam.minFilter)),
-                                       .mipmapMode       = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                                       .mipmapMode       = sam.minFilter == TextureFilter::NEAREST
+                                           ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                           : VK_SAMPLER_MIPMAP_MODE_LINEAR,
                                        .addressModeU     = (ToVkType(sam.wrapS)),
-                                       .addressModeV     = (ToVkType(sam.wrapS)),
+                                       .addressModeV     = (ToVkType(sam.wrapT)),
                                        .addressModeW     = (ToVkType(sam.wrapT)),
                                        .anisotropyEnable = (false),
                                        .maxAnisotropy    = (1.0f),
                                        .compareEnable    = (false),
                                        .compareOp        = VK_COMPARE_OP_NEVER,
                                        .minLod           = (0.0f),
-                                       .maxLod           = (1.0f),
+                                       .maxLod           = max_lod,
                                        .borderColor      = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
                                        .unnormalizedCoordinates = (false) };
     return sampler_info;
@@ -662,21 +667,26 @@ bool CreateImageSlotForTexture(const Device& device, const Image& image, usize s
     if (image_slot.width <= 0 || image_slot.height <= 0 || image_slot.mipmaps.empty()) {
         return false;
     }
+    const float max_lod = mipmap_levels > 0
+        ? static_cast<float>(mipmap_levels - 1)
+        : 0.0f;
     VkSamplerCreateInfo sampler_info {
         .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext                   = nullptr,
         .magFilter               = ToVkType(sam.magFilter),
         .minFilter               = (ToVkType(sam.minFilter)),
-        .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .mipmapMode              = sam.minFilter == TextureFilter::NEAREST
+            ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+            : VK_SAMPLER_MIPMAP_MODE_LINEAR,
         .addressModeU            = (ToVkType(sam.wrapS)),
-        .addressModeV            = (ToVkType(sam.wrapS)),
+        .addressModeV            = (ToVkType(sam.wrapT)),
         .addressModeW            = (ToVkType(sam.wrapT)),
         .anisotropyEnable        = (false),
         .maxAnisotropy           = (1.0f),
         .compareEnable           = (false),
         .compareOp               = VK_COMPARE_OP_NEVER,
         .minLod                  = (0.0f),
-        .maxLod                  = (float)mipmap_levels,
+        .maxLod                  = max_lod,
         .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
         .unnormalizedCoordinates = (false),
     };
@@ -720,6 +730,7 @@ std::size_t TextureKey::HashValue(const TextureKey& k) {
     utils::hash_combine(seed, (int)k.sample.wrapS);
     utils::hash_combine(seed, (int)k.sample.wrapT);
     utils::hash_combine(seed, (int)k.sample.magFilter);
+    utils::hash_combine(seed, (int)k.sample.minFilter);
     return seed;
 }
 
@@ -1116,7 +1127,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
     if (exists(m_query_map, key_string)) {
         auto* query = m_query_map.find(key_string)->second;
 
-        if (query->content_hash != tex_hash) {
+        if (!(query->content_key == content_hash)) {
             // Resource-only render graph refreshes must behave like particle updates: keep the
             // graph and unrelated GPU resources alive, then resize only the specific offscreen
             // image whose render-target contract changed. The old cache returned stale images for
@@ -1141,6 +1152,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             } else {
                 if (auto opt = CreateTex(content_hash); opt.has_value()) {
                     query->image        = std::move(opt.value());
+                    query->content_key  = content_hash;
                     query->content_hash = tex_hash;
                     query->share_ready  = false;
                     query->persist      = persist;
@@ -1162,7 +1174,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
 
     for (auto& query : m_query_texs) {
         if (! (query->share_ready)) continue;
-        if (query->content_hash != tex_hash) continue;
+        if (!(query->content_key == content_hash)) continue;
 
         query->share_ready = false;
         query->persist     = persist;
@@ -1178,6 +1190,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
     m_query_map[key_string] = &query;
 
     query.index        = (idx)m_query_texs.size() - 1;
+    query.content_key  = content_hash;
     query.content_hash = tex_hash;
     query.query_keys.insert(key_string);
     query.persist = persist;

@@ -33,6 +33,7 @@
 #include "Scene/include/Scene/SceneNode.h"
 #include "Scene/include/Scene/Scene.h"
 #include "SpecTexs.hpp"
+#include "Utils/Logging.h"
 #include "Utils/Sha.hpp"
 #include "WPSceneScriptMedia.hpp"
 
@@ -43,6 +44,7 @@ namespace
 
 constexpr std::string_view kFontCacheDir { "/tmp/hanabi-scene-font-cache" };
 constexpr double kBaseTextResolutionDpi { 96.0 };
+constexpr double kTextPointSizeToAuthoringUnits { 4.0 };
 constexpr float  kMinTextVisualScaleFactor { 0.0625f };
 constexpr int    kTextGlyphAtlasMaxExtent { 1024 };
 constexpr int    kTextGlyphAtlasPadding { 1 };
@@ -561,18 +563,22 @@ bool TextLayerUsesMaterialTint(const wpscene::WPTextObject& object) {
     return true;
 }
 
-bool TextLayerUsesTightTransparentGlyphBounds(const wpscene::WPTextObject& object) {
-    return !object.opaquebackground && object.effects.empty();
+bool TextLayerUsesTightTransparentGlyphBounds(
+    const wpscene::WPTextObject& object,
+    const TextLayerRenderContract& render_contract) {
+    return !object.opaquebackground && !render_contract.RequiresBridge();
 }
 
-std::array<int32_t, 4> ResolveTextLayoutPadding(const wpscene::WPTextObject& object) {
+std::array<int32_t, 4> ResolveTextLayoutPadding(
+    const wpscene::WPTextObject& object,
+    const TextLayerRenderContract& render_contract) {
     // Wallpaper Engine's padding belongs to text that keeps its authored logical rectangle alive:
     // opaque-background text needs room for the background quad, and effect-backed text needs the
     // extra transparent source pixels that shaders may sample. Plain transparent text, however,
     // exposes tight glyph coverage to the scene; carrying padding through that direct path turns
     // invisible padding into visible placement geometry and moves the crop center away from the
     // authored text placement.
-    return TextLayerUsesTightTransparentGlyphBounds(object)
+    return TextLayerUsesTightTransparentGlyphBounds(object, render_contract)
                ? UniformTextPadding(0)
                : ClampTextPaddingEdges(object.padding_edges);
 }
@@ -596,8 +602,10 @@ enum class TextCropCenterProjection
     ParentCrossAxis,
 };
 
-TextCropCenterProjection ResolveTextCropCenterProjection(const wpscene::WPTextObject& object) {
-    if (TextLayerUsesTightTransparentGlyphBounds(object) &&
+TextCropCenterProjection ResolveTextCropCenterProjection(
+    const wpscene::WPTextObject& object,
+    const TextLayerRenderContract& render_contract) {
+    if (TextLayerUsesTightTransparentGlyphBounds(object, render_contract) &&
         TextObjectUsesParagraphCenterPivot(object) && TextObjectUsesAutoSizedParagraphBox(object)) {
         return TextCropCenterProjection::ParentCrossAxis;
     }
@@ -639,9 +647,11 @@ float SignedScaleUnit(float value) {
 
 std::array<float, 2> ResolveTextCropLocalCenter(
     const wpscene::WPTextObject& object,
+    const TextLayerRenderContract& render_contract,
     std::array<float, 3>         origin,
     std::array<float, 2>         crop_center) {
-    if (ResolveTextCropCenterProjection(object) != TextCropCenterProjection::ParentCrossAxis ||
+    if (ResolveTextCropCenterProjection(object, render_contract) !=
+            TextCropCenterProjection::ParentCrossAxis ||
         std::abs(crop_center[0]) <= kTextPlacementEpsilon) {
         return crop_center;
     }
@@ -722,12 +732,20 @@ std::array<float, 2> ResolveVisibleTextDisplaySize(const TextLayerRuntimeState& 
     // Once a text layer has been materialized, the live scene primitive is the only authoritative
     // source of visible geometry. Falling back to the authored object is only for deferred logical
     // layers that do not have a shaped primitive yet.
-    if (state.primitive != nullptr) return state.primitive->layout.visible_display_size;
+    if (state.primitive != nullptr) {
+        return state.object.opaquebackground || state.render_contract.RequiresBridge()
+            ? state.primitive->layout.logical_size
+            : state.primitive->layout.glyph_display_size;
+    }
     return state.object.size;
 }
 
 std::array<float, 2> ResolveVisibleTextSourceSize(const TextLayerRuntimeState& state) {
-    if (state.primitive != nullptr) return state.primitive->layout.visible_source_size;
+    if (state.primitive != nullptr) {
+        return state.object.opaquebackground || state.render_contract.RequiresBridge()
+            ? state.primitive->layout.logical_source_size
+            : state.primitive->layout.glyph_source_size;
+    }
     // Deferred text layers have no rasterized primitive yet, so there is no authoritative source
     // texture rectangle to report. Returning the authored box here keeps diagnostics and placeholder
     // alignment stable until the primitive is materialized.
@@ -735,13 +753,9 @@ std::array<float, 2> ResolveVisibleTextSourceSize(const TextLayerRuntimeState& s
 }
 
 std::array<float, 2> ResolveEffectDependencyTextSourceSize(const TextLayerRuntimeState& state) {
-    // Authored text effects were historically sized against the same cropped glyph bitmap that
-    // the scene exposed as the text layer's visible source. Switching the dependency contract to
-    // the logical text box broke that invariant: the effect render targets stopped matching the
-    // actual source pass, which is what produced the distorted weekday effect and the incorrect
-    // offscreen growth decisions visible in the runtime log. Keep the dependency size aligned with
-    // the visible glyph source, and solve update churn through node-capacity reuse rather than by
-    // silently changing what "text source size" means to the effect system.
+    // A bridge source is the authored logical text box even though its glyph coverage comes from
+    // tightly packed atlas pages. VisibleSourceSize() is contract-resolved to that logical extent,
+    // so effect FBOs, the bridge target, camera, and final mesh all share one source rectangle.
     return ResolveVisibleTextSourceSize(state);
 }
 
@@ -833,7 +847,9 @@ std::array<float, 2> ResolveDerivedTextDisplayOffset(const TextLayerRuntimeState
 
 std::array<float, 2> ResolveVisibleTextDisplayOffset(const TextLayerRuntimeState& state,
                                                      std::string_view             alignment) {
-    if (state.object.opaquebackground) return { 0.0f, 0.0f };
+    if (state.object.opaquebackground || state.render_contract.RequiresBridge()) {
+        return { 0.0f, 0.0f };
+    }
     return ResolveDerivedTextDisplayOffset(state, alignment);
 }
 
@@ -846,14 +862,15 @@ float ResolveTextVisualScaleFactor(const wpscene::WPTextObject& object) {
         { std::abs(object.scale[0]), std::abs(object.scale[1]), kMinTextVisualScaleFactor });
 }
 
-float ResolveTextRasterDensityFactor(const wpscene::WPTextObject& object) {
+float ResolveTextRasterDensityFactor(const wpscene::WPTextObject& object,
+                                     const TextLayerRenderContract& render_contract) {
     const float visual_scale = ResolveTextVisualScaleFactor(object);
     // Effect-backed text always goes through at least one extra filtered pass,
     // so dropping its backing texture below 1:1 screen density makes it visibly
     // softer than plain text. Keep the existing sqrt() heuristic for larger
     // scales, but clamp effect layers to full density so we preserve sharpness
     // without changing any display-size math.
-    if (! object.effects.empty()) return std::max(1.0f, std::sqrt(visual_scale));
+    if (render_contract.RequiresBridge()) return std::max(1.0f, std::sqrt(visual_scale));
     return std::sqrt(visual_scale);
 }
 
@@ -869,51 +886,6 @@ bool HasDirectionalTextScreenAnchor(const wpscene::WPTextObject& object) {
     if (! HasExplicitTextScreenAnchor(object)) return false;
     return TextAnchorContains(object.anchor, "left") || TextAnchorContains(object.anchor, "right") ||
            TextAnchorContains(object.anchor, "top") || TextAnchorContains(object.anchor, "bottom");
-}
-
-double ResolveBaseTextGeometryScale(double authoring_scale) {
-    const double scene_authoring_scale =
-        std::max(static_cast<double>(kMinTextVisualScaleFactor), authoring_scale);
-    return std::max(static_cast<double>(kMinTextVisualScaleFactor),
-                    scene_authoring_scale * scene_authoring_scale);
-}
-
-double ResolveMeasuredTextGeometryScale(const wpscene::WPTextObject& object,
-                                        double                       base_geometry_scale,
-                                        int                          measured_width,
-                                        int                          measured_height) {
-    if (!HasDirectionalTextScreenAnchor(object) || object.limitwidth ||
-        !object.size_explicit || object.size[0] <= 0.0f || object.size[1] <= 0.0f) {
-        return base_geometry_scale;
-    }
-
-    // Directionally anchored text is authored as HUD text: its explicit text box describes the
-    // intended screen-space contract, while very small orthographic projections are often only the
-    // game's coordinate system. Infer the glyph geometry scale from the text box after measuring the
-    // concrete font, so low-resolution HUD scenes keep their authored score/label size without
-    // reintroducing compositor scale into text geometry.
-    if (measured_height > 0) {
-        return std::max(base_geometry_scale,
-                        static_cast<double>(object.size[1]) /
-                            static_cast<double>(measured_height));
-    }
-    if (measured_width > 0) {
-        return std::max(base_geometry_scale,
-                        static_cast<double>(object.size[0]) /
-                            static_cast<double>(measured_width));
-    }
-    return base_geometry_scale;
-}
-
-std::array<float, 2> EstimateTextSourceSize(std::array<float, 2>         quad_size,
-                                            const wpscene::WPTextObject& object,
-                                            double                       render_scale) {
-    (void)render_scale;
-    const float raster_density = ResolveTextRasterDensityFactor(object);
-    return {
-        std::max(1.0f, static_cast<float>(std::lround(quad_size[0] * raster_density))),
-        std::max(1.0f, static_cast<float>(std::lround(quad_size[1] * raster_density))),
-    };
 }
 
 bool PropertyHasScriptOrAnimation(const nlohmann::json& json, const char* name) {
@@ -1099,10 +1071,16 @@ struct TextSurfaceCrop {
     bool applied { false };
 };
 
-TextSurfaceCrop ResolveTextSurfaceCrop(const wpscene::WPTextObject& object, int raster_width,
-                                       int raster_height, double raster_scale, int draw_x,
-                                       int draw_y, const PangoRectangle& ink_rect,
-                                       int crop_padding) {
+TextSurfaceCrop ResolveTextSurfaceCrop(
+    const wpscene::WPTextObject& object,
+    const TextLayerRenderContract& render_contract,
+    int raster_width,
+    int raster_height,
+    double raster_scale,
+    int draw_x,
+    int draw_y,
+    const PangoRectangle& ink_rect,
+    int crop_padding) {
     TextSurfaceCrop crop {
         .x       = 0,
         .y       = 0,
@@ -1114,7 +1092,7 @@ TextSurfaceCrop ResolveTextSurfaceCrop(const wpscene::WPTextObject& object, int 
     if (raster_width <= 0 || raster_height <= 0) {
         return crop;
     }
-    if (object.has_dynamic_layout_script && object.effects.empty()) {
+    if (object.has_dynamic_layout_script && !render_contract.RequiresBridge()) {
         return crop;
     }
 
@@ -1130,8 +1108,9 @@ TextSurfaceCrop ResolveTextSurfaceCrop(const wpscene::WPTextObject& object, int 
     int max_x = static_cast<int>(std::ceil(logical_max_x * raster_scale)) - 1;
     int max_y = static_cast<int>(std::ceil(logical_max_y * raster_scale)) - 1;
 
-    const int effect_margin =
-        object.effects.empty() ? 0 : std::max(1, static_cast<int>(std::ceil(raster_scale)));
+    const int effect_margin = render_contract.RequiresBridge()
+        ? std::max(1, static_cast<int>(std::ceil(raster_scale)))
+        : 0;
     crop.margin = std::max({ static_cast<int>(std::lround(std::max(crop_padding, 0) * raster_scale)),
                              effect_margin,
                              std::max(1, static_cast<int>(std::ceil(raster_scale))) });
@@ -1830,45 +1809,28 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
 }
 
 bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
+                             const TextLayerRenderContract& render_contract,
                              const std::string& texture_key, double render_scale,
-                             double authoring_scale,
                              TextRasterLayoutResult* out_image, std::string* out_error) {
     if (out_image == nullptr) return false;
 
-    const auto   input_size          = object.size;
-    const bool   input_size_explicit = object.size_explicit;
-    const auto   font_family      = ResolveFontFamily(vfs, object.font).value_or("Sans");
-    const auto   authored_padding = ResolveTextLayoutPadding(object);
-    const float  raster_density = ResolveTextRasterDensityFactor(object);
-    double scene_geometry_scale = ResolveBaseTextGeometryScale(authoring_scale);
-    double backing_scale = 1.0;
-    double raster_scale = 1.0;
-    double display_scale = 1.0;
-    double display_units_per_layout_unit = 1.0;
-    auto refresh_text_scales = [&]() {
-        backing_scale = std::max(std::max(1.0, render_scale), scene_geometry_scale);
-        raster_scale =
-            std::max(static_cast<double>(kMinTextVisualScaleFactor),
-                     backing_scale * static_cast<double>(raster_density));
-        display_scale = scene_geometry_scale /
-                        std::max(raster_scale,
-                                 static_cast<double>(kMinTextVisualScaleFactor));
-        display_units_per_layout_unit = raster_scale * display_scale;
-    };
-    refresh_text_scales();
-    // Text has two scale contracts. `scene_geometry_scale` is the Wallpaper Engine scene-space
-    // conversion for glyph geometry; it is derived from authored scene data and is therefore stable
-    // when the desktop logical scale changes. `render_scale` only raises backing atlas density above
-    // that scene contract, so HiDPI output can get sharper text without resizing glyph quads, effect
-    // bridge targets, or script-visible text boxes. Keeping `display_units_per_layout_unit` equal to
-    // `scene_geometry_scale` preserves authored results without tying those results to the
-    // compositor's scale value.
+    const auto  font_family      = ResolveFontFamily(vfs, object.font).value_or("Sans");
+    const auto  authored_padding = ResolveTextLayoutPadding(object, render_contract);
+    const float raster_density = ResolveTextRasterDensityFactor(object, render_contract);
+    const double backing_density =
+        std::max(static_cast<double>(kMinTextVisualScaleFactor),
+                 std::max(1.0, render_scale) * static_cast<double>(raster_density));
+    const double raster_scale = backing_density;
+    const double display_scale = 1.0 / backing_density;
+
+    // Wallpaper Engine pointsize is converted once, linearly, into authored text geometry. Object
+    // scale remains on SceneNode, scene projection remains on SceneCamera, and render_scale only
+    // changes `backing_density`; none of those independent quantities may feed back into the
+    // point-size conversion or the logical text box. This is why desktop density can sharpen an
+    // atlas without changing the text's visible scene-space size.
     auto scale_display_metric_to_layout_pixels = [&](double value, int minimum) {
         if (value <= 0.0) return minimum;
-        return std::max(minimum,
-                        static_cast<int>(
-                            std::lround(value / std::max(display_units_per_layout_unit,
-                                                          static_cast<double>(kMinTextVisualScaleFactor)))));
+        return std::max(minimum, static_cast<int>(std::lround(value)));
     };
     std::array<int32_t, 4> padding {
         scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[0]),
@@ -1880,8 +1842,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[3]),
                                               authored_padding[3] > 0 ? 1 : 0),
     };
-    int padding_horizontal = TextPaddingHorizontal(padding);
-    int padding_vertical   = TextPaddingVertical(padding);
+    const int padding_horizontal = TextPaddingHorizontal(padding);
+    const int padding_vertical   = TextPaddingVertical(padding);
 
     auto* measure_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 4, 4);
     auto* measure_cr      = cairo_create(measure_surface);
@@ -1891,7 +1853,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     ApplyTextResolution(measure_layout);
 
     pango_font_description_set_family(desc, font_family.c_str());
-    const double effective_point_size = std::max(1.0, static_cast<double>(object.pointsize));
+    const double effective_point_size =
+        std::max(1.0, static_cast<double>(object.pointsize) * kTextPointSizeToAuthoringUnits);
     ApplyWallpaperEngineTextSize(desc, effective_point_size);
     pango_layout_set_font_description(measure_layout, desc);
 
@@ -1913,25 +1876,6 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     const int ink_overhang_bottom = std::max((ink_rect.y + ink_rect.height) - layout_height, 0);
     const int bounds_width  = std::max(layout_width + ink_overhang_left + ink_overhang_right, 1);
     const int bounds_height = std::max(layout_height + ink_overhang_top + ink_overhang_bottom, 1);
-    const double measured_geometry_scale =
-        ResolveMeasuredTextGeometryScale(object, scene_geometry_scale, bounds_width, bounds_height);
-    if (std::abs(measured_geometry_scale - scene_geometry_scale) > 0.000001) {
-        scene_geometry_scale = measured_geometry_scale;
-        refresh_text_scales();
-        padding = {
-            scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[0]),
-                                                  authored_padding[0] > 0 ? 1 : 0),
-            scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[1]),
-                                                  authored_padding[1] > 0 ? 1 : 0),
-            scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[2]),
-                                                  authored_padding[2] > 0 ? 1 : 0),
-            scale_display_metric_to_layout_pixels(static_cast<double>(authored_padding[3]),
-                                                  authored_padding[3] > 0 ? 1 : 0),
-        };
-        padding_horizontal = TextPaddingHorizontal(padding);
-        padding_vertical   = TextPaddingVertical(padding);
-    }
-
     int resolved_width =
         scale_display_metric_to_layout_pixels(static_cast<double>(object.size[0]), 1);
     int resolved_height =
@@ -1942,10 +1886,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
                                     : std::max(bounds_width + padding_horizontal, 1);
         resolved_height = std::max(bounds_height + padding_vertical, 1);
         object.size     = {
-            static_cast<float>(static_cast<double>(resolved_width) *
-                               display_units_per_layout_unit),
-            static_cast<float>(static_cast<double>(resolved_height) *
-                               display_units_per_layout_unit),
+            static_cast<float>(resolved_width),
+            static_cast<float>(resolved_height),
         };
     } else if (! object.limitwidth) {
         // Non-width-limited text should never be clipped just because Linux font
@@ -1953,10 +1895,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         resolved_width  = std::max(resolved_width, bounds_width + padding_horizontal);
         resolved_height = std::max(resolved_height, bounds_height + padding_vertical);
         object.size     = {
-            static_cast<float>(static_cast<double>(resolved_width) *
-                               display_units_per_layout_unit),
-            static_cast<float>(static_cast<double>(resolved_height) *
-                               display_units_per_layout_unit),
+            static_cast<float>(resolved_width),
+            static_cast<float>(resolved_height),
         };
     }
 
@@ -2028,6 +1968,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
 
     const auto crop = ResolveTextSurfaceCrop(
         object,
+        render_contract,
         raster_width,
         raster_height,
         raster_scale,
@@ -2057,7 +1998,8 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     float visible_source_y = static_cast<float>(crop.y);
     float visible_source_width = static_cast<float>(crop.width);
     float visible_source_height = static_cast<float>(crop.height);
-    const bool normalized_direct_text = TextLayerUsesTightTransparentGlyphBounds(object);
+    const bool normalized_direct_text =
+        TextLayerUsesTightTransparentGlyphBounds(object, render_contract);
     if (normalized_direct_text) {
         const auto glyph_bounds = ResolveGlyphQuadSourceBounds(atlas_result->quads);
         if (glyph_bounds.valid) {
@@ -2099,8 +2041,16 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
         visible_source_width,
         visible_source_height,
     };
+    out_image->glyph_source_crop = {
+        visible_source_x,
+        visible_source_y,
+        visible_source_width,
+        visible_source_height,
+    };
     out_image->glyph_offset   = glyph_offset;
     out_image->display_offset = display_offset;
+    out_image->point_size_authoring_units = static_cast<float>(effective_point_size);
+    out_image->backing_density = static_cast<float>(backing_density);
     out_image->glyph_pages = atlas_result->pages;
     out_image->glyph_quads = atlas_result->quads;
 
@@ -2132,8 +2082,12 @@ std::array<float, 2> ResolveTextPlacementDisplaySize(const TextLayerRuntimeState
 }
 
 std::array<float, 2> ResolveTextLayerVisibleLocalCenter(const TextLayerRuntimeState& state) {
-    if (state.primitive == nullptr || state.object.opaquebackground) return { 0.0f, 0.0f };
+    if (state.primitive == nullptr || state.object.opaquebackground ||
+        state.render_contract.RequiresBridge()) {
+        return { 0.0f, 0.0f };
+    }
     return ResolveTextCropLocalCenter(state.object,
+                                      state.render_contract,
                                       state.object.origin,
                                       state.primitive->layout.glyph_offset);
 }
@@ -2210,15 +2164,22 @@ void RebuildTextMesh(SceneMesh* mesh, std::array<float, 2> size,
 }
 
 std::array<float, 2> ResolveTextVisibleLocalCenter(const SceneTextPrimitive& primitive) {
-    if (primitive.object.opaquebackground) return { 0.0f, 0.0f };
+    if (primitive.object.opaquebackground || primitive.render_contract.RequiresBridge()) {
+        return { 0.0f, 0.0f };
+    }
     return ResolveTextCropLocalCenter(primitive.object,
+                                      primitive.render_contract,
                                       primitive.object.origin,
                                       primitive.layout.glyph_offset);
 }
 
 std::array<float, 2> ResolveTextGlyphPageLocalOffset(const SceneTextPrimitive& primitive) {
-    if (primitive.object.opaquebackground) return primitive.layout.glyph_offset;
-    if (!primitive.object.effects.empty()) return { 0.0f, 0.0f };
+    if (primitive.object.opaquebackground || primitive.render_contract.RequiresBridge()) {
+        // Bridge cameras retain the logical text box. Glyph atlas quads therefore keep the measured
+        // crop-center offset inside that box instead of being recentered as though the crop were the
+        // complete source image.
+        return primitive.layout.glyph_offset;
+    }
     return ResolveTextVisibleLocalCenter(primitive);
 }
 
@@ -2789,23 +2750,31 @@ std::vector<SceneNode*> FindTextPrimitiveRuntimeNodes(Scene& scene, int32_t laye
     return nodes;
 }
 
-TextLayoutResult BuildCanonicalTextLayoutResult(const wpscene::WPTextObject& object,
-                                                const TextRasterLayoutResult& generated) {
+TextLayoutResult BuildCanonicalTextLayoutResult(
+    const wpscene::WPTextObject& object,
+    const TextLayerRenderContract& render_contract,
+    const TextRasterLayoutResult& generated) {
     TextLayoutResult result;
     result.logical_size = generated.logical_size;
     result.logical_source_size = generated.logical_source_size;
     result.glyph_display_size = generated.glyph_display_size;
     result.glyph_source_size = generated.glyph_source_size;
     result.glyph_offset = generated.glyph_offset;
-    result.visible_display_size = object.opaquebackground ? generated.logical_size
-                                                          : generated.glyph_display_size;
-    result.visible_source_size = object.opaquebackground ? generated.logical_source_size
-                                                         : generated.glyph_source_size;
+    result.glyph_source_crop = generated.glyph_source_crop;
+    result.point_size_authoring_units = generated.point_size_authoring_units;
+    result.backing_density = generated.backing_density;
+    const bool preserves_logical_box =
+        object.opaquebackground || render_contract.RequiresBridge();
+    result.visible_display_size = preserves_logical_box ? generated.logical_size
+                                                        : generated.glyph_display_size;
+    result.visible_source_size = preserves_logical_box ? generated.logical_source_size
+                                                       : generated.glyph_source_size;
     // The visible offset records where cropped glyph bounds sit relative to the authored logical
     // box. Node placement consumes the logical box instead; this offset remains available for
     // background composition, diagnostics, and compatibility with callers that need the crop delta.
-    result.visible_display_offset =
-        object.opaquebackground ? std::array<float, 2> { 0.0f, 0.0f } : generated.display_offset;
+    result.visible_display_offset = preserves_logical_box
+        ? std::array<float, 2> { 0.0f, 0.0f }
+        : generated.display_offset;
     result.glyph_pages.reserve(generated.glyph_pages.size());
     for (size_t page_index = 0; page_index < generated.glyph_pages.size(); page_index++) {
         result.glyph_pages.push_back(TextGlyphAtlasPage {
@@ -2955,6 +2924,7 @@ void SyncTextPrimitiveCanonicalState(TextLayerRuntimeState& state, bool rebuild_
     // preserved unless the caller explicitly requests a full layout rebuild.
     state.applied_alignment = ResolveTextLayerSceneAlignment(state.object);
     state.primitive->object = state.object;
+    state.primitive->render_contract = state.render_contract;
     state.primitive->layout.visible_display_size = ResolveVisibleTextDisplaySize(state);
     state.primitive->layout.visible_source_size = ResolveVisibleTextSourceSize(state);
     state.primitive->layout.visible_display_offset =
@@ -3065,6 +3035,59 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
         for (const auto& bridge_target : state.primitive->bridge.render_targets) {
             scene.MarkRenderTargetResourcesDirty(bridge_target.name);
         }
+
+        double camera_width = 0.0;
+        double camera_height = 0.0;
+        if (const auto camera_it = scene.cameras.find(state.primitive->bridge.camera_name);
+            camera_it != scene.cameras.end()) {
+            camera_width = camera_it->second->Width();
+            camera_height = camera_it->second->Height();
+        }
+        int32_t target_width = 0;
+        int32_t target_height = 0;
+        if (const auto target_it = scene.renderTargets.find(state.primitive->bridge.pingpong_a);
+            target_it != scene.renderTargets.end()) {
+            target_width = target_it->second.width;
+            target_height = target_it->second.height;
+        }
+        const auto& layout = state.primitive->layout;
+        const auto  center = next_geometry.visible_local_center;
+        const auto  size = next_geometry.visible_display_size;
+        LOG_INFO("SceneTextBridgeSync: layer=%d name='%s' camera='%s' "
+                 "camera-size=[%.3f %.3f] target='%s' target-size=[%d %d] "
+                 "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
+                 "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
+                 "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
+                 "source-crop=[%.3f %.3f %.3f %.3f] "
+                 "final-mesh-bounds=[%.3f %.3f]-[%.3f %.3f]",
+                 layer_id,
+                 state.object.name.c_str(),
+                 state.primitive->bridge.camera_name.c_str(),
+                 camera_width,
+                 camera_height,
+                 state.primitive->bridge.pingpong_a.c_str(),
+                 target_width,
+                 target_height,
+                 layout.logical_size[0],
+                 layout.logical_size[1],
+                 layout.logical_source_size[0],
+                 layout.logical_source_size[1],
+                 layout.glyph_display_size[0],
+                 layout.glyph_display_size[1],
+                 layout.glyph_source_size[0],
+                 layout.glyph_source_size[1],
+                 layout.glyph_offset[0],
+                 layout.glyph_offset[1],
+                 layout.visible_display_offset[0],
+                 layout.visible_display_offset[1],
+                 layout.glyph_source_crop[0],
+                 layout.glyph_source_crop[1],
+                 layout.glyph_source_crop[2],
+                 layout.glyph_source_crop[3],
+                 center[0] - size[0] * 0.5f,
+                 center[1] - size[1] * 0.5f,
+                 center[0] + size[0] * 0.5f,
+                 center[1] + size[1] * 0.5f);
     }
 
     return true;
@@ -3080,7 +3103,8 @@ bool SyncTextLayerSceneGeometry(Scene&                         scene,
         TextMetricChanged(previous_geometry.visible_local_center,
                           next_geometry.visible_local_center);
 
-    if (visible_local_center_changed && TextLayerUsesTightTransparentGlyphBounds(state.object)) {
+    if (visible_local_center_changed &&
+        TextLayerUsesTightTransparentGlyphBounds(state.object, state.render_contract)) {
         // Transform-only script writes can alter the projected crop center without changing shaped
         // glyph data. The canonical primitive therefore needs a mesh-only refresh: reuse the current
         // atlas/layout, rebuild local quad positions from the new transform inputs, and mark the
@@ -3125,9 +3149,9 @@ bool ApplyTextLayerObjectTransform(TextLayerRuntimeState& state,
 
 bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
                                         wpscene::WPTextObject&           object,
+                                        const TextLayerRenderContract&   render_contract,
                                         uint32_t                         texture_version,
                                         double                           render_scale,
-                                        double                           authoring_scale,
                                         std::shared_ptr<SceneTextPrimitive>* out_primitive,
                                         std::string*                     out_error) {
     if (out_primitive == nullptr) return false;
@@ -3135,9 +3159,9 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
     TextRasterLayoutResult generated;
     if (!RasterizeTextPrimitiveLayout(vfs,
                                       object,
+                                      render_contract,
                                       MakeTextLayerTextureKey(object.id),
                                       render_scale,
-                                      authoring_scale,
                                       &generated,
                                       out_error)) {
         return false;
@@ -3145,7 +3169,8 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
 
     auto primitive = std::make_shared<SceneTextPrimitive>();
     primitive->object = object;
-    primitive->layout = BuildCanonicalTextLayoutResult(object, generated);
+    primitive->render_contract = render_contract;
+    primitive->layout = BuildCanonicalTextLayoutResult(object, render_contract, generated);
     primitive->atlas_version = texture_version;
     primitive->background_mesh = BuildTextPrimitiveBackgroundMesh(*primitive);
     primitive->glyph_pages.reserve(primitive->layout.glyph_pages.size());
@@ -3161,6 +3186,44 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
             .mesh = BuildTextPrimitiveGlyphPageMesh(*primitive, static_cast<uint32_t>(page_index)),
         });
     }
+
+    const auto& layout = primitive->layout;
+    LOG_INFO("SceneTextLayoutContract: layer=%d name='%s' bridge=%s authored-effects=%s "
+             "shader-blend=%s pointsize=%.3f pointsize-authoring=%.3f conversion=%.3f "
+             "object-scale=[%.5f %.5f %.5f] render-scale=%.3f backing-density=%.3f "
+             "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
+             "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
+             "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
+             "source-crop=[%.3f %.3f %.3f %.3f]",
+             object.id,
+             object.name.c_str(),
+             render_contract.RequiresBridge() ? "true" : "false",
+             render_contract.has_materialized_authored_effects ? "true" : "false",
+             render_contract.uses_shader_color_blend_bridge ? "true" : "false",
+             object.pointsize,
+             layout.point_size_authoring_units,
+             static_cast<float>(kTextPointSizeToAuthoringUnits),
+             object.scale[0],
+             object.scale[1],
+             object.scale[2],
+             render_scale,
+             layout.backing_density,
+             layout.logical_size[0],
+             layout.logical_size[1],
+             layout.logical_source_size[0],
+             layout.logical_source_size[1],
+             layout.glyph_display_size[0],
+             layout.glyph_display_size[1],
+             layout.glyph_source_size[0],
+             layout.glyph_source_size[1],
+             layout.glyph_offset[0],
+             layout.glyph_offset[1],
+             layout.visible_display_offset[0],
+             layout.visible_display_offset[1],
+             layout.glyph_source_crop[0],
+             layout.glyph_source_crop[1],
+             layout.glyph_source_crop[2],
+             layout.glyph_source_crop[3]);
 
     *out_primitive = std::move(primitive);
     return true;
@@ -3184,15 +3247,15 @@ bool wallpaper::SyncTextLayerSceneMaterials(Scene& scene, int32_t layer_id) {
 
 bool wallpaper::RasterizeTextPrimitiveLayout(fs::VFS& vfs,
                                              wpscene::WPTextObject& object,
+                                             const TextLayerRenderContract& render_contract,
                                              const std::string& texture_key,
                                              double render_scale,
-                                             double authoring_scale,
                                              TextRasterLayoutResult* out_image,
                                              std::string* out_error) {
     // Production text rasterization is deliberately silent; failures travel through `out_error`
     // so callers can decide how to surface hard rasterization errors.
     return GenerateTextLayoutImage(
-        vfs, object, texture_key, render_scale, authoring_scale, out_image, out_error);
+        vfs, object, render_contract, texture_key, render_scale, out_image, out_error);
 }
 
 bool wallpaper::UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id) {
@@ -3364,9 +3427,9 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     std::shared_ptr<SceneTextPrimitive> rebuilt_primitive;
     if (!BuildSceneTextPrimitive(*scene.vfs,
                                  state.object,
+                                 state.render_contract,
                                  next_texture_version,
                                  scene.textRenderScale,
-                                 scene.textAuthoringScale,
                                  &rebuilt_primitive,
                                  &error)) {
         return false;

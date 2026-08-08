@@ -10,6 +10,7 @@
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
 #include "Utils/Algorism.h"
+#include "Utils/Logging.h"
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -46,6 +47,63 @@ struct MeshBounds2D {
     Vector3d center { Vector3d::Zero() };
     Vector2d halfExtent { Vector2d::Ones() };
 };
+
+struct MeshBounds3D {
+    bool valid { false };
+    Vector3f min { Vector3f::Zero() };
+    Vector3f max { Vector3f::Zero() };
+};
+
+Matrix4d ApplyMeshGeometryTransform(const Matrix4d& model, const SceneMesh* mesh) {
+    if (mesh == nullptr) return model;
+    return model * mesh->GeometryTransform().matrix().cast<double>();
+}
+
+MeshBounds3D ComputeSkinnedMeshBounds(const SceneMesh* mesh,
+                                      std::span<const Affine3f> skinning) {
+    if (mesh == nullptr || mesh->VertexCount() == 0 || skinning.empty()) return {};
+    const auto& vertex_array = mesh->GetVertexArray(0);
+    const auto offsets = vertex_array.GetAttrOffsetMap();
+    const auto position_it = offsets.find(std::string(WE_IN_POSITION));
+    const auto indices_it = offsets.find(std::string(WE_IN_BLENDINDICES));
+    const auto weights_it = offsets.find(std::string(WE_IN_BLENDWEIGHTS));
+    if (position_it == offsets.end() || indices_it == offsets.end() ||
+        weights_it == offsets.end() || vertex_array.Data() == nullptr) {
+        return {};
+    }
+
+    const usize stride = vertex_array.OneSize();
+    const usize position_offset = position_it->second.offset / sizeof(float);
+    const usize indices_offset = indices_it->second.offset / sizeof(float);
+    const usize weights_offset = weights_it->second.offset / sizeof(float);
+    const float* data = vertex_array.Data();
+    Vector3f bounds_min = Vector3f::Constant(std::numeric_limits<float>::infinity());
+    Vector3f bounds_max = Vector3f::Constant(-std::numeric_limits<float>::infinity());
+    bool valid = false;
+
+    for (usize vertex_index = 0; vertex_index < vertex_array.VertexCount(); vertex_index++) {
+        const usize base = vertex_index * stride;
+        const Vector3f bind_position(data + base + position_offset);
+        const auto* blend_indices = reinterpret_cast<const uint32_t*>(
+            data + base + indices_offset);
+        const float* blend_weights = data + base + weights_offset;
+        Vector3f skinned = Vector3f::Zero();
+        float total_weight = 0.0f;
+        for (usize influence = 0; influence < 4; influence++) {
+            const float weight = blend_weights[influence];
+            if (weight <= 0.0f || blend_indices[influence] >= skinning.size()) continue;
+            skinned += weight * (skinning[blend_indices[influence]] * bind_position);
+            total_weight += weight;
+        }
+        if (total_weight <= 0.0f) skinned = bind_position;
+        skinned = mesh->GeometryTransform() * skinned;
+        if (!skinned.allFinite()) continue;
+        bounds_min = bounds_min.cwiseMin(skinned);
+        bounds_max = bounds_max.cwiseMax(skinned);
+        valid = true;
+    }
+    return MeshBounds3D { .valid = valid, .min = bounds_min, .max = bounds_max };
+}
 
 float SanitizeMouseCoord(double value) {
     if (! std::isfinite(value)) return kDefaultMouseCoord;
@@ -477,6 +535,14 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         }
         if (nodeData.puppet_layer.hasPuppet() && info.has_BONES) {
             auto data = nodeData.puppet_layer.AdvanceIfNeeded(m_scene->frameTime, m_puppet_frame_serial);
+            if (nodeData.effect_projection_layer != nullptr &&
+                nodeData.effect_projection_mesh != nullptr && m_scene != nullptr) {
+                const auto bounds = ComputeSkinnedMeshBounds(pNode->Mesh(), data);
+                if (bounds.valid) {
+                    nodeData.effect_projection_layer->UpdatePuppetSurfaceBounds(
+                        *m_scene, bounds.min, bounds.max, m_puppet_frame_serial);
+                }
+            }
             if (m_scene->scriptHost) {
                 m_scene->scriptHost->NotifyAnimationLayersAdvanced(pNode);
             }
@@ -499,7 +565,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_VP) {
         updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
     }
-    if (reqM || reqMVP || reqLMM || reqEMVP || reqMI || reqMVPI || reqETVP || reqETVPI) {
+    if (reqM || reqAM || reqMVP || reqLMM || reqEMVP || reqMI || reqMVPI || reqETVP ||
+        reqETVPI) {
         Matrix4d modelTrans =
             transformResolver.ResolveParallaxedModelTransform(
                 pNode, model_parallax_camera, uniform_cam_name != "effect");
@@ -526,6 +593,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             }
         }
 
+        modelTrans = ApplyMeshGeometryTransform(modelTrans, pNode->Mesh());
+
         if (reqM) updateOp(G_M, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqAM) updateOp(G_AM, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqLMM) updateOp(G_LMM, ToDxcCBufferMatrixUniform(modelTrans));
@@ -548,7 +617,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                 projectionNode = nodeDataPtr->effect_projection_node;
                 projectionMesh = nodeDataPtr->effect_projection_mesh;
                 const_cast<SceneNode*>(projectionNode)->UpdateTrans();
-                projectionModelTrans = projectionNode->ModelTrans();
+                projectionModelTrans = ApplyMeshGeometryTransform(
+                    projectionNode->ModelTrans(), projectionMesh);
                 projectionViewPro    = m_scene->activeCamera->GetViewProjectionMatrix();
             }
 
