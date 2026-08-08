@@ -652,12 +652,19 @@ struct FinalShaderCapabilityEntry {
     FinalOutputCapability capability;
 };
 
-constexpr std::array<FinalShaderCapabilityEntry, 1> kFinalShaderCapabilities {{
+constexpr std::array<FinalShaderCapabilityEntry, 2> kFinalShaderCapabilities {{
     // Scroll evaluates UV/time in the authored layer projection. Running its visible raster in a
     // source-sized private target quantizes repeated pixel art before the layer is scaled to the
     // display. The capability is attached to the shader contract itself, never to a wallpaper,
     // texture name, or nearest-sampler heuristic.
     { "effects/scroll", FinalOutputCapability::SceneAuthoredWriter },
+    // X-Ray unprojects the normalized desktop cursor through the inverse authored layer MVP and
+    // divides the resulting local position by the source texture extent. A private effect-camera
+    // pass uses a 2x2 clip-space helper mesh whose XY MVP is identity, collapsing cursor movement
+    // to roughly one source texel before the neutral publication pass. Keep the authored final
+    // shader in scene space so its matrix, pointer coordinates, and visible layer geometry remain
+    // one coherent projection contract.
+    { "effects/xray", FinalOutputCapability::SceneAuthoredWriter },
 }};
 
 FinalOutputCapability ResolveFinalShaderCapability(std::string_view shader) {
