@@ -32,9 +32,10 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
-    // Geometry now shares the VS/FS structs directly and source normalization is token-aware.
-    // Prepared-source cache entries therefore belong to a new renderer ABI generation.
-    "prepared-shader-v21-dxc-shared-geometry-abi\n"
+    // Prepared shader sources now normalize malformed conditional directives before DXC sees
+    // them. Include that transform in the cache identity so an older prepared-source entry cannot
+    // bypass the sanitizer and reproduce the original preprocessing failure.
+    "prepared-shader-v22-dxc-conditional-directive-sanitize\n"
 };
 
 using namespace wallpaper;
@@ -2024,6 +2025,36 @@ inline std::string ApplyScreenSpaceTextureSampleYFlip(
     return result;
 }
 
+inline bool StripTrailingConditionalDirectiveSemicolon(std::string& line,
+                                                       size_t       first_non_ws) {
+    const auto directive = std::string_view(line).substr(first_non_ws);
+
+    size_t condition_begin { 0 };
+    if (StartsWithToken(directive, "#if")) {
+        condition_begin = first_non_ws + std::string_view("#if").size();
+    } else if (StartsWithToken(directive, "#elif")) {
+        condition_begin = first_non_ws + std::string_view("#elif").size();
+    } else {
+        return false;
+    }
+
+    // Some workshop shaders terminate a preprocessor condition like an ordinary statement, for
+    // example `#elif AUDIOSAMPLES == 32;`. DXC correctly rejects the semicolon as an invalid token
+    // in a preprocessor expression. Rewrite it only when it is the final non-whitespace token
+    // before an optional line comment; replacing it with a space preserves source line and column
+    // stability for subsequent diagnostics without touching semicolons inside shader code.
+    auto condition_end = line.find("//", condition_begin);
+    if (condition_end == std::string::npos) condition_end = line.size();
+    while (condition_end > condition_begin &&
+           std::isspace(static_cast<unsigned char>(line[condition_end - 1]))) {
+        condition_end--;
+    }
+    if (condition_end <= condition_begin || line[condition_end - 1] != ';') return false;
+
+    line[condition_end - 1] = ' ';
+    return true;
+}
+
 inline std::string SanitizeBrokenPreprocessorDirectives(const std::string& src,
                                                         ShaderType         type) {
     std::string out;
@@ -2042,10 +2073,14 @@ inline std::string SanitizeBrokenPreprocessorDirectives(const std::string& src,
         auto first_non_ws = line.find_first_not_of(" \t\r");
         bool handled      = false;
         if (first_non_ws != std::string::npos && line[first_non_ws] == '#') {
+            StripTrailingConditionalDirectiveSemicolon(line, first_non_ws);
+
             auto directive = line.substr(first_non_ws);
-            if (directive.rfind("#if", 0) == 0) {
+            if (StartsWithToken(directive, "#if") ||
+                StartsWithToken(directive, "#ifdef") ||
+                StartsWithToken(directive, "#ifndef")) {
                 if_stack.push_back(pos);
-            } else if (directive.rfind("#endif", 0) == 0) {
+            } else if (StartsWithToken(directive, "#endif")) {
                 if (if_stack.empty()) {
                     out.append(line.substr(0, first_non_ws));
                     out.append("// stripped unmatched #endif");
