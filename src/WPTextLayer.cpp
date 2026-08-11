@@ -2246,8 +2246,9 @@ uint32_t AlignTextBridgeBackingExtent(uint32_t required_extent) {
         std::min<uint64_t>(aligned, std::numeric_limits<uint32_t>::max()));
 }
 
-std::array<uint32_t, 2> ApplyTextBridgeRasterDensity(
+std::array<uint32_t, 2> ResolveTextBridgeRasterExtent(
     std::array<uint32_t, 2> projected_extent,
+    std::array<float, 2>    source_extent,
     float                   backing_density) {
     const double density = std::isfinite(backing_density)
         ? std::max(1.0, static_cast<double>(backing_density))
@@ -2257,14 +2258,22 @@ std::array<uint32_t, 2> ApplyTextBridgeRasterDensity(
      * A bridge is followed by at least one linearly filtered effect/composite pass. Allocating it
      * at exactly one texel per final output pixel throws away the supersampling already carried by
      * the glyph atlas, so small text becomes visibly softer even though its final quad dimensions
-     * are correct. Scale projected coverage by the primitive's raster density to retain that
-     * antialiasing headroom, while still avoiding the old allocation of the entire authored source
-     * rectangle for layers that are heavily downscaled by their node or camera transform.
+     * are correct. That supersampling is only meaningful up to the rasterized source resolution:
+     * multiplying a large screen projection by the full atlas density creates texels that contain
+     * no additional glyph detail and makes every downstream effect process the same interpolation
+     * repeatedly. Keep at least one bridge texel per projected output pixel, use the atlas density
+     * as antialiasing headroom while the layer is downscaled, and stop at the source resolution
+     * until screen coverage itself exceeds it.
      */
-    return {
-        ResolveProjectedPixelLength(static_cast<double>(projected_extent[0]) * density),
-        ResolveProjectedPixelLength(static_cast<double>(projected_extent[1]) * density),
-    };
+    std::array<uint32_t, 2> raster_extent {};
+    for (size_t axis = 0; axis < raster_extent.size(); axis++) {
+        const double projected = static_cast<double>(projected_extent[axis]);
+        const double source = std::max(1.0, static_cast<double>(source_extent[axis]));
+        const double supersampled = std::min(projected * density, source);
+        raster_extent[axis] = ResolveProjectedPixelLength(
+            std::max(projected, supersampled));
+    }
+    return raster_extent;
 }
 
 std::array<uint32_t, 2> StabilizeTextBridgeBackingExtent(
@@ -2416,8 +2425,9 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
     if (!projection.has_value()) return false;
 
     auto& bridge = state.primitive->bridge;
-    const auto density_adjusted_projection = ApplyTextBridgeRasterDensity(
-        *projection, state.primitive->layout.backing_density);
+    const auto source_extent = ResolveVisibleTextSourceSize(state);
+    const auto density_adjusted_projection = ResolveTextBridgeRasterExtent(
+        *projection, source_extent, state.primitive->layout.backing_density);
     const bool output_extent_changed =
         bridge.projected_output_extent != scene.physicalOutputExtent;
     const double backing_density = std::isfinite(state.primitive->layout.backing_density)
@@ -2471,7 +2481,8 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
         scene.MarkRenderTargetResourcesDirty(bridge_target.name);
         any_target_changed = true;
         LOG_INFO("SceneTextBridgeBacking: layer=%d name='%s' target='%s' "
-                 "output=[%u %u] projected=[%u %u] density=%.3f required=[%u %u] "
+                 "output=[%u %u] projected=[%u %u] source=[%.3f %.3f] "
+                 "density=%.3f required=[%u %u] "
                  "stable=[%u %u] "
                  "previous-physical=[%d %d] physical=[%d %d] "
                  "previous-logical=[%d %d] logical=[%d %d] scale=%u fit=%u feedback=%s",
@@ -2482,6 +2493,8 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
                  scene.physicalOutputExtent[1],
                  (*projection)[0],
                  (*projection)[1],
+                 source_extent[0],
+                 source_extent[1],
                  state.primitive->layout.backing_density,
                  density_adjusted_projection[0],
                  density_adjusted_projection[1],
