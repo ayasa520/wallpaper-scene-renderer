@@ -2,6 +2,10 @@ find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 pkg_check_modules(PANGOCAIRO REQUIRED pangocairo)
+# WPTextLayer directly uses PangoFcFontMap APIs. Keep pangoft2 on the static library's own link
+# interface so every consumer emits the DSO after libwescene-renderer.a; declaring it only on a
+# parent executable can place it before the archive and --as-needed will discard it too early.
+pkg_check_modules(PANGOFT2 REQUIRED pangoft2)
 pkg_check_modules(FONTCONFIG REQUIRED fontconfig)
 pkg_check_modules(FREETYPE2 REQUIRED freetype2)
 
@@ -81,17 +85,19 @@ target_link_libraries(
   ${PROJECT_NAME}
   PUBLIC wpUtils
   PRIVATE ${InteralLib} nlohmann_json ${LZ4_LIBRARIES} wpquickjs
-          ${PANGOCAIRO_LIBRARIES} ${FONTCONFIG_LIBRARIES} ${FREETYPE2_LIBRARIES}
+          ${PANGOCAIRO_LIBRARIES} ${PANGOFT2_LIBRARIES} ${FONTCONFIG_LIBRARIES} ${FREETYPE2_LIBRARIES}
           ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 
 target_include_directories(${PROJECT_NAME}
                            PUBLIC .
                                   Swapchain
                            PRIVATE ${PANGOCAIRO_INCLUDE_DIRS}
+                                   ${PANGOFT2_INCLUDE_DIRS}
                                    ${FONTCONFIG_INCLUDE_DIRS}
                                    ${FREETYPE2_INCLUDE_DIRS})
 target_compile_options(${PROJECT_NAME}
                        PRIVATE ${PANGOCAIRO_CFLAGS_OTHER}
+                               ${PANGOFT2_CFLAGS_OTHER}
                                ${FONTCONFIG_CFLAGS_OTHER}
                                ${FREETYPE2_CFLAGS_OTHER})
 set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
