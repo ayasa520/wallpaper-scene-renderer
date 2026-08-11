@@ -943,7 +943,8 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     auto width  = m_device->out_extent().width;
     auto height = m_device->out_extent().height;
 
-    if (width == 0) return;
+    if (width == 0 || height == 0) return;
+    scene.physicalOutputExtent = { width, height };
     double sw = scene.ortho[0], sh = scene.ortho[1];
     double fboAspect = width / (double)height, sAspect = sw / sh;
     auto&  gCam    = *scene.cameras.at("global");
@@ -1056,6 +1057,10 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     // visible frame. Re-apply those anchor transforms after camera framing so HUD-style text
     // remains inside the actual output instead of the uncropped project bounds.
     ApplyTextLayerScreenAnchorTransforms(scene);
+    // Text bridge images are final-screen-density resources, not glyph-atlas-density resources.
+    // Recompute them only after fill mode and screen anchors have produced the frame's authoritative
+    // camera and world transforms.
+    UpdateAllTextLayerBridgeBackings(scene);
 }
 
 void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {

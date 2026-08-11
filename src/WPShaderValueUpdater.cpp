@@ -282,6 +282,38 @@ void WPShaderValueUpdater::AdvanceAllPuppets() {
 
 void WPShaderValueUpdater::FrameEnd() {}
 
+Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
+    SceneNode* node, const SceneCamera* camera, bool apply_parallax) {
+    if (m_scene == nullptr || node == nullptr) return Matrix4d::Identity();
+
+    // Projection can run before render-graph refresh while ordinary uniform updates happen during
+    // draw. Isolated caches make this query observe the current node graph without consuming a
+    // matrix cached before a script changed an origin, scale, parent, or attachment in this frame.
+    Map<void*, Matrix4d> local_model_cache;
+    Map<void*, Vector3f> local_parallax_cache;
+    Map<void*, Affine3f> local_attachment_cache;
+    WPNodeTransformResolver transform_resolver(*m_scene,
+                                               m_parallax,
+                                               m_nodeDataMap,
+                                               local_model_cache,
+                                               local_parallax_cache,
+                                               local_attachment_cache,
+                                               camera,
+                                               m_mousePos,
+                                               m_puppet_frame_serial);
+
+    if (const auto* node_data = GetNodeData(node); node_data != nullptr) {
+        transform_resolver.UpdateAttachmentParentIfNeeded(*node_data);
+        if (const auto local_transform =
+                transform_resolver.ResolveAttachmentLocalTransform(node);
+            local_transform.has_value()) {
+            node->SetLocalAffine(*local_transform);
+        }
+    }
+
+    return transform_resolver.ResolveParallaxedModelTransform(node, camera, apply_parallax);
+}
+
 void WPShaderValueUpdater::MouseInput(double x, double y) {
     m_mousePosInput[0] = SanitizeMouseCoord(x);
     m_mousePosInput[1] = SanitizeMouseCoord(y);

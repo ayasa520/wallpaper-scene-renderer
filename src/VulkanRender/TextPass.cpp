@@ -136,7 +136,9 @@ struct PSInput {
 };
 
 float4 main_ps(PSInput input) : SV_Target0 {
-    const float coverage = g_Texture0.Sample(g_Texture0_ww_sampler, input.v_TexCoord).a;
+    // Glyph atlas pages use R8 coverage. The shared background texture is white in every channel,
+    // so reading red keeps glyph and background draws on the same dedicated text pipeline.
+    const float coverage = g_Texture0.Sample(g_Texture0_ww_sampler, input.v_TexCoord).r;
     return float4(input.v_Color.rgb, input.v_Color.a * coverage);
 }
 )";

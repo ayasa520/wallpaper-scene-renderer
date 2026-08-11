@@ -48,6 +48,7 @@ constexpr double kTextPointSizeToAuthoringUnits { 4.0 };
 constexpr float  kMinTextVisualScaleFactor { 0.0625f };
 constexpr int    kTextGlyphAtlasMaxExtent { 1024 };
 constexpr int    kTextGlyphAtlasPadding { 1 };
+constexpr uint32_t kTextBridgeBackingAlignment { 16u };
 constexpr float  kScreenAnchoredTextStackGap { 1.0f };
 constexpr float  kTextPlacementEpsilon { 0.000001f };
 
@@ -752,37 +753,51 @@ std::array<float, 2> ResolveVisibleTextSourceSize(const TextLayerRuntimeState& s
     return state.object.size;
 }
 
-std::array<float, 2> ResolveEffectDependencyTextSourceSize(const TextLayerRuntimeState& state) {
-    // A bridge source is the authored logical text box even though its glyph coverage comes from
-    // tightly packed atlas pages. VisibleSourceSize() is contract-resolved to that logical extent,
-    // so effect FBOs, the bridge target, camera, and final mesh all share one source rectangle.
-    return ResolveVisibleTextSourceSize(state);
+std::array<int32_t, 2> RoundTextExtent(std::array<float, 2> extent) {
+    auto round_axis = [](float value) {
+        if (!std::isfinite(value)) return int32_t { 1 };
+        const double clamped = std::clamp(
+            static_cast<double>(value),
+            1.0,
+            static_cast<double>(std::numeric_limits<int32_t>::max()));
+        return static_cast<int32_t>(std::lround(clamped));
+    };
+    return { round_axis(extent[0]), round_axis(extent[1]) };
 }
 
-bool GrowTextDependencyRenderTarget(SceneRenderTarget& render_target,
-                                    std::array<float, 2> desired_source_size) {
-    // A formal text source bridge always renders into an exact-size offscreen texture. Unlike the
-    // old grow-only bucket path, the physical Vulkan target and the logical text source rectangle
-    // are intentionally identical, so later effect shaders never need text-specific UV or
-    // resolution compensation to recover the authored content width.
-    const int32_t next_width =
-        std::max(1, static_cast<int32_t>(std::lround(std::max(1.0f, desired_source_size[0]))));
-    const int32_t next_height =
-        std::max(1, static_cast<int32_t>(std::lround(std::max(1.0f, desired_source_size[1]))));
-    const bool changed = next_width != render_target.width || next_height != render_target.height ||
-                         next_width != render_target.mapWidth ||
-                         next_height != render_target.mapHeight;
-    render_target.width = next_width;
-    render_target.height = next_height;
-    render_target.mapWidth = next_width;
-    render_target.mapHeight = next_height;
+bool UpdateTextDependencyRenderTarget(SceneRenderTarget&  render_target,
+                                      std::array<float, 2> physical_extent,
+                                      std::array<float, 2> logical_extent) {
+    /*
+     * Projected text bridges deliberately decouple two resolution domains:
+     *
+     *  - width/height are the Vulkan backing pixels needed for projected screen coverage at the
+     *    text raster density;
+     *  - mapWidth/mapHeight are the authored effect grid represented by that backing.
+     *
+     * Wallpaper Engine shaders derive kernel offsets from g_TextureNResolution. Collapsing the
+     * logical grid to the projected backing makes blur, displacement, and convolution strength
+     * change whenever a parent scales the layer. Retaining the authored grid preserves the effect
+     * contract while the physical extent avoids allocating the full authored rectangle for text
+     * that occupies only a small portion of the final output.
+     */
+    const auto physical = RoundTextExtent(physical_extent);
+    const auto logical = RoundTextExtent(logical_extent);
+    const bool changed = physical[0] != render_target.width ||
+                         physical[1] != render_target.height ||
+                         logical[0] != render_target.mapWidth ||
+                         logical[1] != render_target.mapHeight;
+    render_target.width     = physical[0];
+    render_target.height    = physical[1];
+    render_target.mapWidth  = logical[0];
+    render_target.mapHeight = logical[1];
     return changed;
 }
 
-std::array<float, 2> ResolveTextBridgeRenderTargetSourceSize(
-    const TextBridgeRenderTarget& bridge_target, std::array<float, 2> dependency_source_size) {
-    const float source_width  = std::max(1.0f, dependency_source_size[0]);
-    const float source_height = std::max(1.0f, dependency_source_size[1]);
+std::array<float, 2> ResolveTextBridgeRenderTargetExtent(
+    const TextBridgeRenderTarget& bridge_target, std::array<float, 2> bridge_extent) {
+    const float source_width  = std::max(1.0f, bridge_extent[0]);
+    const float source_height = std::max(1.0f, bridge_extent[1]);
 
     if (bridge_target.fit > 0) {
         const float longest_edge = std::max(source_width, source_height);
@@ -1177,11 +1192,12 @@ void NormalizeGlyphQuadSourceBounds(std::vector<TextRasterLayoutResult::GlyphQua
     }
 }
 
-std::shared_ptr<Image> BuildImageFromRgbaPixels(const std::string&             texture_key,
-                                                int                            width,
-                                                int                            height,
-                                                std::unique_ptr<uint8_t[]> rgba) {
-    if (width <= 0 || height <= 0 || rgba == nullptr) return nullptr;
+std::shared_ptr<Image> BuildImageFromCoveragePixels(
+    const std::string& texture_key,
+    int                width,
+    int                height,
+    std::unique_ptr<uint8_t[]> coverage) {
+    if (width <= 0 || height <= 0 || coverage == nullptr) return nullptr;
 
     auto image                     = std::make_shared<Image>();
     image->key                     = texture_key;
@@ -1190,7 +1206,7 @@ std::shared_ptr<Image> BuildImageFromRgbaPixels(const std::string&             t
     image->header.mapWidth         = width;
     image->header.mapHeight        = height;
     image->header.count            = 1;
-    image->header.format           = TextureFormat::RGBA8;
+    image->header.format           = TextureFormat::R8;
     image->header.type             = ImageType::PNG;
     image->header.sample.wrapS     = TextureWrap::CLAMP_TO_EDGE;
     image->header.sample.wrapT     = TextureWrap::CLAMP_TO_EDGE;
@@ -1203,9 +1219,9 @@ std::shared_ptr<Image> BuildImageFromRgbaPixels(const std::string&             t
     ImageData mipmap;
     mipmap.width  = width;
     mipmap.height = height;
-    mipmap.size =
-        static_cast<isize>(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
-    mipmap.data = ImageDataPtr(rgba.release(), [](uint8_t* ptr) {
+    mipmap.size = static_cast<isize>(
+        static_cast<size_t>(width) * static_cast<size_t>(height));
+    mipmap.data = ImageDataPtr(coverage.release(), [](uint8_t* ptr) {
         delete[] ptr;
     });
     image->slots[0].mipmaps.push_back(std::move(mipmap));
@@ -1217,7 +1233,7 @@ struct TextGlyphBitmap {
     int                       height { 0 };
     int                       origin_x_px { 0 };
     int                       origin_y_px { 0 };
-    std::unique_ptr<uint8_t[]> rgba;
+    std::unique_ptr<uint8_t[]> coverage;
 };
 
 struct TextGlyphOccurrence {
@@ -1448,29 +1464,18 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     const int width = std::max(1, crop_max_x - crop_min_x + 1);
     const int height = std::max(1, crop_max_y - crop_min_y + 1);
 
-    auto rgba = std::unique_ptr<uint8_t[]>(
-        new uint8_t[static_cast<size_t>(width) * static_cast<size_t>(height) * 4]);
+    // Text color is applied by TextPass, so the glyph payload only needs one coverage byte per
+    // texel. Keeping duplicate RGB channels here would multiply the same data through the glyph
+    // cache, atlas pages, Vulkan staging buffers, and resident images without changing output.
+    auto coverage_pixels = std::unique_ptr<uint8_t[]>(
+        new uint8_t[static_cast<size_t>(width) * static_cast<size_t>(height)]);
     for (int y = 0; y < height; y++) {
         const auto* src_row = data + stride * (crop_min_y + y);
-        auto*       dst_row =
-            rgba.get() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+        auto* dst_row =
+            coverage_pixels.get() + static_cast<size_t>(y) * static_cast<size_t>(width);
         for (int x = 0; x < width; x++) {
             const auto* src = src_row + (crop_min_x + x) * 4;
-            auto*       dst = dst_row + x * 4;
-            const uint8_t b = src[0];
-            const uint8_t g = src[1];
-            const uint8_t r = src[2];
-            const uint8_t a = src[3];
-
-            if (a == 0) {
-                dst[0] = dst[1] = dst[2] = dst[3] = 0;
-                continue;
-            }
-
-            dst[0] = static_cast<uint8_t>(std::min(255, (static_cast<int>(r) * 255) / a));
-            dst[1] = static_cast<uint8_t>(std::min(255, (static_cast<int>(g) * 255) / a));
-            dst[2] = static_cast<uint8_t>(std::min(255, (static_cast<int>(b) * 255) / a));
-            dst[3] = a;
+            dst_row[x] = src[3];
         }
     }
 
@@ -1483,7 +1488,7 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     bitmap->height = height;
     bitmap->origin_x_px = scratch_min_x_px + crop_min_x;
     bitmap->origin_y_px = scratch_min_y_px + crop_min_y;
-    bitmap->rgba = std::move(rgba);
+    bitmap->coverage = std::move(coverage_pixels);
     (void)out_error;
     return bitmap;
 }
@@ -1514,26 +1519,24 @@ std::shared_ptr<TextGlyphBitmap> GetOrCreateTextGlyphBitmap(PangoFont*   font,
     return it->second;
 }
 
-void CopyGlyphBitmapIntoAtlas(uint8_t*                 dst_rgba,
+void CopyGlyphBitmapIntoAtlas(uint8_t*                 dst_coverage,
                               int                      dst_width,
                               int                      dst_height,
                               int                      dst_x,
                               int                      dst_y,
                               const TextGlyphBitmap& source) {
-    if (dst_rgba == nullptr || source.rgba == nullptr) return;
+    if (dst_coverage == nullptr || source.coverage == nullptr) return;
     if (source.width <= 0 || source.height <= 0) return;
 
     auto copy_pixel = [&](int dst_px, int dst_py, int src_px, int src_py) {
         if (dst_px < 0 || dst_py < 0 || dst_px >= dst_width || dst_py >= dst_height) return;
         const auto src_index =
-            (static_cast<size_t>(src_py) * static_cast<size_t>(source.width) +
-             static_cast<size_t>(src_px)) *
-            4;
+            static_cast<size_t>(src_py) * static_cast<size_t>(source.width) +
+            static_cast<size_t>(src_px);
         const auto dst_index =
-            (static_cast<size_t>(dst_py) * static_cast<size_t>(dst_width) +
-             static_cast<size_t>(dst_px)) *
-            4;
-        std::copy_n(source.rgba.get() + src_index, 4, dst_rgba + dst_index);
+            static_cast<size_t>(dst_py) * static_cast<size_t>(dst_width) +
+            static_cast<size_t>(dst_px);
+        dst_coverage[dst_index] = source.coverage[src_index];
     };
 
     for (int y = 0; y < source.height; y++) {
@@ -1683,7 +1686,7 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
         int                        row_height { 0 };
         int                        used_width { 0 };
         int                        used_height { 0 };
-        std::unique_ptr<uint8_t[]> rgba;
+        std::unique_ptr<uint8_t[]> coverage;
     };
 
     const int max_bitmap_width =
@@ -1703,10 +1706,10 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
         AtlasPageBuffer page;
         page.width = target_page_width;
         page.height = kTextGlyphAtlasMaxExtent;
-        page.rgba = std::unique_ptr<uint8_t[]>(
-            new uint8_t[static_cast<size_t>(page.width) * static_cast<size_t>(page.height) * 4]);
-        std::fill_n(page.rgba.get(),
-                    static_cast<size_t>(page.width) * static_cast<size_t>(page.height) * 4,
+        page.coverage = std::unique_ptr<uint8_t[]>(
+            new uint8_t[static_cast<size_t>(page.width) * static_cast<size_t>(page.height)]);
+        std::fill_n(page.coverage.get(),
+                    static_cast<size_t>(page.width) * static_cast<size_t>(page.height),
                     0);
         atlas_pages.push_back(std::move(page));
         return atlas_pages.back();
@@ -1734,7 +1737,7 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
 
         const int atlas_x = current_page->cursor_x + kTextGlyphAtlasPadding;
         const int atlas_y = current_page->cursor_y + kTextGlyphAtlasPadding;
-        CopyGlyphBitmapIntoAtlas(current_page->rgba.get(),
+        CopyGlyphBitmapIntoAtlas(current_page->coverage.get(),
                                  current_page->width,
                                  current_page->height,
                                  atlas_x,
@@ -1763,20 +1766,21 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
         auto& page = atlas_pages[page_index];
         const int image_width = std::max(1, page.used_width);
         const int image_height = std::max(1, page.used_height);
-        auto trimmed_rgba = std::unique_ptr<uint8_t[]>(
-            new uint8_t[static_cast<size_t>(image_width) * static_cast<size_t>(image_height) * 4]);
+        auto trimmed_coverage = std::unique_ptr<uint8_t[]>(
+            new uint8_t[static_cast<size_t>(image_width) * static_cast<size_t>(image_height)]);
         for (int y = 0; y < image_height; y++) {
-            std::copy_n(page.rgba.get() + static_cast<size_t>(y) * static_cast<size_t>(page.width) * 4,
-                        static_cast<size_t>(image_width) * 4,
-                        trimmed_rgba.get() +
-                            static_cast<size_t>(y) * static_cast<size_t>(image_width) * 4);
+            std::copy_n(page.coverage.get() +
+                            static_cast<size_t>(y) * static_cast<size_t>(page.width),
+                        static_cast<size_t>(image_width),
+                        trimmed_coverage.get() +
+                            static_cast<size_t>(y) * static_cast<size_t>(image_width));
         }
         result.pages.push_back(TextRasterLayoutResult::GlyphPage {
-            .image = BuildImageFromRgbaPixels(texture_key + "__glyph_page_" +
-                                                  std::to_string(page_index),
-                                              image_width,
-                                              image_height,
-                                              std::move(trimmed_rgba)),
+            .image = BuildImageFromCoveragePixels(texture_key + "__glyph_page_" +
+                                                      std::to_string(page_index),
+                                                  image_width,
+                                                  image_height,
+                                                  std::move(trimmed_coverage)),
             .source_size = {
                 static_cast<float>(image_width),
                 static_cast<float>(image_height),
@@ -2191,6 +2195,306 @@ bool IsCameraLinkedFromScene(const Scene& scene, std::string_view camera_name) {
         });
 }
 
+uint32_t ResolveProjectedPixelLength(double length) {
+    // The backing represents local texel density rather than the quad's phase against the output
+    // pixel grid. Measuring edge length makes allocation invariant under rigid translation. Values
+    // that differ from an integer only by matrix round-off are normalized before the final ceil so
+    // a stable transform cannot manufacture a one-pixel resize.
+    const double span = std::max(0.0, length);
+    const double integer_span = std::round(span);
+    const double tolerance =
+        std::numeric_limits<double>::epsilon() * std::max(1.0, span) * 32.0;
+    const double stable_span =
+        std::abs(span - integer_span) <= tolerance ? integer_span : span;
+    const double extent = std::max(1.0, std::ceil(stable_span));
+    return static_cast<uint32_t>(
+        std::min(extent, static_cast<double>(std::numeric_limits<uint32_t>::max())));
+}
+
+double ResolveProjectedEdgeDensityLength(const Eigen::Vector2d& first,
+                                         const Eigen::Vector2d& second,
+                                         double                 first_clip_w,
+                                         double                 second_clip_w) {
+    const double projected_length = (second - first).norm();
+    const double minimum_w = std::min(first_clip_w, second_clip_w);
+    const double maximum_w = std::max(first_clip_w, second_clip_w);
+    if (!std::isfinite(projected_length) || !std::isfinite(minimum_w) ||
+        !std::isfinite(maximum_w) || minimum_w <= 0.0) {
+        return 0.0;
+    }
+
+    // Perspective interpolation is non-linear along an edge. Endpoint distance describes average
+    // density; max(w) / min(w) converts it to the maximum endpoint derivative for a projective
+    // line. Orthographic projection naturally keeps the factor at one.
+    return projected_length * (maximum_w / minimum_w);
+}
+
+uint32_t AlignTextBridgeBackingExtent(uint32_t required_extent) {
+    const uint64_t required = std::max<uint64_t>(required_extent, 1u);
+    const uint64_t aligned =
+        ((required + kTextBridgeBackingAlignment - 1u) / kTextBridgeBackingAlignment) *
+        kTextBridgeBackingAlignment;
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(aligned, std::numeric_limits<uint32_t>::max()));
+}
+
+std::array<uint32_t, 2> ApplyTextBridgeRasterDensity(
+    std::array<uint32_t, 2> projected_extent,
+    float                   backing_density) {
+    const double density = std::isfinite(backing_density)
+        ? std::max(1.0, static_cast<double>(backing_density))
+        : 1.0;
+
+    /*
+     * A bridge is followed by at least one linearly filtered effect/composite pass. Allocating it
+     * at exactly one texel per final output pixel throws away the supersampling already carried by
+     * the glyph atlas, so small text becomes visibly softer even though its final quad dimensions
+     * are correct. Scale projected coverage by the primitive's raster density to retain that
+     * antialiasing headroom, while still avoiding the old allocation of the entire authored source
+     * rectangle for layers that are heavily downscaled by their node or camera transform.
+     */
+    return {
+        ResolveProjectedPixelLength(static_cast<double>(projected_extent[0]) * density),
+        ResolveProjectedPixelLength(static_cast<double>(projected_extent[1]) * density),
+    };
+}
+
+std::array<uint32_t, 2> StabilizeTextBridgeBackingExtent(
+    std::array<uint32_t, 2> required_extent,
+    std::array<uint32_t, 2> current_extent,
+    std::array<uint32_t, 2> backing_limit,
+    bool                    reset_for_output_change) {
+    std::array<uint32_t, 2> stable_extent {};
+    for (size_t axis = 0; axis < stable_extent.size(); axis++) {
+        const uint32_t required = std::max(required_extent[axis], 1u);
+        const uint32_t aligned = std::min(
+            AlignTextBridgeBackingExtent(required), std::max(backing_limit[axis], 1u));
+        const uint32_t current = current_extent[axis];
+
+        if (reset_for_output_change || current == 0u || aligned > current) {
+            stable_extent[axis] = aligned;
+            continue;
+        }
+
+        // Audio-driven scale often oscillates across one 16-pixel bucket boundary. Recreating two
+        // ping-pong images on every crossing is more expensive than retaining that small margin.
+        // A shrink larger than 40% still releases a genuine content/output-scale peak instead of
+        // keeping a lifetime high-water allocation. The target wallpaper's authored 0.9..1.1 audio
+        // scale crosses the 25% range once projection and integer buckets are included, so a lower
+        // threshold would continuously recreate both ping-pong images during normal playback.
+        const bool substantial_shrink =
+            static_cast<uint64_t>(required) * 5u < static_cast<uint64_t>(current) * 3u;
+        stable_extent[axis] = substantial_shrink ? aligned : current;
+    }
+    return stable_extent;
+}
+
+bool TextLayerNeedsBridgeResidency(const Scene& scene, int32_t layer_id) {
+    return scene.IsLayerVisible(layer_id) ||
+           scene.offscreenDependencyLayerIds.count(layer_id) != 0;
+}
+
+std::optional<std::array<uint32_t, 2>> ResolveTextBridgeProjection(
+    Scene& scene, int32_t layer_id, const TextLayerRuntimeState& state) {
+    if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
+        scene.activeCamera == nullptr || scene.shaderValueUpdater == nullptr ||
+        scene.physicalOutputExtent[0] == 0u || scene.physicalOutputExtent[1] == 0u) {
+        return std::nullopt;
+    }
+
+    const auto node_it = scene.layerNodes.find(layer_id);
+    if (node_it == scene.layerNodes.end() || node_it->second == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto logical_extent = ResolveVisibleTextDisplaySize(state);
+    if (!std::isfinite(logical_extent[0]) || !std::isfinite(logical_extent[1]) ||
+        !(logical_extent[0] > 0.0f) || !(logical_extent[1] > 0.0f)) {
+        return std::nullopt;
+    }
+
+    const Eigen::Matrix4d model =
+        scene.shaderValueUpdater->ResolveModelTransformForProjection(
+            node_it->second, scene.activeCamera, true);
+    const Eigen::Matrix4d local_to_clip =
+        scene.activeCamera->GetViewProjectionMatrix() * model;
+
+    std::array<uint32_t, 2> backing_extent { 1u, 1u };
+    const uint32_t maximum_edge_extent = ResolveProjectedPixelLength(std::hypot(
+        static_cast<double>(scene.physicalOutputExtent[0]),
+        static_cast<double>(scene.physicalOutputExtent[1])));
+
+    const double half_width = static_cast<double>(logical_extent[0]) * 0.5;
+    const double half_height = static_cast<double>(logical_extent[1]) * 0.5;
+    const std::array<Eigen::Vector4d, 4> corners {
+        Eigen::Vector4d { -half_width, -half_height, 0.0, 1.0 },
+        Eigen::Vector4d { -half_width, half_height, 0.0, 1.0 },
+        Eigen::Vector4d { half_width, -half_height, 0.0, 1.0 },
+        Eigen::Vector4d { half_width, half_height, 0.0, 1.0 },
+    };
+
+    constexpr double kMinimumClipW = 1e-6;
+    std::array<Eigen::Vector4d, 4> clip_corners;
+    size_t front_corner_count = 0;
+    for (size_t index = 0; index < corners.size(); index++) {
+        clip_corners[index] = local_to_clip * corners[index];
+        if (std::isfinite(clip_corners[index].w()) &&
+            clip_corners[index].w() > kMinimumClipW) {
+            front_corner_count++;
+        }
+    }
+
+    if (front_corner_count == 0) {
+        // A quad entirely behind a perspective camera has no screen coverage. A one-pixel backing
+        // keeps the stable render-target identity valid until it moves back into view.
+    } else if (front_corner_count != corners.size()) {
+        // An edge crossing the camera plane is unbounded before clipping. The maximum visible
+        // output-edge length is the conservative finite allocation for that transient state.
+        backing_extent = { maximum_edge_extent, maximum_edge_extent };
+    } else {
+        std::array<Eigen::Vector2d, 4> pixel_corners;
+        for (size_t index = 0; index < clip_corners.size(); index++) {
+            const auto& clip = clip_corners[index];
+            const double ndc_x = clip.x() / clip.w();
+            const double ndc_y = clip.y() / clip.w();
+            if (!std::isfinite(ndc_x) || !std::isfinite(ndc_y)) {
+                return std::nullopt;
+            }
+            pixel_corners[index] = Eigen::Vector2d {
+                (ndc_x * 0.5 + 0.5) * static_cast<double>(scene.physicalOutputExtent[0]),
+                (ndc_y * 0.5 + 0.5) * static_cast<double>(scene.physicalOutputExtent[1]),
+            };
+        }
+
+        // Backing X/Y correspond to the text quad's local U/V axes, not to a screen-space AABB.
+        // Measuring both opposite local edges preserves density under rotation, non-uniform scale,
+        // shear, and perspective without allocating both AABB dimensions at a 45-degree rotation.
+        const double projected_u_length = std::max(
+            ResolveProjectedEdgeDensityLength(pixel_corners[0],
+                                              pixel_corners[2],
+                                              clip_corners[0].w(),
+                                              clip_corners[2].w()),
+            ResolveProjectedEdgeDensityLength(pixel_corners[1],
+                                              pixel_corners[3],
+                                              clip_corners[1].w(),
+                                              clip_corners[3].w()));
+        const double projected_v_length = std::max(
+            ResolveProjectedEdgeDensityLength(pixel_corners[0],
+                                              pixel_corners[1],
+                                              clip_corners[0].w(),
+                                              clip_corners[1].w()),
+            ResolveProjectedEdgeDensityLength(pixel_corners[2],
+                                              pixel_corners[3],
+                                              clip_corners[2].w(),
+                                              clip_corners[3].w()));
+        backing_extent = {
+            std::min(ResolveProjectedPixelLength(projected_u_length), maximum_edge_extent),
+            std::min(ResolveProjectedPixelLength(projected_v_length), maximum_edge_extent),
+        };
+    }
+
+    return backing_extent;
+}
+
+bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
+                                          int32_t layer_id,
+                                          TextLayerRuntimeState& state) {
+    if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
+        !TextLayerNeedsBridgeResidency(scene, layer_id)) {
+        return false;
+    }
+
+    const auto projection = ResolveTextBridgeProjection(scene, layer_id, state);
+    if (!projection.has_value()) return false;
+
+    auto& bridge = state.primitive->bridge;
+    const auto density_adjusted_projection = ApplyTextBridgeRasterDensity(
+        *projection, state.primitive->layout.backing_density);
+    const bool output_extent_changed =
+        bridge.projected_output_extent != scene.physicalOutputExtent;
+    const double backing_density = std::isfinite(state.primitive->layout.backing_density)
+        ? std::max(1.0, static_cast<double>(state.primitive->layout.backing_density))
+        : 1.0;
+    const uint32_t maximum_edge_extent = ResolveProjectedPixelLength(
+        std::hypot(static_cast<double>(scene.physicalOutputExtent[0]),
+                   static_cast<double>(scene.physicalOutputExtent[1])) *
+        backing_density);
+    const auto next_backing_extent = StabilizeTextBridgeBackingExtent(
+        density_adjusted_projection,
+        bridge.bridge_backing_extent,
+        { maximum_edge_extent, maximum_edge_extent },
+        output_extent_changed);
+    bridge.bridge_backing_extent = next_backing_extent;
+    bridge.projected_output_extent = scene.physicalOutputExtent;
+
+    bool any_target_changed = false;
+    const auto bridge_logical_extent = ResolveVisibleTextDisplaySize(state);
+    for (const auto& bridge_target : bridge.render_targets) {
+        auto render_target_it = scene.renderTargets.find(bridge_target.name);
+        if (render_target_it == scene.renderTargets.end()) continue;
+        auto& render_target = render_target_it->second;
+        if (render_target.bind.enable) continue;
+
+        const auto target_logical_extent =
+            ResolveTextBridgeRenderTargetExtent(bridge_target, bridge_logical_extent);
+        // Fixed-fit targets are authored absolute resolutions, while feedback targets retain
+        // history across frames. Both remain in the authored effect domain. Ordinary transient
+        // targets follow projected coverage and carry the authored grid separately in mapWidth/
+        // mapHeight so shader kernel strength remains unchanged.
+        const auto target_physical_extent =
+            bridge_target.fit > 0 || bridge_target.persistent_feedback
+            ? target_logical_extent
+            : ResolveTextBridgeRenderTargetExtent(
+                  bridge_target,
+                  { static_cast<float>(next_backing_extent[0]),
+                    static_cast<float>(next_backing_extent[1]) });
+
+        const auto previous_extent = std::array<int32_t, 4> {
+            render_target.width,
+            render_target.height,
+            render_target.ContentWidth(),
+            render_target.ContentHeight(),
+        };
+        if (!UpdateTextDependencyRenderTarget(
+                render_target, target_physical_extent, target_logical_extent)) {
+            continue;
+        }
+
+        scene.MarkRenderTargetResourcesDirty(bridge_target.name);
+        any_target_changed = true;
+        LOG_INFO("SceneTextBridgeBacking: layer=%d name='%s' target='%s' "
+                 "output=[%u %u] projected=[%u %u] density=%.3f required=[%u %u] "
+                 "stable=[%u %u] "
+                 "previous-physical=[%d %d] physical=[%d %d] "
+                 "previous-logical=[%d %d] logical=[%d %d] scale=%u fit=%u feedback=%s",
+                 layer_id,
+                 state.object.name.c_str(),
+                 bridge_target.name.c_str(),
+                 scene.physicalOutputExtent[0],
+                 scene.physicalOutputExtent[1],
+                 (*projection)[0],
+                 (*projection)[1],
+                 state.primitive->layout.backing_density,
+                 density_adjusted_projection[0],
+                 density_adjusted_projection[1],
+                 next_backing_extent[0],
+                 next_backing_extent[1],
+                 previous_extent[0],
+                 previous_extent[1],
+                 render_target.width,
+                 render_target.height,
+                 previous_extent[2],
+                 previous_extent[3],
+                 render_target.ContentWidth(),
+                 render_target.ContentHeight(),
+                 bridge_target.scale,
+                 bridge_target.fit,
+                 bridge_target.persistent_feedback ? "true" : "false");
+    }
+
+    return any_target_changed;
+}
+
 std::string ResolveTextContentAlignment(const wpscene::WPTextObject& object) {
     std::string alignment;
     if (object.verticalalign == "top") alignment += "top";
@@ -2468,8 +2772,29 @@ bool ResolveBottomScreenAnchoredTextStack(std::vector<ScreenAnchoredTextPlacemen
     return changed_any;
 }
 
-void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id, SceneNode* node) {
-    if (node == nullptr) return;
+void SyncTextEffectLayerResolvedTransform(Scene&                  scene,
+                                          SceneImageEffectLayer& effect_layer) {
+    auto* world_node = effect_layer.WorldNode();
+    if (world_node == nullptr || scene.shaderValueUpdater == nullptr ||
+        scene.activeCamera == nullptr) {
+        return;
+    }
+
+    /*
+     * Effect-backed text may be detached from its authored parent in the physical SceneNode tree
+     * and reintroduced by a render-order proxy. Copying WorldNode::ModelTrans during a resource
+     * refresh would then observe only that detached tree and can publish one frame at the wrong
+     * origin. Resolve through the same parent/attachment/parallax contract used by shader uniforms
+     * so transform and backing-size updates enter one coherent refresh transaction.
+     */
+    const bool apply_parallax = !effect_layer.PublishesPrivateFinalComposite();
+    const auto resolved_model =
+        scene.shaderValueUpdater->ResolveModelTransformForProjection(
+            world_node, scene.activeCamera, apply_parallax);
+    effect_layer.SyncResolvedNodeToMatrix(Eigen::Affine3f(resolved_model.cast<float>()));
+}
+
+void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id) {
 
     auto camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
     if (camera_names_it == scene.objectRuntimeCameraNames.end()) return;
@@ -2481,16 +2806,9 @@ void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id, SceneNode* nod
         auto* effect_layer = camera_it->second->GetImgEffect().get();
         if (effect_layer == nullptr) continue;
 
-        // Screen-anchor adjustments mutate the visible world node, so effect-backed text needs the
-        // same final-composite resynchronization that script-driven origin/scale writes already
-        // perform. The offscreen source camera stays in local text space; only the resolved output
-        // node follows the anchored world transform.
-        if (effect_layer->WorldNode() != nullptr) {
-            effect_layer->SyncResolvedNodeToWorld();
-        } else {
-            effect_layer->SyncResolvedNodeToMatrix(
-                Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
-        }
+        // The offscreen source camera remains in local text space; only the final published node
+        // follows the authoritative world transform.
+        SyncTextEffectLayerResolvedTransform(scene, *effect_layer);
     }
 }
 
@@ -2896,8 +3214,6 @@ struct TextLayerSceneGeometrySnapshot {
     std::string         alignment;
     std::array<float, 2> placement_display_size { 0.0f, 0.0f };
     std::array<float, 2> visible_display_size { 0.0f, 0.0f };
-    std::array<float, 2> visible_source_size { 0.0f, 0.0f };
-    std::array<float, 2> dependency_source_size { 0.0f, 0.0f };
     std::array<float, 2> visible_local_center { 0.0f, 0.0f };
 };
 
@@ -2909,8 +3225,6 @@ TextLayerSceneGeometrySnapshot CaptureTextLayerSceneGeometry(const TextLayerRunt
         .alignment = alignment,
         .placement_display_size = ResolveTextPlacementDisplaySize(state),
         .visible_display_size = ResolveVisibleTextDisplaySize(state),
-        .visible_source_size = ResolveVisibleTextSourceSize(state),
-        .dependency_source_size = ResolveEffectDependencyTextSourceSize(state),
         .visible_local_center = ResolveTextLayerVisibleLocalCenter(state),
     };
 }
@@ -2929,7 +3243,6 @@ void SyncTextPrimitiveCanonicalState(TextLayerRuntimeState& state, bool rebuild_
     state.primitive->layout.visible_source_size = ResolveVisibleTextSourceSize(state);
     state.primitive->layout.visible_display_offset =
         ResolveVisibleTextDisplayOffset(state, state.applied_alignment);
-    state.primitive->bridge.source_size = ResolveEffectDependencyTextSourceSize(state);
 
     if (!rebuild_runtime_meshes) return;
 
@@ -2963,9 +3276,6 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
                           next_geometry.placement_display_size);
     const bool visible_display_size_changed =
         TextMetricChanged(previous_geometry.visible_display_size, next_geometry.visible_display_size);
-    const bool dependency_source_size_changed =
-        TextMetricChanged(previous_geometry.dependency_source_size,
-                          next_geometry.dependency_source_size);
     const bool visible_local_center_changed =
         TextMetricChanged(previous_geometry.visible_local_center,
                           next_geometry.visible_local_center);
@@ -2978,16 +3288,17 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
         }
     }
 
-    bool       bridge_render_target_changed = false;
     const auto  camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
     const bool  has_runtime_cameras = camera_names_it != scene.objectRuntimeCameraNames.end();
     if (has_runtime_cameras) {
         const auto camera_size = next_geometry.visible_display_size;
+        const bool local_bridge_geometry_changed =
+            visible_display_size_changed || visible_local_center_changed;
         for (const auto& camera_name : camera_names_it->second) {
             auto camera_it = scene.cameras.find(camera_name);
             if (camera_it == scene.cameras.end()) continue;
 
-            if (!IsCameraLinkedFromScene(scene, camera_name)) {
+            if (local_bridge_geometry_changed && !IsCameraLinkedFromScene(scene, camera_name)) {
                 camera_it->second->SetWidth(std::max(1.0, static_cast<double>(camera_size[0])));
                 camera_it->second->SetHeight(std::max(1.0, static_cast<double>(camera_size[1])));
                 camera_it->second->Update();
@@ -2996,99 +3307,19 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
             if (!camera_it->second->HasImgEffect()) continue;
 
             auto& effect_layer = *camera_it->second->GetImgEffect();
-            // Text bridges now expose exact-size source images. Once the canonical visible box is
-            // known, every downstream effect pass can keep using a plain full-UV card; runtime text
-            // updates only need to resize that card to the latest visible display size.
-            RebuildTextMesh(&effect_layer.FinalMesh(),
-                            camera_size,
-                            next_geometry.visible_local_center);
-            effect_layer.SyncResolvedOutputMesh();
-            effect_layer.SyncResolvedNodeToWorld();
+            if (local_bridge_geometry_changed) {
+                // Local text-box changes rebuild the final quad and bridge camera. Transform-only
+                // scripts keep that mesh intact and only republish the resolved world matrix.
+                RebuildTextMesh(&effect_layer.FinalMesh(),
+                                camera_size,
+                                next_geometry.visible_local_center);
+                effect_layer.SyncResolvedOutputMesh();
+            }
+            SyncTextEffectLayerResolvedTransform(scene, effect_layer);
         }
     }
 
-    if (state.primitive != nullptr) {
-        for (const auto& bridge_target : state.primitive->bridge.render_targets) {
-            auto render_target_it = scene.renderTargets.find(bridge_target.name);
-            if (render_target_it == scene.renderTargets.end()) continue;
-            auto& render_target = render_target_it->second;
-            if (render_target.bind.enable) continue;
-
-            const auto scaled_source_size = ResolveTextBridgeRenderTargetSourceSize(
-                bridge_target, next_geometry.dependency_source_size);
-            const bool dependency_rt_changed =
-                GrowTextDependencyRenderTarget(render_target, scaled_source_size);
-            bridge_render_target_changed = bridge_render_target_changed || dependency_rt_changed;
-        }
-    }
-
-    const bool has_bridge_resources =
-        state.primitive != nullptr && !state.primitive->bridge.render_targets.empty();
-    if (has_bridge_resources &&
-        (visible_display_size_changed || visible_local_center_changed ||
-         dependency_source_size_changed ||
-         bridge_render_target_changed)) {
-        // The final text bridge keeps a stable pass identity and exact-size backing images. The
-        // only Vulkan resources affected by a text size change are the bridge outputs and the
-        // passes that sample them, so mark those render targets explicitly instead of requesting a
-        // scene-wide resource refresh that would walk every unrelated effect pass on minute ticks.
-        for (const auto& bridge_target : state.primitive->bridge.render_targets) {
-            scene.MarkRenderTargetResourcesDirty(bridge_target.name);
-        }
-
-        double camera_width = 0.0;
-        double camera_height = 0.0;
-        if (const auto camera_it = scene.cameras.find(state.primitive->bridge.camera_name);
-            camera_it != scene.cameras.end()) {
-            camera_width = camera_it->second->Width();
-            camera_height = camera_it->second->Height();
-        }
-        int32_t target_width = 0;
-        int32_t target_height = 0;
-        if (const auto target_it = scene.renderTargets.find(state.primitive->bridge.pingpong_a);
-            target_it != scene.renderTargets.end()) {
-            target_width = target_it->second.width;
-            target_height = target_it->second.height;
-        }
-        const auto& layout = state.primitive->layout;
-        const auto  center = next_geometry.visible_local_center;
-        const auto  size = next_geometry.visible_display_size;
-        LOG_INFO("SceneTextBridgeSync: layer=%d name='%s' camera='%s' "
-                 "camera-size=[%.3f %.3f] target='%s' target-size=[%d %d] "
-                 "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
-                 "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
-                 "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
-                 "source-crop=[%.3f %.3f %.3f %.3f] "
-                 "final-mesh-bounds=[%.3f %.3f]-[%.3f %.3f]",
-                 layer_id,
-                 state.object.name.c_str(),
-                 state.primitive->bridge.camera_name.c_str(),
-                 camera_width,
-                 camera_height,
-                 state.primitive->bridge.pingpong_a.c_str(),
-                 target_width,
-                 target_height,
-                 layout.logical_size[0],
-                 layout.logical_size[1],
-                 layout.logical_source_size[0],
-                 layout.logical_source_size[1],
-                 layout.glyph_display_size[0],
-                 layout.glyph_display_size[1],
-                 layout.glyph_source_size[0],
-                 layout.glyph_source_size[1],
-                 layout.glyph_offset[0],
-                 layout.glyph_offset[1],
-                 layout.visible_display_offset[0],
-                 layout.visible_display_offset[1],
-                 layout.glyph_source_crop[0],
-                 layout.glyph_source_crop[1],
-                 layout.glyph_source_crop[2],
-                 layout.glyph_source_crop[3],
-                 center[0] - size[0] * 0.5f,
-                 center[1] - size[1] * 0.5f,
-                 center[0] + size[0] * 0.5f,
-                 center[1] + size[1] * 0.5f);
-    }
+    UpdateTextLayerBridgeBackingInternal(scene, layer_id, state);
 
     return true;
 }
@@ -3269,6 +3500,22 @@ bool wallpaper::UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id) {
     return SyncTextLayerSceneGeometry(scene, layer_id, state, previous_geometry);
 }
 
+void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
+    for (auto& [layer_id, state] : scene.textLayers) {
+        if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
+            scene.deferredRuntimeTextLayerIds.count(layer_id) != 0 ||
+            !TextLayerNeedsBridgeResidency(scene, layer_id)) {
+            continue;
+        }
+
+        // PrepareFrame() has already advanced parallax and attachment poses. Republish the same
+        // resolved world transform before sizing and resource refresh so the final composite and
+        // its projected backing always describe one frame of scene state.
+        SyncTextLayerEffectTransform(scene, layer_id);
+        UpdateTextLayerBridgeBackingInternal(scene, layer_id, state);
+    }
+}
+
 bool wallpaper::ApplyTextLayerNodePlacement(SceneNode*                   node,
                                             const TextLayerRuntimeState& state,
                                             std::array<float, 3>         origin) {
@@ -3366,7 +3613,7 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
         if (!changed) {
             continue;
         }
-        SyncTextLayerEffectTransform(scene, placement.layer_id, placement.node);
+        SyncTextLayerEffectTransform(scene, placement.layer_id);
         changed_any_node = true;
     }
 
@@ -3388,7 +3635,7 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
     // Bridge-resource updates are the permanent cheap path for geometry changes that do not alter
     // shaping results, such as toggling the opaque background. The primitive keeps the existing
     // atlas/layout data and only rebuilds the meshes whose local placement depends on the
-    // canonical visible box before refreshing exact-size bridge targets and effect cameras.
+    // canonical visible box before refreshing projected bridge targets and effect cameras.
     SyncTextPrimitiveCanonicalState(state, true);
     if (!ApplyTextLayerSceneGeometry(scene,
                                      layer_id,
@@ -3442,7 +3689,6 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     if (state.primitive != nullptr) {
         rebuilt_primitive->bridge = state.primitive->bridge;
     }
-    rebuilt_primitive->bridge.source_size = rebuilt_primitive->VisibleSourceSize();
 
     auto primitive_nodes = FindTextPrimitiveRuntimeNodes(scene, layer_id);
     if (primitive_nodes.empty()) {

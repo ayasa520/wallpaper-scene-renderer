@@ -202,6 +202,8 @@ public:
     void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
                         const ShaderUniformOverrides* overrides = nullptr) override;
     void FrameEnd() override;
+    Eigen::Matrix4d ResolveModelTransformForProjection(
+        SceneNode* node, const SceneCamera* camera, bool apply_parallax) override;
     void MouseInput(double, double) override;
     void SetTexelSize(float x, float y) override;
 

@@ -5063,7 +5063,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         primitive->bridge.camera_name = camera_name;
         primitive->bridge.pingpong_a  = WE_EFFECT_PPONG_PREFIX_A.data() + camera_name;
         primitive->bridge.pingpong_b  = WE_EFFECT_PPONG_PREFIX_B.data() + camera_name;
-        primitive->bridge.source_size = primitive->VisibleSourceSize();
+        primitive->bridge.bridge_backing_extent = {
+            static_cast<uint32_t>(std::max(
+                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0])))),
+            static_cast<uint32_t>(std::max(
+                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1])))),
+        };
         primitive->bridge.render_targets.push_back(
             TextBridgeRenderTarget { .name = primitive->bridge.pingpong_a, .scale = 1 });
         primitive->bridge.render_targets.push_back(
@@ -5101,15 +5106,16 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
 
         scene.renderTargets[primitive->bridge.pingpong_a] = SceneRenderTarget {
-            .width =
-                std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[0]))),
-            .height =
-                std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[1]))),
-            .mapWidth =
-                std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[0]))),
-            .mapHeight =
-                std::max(1, static_cast<int32_t>(std::lround(primitive->VisibleSourceSize()[1]))),
-            .allowReuse = true,
+            .width = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
+            .height = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
+            .mapWidth = std::max(
+                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0]))),
+            .mapHeight = std::max(
+                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1]))),
+            // Text targets keep stable logical names while their physical backing follows runtime
+            // projection. Persisting the cache entry replaces the old image in place; transient
+            // aliasing would retain one reusable image for every historical projected size.
+            .allowReuse = false,
         };
         scene.renderTargets[primitive->bridge.pingpong_b] =
             scene.renderTargets.at(primitive->bridge.pingpong_a);
@@ -5194,7 +5200,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
 
             for (const auto& wp_fbo : wp_effect.fbos) {
                 const std::string rt_name = wp_fbo.name + "_" + effect_addr;
-                const auto        fbo_size = wp_fbo.ResolveSize(primitive->VisibleSourceSize());
+                const auto fbo_size = wp_fbo.ResolveSize(primitive->VisibleDisplaySize());
                 const bool        persistent_feedback_fbo =
                     feedback_fbos.count(wp_fbo.name) != 0;
                 scene.renderTargets[rt_name] = SceneRenderTarget {
@@ -5202,7 +5208,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                     .height     = fbo_size[1],
                     .mapWidth   = fbo_size[0],
                     .mapHeight  = fbo_size[1],
-                    .allowReuse = ! persistent_feedback_fbo,
+                    // Text-owned effect targets are runtime-sized under stable names. Keeping each
+                    // entry persistent prevents the reusable image pool from retaining every old
+                    // size after audio-driven scale or output changes.
+                    .allowReuse = false,
                 };
                 if (wp_fbo.fit > 0 || persistent_feedback_fbo) {
                     LOG_INFO("SceneTextEffectFboResolve: layer=%d effect-id=%d effect='%s' "
@@ -5224,6 +5233,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                     .name = rt_name,
                     .scale = std::max<uint32_t>(1u, wp_fbo.scale),
                     .fit = wp_fbo.fit,
+                    .persistent_feedback = persistent_feedback_fbo,
                 });
                 fbo_map[wp_fbo.name] = rt_name;
             }

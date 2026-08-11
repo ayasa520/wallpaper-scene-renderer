@@ -3,12 +3,15 @@
 #include "Core/NoCopyMove.hpp"
 #include "Core/MapSet.hpp"
 
+#include <Eigen/Dense>
+
 #include <functional>
 #include <string_view>
 
 namespace wallpaper
 {
 class SceneNode;
+class SceneCamera;
 class SceneShader;
 class ShaderValue;
 class SpriteAnimation;
@@ -40,6 +43,12 @@ public:
     virtual void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
                                 const ShaderUniformOverrides* overrides = nullptr) = 0;
     virtual void FrameEnd()                                                        = 0;
+
+    // Projection-driven resources must use the same inherited-parent, attachment, and camera
+    // parallax transform contract as shader uniforms. Exposing that matrix here keeps sizing code
+    // independent from the concrete Wallpaper Engine updater implementation.
+    virtual Eigen::Matrix4d ResolveModelTransformForProjection(
+        SceneNode* node, const SceneCamera* camera, bool apply_parallax) = 0;
 
     virtual void MouseInput(double x, double y) = 0;
     virtual void SetTexelSize(float x, float y) = 0;

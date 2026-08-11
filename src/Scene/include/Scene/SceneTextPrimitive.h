@@ -54,7 +54,7 @@ struct TextLayoutResult {
 };
 
 struct TextBridgeRenderTarget {
-    // A first-class text bridge owns exact-size offscreen targets that image effects sample from.
+    // A first-class text bridge owns projected-density offscreen targets that image effects sample.
     // `scale` and `fit` mirror Wallpaper Engine's authored effect FBO sizing rules so runtime text
     // updates can recompute the same target dimensions that parse-time image/text effect material
     // construction used. Keeping the sizing metadata with the bridge avoids texture-resolution
@@ -62,13 +62,23 @@ struct TextBridgeRenderTarget {
     std::string name;
     uint32_t    scale { 1 };
     uint32_t    fit { 0 };
+    // Feedback targets retain history across frames. Their physical grid must remain in the
+    // authored effect domain instead of following transient projected text scale changes that
+    // would recreate the image and discard the accumulated state.
+    bool        persistent_feedback { false };
 };
 
 struct TextSourceBridge {
-    std::string          camera_name;
-    std::string          pingpong_a;
-    std::string          pingpong_b;
-    std::array<float, 2> source_size { 0.0f, 0.0f };
+    std::string camera_name;
+    std::string pingpong_a;
+    std::string pingpong_b;
+
+    // The Vulkan backing follows final projected screen coverage at the glyph raster density.
+    // Authored local geometry and the logical effect sampling grid remain owned by TextLayoutResult
+    // and the bridge camera; the backing therefore retains text antialiasing headroom without
+    // reverting to the full authored source rectangle for a heavily downscaled layer.
+    std::array<uint32_t, 2> bridge_backing_extent { 1u, 1u };
+    std::array<uint32_t, 2> projected_output_extent { 0u, 0u };
     std::vector<TextBridgeRenderTarget> render_targets;
 };
 

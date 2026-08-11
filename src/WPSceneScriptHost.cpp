@@ -9041,6 +9041,14 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
     std::unordered_set<int32_t> queued;
     auto append_if_deferred = [&](int32_t layer_id) {
         if (layer_id == 0 || !queued.insert(layer_id).second) return;
+        if (m_scene->deferredRuntimeTextLayerIds.count(layer_id) != 0) {
+            // Hidden text remains a logical placeholder until its parent chain first becomes
+            // effectively visible. Materializing it during residency warm-up would retain Pango
+            // shaping state, glyph bitmaps, atlas payloads, and effect bridge objects even though
+            // render-graph pruning keeps the layer from drawing. The visibility path already
+            // materializes the selected text variant before rebuilding its graph resources.
+            return;
+        }
         if (!IsDeferredRuntimeLayer(m_impl, layer_id)) return;
         layer_ids.push_back(layer_id);
     };
@@ -9052,9 +9060,6 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
         append_if_deferred(layer_id);
     }
     for (const auto layer_id : m_scene->deferredRuntimeParticleLayerIds) {
-        append_if_deferred(layer_id);
-    }
-    for (const auto layer_id : m_scene->deferredRuntimeTextLayerIds) {
         append_if_deferred(layer_id);
     }
     if (layer_ids.empty()) return;
@@ -9071,7 +9076,6 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
         // only need to compile/prepare the graph resources for the newly visible branch.
         if (!MaterializeDeferredImageLayerIfNeeded(m_impl, layer_id)) continue;
         if (!MaterializeDeferredParticleLayerIfNeeded(m_impl, layer_id)) continue;
-        if (!MaterializeDeferredTextLayerIfNeeded(m_impl, layer_id)) continue;
 
         materialized_layers++;
     }
