@@ -265,6 +265,10 @@ public:
     int32_t                        activeModelCameraPathSegment { -1 };
 
     i32                  ortho[2] { 1920, 1080 }; // w, h
+    // The authored canvas and the physical renderer output are independent. Text bridge
+    // projection uses the final pixel extent after fill-mode framing, while layout, cameras, and
+    // effect sampling continue to use authored scene units.
+    std::array<uint32_t, 2> physicalOutputExtent { 0u, 0u };
     std::array<float, 3> clearColor { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> ambientColor { 0.2f, 0.2f, 0.2f };
     std::array<float, 3> skylightColor { 0.3f, 0.3f, 0.3f };

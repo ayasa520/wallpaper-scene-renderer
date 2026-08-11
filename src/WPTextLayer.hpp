@@ -121,5 +121,6 @@ void RebuildTextPrimitiveVisibleMesh(SceneMesh* mesh, const SceneTextPrimitive& 
 bool UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id);
 bool UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_id);
 bool RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id);
+void UpdateAllTextLayerBridgeBackings(Scene& scene);
 
 } // namespace wallpaper

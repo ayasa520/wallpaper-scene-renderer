@@ -468,13 +468,16 @@ private:
             if (m_scene->scriptHost) {
                 m_scene->scriptHost->FrameBegin(frame_time);
             }
+            // Parallax and puppet state can change the projected size of a text bridge. Advance that
+            // resource-affecting state before UpdateCameraFillMode() recomputes backing extents and
+            // before a resource-only graph refresh prepares resized framebuffers.
+            m_scene->shaderValueUpdater->PrepareFrame();
             // Property animations update camera-layer zoom/origin through the script host before
             // shader uniforms are refreshed. Reapplying the renderer-side fill-mode camera
             // framing here keeps those animated camera values in monitor-relative coordinates
             // instead of letting the animation path snap the shared global camera back to the
             // project's native aspect until a later resize/fill-mode event repairs it.
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
-            m_scene->shaderValueUpdater->PrepareFrame();
             RefreshRenderGraphIfNeeded();
             m_render->refreshImportedTextures(*m_scene);
 
