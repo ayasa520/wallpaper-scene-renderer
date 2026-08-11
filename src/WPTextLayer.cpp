@@ -1269,7 +1269,15 @@ std::string MakeTextGlyphCacheKey(PangoFont* font, PangoGlyph glyph, double rast
     std::string description = "<unknown>";
     if (font != nullptr) {
         if (auto* desc = pango_font_describe(font); desc != nullptr) {
-            description = pango_font_description_to_string(desc);
+            // pango_font_description_to_string() returns a newly allocated GLib string. Dynamic
+            // text rebuilds call this path for every glyph occurrence, so copying the result into
+            // std::string without releasing the transfer-full buffer leaked thousands of small
+            // allocations per frame and produced linear renderer heap growth.
+            gchar* serialized_desc = pango_font_description_to_string(desc);
+            if (serialized_desc != nullptr) {
+                description = serialized_desc;
+                g_free(serialized_desc);
+            }
             pango_font_description_free(desc);
         }
     }
