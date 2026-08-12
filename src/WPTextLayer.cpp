@@ -2261,17 +2261,20 @@ std::array<uint32_t, 2> ResolveTextBridgeRasterExtent(
      * are correct. That supersampling is only meaningful up to the rasterized source resolution:
      * multiplying a large screen projection by the full atlas density creates texels that contain
      * no additional glyph detail and makes every downstream effect process the same interpolation
-     * repeatedly. Keep at least one bridge texel per projected output pixel, use the atlas density
-     * as antialiasing headroom while the layer is downscaled, and stop at the source resolution
-     * until screen coverage itself exceeds it.
+     * repeatedly. The source raster is also the stable ownership boundary for this resource:
+     * audio-driven node scale changes must not turn a transform update into ping-pong image
+     * replacement. Once final screen coverage exceeds the source raster, the scene-space
+     * publication pass performs that unavoidable enlargement; allocating more bridge texels would
+     * only pre-upsample the same source and force every authored effect to process the extra pixels.
+     * Use the atlas density as antialiasing headroom while the layer is downscaled, then stop at the
+     * source raster on each axis.
      */
     std::array<uint32_t, 2> raster_extent {};
     for (size_t axis = 0; axis < raster_extent.size(); axis++) {
         const double projected = static_cast<double>(projected_extent[axis]);
         const double source = std::max(1.0, static_cast<double>(source_extent[axis]));
         const double supersampled = std::min(projected * density, source);
-        raster_extent[axis] = ResolveProjectedPixelLength(
-            std::max(projected, supersampled));
+        raster_extent[axis] = ResolveProjectedPixelLength(supersampled);
     }
     return raster_extent;
 }
