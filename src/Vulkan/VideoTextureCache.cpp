@@ -442,16 +442,51 @@ void SetPluginDecoderRanks(const char* plugin_name, guint rank, bool use_statele
     gst_plugin_feature_list_free(features);
 }
 
+bool LoadDecoderPluginFactories(const char* plugin_name) {
+    /*
+     * Hardware decoder plugins discover device-specific factories when their
+     * module is loaded in the renderer process.  Registry metadata can know a
+     * plugin while exposing none of the factories that its current VA or CUDA
+     * probe would register.  Explicit process-local loading runs that probe
+     * before ConfigureDecoderRanks() reads or changes the route's factories.
+     * This does not scan plugin directories or alter GPU selection: VA
+     * elements must still report the selected render node, and NVIDIA
+     * elements are still accepted only after render-node-to-CUDA matching.
+     */
+    GstPlugin* plugin = gst_plugin_load_by_name(plugin_name);
+    if (plugin == nullptr) {
+        LOG_ERROR("VideoTextureDecoderInit: failed to load GStreamer plugin %s", plugin_name);
+        return false;
+    }
+
+    GstRegistry* registry = gst_registry_get();
+    GList* features =
+        registry != nullptr ? gst_registry_get_feature_list_by_plugin(registry, plugin_name)
+                            : nullptr;
+    const guint feature_count = g_list_length(features);
+    LOG_INFO("VideoTextureDecoderInit: loaded plugin=%s version=%s filename=%s features=%u",
+             gst_plugin_get_name(plugin),
+             gst_plugin_get_version(plugin),
+             gst_plugin_get_filename(plugin) != nullptr ? gst_plugin_get_filename(plugin)
+                                                        : "(unknown)",
+             feature_count);
+    gst_plugin_feature_list_free(features);
+    gst_object_unref(plugin);
+    return true;
+}
+
 void ConfigureDecoderRanks(const DecoderSettings& settings) {
     // The producer resolves the physical GPU before scene Vulkan starts. These
     // rank tweaks only make the selected decoder route deterministic inside
     // GStreamer; they are not a separate GPU selection policy.
     constexpr guint preferred_rank = GST_RANK_PRIMARY + 4;
     if (settings.decoder_route == VideoTextureDecoderRoute::Va) {
+        LoadDecoderPluginFactories("va");
         SetPluginDecoderRanks("va", preferred_rank, false);
         SetPluginDecoderRanks("nvcodec", GST_RANK_NONE, false);
         SetPluginDecoderRanks("nvcodec", GST_RANK_NONE, true);
     } else {
+        LoadDecoderPluginFactories("nvcodec");
         SetPluginDecoderRanks("va", GST_RANK_NONE, false);
         SetPluginDecoderRanks("nvcodec", preferred_rank + 1, false);
         SetPluginDecoderRanks("nvcodec", preferred_rank, true);
