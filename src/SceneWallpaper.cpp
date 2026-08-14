@@ -463,6 +463,9 @@ private:
         if (m_rg) {
             const double frame_time = frame_timer.IdeaTime() * m_speed;
             m_scene->PassFrameTime(frame_time);
+            // Scene camerashake is a view-space translation of the authored camera. Apply it after
+            // the clock advances and before scripts/parallax/fill-mode read camera position.
+            m_scene->UpdateCameraShake();
             if (m_scene->scriptHost) {
                 m_scene->scriptHost->FrameBegin(frame_time);
             }

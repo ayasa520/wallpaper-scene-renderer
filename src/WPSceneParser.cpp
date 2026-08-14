@@ -3195,6 +3195,11 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
     scene.cameraParallaxAmount         = sc.general.cameraparallaxamount;
     scene.cameraParallaxDelay          = sc.general.cameraparallaxdelay;
     scene.cameraParallaxMouseInfluence = sc.general.cameraparallaxmouseinfluence;
+    scene.cameraOrthographic           = sc.general.isOrtho;
+    scene.cameraShake                  = sc.general.camerashake;
+    scene.cameraShakeAmplitude         = sc.general.camerashakeamplitude;
+    scene.cameraShakeRoughness         = sc.general.camerashakeroughness;
+    scene.cameraShakeSpeed             = sc.general.camerashakespeed;
     scene.ortho[0]                     = sc.general.orthogonalprojection.width;
     scene.ortho[1]                     = sc.general.orthogonalprojection.height;
     context.ortho_w                    = scene.ortho[0];
@@ -3209,6 +3214,15 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
         cam_para.delay          = sc.general.cameraparallaxdelay;
         cam_para.mouseinfluence = sc.general.cameraparallaxmouseinfluence;
         context.shader_updater->SetCameraParallax(cam_para);
+    }
+    if (scene.cameraShake) {
+        LOG_INFO("SceneCameraShake: enabled=true amplitude=%.3f roughness=%.3f speed=%.3f "
+                 "ortho=%s height=%d",
+                 scene.cameraShakeAmplitude,
+                 scene.cameraShakeRoughness,
+                 scene.cameraShakeSpeed,
+                 scene.cameraOrthographic ? "true" : "false",
+                 scene.ortho[1]);
     }
 }
 
@@ -6936,6 +6950,14 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             context, general_json, "cameraparallaxdelay", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "cameraparallaxmouseinfluence", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "camerashake", WPDynamicValue::Type::Boolean);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "camerashakeamplitude", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "camerashakeroughness", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "camerashakespeed", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "fov", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(

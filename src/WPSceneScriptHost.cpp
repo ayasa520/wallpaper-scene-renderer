@@ -510,6 +510,10 @@ LayerValueHint SceneValueType(std::string_view property_name) {
     if (property_name == "cameraparallaxdelay") return { WPDynamicValue::Type::Float, true };
     if (property_name == "cameraparallaxmouseinfluence")
         return { WPDynamicValue::Type::Float, true };
+    if (property_name == "camerashake") return { WPDynamicValue::Type::Boolean, true };
+    if (property_name == "camerashakeamplitude") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "camerashakeroughness") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "camerashakespeed") return { WPDynamicValue::Type::Float, true };
     if (property_name == "fov") return { WPDynamicValue::Type::Float, true };
     if (property_name == "nearz") return { WPDynamicValue::Type::Float, true };
     if (property_name == "farz") return { WPDynamicValue::Type::Float, true };
@@ -5598,6 +5602,16 @@ std::optional<WPDynamicValue> ReadScenePropertyValue(const WPSceneScriptHost::Op
     if (property_name == "cameraparallaxmouseinfluence") {
         return WPDynamicValue(opaque->scene->cameraParallaxMouseInfluence);
     }
+    if (property_name == "camerashake") return WPDynamicValue(opaque->scene->cameraShake);
+    if (property_name == "camerashakeamplitude") {
+        return WPDynamicValue(opaque->scene->cameraShakeAmplitude);
+    }
+    if (property_name == "camerashakeroughness") {
+        return WPDynamicValue(opaque->scene->cameraShakeRoughness);
+    }
+    if (property_name == "camerashakespeed") {
+        return WPDynamicValue(opaque->scene->cameraShakeSpeed);
+    }
     if (const auto* camera = GetPerspectiveSceneCamera(opaque)) {
         if (property_name == "fov") return WPDynamicValue(static_cast<float>(camera->Fov()));
         if (property_name == "nearz") return WPDynamicValue(static_cast<float>(camera->NearClip()));
@@ -5693,6 +5707,14 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
                  enabled ? "true" : "false");
         return true;
     }
+    if (property_name == "camerashake") {
+        bool enabled = false;
+        if (! value.tryGet(&enabled)) return false;
+        opaque->scene->cameraShake = enabled;
+        LOG_INFO("SceneGeneralApply: property='camerashake' value=%s",
+                 enabled ? "true" : "false");
+        return true;
+    }
 
     float scalar = 0.0f;
     if (! value.tryGet(&scalar)) return false;
@@ -5730,6 +5752,21 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         opaque->scene->cameraParallaxMouseInfluence = scalar;
         ApplySceneCameraParallax(opaque);
         LOG_INFO("SceneGeneralApply: property='cameraparallaxmouseinfluence' value=%.3f", scalar);
+        return true;
+    }
+    if (property_name == "camerashakeamplitude") {
+        opaque->scene->cameraShakeAmplitude = scalar;
+        LOG_INFO("SceneGeneralApply: property='camerashakeamplitude' value=%.3f", scalar);
+        return true;
+    }
+    if (property_name == "camerashakeroughness") {
+        opaque->scene->cameraShakeRoughness = scalar;
+        LOG_INFO("SceneGeneralApply: property='camerashakeroughness' value=%.3f", scalar);
+        return true;
+    }
+    if (property_name == "camerashakespeed") {
+        opaque->scene->cameraShakeSpeed = scalar;
+        LOG_INFO("SceneGeneralApply: property='camerashakespeed' value=%.3f", scalar);
         return true;
     }
 

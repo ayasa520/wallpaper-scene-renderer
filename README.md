@@ -33,7 +33,7 @@ Wallpaper Engine editor/runtime clone. -->
 - [x] Camera
   - [x] Zoom
   - [x] Path
-  - [ ] Shake
+  - [x] Shake
   - [ ] Fade
 - [x] Audio
   - [x] Loop
