@@ -53,6 +53,10 @@ public:
                          const Eigen::Vector3d& center,
                          const Eigen::Vector3d& up);
     void ClearExplicitView() { m_hasExplicitView = false; }
+    // Scene camerashake adds the same translation to eye and center. Keep it off the authored
+    // node/path pose so fill-mode framing and camera-layer origins stay stable.
+    void SetShakeOffset(const Eigen::Vector3d& offset) { m_shakeOffset = offset; }
+    Eigen::Vector3d ShakeOffset() const { return m_shakeOffset; }
     // Orthographic cameras normally derive a symmetric rectangle from width/height. Puppet
     // surfaces need an authored, asymmetric envelope because animation can extend beyond one edge
     // of the layer. Store that rectangle explicitly so the private raster and publication mesh use
@@ -93,6 +97,7 @@ public:
         m_orthoRight = cam.m_orthoRight;
         m_orthoBottom = cam.m_orthoBottom;
         m_orthoTop = cam.m_orthoTop;
+        m_shakeOffset = cam.m_shakeOffset;
     }
 
 private:
@@ -114,6 +119,7 @@ private:
     double m_orthoRight { 0.5 };
     double m_orthoBottom { -0.5 };
     double m_orthoTop { 0.5 };
+    Eigen::Vector3d m_shakeOffset { Eigen::Vector3d::Zero() };
 
     Eigen::Matrix4d m_viewMat { Eigen::Matrix4d::Identity() };
     Eigen::Matrix4d m_viewProjectionMat { Eigen::Matrix4d::Identity() };

@@ -53,6 +53,12 @@ public:
     float                cameraparallaxamount { 0.0f };
     float                cameraparallaxdelay { 0.0f };
     float                cameraparallaxmouseinfluence { 0.0f };
+    // Scene-level camera shake. These defaults match Wallpaper Engine when the keys are absent:
+    // disabled, amplitude 0.5, roughness 1.0, speed 3.0.
+    bool                 camerashake { false };
+    float                camerashakeamplitude { 0.5f };
+    float                camerashakeroughness { 1.0f };
+    float                camerashakespeed { 3.0f };
     bool                 isOrtho { true };
     Orthogonalprojection orthogonalprojection { 1920, 1080 };
     float                zoom { 1.0f };

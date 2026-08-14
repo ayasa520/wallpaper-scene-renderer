@@ -131,6 +131,7 @@ public:
     void ApplyLayerVisibility(int32_t layer_id);
     void ApplyAllLayerVisibility();
     void UpdateModelCameraPath();
+    void UpdateCameraShake();
     Eigen::Vector3f ResolveCameraLayerNodeTranslation(
         const std::array<float, 3>& authored_origin) const;
     void UpdateActiveCameraLayer();
@@ -277,6 +278,11 @@ public:
     float                cameraParallaxAmount { 0.0f };
     float                cameraParallaxDelay { 0.0f };
     float                cameraParallaxMouseInfluence { 0.0f };
+    bool                 cameraOrthographic { true };
+    bool                 cameraShake { false };
+    float                cameraShakeAmplitude { 0.5f };
+    float                cameraShakeRoughness { 1.0f };
+    float                cameraShakeSpeed { 3.0f };
     double               textRenderScale { 1.0 };
 
     double elapsingTime { 0.0f }, frameTime { 0.0f };

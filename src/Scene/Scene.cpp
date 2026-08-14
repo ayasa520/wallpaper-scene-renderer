@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <future>
+#include <string_view>
 #include <unordered_set>
 
 namespace wallpaper 
@@ -522,6 +523,75 @@ void Scene::UpdateModelCameraPath() {
                  sample.center[1],
                  sample.center[2]);
         activeModelCameraPathSegment = active_segment;
+    }
+}
+
+namespace
+{
+
+// The same translation is added to eye and center so look direction stays unchanged.
+constexpr float kCameraShakeYFrequency     = 1.3329999446868896f;
+constexpr float kCameraShakeAmplitudeScale = 0.1f;
+constexpr float kCameraShakeRoughnessPow   = 3.0f;
+constexpr float kCameraShakeRoughnessEps   = 0.001f;
+
+Eigen::Vector3d ComputeSceneCameraShakeOffset(bool enabled, bool orthographic, float amplitude,
+                                              float roughness, float speed, double time_seconds,
+                                              int32_t ortho_height) {
+    if (!enabled) return Eigen::Vector3d::Zero();
+
+    const float p     = std::pow(roughness, kCameraShakeRoughnessPow);
+    const float t     = speed * speed * static_cast<float>(time_seconds);
+    float       x     = std::sin(t);
+    float       y     = std::cos(t * kCameraShakeYFrequency);
+    float       z     = std::cos(t);
+    float       scale = amplitude * kCameraShakeAmplitudeScale;
+    if (orthographic) {
+        z = 0.0f;
+        scale *= static_cast<float>(ortho_height) * kCameraShakeAmplitudeScale;
+    }
+    if (p > kCameraShakeRoughnessEps && p != 1.0f) {
+        const float len2 = x * x + y * y + z * z;
+        if (len2 > 0.0f) {
+            const float len = std::sqrt(len2);
+            const float n   = std::pow(len, p) / len;
+            x *= n;
+            y *= n;
+            z *= n;
+        }
+    }
+    return Eigen::Vector3d(static_cast<double>(x * scale),
+                           static_cast<double>(y * scale),
+                           static_cast<double>(z * scale));
+}
+
+void ApplyCameraShakeOffset(Scene& scene, std::string_view camera_name,
+                            const Eigen::Vector3d& offset) {
+    auto camera_it = scene.cameras.find(std::string(camera_name));
+    if (camera_it == scene.cameras.end() || !camera_it->second) return;
+    camera_it->second->SetShakeOffset(offset);
+    camera_it->second->Update();
+}
+
+} // namespace
+
+void Scene::UpdateCameraShake() {
+    const Eigen::Vector3d offset =
+        ComputeSceneCameraShakeOffset(cameraShake,
+                                      cameraOrthographic,
+                                      cameraShakeAmplitude,
+                                      cameraShakeRoughness,
+                                      cameraShakeSpeed,
+                                      elapsingTime,
+                                      ortho[1]);
+    ApplyCameraShakeOffset(*this, "global", offset);
+    ApplyCameraShakeOffset(*this, "global_perspective", offset);
+    if (activeCamera != nullptr) {
+        activeCamera->SetShakeOffset(offset);
+        activeCamera->Update();
+    }
+    if (!cameraOrthographic && !modelPerspectiveCameraName.empty()) {
+        ApplyCameraShakeOffset(*this, modelPerspectiveCameraName, offset);
     }
 }
 

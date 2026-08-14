@@ -8,13 +8,13 @@ using namespace wallpaper;
 using namespace Eigen;
 
 Vector3d SceneCamera::GetPosition() const {
+	Vector3d position = Vector3d::Zero();
 	if (m_hasExplicitView) {
-		return m_explicitEye;
+		position = m_explicitEye;
+	} else if(m_node) {
+		position = Affine3d(m_node->GetLocalTrans()) * Vector3d::Zero();
 	}
-	if(m_node) {
-		return Affine3d(m_node->GetLocalTrans()) * Vector3d::Zero();
-	}
-	return Vector3d::Zero();
+	return position + m_shakeOffset;
 }
 
 Vector3d SceneCamera::GetDirection() const {
@@ -53,11 +53,13 @@ void SceneCamera::CalculateViewProjectionMatrix() {
 			// The model camera can be driven by Wallpaper Engine path keyframes without converting
 			// through Euler scene-node state. This explicit branch is inert for 2D cameras because
 			// only the model parser calls SetExplicitView().
-			m_viewMat = LookAt(m_explicitEye, m_explicitCenter, m_explicitUp);
+			m_viewMat = LookAt(m_explicitEye + m_shakeOffset,
+			                  m_explicitCenter + m_shakeOffset,
+			                  m_explicitUp);
 		} else if(m_node) {
 			Affine3d nodeTrans(m_node->GetLocalTrans());
-			Vector3d eye = nodeTrans * Vector3d::Zero();
-			Vector3d center = nodeTrans * (-Vector3d::UnitZ());
+			Vector3d eye = nodeTrans * Vector3d::Zero() + m_shakeOffset;
+			Vector3d center = nodeTrans * (-Vector3d::UnitZ()) + m_shakeOffset;
 			Vector3d up = Vector3d::UnitY();
 			m_viewMat = LookAt(eye, center, up);
 		} else 
