@@ -8,6 +8,10 @@
 #include <memory>
 #include <optional>
 #include <functional>
+#include <fstream>
+#include <cstdint>
+#include <string_view>
+#include <unordered_map>
 
 namespace wallpaper
 {
@@ -114,6 +118,29 @@ public:
     void      SetRuntimeSizeOverride(float size);
     std::optional<float> RuntimeSizeOverride() const;
 
+    struct TrajectorySample {
+        uint64_t        spawn_sequence { 0 };
+        float           lifetime_passed { 0.0f };
+        Eigen::Vector3f position { Eigen::Vector3f::Zero() };
+        Eigen::Vector3f velocity { Eigen::Vector3f::Zero() };
+    };
+
+    struct TrajectorySnapshot {
+        int32_t                       layer_id { -1 };
+        std::string                   layer_name;
+        uint64_t                      frame_index { 0 };
+        double                        simulation_time { 0.0 };
+        size_t                        live_particle_count { 0 };
+        Eigen::Vector3f               live_position_min { Eigen::Vector3f::Zero() };
+        Eigen::Vector3f               live_position_max { Eigen::Vector3f::Zero() };
+        std::vector<TrajectorySample> samples;
+    };
+
+    // Returns a bounded snapshot of post-operator simulation state. This is intentionally a
+    // read-only diagnostics surface: callers can compare particle trajectories without coupling
+    // capture code to the subsystem's slot-reuse and child-instance storage internals.
+    TrajectorySnapshot CaptureTrajectorySnapshot(size_t sample_limit) const;
+
 private:
     void UpdateLinkedControlpoints();
     Eigen::Vector3f ResolveEventAnchorPosition(const Eigen::Vector3f& parent_position);
@@ -124,6 +151,7 @@ private:
     void ApplyRuntimeSizeOverrideToNewParticle(Particle& particle) const;
     void SynchronizeTrailSlots(ParticleInstance& instance);
     void SampleTrailHistory(double frame_time);
+    void WriteTrajectoryDiagnostics();
 
     ParticleSystem&            m_sys;
     std::shared_ptr<SceneMesh> m_mesh;
@@ -149,11 +177,15 @@ private:
     // here would seed them with the already-reduced cold value and shrink every update twice.
     std::optional<float>       m_runtime_rate_override;
     double                     m_time;
+    uint64_t                   m_frame_index { 0 };
     uint64_t                   m_next_spawn_sequence { 0 };
     uint16_t                   m_trail_length { 0 };
     double                     m_trail_sample_interval { 0.0 };
     double                     m_trail_sample_accumulator { 0.0 };
     std::function<void(float)> m_trail_uniform_update;
+    bool                       m_trajectory_diagnostics_initialized { false };
+    std::ofstream              m_trajectory_diagnostics_stream;
+    std::unordered_map<uint64_t, Eigen::Vector3f> m_trajectory_initial_positions;
 
     std::vector<std::unique_ptr<ParticleSubSystem>> m_children;
     std::vector<std::unique_ptr<ParticleInstance>>  m_instances;
@@ -187,6 +219,34 @@ public:
     std::array<float, 2> MousePos() const;
     Eigen::Vector3d MouseScenePosition() const;
 
+    // Marked during parse when any emitter carries audioprocessingmode != 0, so the render loop
+    // only queries the audio spectrum for scenes that actually consume it.
+    void MarkNeedsAudioSpectrum();
+    bool NeedsAudioSpectrum() const;
+
+    // Per-frame audio loudness snapshot for audio-responsive emitters. Both spans must contain
+    // kParticleAudioBandCount normalized band values; Clear marks the spectrum unavailable.
+    void SetAudioSpectrum(std::span<const float> left, std::span<const float> right);
+    void ClearAudioSpectrum();
+
+    // Collect post-operator state for top-level particle layers. The layer filter is optional and
+    // keeps diagnostics consumers independent from subsystem ordering in the parsed scene graph.
+    std::vector<ParticleSubSystem::TrajectorySnapshot>
+    CaptureTrajectorySnapshots(std::span<const int32_t> layer_ids, size_t sample_limit) const;
+
+    // Inclusive-band peak, smoothstep(bounds), authored power, then saturation. Mode zero is an
+    // explicit caller-side bypass; an unavailable spectrum is the same all-zero input consumed by
+    // a valid silent source.
+    double AudioResponseFactor(const ParticleAudioResponseParams& params) const;
+
+    // Opt-in per-subsystem emit/operator/gen timings. Dormant unless the capture driver supplies
+    // VIVID_PARTICLE_CPU_DIAGNOSTICS_PATH; the production hot path stays a single boolean check.
+    bool EnsureCpuDiagnostics();
+    void WriteCpuDiagnostics(int32_t layer_id, std::string_view layer_name, uint64_t frame_index,
+                             double simulation_time, size_t live_count, size_t storage_count,
+                             double emit_ms, double lifetime_ms, double operators_ms,
+                             double trail_ms, double gen_ms, double total_ms);
+
     Scene& scene;
 
     std::vector<std::unique_ptr<ParticleSubSystem>> subsystems;
@@ -194,5 +254,16 @@ public:
 
 private:
     std::array<float, 2> m_mouse_pos { 0.5f, 0.5f };
+
+    bool m_needs_audio_spectrum { false };
+    bool m_audio_spectrum_valid { false };
+    mutable bool m_audio_response_diagnostics_initialized { false };
+    mutable uint64_t m_audio_response_diagnostics_sample { 0 };
+    mutable std::ofstream m_audio_response_diagnostics_stream;
+    bool m_cpu_diagnostics_initialized { false };
+    bool m_cpu_diagnostics_enabled { false };
+    std::ofstream m_cpu_diagnostics_stream;
+    std::array<float, kParticleAudioBandCount> m_audio_left {};
+    std::array<float, kParticleAudioBandCount> m_audio_right {};
 };
 } // namespace wallpaper

@@ -170,6 +170,7 @@ struct OffscreenExportReconfigureRequest {
     };
     std::promise<bool>            result;
 };
+
 } // namespace
 
 namespace wallpaper
@@ -216,8 +217,6 @@ public:
     void        sendRenderReady();
     void        sendFirstFrameOk();
     bool        isGenGraphviz() const { return m_gen_graphviz; }
-    const auto& mediaState() const { return m_media_state; }
-    const auto& audioSamples() const { return m_audio_samples; }
 
 private:
     void loadScene();
@@ -318,10 +317,9 @@ public:
     bool renderInited() const { return m_render->inited(); }
 
     double textRenderScale() const {
-        // Scene parsing can now rasterize text at the final render scale directly.
-        // Exposing the normalized scale here lets the main thread avoid a guaranteed
-        // rerender pass every time a scene is first handed to the render thread.
-        return std::max(1.0, m_render_scale);
+        // Text stays in the authored letter box. Desktop render scale is applied when the
+        // composited result is presented, not by enlarging atlases or effect ping-pong.
+        return 1.0;
     }
 
 private:
@@ -487,6 +485,19 @@ private:
                 auto pos = m_mouse_pos.load();
                 m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
             }
+            if (m_scene->paritileSys->NeedsAudioSpectrum()) {
+                // Particle responses consume the same normalized 16-band snapshot as SceneScript
+                // and stock audio shaders. A missing source is cleared to zero-strength response;
+                // mode zero remains the explicit authored bypass.
+                std::vector<float> audio_left, audio_right, audio_average;
+                if (m_scene->scriptHost &&
+                    m_scene->scriptHost->GetAudioSpectrum(
+                        kParticleAudioBandCount, &audio_left, &audio_right, &audio_average)) {
+                    m_scene->paritileSys->SetAudioSpectrum(audio_left, audio_right);
+                } else {
+                    m_scene->paritileSys->ClearAudioSpectrum();
+                }
+            }
             m_scene->paritileSys->Emitt();
 
             m_render->drawFrame(*m_scene);
@@ -512,12 +523,15 @@ private:
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
-            // Scene text arrives with authoring geometry already resolved by WPSceneParser. The
-            // render thread records the active density for future runtime rerasterization, but it
-            // must not rebuild parsed text just because the desktop scale changed: render scale
-            // controls atlas sharpness, while the renderer's fixed pointsize conversion controls
-            // authored glyph geometry.
-            m_scene->textRenderScale = std::max(1.0, m_render_scale);
+            std::shared_ptr<WPSceneScriptMediaState> media_state;
+            std::shared_ptr<std::vector<float>>      audio_samples;
+            msg->findObject("media_state", &media_state);
+            msg->findObject("audio_samples", &audio_samples);
+
+            // Scene text arrives with authoring geometry already resolved by WPSceneParser. Keep
+            // that authored density for later rerasterization; desktop render scale must not
+            // rebuild glyphs or enlarge effect ping-pong.
+            m_scene->textRenderScale = 1.0;
             m_scene->scriptHost = std::make_unique<WPSceneScriptHost>(m_scene.get());
             for (const auto& registration : m_scene->bindingRegistrations) {
                 m_scene->scriptHost->RegisterPropertyBinding(registration);
@@ -529,12 +543,12 @@ private:
                 m_scene->scriptHost->RegisterPropertyScript(registration);
             }
             m_scene->scriptHost->Initialize();
-            if (main_handler.mediaState()) {
-                m_scene->scriptHost->ApplyMediaState(*main_handler.mediaState());
-                m_applied_media_state = main_handler.mediaState();
+            if (media_state) {
+                m_scene->scriptHost->ApplyMediaState(*media_state);
+                m_applied_media_state = std::move(media_state);
             }
-            if (main_handler.audioSamples()) {
-                m_scene->scriptHost->ApplyAudioSamples(*main_handler.audioSamples());
+            if (audio_samples) {
+                m_scene->scriptHost->ApplyAudioSamples(*audio_samples);
             }
             m_scene->scriptHost->MaterializeDeferredRuntimeLayersForResidency();
 
@@ -948,6 +962,8 @@ void MainHandler::loadScene() {
     {
         auto msg = CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_SCENE);
         msg->setObject("scene", scene);
+        msg->setObject("media_state", m_media_state);
+        msg->setObject("audio_samples", m_audio_samples);
         msg->post();
     }
 

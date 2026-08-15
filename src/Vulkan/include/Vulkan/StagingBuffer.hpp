@@ -4,6 +4,7 @@
 #include "Parameters.hpp"
 #include "vk_mem_alloc.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace wallpaper
@@ -48,6 +49,22 @@ public:
     VkDeviceSize trackedBytes() const;
     size_t       blockCount() const;
 
+    // Opt-in counters for T4. Default off; the write/fill hot path stays a single boolean check.
+    struct FrameStats {
+        uint32_t write_calls { 0 };
+        uint32_t fill_calls { 0 };
+        uint32_t mark_dirty_calls { 0 };
+        uint32_t dirty_range_count { 0 };
+        uint32_t copy_commands { 0 };
+        uint64_t memcpy_bytes { 0 };
+        uint64_t fill_bytes { 0 };
+        uint64_t flush_bytes { 0 };
+    };
+
+    void              setCollectFrameStats(bool enabled);
+    void              resetFrameStats();
+    const FrameStats& frameStats() const;
+
 private:
     struct DirtyRange {
         VkDeviceSize offset { 0 };
@@ -67,6 +84,7 @@ private:
     bool          increaseBuf(VkDeviceSize);
     void          markDirty(VkDeviceSize offset, VkDeviceSize size);
     void          markAllDirty();
+    void          coalesceDirtyRanges();
 
     const Device& m_device;
     VkDeviceSize  m_size_step;
@@ -82,6 +100,8 @@ private:
     // merged dirty ranges keeps per-frame flush/copy work proportional to real writes instead of
     // to the total backing allocation reserved for possible future particle growth.
     std::vector<DirtyRange> m_dirty_ranges;
+    bool                    m_collect_frame_stats { false };
+    FrameStats              m_frame_stats {};
 };
 
 } // namespace vulkan

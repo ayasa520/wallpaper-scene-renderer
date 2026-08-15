@@ -31,15 +31,18 @@ ParticleParallelExecutor::~ParticleParallelExecutor() {
 }
 
 void ParticleParallelExecutor::ParallelFor(
-    size_t item_count, const std::function<void(size_t begin, size_t end)>& operation) {
+    size_t item_count, const std::function<void(size_t begin, size_t end)>& operation,
+    size_t max_participants) {
     if (item_count == 0) return;
-    if (m_workers.empty() || item_count == 1) {
+    const size_t hardware_limit = m_workers.empty() ? 1 : m_workers.size() + 1;
+    const size_t participant_count =
+        std::min(item_count, std::min(hardware_limit, max_participants));
+    if (participant_count <= 1) {
         operation(0, item_count);
         return;
     }
 
     std::unique_lock<std::mutex> dispatch_lock { m_dispatch_mutex };
-    const size_t participant_count = std::min(item_count, m_workers.size() + 1);
     const size_t active_worker_count = participant_count - 1;
 
     {

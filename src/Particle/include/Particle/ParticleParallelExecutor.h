@@ -18,7 +18,8 @@ public:
     static ParticleParallelExecutor& Instance();
 
     void ParallelFor(size_t item_count,
-                     const std::function<void(size_t begin, size_t end)>& operation);
+                     const std::function<void(size_t begin, size_t end)>& operation,
+                     size_t max_participants = static_cast<size_t>(-1));
 
 private:
     ParticleParallelExecutor();

@@ -112,6 +112,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPushConstants                    vkCmdPushConstants {};
     PFN_vkCmdPushDescriptorSetKHR             vkCmdPushDescriptorSetKHR {};
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR {};
+    PFN_vkCmdResetQueryPool                   vkCmdResetQueryPool {};
     PFN_vkCmdResolveImage                     vkCmdResolveImage {};
     PFN_vkCmdSetBlendConstants                vkCmdSetBlendConstants {};
     PFN_vkCmdSetDepthBias                     vkCmdSetDepthBias {};
@@ -124,6 +125,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetStencilWriteMask              vkCmdSetStencilWriteMask {};
     PFN_vkCmdSetViewport                      vkCmdSetViewport {};
     PFN_vkCmdWaitEvents                       vkCmdWaitEvents {};
+    PFN_vkCmdWriteTimestamp                   vkCmdWriteTimestamp {};
     PFN_vkCreateBuffer                        vkCreateBuffer {};
     PFN_vkCreateBufferView                    vkCreateBufferView {};
     PFN_vkCreateCommandPool                   vkCreateCommandPool {};
@@ -321,6 +323,7 @@ void Destroy(VkDevice, VkSampler, const DeviceDispatch&) noexcept;
 void Destroy(VkDevice, VkSemaphore, const DeviceDispatch&) noexcept;
 void Destroy(VkDevice, VkFence, const DeviceDispatch&) noexcept;
 void Destroy(VkDevice, VkFramebuffer, const DeviceDispatch&) noexcept;
+void Destroy(VkDevice, VkQueryPool, const DeviceDispatch&) noexcept;
 
 VkResult Free(VkDevice, VkCommandPool, Span<VkCommandBuffer>, const DeviceDispatch&) noexcept;
 
@@ -471,6 +474,12 @@ public:
     VkResult Reset() const { return dld->vkResetFences(owner, 1, &handle); }
 };
 
+class QueryPool : public Handle<VkQueryPool, VkDevice, DeviceDispatch> {
+    using Handle<VkQueryPool, VkDevice, DeviceDispatch>::Handle;
+
+public:
+};
+
 class Semaphore : public Handle<VkSemaphore, VkDevice, DeviceDispatch> {
     using Handle<VkSemaphore, VkDevice, DeviceDispatch>::Handle;
 
@@ -534,6 +543,12 @@ public:
 
     VkResult CreateFence(const VkFenceCreateInfo& ci, Fence&) const noexcept;
 
+    VkResult CreateQueryPool(const VkQueryPoolCreateInfo& ci, QueryPool&) const noexcept;
+
+    VkResult GetQueryPoolResults(VkQueryPool pool, uint32_t first_query, uint32_t query_count,
+                                 size_t data_size, void* data, VkDeviceSize stride,
+                                 VkQueryResultFlags flags) const noexcept;
+
     VkResult CreateSampler(const VkSamplerCreateInfo& ci, Sampler&) const noexcept;
 
     VkResult WaitIdle() const noexcept { return dld->vkDeviceWaitIdle(handle); }
@@ -573,6 +588,16 @@ public:
 
     void EndQuery(VkQueryPool query_pool, uint32_t query) const noexcept {
         dld->vkCmdEndQuery(handle, query_pool, query);
+    }
+
+    void ResetQueryPool(VkQueryPool query_pool, uint32_t first_query,
+                        uint32_t query_count) const noexcept {
+        dld->vkCmdResetQueryPool(handle, query_pool, first_query, query_count);
+    }
+
+    void WriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
+                        uint32_t query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, pipeline_stage, query_pool, query);
     }
 
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, uint32_t first,

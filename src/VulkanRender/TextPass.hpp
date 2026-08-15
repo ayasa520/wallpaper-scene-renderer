@@ -56,6 +56,7 @@ public:
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
     bool referencesTextLayer(int32_t) const override;
+    GpuPassDiagInfo gpuDiagInfo() const override;
 
 private:
     struct MeshBuffers {

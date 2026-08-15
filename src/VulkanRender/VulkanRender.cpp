@@ -1,4 +1,6 @@
 #include "VulkanRender.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <typeinfo>
 
 #include "Utils/Logging.h"
@@ -23,14 +25,18 @@
 
 #include "Core/ArrayHelper.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -93,6 +99,66 @@ const char* ExternalMemoryPreferenceName(wallpaper::ExternalFrameMemoryPreferenc
     }
 }
 
+constexpr uint32_t kGpuTimestampBegin         = 0;
+constexpr uint32_t kGpuTimestampAfterBuffers  = 1;
+constexpr uint32_t kGpuTimestampAfterTextures = 2;
+constexpr uint32_t kGpuTimestampEnd           = 3;
+constexpr uint32_t kGpuTimestampPassBase      = 4;
+constexpr uint32_t kGpuPassCapacity           = 256;
+constexpr uint32_t kGpuTimestampQueryCount    = kGpuTimestampPassBase + kGpuPassCapacity;
+constexpr uint32_t kGpuPipelineStatCount      = 8;
+constexpr VkQueryPipelineStatisticFlags kGpuPipelineStatFlags =
+    VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_INVOCATIONS_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+constexpr uint32_t kGpuPassCategoryCount = 8;
+
+struct GpuPassDiagRecord {
+    GpuPassCategory category { GpuPassCategory::Other };
+    int32_t         layer_id { -1 };
+    uint32_t        draws { 0 };
+    uint32_t        vertices { 0 };
+    uint32_t        indices { 0 };
+    const char*     primitive { "none" };
+    const char*     blend { "none" };
+    std::string     key;
+};
+
+template <typename Fn>
+double TimeMs(Fn&& fn) {
+    const auto started = std::chrono::steady_clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+        .count();
+}
+
+double TimestampDeltaMs(uint64_t begin, uint64_t end, float period_ns) {
+    if (end < begin) return 0.0;
+    return static_cast<double>(end - begin) * static_cast<double>(period_ns) / 1.0e6;
+}
+
+std::string CsvEscape(std::string_view value) {
+    if (value.find_first_of(",\"\n\r") == std::string_view::npos) return std::string(value);
+    std::string out = "\"";
+    for (char c : value) {
+        if (c == '"') out += "\"\"";
+        else out += c;
+    }
+    out += '"';
+    return out;
+}
+
+std::string GpuPassCsvPath(std::string_view frame_path) {
+    const auto slash = frame_path.find_last_of("/\\");
+    if (slash == std::string_view::npos) return "gpu-pass.csv";
+    return std::string(frame_path.substr(0, slash + 1)) + "gpu-pass.csv";
+}
+
 } // namespace
 
 struct VulkanRender::Impl {
@@ -132,6 +198,9 @@ struct VulkanRender::Impl {
     bool isDeviceFaultResult(VkResult) const;
     bool checkVkResult(VkResult, const char* operation);
     void abandonDeviceOwnedResourcesAfterFault();
+    void ensureGpuFrameDiagnostics();
+    void finishGpuFrameDiagnostics(double cpu_update_ms, double cpu_record_upload_ms,
+                                   double cpu_execute_ms, double cpu_fence_ms, double cpu_frame_ms);
 
     Instance                m_instance;
     std::unique_ptr<Device> m_device;
@@ -162,6 +231,21 @@ struct VulkanRender::Impl {
 
     std::vector<VulkanPass*> m_passes;
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
+
+    bool            m_gpu_diag_initialized { false };
+    bool            m_gpu_diag_enabled { false };
+    bool            m_pass_diag_enabled { false };
+    bool            m_timestamps_ok { false };
+    bool            m_pipeline_stats_ok { false };
+    std::ofstream   m_gpu_diag_stream;
+    std::ofstream   m_gpu_pass_diag_stream;
+    vvk::QueryPool  m_timestamp_pool;
+    vvk::QueryPool  m_pipeline_stats_pool;
+    float           m_timestamp_period_ns { 1.0f };
+    uint64_t        m_gpu_diag_frame { 0 };
+    FrameDrawStats  m_frame_draw_stats {};
+    StagingBuffer::FrameStats m_dyn_stats_before_upload {};
+    std::vector<GpuPassDiagRecord> m_gpu_diag_passes;
 
 };
 
@@ -435,6 +519,11 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
 
     m_render_cmd.abandon();
     m_cmds.abandon();
+    m_timestamp_pool.abandon();
+    m_pipeline_stats_pool.abandon();
+    m_gpu_diag_stream.close();
+    m_gpu_pass_diag_stream.close();
+    m_rendering_resources.frame_draw_stats = nullptr;
     m_compiled_pass_refs.clear();
     m_passes.clear();
     (void)m_prepass.release();
@@ -482,6 +571,11 @@ void VulkanRender::Impl::destroy() {
         m_rendering_resources.command.reset();
         m_render_cmd.reset();
         m_cmds.reset();
+        m_timestamp_pool.reset();
+        m_pipeline_stats_pool.reset();
+        m_gpu_diag_stream.close();
+        m_gpu_pass_diag_stream.close();
+        m_rendering_resources.frame_draw_stats = nullptr;
 
         m_device->Destroy();
     }
@@ -530,6 +624,238 @@ bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
 
 void VulkanRender::Impl::DestroyRenderingResource(RenderingResources& rr) {}
 
+void VulkanRender::Impl::ensureGpuFrameDiagnostics() {
+    if (m_gpu_diag_initialized) return;
+    m_gpu_diag_initialized = true;
+
+    const char* path = std::getenv("VIVID_GPU_FRAME_DIAGNOSTICS_PATH");
+    if (path == nullptr || path[0] == '\0') return;
+
+    m_gpu_diag_stream.open(path, std::ios::out | std::ios::trunc);
+    if (! m_gpu_diag_stream) {
+        LOG_ERROR("GpuFrameDiagnostics: open failed path='%s'", path);
+        return;
+    }
+    m_gpu_diag_stream
+        << "frame,cpu_update_ms,cpu_record_upload_ms,cpu_execute_ms,cpu_fence_ms,cpu_frame_ms,"
+           "gpu_buffer_upload_ms,gpu_tex_upload_ms,gpu_draw_ms,gpu_total_ms,"
+           "gpu_particle_ms,gpu_video_ms,gpu_effect_ms,gpu_copy_ms,gpu_clear_ms,gpu_text_ms,"
+           "gpu_composite_ms,gpu_other_ms,"
+           "vertex_writes,vertex_mark_dirty,vertex_memcpy_bytes,vertex_ranges,vertex_flush_bytes,"
+           "dyn_writes,dyn_mark_dirty,dyn_memcpy_bytes,dyn_ranges,dyn_flush_bytes,"
+           "dyn_writes_after_upload,dyn_mark_dirty_after_upload,dyn_memcpy_after_upload,"
+           "shader_draws,shader_vertices,shader_indices,prepared_passes,"
+           "ia_vertices,ia_primitives,vs_invocations,gs_invocations,gs_primitives,"
+           "clip_invocations,clip_primitives,fs_invocations,"
+           "particle_draws,particle_vertices\n";
+
+    const char* pass_env = std::getenv("VIVID_GPU_PASS_DIAGNOSTICS");
+    m_pass_diag_enabled =
+        pass_env == nullptr || pass_env[0] == '\0' ||
+        (pass_env[0] != '0' && pass_env[0] != 'n' && pass_env[0] != 'N' && pass_env[0] != 'f' &&
+         pass_env[0] != 'F');
+    if (m_pass_diag_enabled) {
+        const auto pass_path = GpuPassCsvPath(path);
+        m_gpu_pass_diag_stream.open(pass_path, std::ios::out | std::ios::trunc);
+        if (m_gpu_pass_diag_stream) {
+            m_gpu_pass_diag_stream
+                << "frame,pass_index,category,layer_id,primitive,blend,draws,vertices,indices,"
+                   "gpu_ms,ia_vertices,ia_primitives,vs_invocations,gs_invocations,gs_primitives,"
+                   "clip_invocations,clip_primitives,fs_invocations,key\n";
+        } else {
+            LOG_ERROR("GpuFrameDiagnostics: open pass csv failed path='%s'", pass_path.c_str());
+        }
+    }
+
+    m_vertex_buf->setCollectFrameStats(true);
+    m_dyn_buf->setCollectFrameStats(true);
+    m_rendering_resources.frame_draw_stats = &m_frame_draw_stats;
+    m_gpu_diag_passes.reserve(kGpuPassCapacity);
+
+    const auto families = m_device->gpu().GetQueueFamilyProperties();
+    const auto family   = m_device->graphics_queue().family_index;
+    if (family < families.size() && families[family].timestampValidBits > 0) {
+        VkQueryPoolCreateInfo ci {
+            .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = kGpuTimestampQueryCount,
+        };
+        if (m_device->handle().CreateQueryPool(ci, m_timestamp_pool) == VK_SUCCESS) {
+            m_timestamp_period_ns = m_device->limits().timestampPeriod;
+            m_timestamps_ok       = true;
+        } else {
+            LOG_ERROR("GpuFrameDiagnostics: timestamp query pool create failed");
+        }
+    }
+
+    const auto gpu_features = m_device->gpu().GetFeatures();
+    if (m_pass_diag_enabled && gpu_features.pipelineStatisticsQuery) {
+        VkQueryPoolCreateInfo ci {
+            .sType              = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType          = VK_QUERY_TYPE_PIPELINE_STATISTICS,
+            .queryCount         = kGpuPassCapacity,
+            .pipelineStatistics = kGpuPipelineStatFlags,
+        };
+        if (m_device->handle().CreateQueryPool(ci, m_pipeline_stats_pool) == VK_SUCCESS) {
+            m_pipeline_stats_ok = true;
+        } else {
+            LOG_ERROR("GpuFrameDiagnostics: pipeline statistics query pool create failed");
+        }
+    }
+
+    m_gpu_diag_enabled = true;
+    LOG_INFO("GpuFrameDiagnostics: recording path='%s' timestamps=%d pass_diag=%d "
+             "pipeline_stats=%d period_ns=%f",
+             path,
+             m_timestamps_ok ? 1 : 0,
+             m_pass_diag_enabled ? 1 : 0,
+             m_pipeline_stats_ok ? 1 : 0,
+             static_cast<double>(m_timestamp_period_ns));
+}
+
+void VulkanRender::Impl::finishGpuFrameDiagnostics(double cpu_update_ms, double cpu_record_upload_ms,
+                                                   double cpu_execute_ms, double cpu_fence_ms,
+                                                   double cpu_frame_ms) {
+    if (! m_gpu_diag_enabled || ! m_gpu_diag_stream) return;
+
+    const uint32_t pass_count =
+        static_cast<uint32_t>(std::min(m_gpu_diag_passes.size(), static_cast<size_t>(kGpuPassCapacity)));
+    const uint32_t stamp_count =
+        m_pass_diag_enabled ? kGpuTimestampPassBase + pass_count : (kGpuTimestampEnd + 1);
+
+    double gpu_buffer_upload_ms = 0.0;
+    double gpu_tex_upload_ms    = 0.0;
+    double gpu_draw_ms          = 0.0;
+    double gpu_total_ms         = 0.0;
+    std::array<double, kGpuPassCategoryCount> category_ms {};
+    std::vector<double> pass_gpu_ms(pass_count, 0.0);
+    std::vector<uint64_t> stamps(stamp_count, 0);
+    if (m_timestamps_ok && m_timestamp_pool && stamp_count > 0) {
+        const VkResult res = m_device->handle().GetQueryPoolResults(
+            *m_timestamp_pool,
+            0,
+            stamp_count,
+            stamps.size() * sizeof(uint64_t),
+            stamps.data(),
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (res == VK_SUCCESS) {
+            gpu_buffer_upload_ms =
+                TimestampDeltaMs(stamps[kGpuTimestampBegin], stamps[kGpuTimestampAfterBuffers],
+                                 m_timestamp_period_ns);
+            gpu_tex_upload_ms = TimestampDeltaMs(
+                stamps[kGpuTimestampAfterBuffers], stamps[kGpuTimestampAfterTextures],
+                m_timestamp_period_ns);
+            const uint64_t draw_end = stamps[kGpuTimestampEnd];
+            gpu_draw_ms = TimestampDeltaMs(stamps[kGpuTimestampAfterTextures], draw_end,
+                                           m_timestamp_period_ns);
+            gpu_total_ms = TimestampDeltaMs(stamps[kGpuTimestampBegin], draw_end,
+                                            m_timestamp_period_ns);
+            uint64_t prev = stamps[kGpuTimestampAfterTextures];
+            for (uint32_t i = 0; i < pass_count; i++) {
+                const uint64_t cur = stamps[kGpuTimestampPassBase + i];
+                const double ms = TimestampDeltaMs(prev, cur, m_timestamp_period_ns);
+                pass_gpu_ms[i] = ms;
+                const auto cat = static_cast<uint32_t>(m_gpu_diag_passes[i].category);
+                if (cat < kGpuPassCategoryCount) category_ms[cat] += ms;
+                prev = cur;
+            }
+        }
+    }
+
+    std::array<uint64_t, kGpuPipelineStatCount> totals {};
+    std::vector<uint64_t> pass_stats(static_cast<size_t>(pass_count) * kGpuPipelineStatCount, 0);
+    if (m_pipeline_stats_ok && m_pipeline_stats_pool && pass_count > 0) {
+        const VkResult res = m_device->handle().GetQueryPoolResults(
+            *m_pipeline_stats_pool,
+            0,
+            pass_count,
+            pass_stats.size() * sizeof(uint64_t),
+            pass_stats.data(),
+            sizeof(uint64_t) * kGpuPipelineStatCount,
+            VK_QUERY_RESULT_64_BIT);
+        if (res == VK_SUCCESS) {
+            for (uint32_t i = 0; i < pass_count; i++) {
+                for (uint32_t s = 0; s < kGpuPipelineStatCount; s++) {
+                    totals[s] += pass_stats[i * kGpuPipelineStatCount + s];
+                }
+            }
+        }
+    }
+
+    uint32_t particle_draws    = 0;
+    uint32_t particle_vertices = 0;
+    for (uint32_t i = 0; i < pass_count; i++) {
+        const auto& rec = m_gpu_diag_passes[i];
+        if (rec.category != GpuPassCategory::Particle) continue;
+        particle_draws += rec.draws;
+        particle_vertices += rec.vertices;
+    }
+
+    const auto& vertex = m_vertex_buf->frameStats();
+    const auto& dyn    = m_dyn_buf->frameStats();
+    const auto& before = m_dyn_stats_before_upload;
+    const auto  sub_u32 = [](uint32_t later, uint32_t earlier) {
+        return later > earlier ? later - earlier : 0u;
+    };
+    const auto sub_u64 = [](uint64_t later, uint64_t earlier) {
+        return later > earlier ? later - earlier : 0ull;
+    };
+
+    auto category = [&](GpuPassCategory c) {
+        return category_ms[static_cast<uint32_t>(c)];
+    };
+
+    m_gpu_diag_stream << m_gpu_diag_frame << ',' << cpu_update_ms << ',' << cpu_record_upload_ms
+                      << ',' << cpu_execute_ms << ',' << cpu_fence_ms << ',' << cpu_frame_ms << ','
+                      << gpu_buffer_upload_ms << ',' << gpu_tex_upload_ms << ',' << gpu_draw_ms
+                      << ',' << gpu_total_ms << ','
+                      << category(GpuPassCategory::Particle) << ','
+                      << category(GpuPassCategory::Video) << ','
+                      << category(GpuPassCategory::Effect) << ','
+                      << category(GpuPassCategory::Copy) << ','
+                      << category(GpuPassCategory::Clear) << ','
+                      << category(GpuPassCategory::Text) << ','
+                      << category(GpuPassCategory::Composite) << ','
+                      << category(GpuPassCategory::Other) << ','
+                      << vertex.write_calls << ','
+                      << vertex.mark_dirty_calls << ',' << vertex.memcpy_bytes << ','
+                      << vertex.dirty_range_count << ',' << vertex.flush_bytes << ','
+                      << dyn.write_calls << ',' << dyn.mark_dirty_calls << ',' << dyn.memcpy_bytes
+                      << ',' << dyn.dirty_range_count << ',' << dyn.flush_bytes << ','
+                      << sub_u32(dyn.write_calls, before.write_calls) << ','
+                      << sub_u32(dyn.mark_dirty_calls, before.mark_dirty_calls) << ','
+                      << sub_u64(dyn.memcpy_bytes, before.memcpy_bytes) << ','
+                      << m_frame_draw_stats.shader_draws << ','
+                      << m_frame_draw_stats.shader_vertices << ','
+                      << m_frame_draw_stats.shader_indices << ','
+                      << m_frame_draw_stats.prepared_passes << ','
+                      << totals[0] << ',' << totals[1] << ',' << totals[2] << ',' << totals[3] << ','
+                      << totals[4] << ',' << totals[5] << ',' << totals[6] << ',' << totals[7] << ','
+                      << particle_draws << ',' << particle_vertices << '\n';
+
+    if (m_gpu_pass_diag_stream) {
+        for (uint32_t i = 0; i < pass_count; i++) {
+            const auto& rec = m_gpu_diag_passes[i];
+            const uint64_t* stats = pass_stats.data() + static_cast<size_t>(i) * kGpuPipelineStatCount;
+            m_gpu_pass_diag_stream
+                << m_gpu_diag_frame << ',' << i << ',' << GpuPassCategoryName(rec.category) << ','
+                << rec.layer_id << ',' << rec.primitive << ',' << rec.blend << ','
+                << rec.draws << ',' << rec.vertices << ',' << rec.indices << ','
+                << pass_gpu_ms[i] << ','
+                << stats[0] << ',' << stats[1] << ',' << stats[2] << ',' << stats[3] << ','
+                << stats[4] << ',' << stats[5] << ',' << stats[6] << ',' << stats[7] << ','
+                << CsvEscape(rec.key) << '\n';
+        }
+    }
+
+    if ((m_gpu_diag_frame % 30) == 0) {
+        m_gpu_diag_stream.flush();
+        if (m_gpu_pass_diag_stream) m_gpu_pass_diag_stream.flush();
+    }
+    m_gpu_diag_frame++;
+}
+
 // VulkanExSwapchain* VulkanRender::exSwapchain() const { return m_ex_swapchain.get(); }
 
 void VulkanRender::Impl::drawFrame(Scene& scene) {
@@ -550,7 +876,28 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
         scene.videoTextureRuntimeStates, scene.videoTextureRuntimeStateRequests);
     processDeferredGraphPreparation(scene);
 
-        // LOG_INFO("used ram: %fm", (m_device->GetUsage()/1024.0f)/1024.0f);
+    // Opt-in GPU memory attribution dump for diagnosing device-memory regressions against the
+    // reference implementation. VMA's JSON stats list every allocation with its size and pool, so
+    // one periodic snapshot in a real desktop session shows exactly which textures/buffers own
+    // the footprint. Enabled only via environment variable to keep steady-state frames free of
+    // stats-collection cost.
+    {
+        static const bool  dump_vma_stats = std::getenv("VIVID_VMA_STATS") != nullptr;
+        static std::size_t vma_stats_frame_counter { 0 };
+        if (dump_vma_stats && m_device && (vma_stats_frame_counter++ % 600 == 0)) {
+            char* stats_json = nullptr;
+            vmaBuildStatsString(m_device->vma_allocator(), &stats_json, VK_TRUE);
+            if (stats_json != nullptr) {
+                if (FILE* out = std::fopen("/tmp/vivid-vma-stats.json", "w")) {
+                    std::fputs(stats_json, out);
+                    std::fclose(out);
+                    LOG_INFO("VMA stats dumped to /tmp/vivid-vma-stats.json usage=%.1fMiB",
+                             m_device->GetUsage() / 1024.0 / 1024.0);
+                }
+                vmaFreeStatsString(m_device->vma_allocator(), stats_json);
+            }
+        }
+    }
 
 #if ENABLE_RENDERDOC_API
     if (rdoc_api)
@@ -842,18 +1189,30 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         }
     }
 
+    ensureGpuFrameDiagnostics();
+    const auto frame_started = std::chrono::steady_clock::now();
+    if (m_gpu_diag_enabled) {
+        m_frame_draw_stats.reset();
+        m_vertex_buf->resetFrameStats();
+        m_dyn_buf->resetFrameStats();
+        m_dyn_stats_before_upload = {};
+    }
+
     ImageParameters image = m_ex_swapchain->GetInprogressImage();
 
     m_finpass->setPresent(image);
 
-    for (auto* p : m_passes) {
-        if (p->prepared()) {
-            // Offscreen rendering exports the result to GTK, making stale particle bytes visible as
-            // source-switch flicker. Pre-updating dynamic mesh data aligns the following m_dyn_buf
-            // upload with the frame that will be exported.
-            p->updateBeforeUpload();
+    const double cpu_update_ms = TimeMs([&] {
+        for (auto* p : m_passes) {
+            if (p->prepared()) {
+                // Offscreen rendering exports the result to GTK, making stale particle bytes visible as
+                // source-switch flicker. Pre-updating dynamic mesh data aligns the following m_dyn_buf
+                // upload with the frame that will be exported.
+                p->updateBeforeUpload();
+            }
         }
-    }
+    });
+    if (m_gpu_diag_enabled) m_dyn_stats_before_upload = m_dyn_buf->frameStats();
 
     if (!checkVkResult(rr.command.Begin(VkCommandBufferBeginInfo {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -861,15 +1220,70 @@ void VulkanRender::Impl::drawFrameOffscreen() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
-    m_vertex_buf->recordUpload(rr.command);
-    m_dyn_buf->recordUpload(rr.command);
-    m_device->tex_cache().RecordUploads(rr.command);
-    m_device->video_tex_cache().RecordUploads(rr.command);
-
-    for (auto* p : m_passes) {
-        if (p->prepared()) {
-            p->execute(*m_device, rr);
+    if (m_timestamps_ok) {
+        rr.command.ResetQueryPool(*m_timestamp_pool, 0, kGpuTimestampQueryCount);
+        rr.command.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *m_timestamp_pool,
+                                  kGpuTimestampBegin);
+    }
+    if (m_pass_diag_enabled && m_pipeline_stats_ok) {
+        rr.command.ResetQueryPool(*m_pipeline_stats_pool, 0, kGpuPassCapacity);
+    }
+    const double cpu_record_upload_ms = TimeMs([&] {
+        m_vertex_buf->recordUpload(rr.command);
+        m_dyn_buf->recordUpload(rr.command);
+        if (m_timestamps_ok) {
+            rr.command.WriteTimestamp(VK_PIPELINE_STAGE_TRANSFER_BIT, *m_timestamp_pool,
+                                      kGpuTimestampAfterBuffers);
         }
+        m_device->tex_cache().RecordUploads(rr.command);
+        m_device->video_tex_cache().RecordUploads(rr.command);
+        if (m_timestamps_ok) {
+            rr.command.WriteTimestamp(VK_PIPELINE_STAGE_TRANSFER_BIT, *m_timestamp_pool,
+                                      kGpuTimestampAfterTextures);
+        }
+    });
+
+    if (m_gpu_diag_enabled) m_gpu_diag_passes.clear();
+    const double cpu_execute_ms = TimeMs([&] {
+        uint32_t pass_index = 0;
+        for (auto* p : m_passes) {
+            if (! p->prepared()) continue;
+            if (m_gpu_diag_enabled) m_frame_draw_stats.prepared_passes++;
+            const bool record_pass =
+                m_gpu_diag_enabled && m_pass_diag_enabled && pass_index < kGpuPassCapacity;
+            const uint32_t draws_before    = m_frame_draw_stats.shader_draws;
+            const uint32_t vertices_before = m_frame_draw_stats.shader_vertices;
+            const uint32_t indices_before  = m_frame_draw_stats.shader_indices;
+            if (record_pass && m_pipeline_stats_ok) {
+                rr.command.BeginQuery(*m_pipeline_stats_pool, pass_index, 0);
+            }
+            p->execute(*m_device, rr);
+            if (record_pass && m_pipeline_stats_ok) {
+                rr.command.EndQuery(*m_pipeline_stats_pool, pass_index);
+            }
+            if (record_pass && m_timestamps_ok) {
+                rr.command.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *m_timestamp_pool,
+                                          kGpuTimestampPassBase + pass_index);
+            }
+            if (record_pass) {
+                const auto info = p->gpuDiagInfo();
+                m_gpu_diag_passes.push_back(GpuPassDiagRecord {
+                    .category  = info.category,
+                    .layer_id  = info.layer_id,
+                    .draws     = m_frame_draw_stats.shader_draws - draws_before,
+                    .vertices  = m_frame_draw_stats.shader_vertices - vertices_before,
+                    .indices   = m_frame_draw_stats.shader_indices - indices_before,
+                    .primitive = info.primitive,
+                    .blend     = info.blend,
+                    .key       = p->residencyKey(),
+                });
+            }
+            pass_index++;
+        }
+    });
+    if (m_timestamps_ok) {
+        rr.command.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *m_timestamp_pool,
+                                  kGpuTimestampEnd);
     }
 
     if (!checkVkResult(rr.command.End(), "end offscreen frame command buffer"))
@@ -885,12 +1299,24 @@ void VulkanRender::Impl::drawFrameOffscreen() {
                        "submit offscreen frame"))
         return;
 
+    const auto fence_started = std::chrono::steady_clock::now();
     if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
         return;
+    const double cpu_fence_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_started)
+            .count();
     m_device->tex_cache().RetireCompletedUploads();
     if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
         return;
     m_ex_swapchain->renderFrame();
+    if (m_gpu_diag_enabled) {
+        const double cpu_frame_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      frame_started)
+                .count();
+        finishGpuFrameDiagnostics(cpu_update_ms, cpu_record_upload_ms, cpu_execute_ms, cpu_fence_ms,
+                                  cpu_frame_ms);
+    }
 }
 
 void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) {
@@ -898,8 +1324,22 @@ void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) 
     for (auto& item : scene.renderTargets) {
         auto& rt = item.second;
         if (rt.bind.enable && rt.bind.screen) {
-            rt.width  = (i32)(rt.bind.scale * ext.width);
-            rt.height = (i32)(rt.bind.scale * ext.height);
+            const i32 new_w = (i32)(rt.bind.scale * ext.width);
+            const i32 new_h = (i32)(rt.bind.scale * ext.height);
+            if (rt.width != new_w || rt.height != new_h) {
+                LOG_INFO("SceneScreenBoundTarget: name='%s' previous=[%d %d] screen=[%d %d] "
+                         "scale=%.3f extent=%ux%u",
+                         item.first.c_str(),
+                         rt.width,
+                         rt.height,
+                         new_w,
+                         new_h,
+                         rt.bind.scale,
+                         ext.width,
+                         ext.height);
+            }
+            rt.width  = new_w;
+            rt.height = new_h;
             // Screen-sized render targets expose the full framebuffer as both their physical and
             // logical extent. Only text-owned runtime targets intentionally diverge these values.
             rt.mapWidth = rt.width;
@@ -1324,7 +1764,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     std::size_t deferred_waiting_count = 0;
     std::size_t already_prepared_count = 0;
     // CopyPass is a lightweight graph-residency pass, not a heavy shader pass: it registers
-    // dynamic copy render targets such as `_rt_default_*_copy` in Scene::renderTargets and binds
+    // dynamic copy render targets such as `_rt_default_pingpong` in Scene::renderTargets and binds
     // their TextureCache images. Reused shader passes can legitimately sample those copy targets
     // during the same topology compile, so deferring CopyPass creation lets refreshed passes see a
     // missing input and black out the frame. Prepare copy dependencies up front, then keep the

@@ -6,10 +6,13 @@ namespace wallpaper
 {
 class WPParticleParser {
 public:
-    static ParticleInitOp     genParticleInitOp(const nlohmann::json&);
+    static ParticleInitOp     genParticleInitOp(const nlohmann::json&,
+                                                ParticleAudioResponseFactor audio_factor = {});
     static ParticleOperatorOp genParticleOperatorOp(const nlohmann::json&,
-                                                    const wpscene::ParticleInstanceoverride&);
-    static ParticleEmittOp genParticleEmittOp(const wpscene::Emitter&);
+                                                    const wpscene::ParticleInstanceoverride&,
+                                                    ParticleAudioResponseFactor audio_factor = {});
+    static ParticleEmittOp genParticleEmittOp(const wpscene::Emitter&,
+                                              ParticleAudioResponseFactor audio_rate_factor = {});
     static ParticleInitOp  genOverrideInitOp(const wpscene::ParticleInstanceoverride&);
 };
 } // namespace wallpaper

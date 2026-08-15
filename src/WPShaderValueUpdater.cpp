@@ -5,7 +5,6 @@
 #include "Scene/Scene.h"
 #include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SceneNode.h"
-#include "Audio/SoundManager.h"
 #include "SpriteAnimation.hpp"
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
@@ -699,21 +698,15 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {
         if (!info.has_audio_spectrum_left[index] && !info.has_audio_spectrum_right[index]) continue;
 
+        const uint32_t     resolution = kAudioSpectrumResolutions[index];
         std::vector<float> left;
         std::vector<float> right;
         std::vector<float> average;
-        bool has_audio = false;
-        if (m_scene->scriptHost != nullptr) {
-            has_audio = m_scene->scriptHost->GetAudioSpectrum(kAudioSpectrumResolutions[index],
-                                                              &left,
-                                                              &right,
-                                                              &average);
-        } else if (m_scene->soundManager != nullptr) {
-            m_scene->soundManager->GetSpectrum(kAudioSpectrumResolutions[index], &left, &right, &average);
-            has_audio = !left.empty() || !right.empty() || !average.empty();
-        }
-        if (!has_audio) {
-            continue;
+        if (m_scene->scriptHost == nullptr ||
+            ! m_scene->scriptHost->GetAudioSpectrum(resolution, &left, &right, &average)) {
+            left.assign(resolution, 0.0f);
+            right.assign(resolution, 0.0f);
+            average.assign(resolution, 0.0f);
         }
 
         if (info.has_audio_spectrum_left[index]) {

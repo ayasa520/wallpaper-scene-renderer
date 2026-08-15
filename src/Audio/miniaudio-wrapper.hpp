@@ -205,18 +205,17 @@ public:
         for (size_t i = 0; i < size; i++) {
             const size_t begin = (i * source_size) / size;
             const size_t end   = std::max(begin + 1, ((i + 1) * source_size) / size);
-            float left_sum { 0.0f };
-            float right_sum { 0.0f };
-            float average_sum { 0.0f };
+            float left_peak { 0.0f };
+            float right_peak { 0.0f };
+            float average_peak { 0.0f };
             for (size_t j = begin; j < std::min(end, source_size); j++) {
-                left_sum += m_spectrum_left[j];
-                right_sum += m_spectrum_right[j];
-                average_sum += m_spectrum_average[j];
+                left_peak = std::max(left_peak, m_spectrum_left[j]);
+                right_peak = std::max(right_peak, m_spectrum_right[j]);
+                average_peak = std::max(average_peak, m_spectrum_average[j]);
             }
-            const auto count = static_cast<float>(std::max<size_t>(1, std::min(end, source_size) - begin));
-            (*left)[i] = left_sum / count;
-            (*right)[i] = right_sum / count;
-            (*average)[i] = average_sum / count;
+            (*left)[i] = left_peak;
+            (*right)[i] = right_peak;
+            (*average)[i] = average_peak;
         }
     }
     void MountChannel(std::shared_ptr<Channel> chn) {

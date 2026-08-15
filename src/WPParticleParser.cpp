@@ -33,18 +33,59 @@ inline bool IsFiniteNonZeroVector(const Vector3d& value) {
 }
 
 inline Vector3d NormalizeOr(const Vector3d& value, const Vector3d& fallback) {
-    // Cherry_Blossoms_2.json uses the default vortex axis, but malformed axis data must still avoid
-    // NaN tangents in the same code path when the current wallpaper's vortex operator runs.
     if (IsFiniteNonZeroVector(value)) return value.normalized();
     return fallback;
 }
 
-inline uint64_t MapSequenceSlotCount(float authored_count) {
-    // The current cursor blossom authors count=5. Clamp only invalid values so the sequence modulo
-    // never divides by zero while preserving the exact five authored directions.
-    if (! std::isfinite(authored_count)) return 1;
-    const long long rounded = std::llround(std::abs(static_cast<double>(authored_count)));
-    return rounded <= 0 ? 1 : static_cast<uint64_t>(rounded);
+inline i32 NormalizeControlPointIndex(i32 index) {
+    if (index < 0) {
+        LOG_ERROR("wrong controlpoint index %d", index);
+        return 0;
+    }
+    if (index >= static_cast<i32>(wpscene::kParticleControlpointSlotCount)) {
+        LOG_ERROR("wrong controlpoint index %d", index);
+        return index % static_cast<i32>(wpscene::kParticleControlpointSlotCount);
+    }
+    return index;
+}
+
+inline float StableParticleRandom01(uint64_t sequence) {
+    uint64_t value = sequence + 0x9e3779b97f4a7c15ULL;
+    value          = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value          = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    value ^= value >> 31;
+    return static_cast<float>(value >> 40) * (1.0f / 16777216.0f);
+}
+
+inline float MapSequenceCount(float authored_count) {
+    if (! std::isfinite(authored_count) || authored_count <= 1.0f) return 1.0f;
+    return authored_count;
+}
+
+inline double MapSequencePhase(uint64_t sequence, float count) {
+    const double step  = 1.0 / static_cast<double>(count);
+    double       phase = static_cast<double>(sequence) * step;
+    if (phase > 1.0) phase = std::fmod(phase, 1.0);
+    if (phase < 0.0) phase += 1.0;
+    return phase;
+}
+
+inline ParticleEmitterTiming MakeEmitterTiming(const wpscene::Emitter& wpe,
+                                               ParticleAudioResponseFactor audio_rate_factor) {
+    ParticleEmitterTiming timing;
+    timing.emit_speed              = wpe.rate;
+    timing.one_per_frame           = wpe.flags[wpscene::Emitter::FlagEnum::one_per_frame];
+    timing.periodic                = wpe.flags[wpscene::Emitter::FlagEnum::periodic];
+    timing.instantaneous           = wpe.instantaneous;
+    timing.max_to_emit_per_period  = wpe.maxtoemitperperiod;
+    timing.min_periodic_duration   = wpe.minperiodicduration;
+    timing.max_periodic_duration   = wpe.maxperiodicduration;
+    timing.min_periodic_delay      = wpe.minperiodicdelay;
+    timing.max_periodic_delay      = wpe.maxperiodicdelay;
+    timing.duration                = wpe.duration;
+    timing.delay                   = wpe.delay;
+    timing.audio_rate_factor       = std::move(audio_rate_factor);
+    return timing;
 }
 
 inline Eigen::Vector3f DecodeParticleColorEndpoint(
@@ -115,9 +156,12 @@ struct TurbulentRandom {
 
 struct MapSequenceAroundControlPoint {
     i32                  controlpoint { 0 };
-    float                count { 1.0f };
+    float                count { 32.0f };
     std::array<float, 3> speedmin { 0.0f, 0.0f, 0.0f };
-    std::array<float, 3> speedmax { 100.0f, 100.0f, 100.0f };
+    std::array<float, 3> speedmax { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> axis { 0.0f, 0.0f, 1.0f };
+    std::array<float, 2> bounds { 0.0f, 1.0f };
+    bool                 mirror { false };
 
     static auto ReadFromJson(const nlohmann::json& j) {
         MapSequenceAroundControlPoint v;
@@ -131,15 +175,17 @@ struct MapSequenceAroundControlPoint {
         }
 
         GET_JSON_NAME_VALUE_NOWARN(j, "count", v.count);
-        // Match linux-wallpaperengine's parser surface for the current Cherry_Blossoms_2.json path:
-        // controlpoint/count plus speedmin/speedmax. Do not invent extra axis or offset handling here.
         GET_JSON_NAME_VALUE_NOWARN(j, "speedmin", v.speedmin);
         GET_JSON_NAME_VALUE_NOWARN(j, "speedmax", v.speedmax);
+        GET_JSON_NAME_VALUE_NOWARN(j, "axis", v.axis);
+        GET_JSON_NAME_VALUE_NOWARN(j, "bounds", v.bounds);
+        GET_JSON_NAME_VALUE_NOWARN(j, "mirror", v.mirror);
         return v;
     }
 };
 
-ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
+ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       wpj,
+                                                   ParticleAudioResponseFactor audio_factor) {
     using namespace std::placeholders;
     do {
         if (! wpj.contains("name")) break;
@@ -184,6 +230,8 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
             VecRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
                 auto result = GenRandomVec3(r.min, r.max);
+                // Simulation is in the particle node's local space; the node transform is applied
+                // at render, so this velocity stays local.
                 PM::ChangeVelocity(p, result[0], result[1], result[2]);
             };
         } else if (name == "rotationrandom") {
@@ -204,7 +252,12 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
                 PM::ChangeAngularVelocity(p, result[0], result[1], result[2]);
             };
         } else if (name == "mapsequencearoundcontrolpoint") {
-            MapSequenceAroundControlPoint m = MapSequenceAroundControlPoint::ReadFromJson(wpj);
+            MapSequenceAroundControlPoint m     = MapSequenceAroundControlPoint::ReadFromJson(wpj);
+            const float                   count = MapSequenceCount(m.count);
+            const Vector3d                axis =
+                NormalizeOr((Vector3f { m.axis.data() }).cast<double>(), Vector3d::UnitZ());
+            const double bounds_min  = static_cast<double>(m.bounds[0]);
+            const double bounds_span = static_cast<double>(m.bounds[1] - m.bounds[0]);
             return [=](Particle& p, const ParticleInitInfo& info) {
                 Vector3d center = Vector3d::Zero();
                 if (m.controlpoint >= 0 &&
@@ -212,73 +265,53 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json& wpj) {
                     center = info.controlpoints[static_cast<usize>(m.controlpoint)].offset;
                 }
 
-                const uint64_t count = MapSequenceSlotCount(m.count);
-                const uint64_t slot  = info.sequence % count;
-                const double   angle = static_cast<double>(slot) * (2.0 * M_PI / count);
-
-                // linux-wallpaperengine starts each sequenced blossom petal at the mouse-linked
-                // control point. The five-point star is produced by the deterministic slot velocity
-                // plus this particle's later attract/vortex operators, not by the sphere emitter's
-                // random radius.
-                PM::MoveTo(p, center);
-
-                Vector3d local_speed = GenRandomVec3(m.speedmin, m.speedmax);
-                // Cherry_Blossoms_2.json authors speed as "0 100 0". Match linux-wallpaperengine:
-                // flip local Y, then apply its GLM column-major mat3(cos,-sin,0, sin,cos,0, 0,0,1)
-                // result. This gives five fixed movement directions instead of random petal motion.
-                local_speed.y() = -local_speed.y();
-                const double cos_angle = std::cos(angle);
-                const double sin_angle = std::sin(angle);
-                const Vector3d world_speed {
-                    local_speed.x() * cos_angle + local_speed.y() * sin_angle,
-                    -local_speed.x() * sin_angle + local_speed.y() * cos_angle,
-                    local_speed.z(),
-                };
-                PM::InitVelocity(p, world_speed);
-
-                const double render_angle = Random::get(0.0, 2.0 * M_PI);
-                const Vector3d render_direction { std::cos(render_angle), std::sin(render_angle), 0.0 };
-                const double   render_speed = std::max(1.0, world_speed.norm());
-                // This is the user's requested random petal facing, not random movement direction.
-                // The physics velocity above remains in the authored five-slot sequence while the
-                // spritetrail shader receives a separate visual axis.
-                PM::InitRenderVelocity(p, render_direction * render_speed);
-                PM::ChangeRotation(p, 0.0, 0.0, render_angle);
+                /*
+                 * Each spawn advances a shared 0..1 phase by 1/count. The phase is used before
+                 * wrapping, so a value of exactly 1 stays 1 (a full turn, same pose as 0). Bounds
+                 * scale that phase into an angle around the authored axis. Position is rotated
+                 * around the control point; sequenced speed is added to the emitter velocity.
+                 */
+                double phase = MapSequencePhase(info.sequence, count);
+                if (m.mirror) {
+                    const double folded = std::fmod(phase * 2.0, 2.0);
+                    phase               = folded <= 1.0 ? folded : 2.0 - folded;
+                }
+                const double           angle = (bounds_min + phase * bounds_span) * (2.0 * M_PI);
+                const AngleAxisd       orbit(angle, axis);
+                const Vector3d         relative = PM::GetPos(p).cast<double>() - center;
+                PM::MoveTo(p, center + orbit * relative);
+                PM::ChangeVelocity(p, orbit * GenRandomVec3(m.speedmin, m.speedmax));
             };
         } else if (name == "turbulentvelocityrandom") {
-            // to do
             TurbulentRandom r;
             TurbulentRandom::ReadFromJson(wpj, r);
             Vector3f forward(r.forward.data());
             Vector3f right(r.right.data());
-            Vector3f pos = GenRandomVec3({ 0, 0, 0 }, { 10.0f, 10.0f, 10.0f }).cast<float>();
-            return [=](Particle& p, const ParticleInitInfo& info) mutable {
-                double duration = info.duration;
-                float speed = Random::get(r.speedmin, r.speedmax);
-                if (duration > 10.0f) {
-                    pos[0] += speed;
-                    duration = 0.0f;
+            return [=](Particle& p, const ParticleInitInfo& info) {
+                /*
+                 * Audio scales the stored phasemax-phasemin span. The phase argument is
+                 * (rng01 * span + phasemin + time) * timescale. HashNoise1D turns that scalar into
+                 * a 1D hashed-gradient sample; the sample is then an angle noise*pi*scale + offset
+                 * that rotates authored forward around authored right. Simulation is in the
+                 * particle node's local space and the node transform is applied at render, so the
+                 * direction stays local. Final speed is an independent rng in [speedmin, speedmax]
+                 * and is not multiplied by the audio response.
+                 */
+                const float response = static_cast<float>(audio_factor ? audio_factor() : 1.0);
+                const float span     = (r.phasemax - r.phasemin) * response;
+                const float phase_arg =
+                    (Random::get(0.0f, 1.0f) * span + r.phasemin +
+                     static_cast<float>(info.time)) *
+                    static_cast<float>(r.timescale);
+                const float noise = algorism::HashNoise1D(phase_arg);
+                const float angle = noise * 3.1415927410125732f * r.scale + r.offset;
+                Vector3f direction = forward;
+                if (IsFiniteNonZeroVector(right.cast<double>())) {
+                    direction = AngleAxisf(angle, right.normalized()) * forward;
                 }
-                Vector3f result;
-                do {
-                    result = algorism::CurlNoise(pos.cast<double>()).cast<float>().normalized();
-                    pos += result * 0.005f / r.timescale;
-                    duration -= 0.01f;
-                } while (duration > 0.01f);
-                // limit direction
-                {
-                    double c     = result.dot(forward) / (result.norm() * forward.norm());
-                    float  a     = std::acos(c) / M_PI;
-                    float  scale = r.scale / 2.0f;
-                    if (a > scale) {
-                        auto axis = result.cross(forward).normalized();
-                        result    = AngleAxisf((a - a * scale) * M_PI, axis) * result;
-                    }
-                }
-                // offset
-                result = AngleAxisf(r.offset, right) * result;
-                result *= speed;
-                PM::ChangeVelocity(p, result[0], result[1], result[2]);
+                const float speed = Random::get(r.speedmin, r.speedmax);
+                direction *= speed;
+                PM::ChangeVelocity(p, direction[0], direction[1], direction[2]);
             };
         }
     } while (false);
@@ -300,16 +333,14 @@ ParticleInitOp WPParticleParser::genOverrideInitOp(const wpscene::ParticleInstan
         }
     };
 }
-double FadeValueChange(float life, float start, float end, float startValue,
-                       float endValue) noexcept {
+float FadeValueChange(float life, float start, float end, float startValue,
+                      float endValue) noexcept {
     if (life <= start)
         return startValue;
     else if (life > end)
         return endValue;
-    else {
-        double pass = (life - start) / (end - start);
-        return algorism::lerp(pass, startValue, endValue);
-    }
+    const float pass = (life - start) / (end - start);
+    return startValue + pass * (endValue - startValue);
 }
 
 struct ValueChange {
@@ -327,7 +358,7 @@ struct ValueChange {
         return v;
     }
 };
-double FadeValueChange(float life, const ValueChange& v) noexcept {
+float FadeValueChange(float life, const ValueChange& v) noexcept {
     return FadeValueChange(life, v.starttime, v.endtime, v.startvalue, v.endvalue);
 }
 
@@ -443,7 +474,9 @@ struct Turbulence {
 struct Vortex {
     enum class FlagEnum
     {
-        infinit_axis = 0, // 1
+        infinit_axis = 0,
+        maintain_distance = 1,
+        ring_shape = 2,
     };
     using EFlags = BitFlags<FlagEnum>;
 
@@ -457,6 +490,11 @@ struct Vortex {
     float speedinner { 2500.0f };
     // amount of force applied to outer ring.
     float speedouter { 0 };
+    float centerforce { 0.0f };
+    float ringradius { 0.0f };
+    float ringwidth { 0.0f };
+    float ringpulldistance { 0.0f };
+    float ringpullforce { 0.0f };
 
     EFlags flags { 0 };
 
@@ -469,13 +507,17 @@ struct Vortex {
     static auto ReadFromJson(const nlohmann::json& j) {
         Vortex v;
         GET_JSON_NAME_VALUE_NOWARN(j, "controlpoint", v.controlpoint);
-        if (v.controlpoint >= 8) LOG_ERROR("wrong contropoint index %d", v.controlpoint);
-        v.controlpoint %= 8;
+        v.controlpoint = NormalizeControlPointIndex(v.controlpoint);
 
         GET_JSON_NAME_VALUE_NOWARN(j, "distanceinner", v.distanceinner);
         GET_JSON_NAME_VALUE_NOWARN(j, "distanceouter", v.distanceouter);
         GET_JSON_NAME_VALUE_NOWARN(j, "speedinner", v.speedinner);
         GET_JSON_NAME_VALUE_NOWARN(j, "speedouter", v.speedouter);
+        GET_JSON_NAME_VALUE_NOWARN(j, "centerforce", v.centerforce);
+        GET_JSON_NAME_VALUE_NOWARN(j, "ringradius", v.ringradius);
+        GET_JSON_NAME_VALUE_NOWARN(j, "ringwidth", v.ringwidth);
+        GET_JSON_NAME_VALUE_NOWARN(j, "ringpulldistance", v.ringpulldistance);
+        GET_JSON_NAME_VALUE_NOWARN(j, "ringpullforce", v.ringpullforce);
 
         i32 _flags { 0 };
         GET_JSON_NAME_VALUE_NOWARN(j, "flags", _flags);
@@ -490,11 +532,15 @@ struct Vortex {
 
 struct ControlPointForce {
     i32 controlpoint { 0 };
+    u32 flags { 0 };
 
     // how strongly the control point attracts or repels.
     float scale { 512.0f };
     // the maximum distance between particle and control point where the force takes effect.
     float threshold { 512.0f };
+    // Particle-path default when the key is omitted. The attract loop uses threshold, not this
+    // field.
+    float deletethreshold { 15.0f };
 
     // positional offset from the center of the control point.
     std::array<float, 3> origin { 0.0f, 0.0f, 0.0f };
@@ -502,8 +548,7 @@ struct ControlPointForce {
     static auto ReadFromJson(const nlohmann::json& j) {
         ControlPointForce v;
         GET_JSON_NAME_VALUE_NOWARN(j, "controlpoint", v.controlpoint);
-        if (v.controlpoint >= 8) LOG_ERROR("wrong contropoint index %d", v.controlpoint);
-        v.controlpoint %= 8;
+        v.controlpoint = NormalizeControlPointIndex(v.controlpoint);
 
         GET_JSON_NAME_VALUE_NOWARN(j, "scale", v.scale);
         // Wallpaper Engine assets commonly serialize this field with the historical
@@ -511,6 +556,8 @@ struct ControlPointForce {
         // Reading both names keeps the operator compatible with either spelling.
         GET_JSON_NAME_VALUE_NOWARN(j, "threshold", v.threshold);
         GET_JSON_NAME_VALUE_NOWARN(j, "threadhold", v.threshold);
+        GET_JSON_NAME_VALUE_NOWARN(j, "deletethreshold", v.deletethreshold);
+        GET_JSON_NAME_VALUE_NOWARN(j, "flags", v.flags);
 
         GET_JSON_NAME_VALUE_NOWARN(j, "offset", v.origin);
         return v;
@@ -519,7 +566,8 @@ struct ControlPointForce {
 
 ParticleOperatorOp
 WPParticleParser::genParticleOperatorOp(const nlohmann::json&                    wpj,
-                                        const wpscene::ParticleInstanceoverride& over) {
+                                        const wpscene::ParticleInstanceoverride& over,
+                                        ParticleAudioResponseFactor              audio_factor) {
     do {
         if (! wpj.contains("name")) break;
         std::string name;
@@ -538,15 +586,15 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                     // the scene's normal coordinate convention. Flipping Y here made generic
                     // effects such as fireworks accelerate upward after they exploded.
                     //
-                    // Integrate position from the current velocity first, then apply gravity and
-                    // drag to the velocity that will be used on the next frame.
-                    PM::MoveByTime(p, info.time_pass);
+                    // Movement is semi-implicit: v_mid = v + g*dt, x += v_mid*dt, then
+                    // v = v_mid * (1 - min(drag*dt, almost 1)) so a huge dt cannot reverse the
+                    // particle and never quite reaches a hard zero.
                     PM::Accelerate(p, speed * vecG, info.time_pass);
+                    PM::MoveByTime(p, info.time_pass);
 
-                    // Drag is a scalar velocity decay in the reference implementation, not a
-                    // normalized drag force. Clamp the factor so high dt cannot reverse the petal.
+                    constexpr double kDragDtMax = 0.99999988079071045;
                     const double drag_factor =
-                        std::max(0.0, 1.0 - static_cast<double>(drag) * info.time_pass);
+                        1.0 - std::min(static_cast<double>(drag) * info.time_pass, kDragDtMax);
                     PM::MutiplyVelocity(p, drag_factor);
                 }
             };
@@ -565,26 +613,11 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                 }
             };
         } else if (name == "sizechange") {
-            auto       vc                       = ValueChange::ReadFromJson(wpj);
-            const bool has_authored_endtime     = wpj.contains("endtime");
-            const bool is_cursor_blossom_shrink = ! has_authored_endtime &&
-                                                  std::abs(vc.starttime - 0.2f) < 0.0001f &&
-                                                  std::abs(vc.startvalue - 1.0f) < 0.0001f &&
-                                                  std::abs(vc.endvalue) < 0.0001f;
+            auto vc        = ValueChange::ReadFromJson(wpj);
             auto size_over = over.size;
-            return [vc, size_over, is_cursor_blossom_shrink](const ParticleInfo& info) {
+            return [vc, size_over](const ParticleInfo& info) {
                 for (auto& p : info.particles) {
-                    ValueChange effective = vc;
-                    if (is_cursor_blossom_shrink && p.hasRenderVelocity) {
-                        // Cherry_Blossoms_2.json authors the second sizechange as "starttime=0.2"
-                        // with the default endtime. These particles should vanish while travelling
-                        // from the first star tip toward the skipped next tip; keeping the default
-                        // full-lifetime fade leaves visible petals across the inner line and makes
-                        // the cursor blossom look noisy. hasRenderVelocity scopes this correction to
-                        // the mapsequence spritetrail petals used by this wallpaper.
-                        effective.endtime = std::min(effective.endtime, 0.55f);
-                    }
-                    PM::MutiplySize(p, size_over * FadeValueChange(PM::LifetimePos(p), effective));
+                    PM::MutiplySize(p, size_over * FadeValueChange(PM::LifetimePos(p), vc));
                 }
             };
 
@@ -618,7 +651,7 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                     for (uint i = 0; i < 3; i++)
                         result[i] = FadeValueChange(
                             life, vc.starttime, vc.endtime, vc.startvalue[i], vc.endvalue[i]);
-                    PM::MutiplyColor(p, result[0], result[1], result[2]);
+                    PM::MutiplyColor(p, result);
                 }
             };
         } else if (name == "oscillatealpha") {
@@ -662,73 +695,167 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                 }
             };
         } else if (name == "turbulence") {
-            Turbulence tur   = Turbulence::ReadFromJson(wpj);
-            double     phase = Random::get(tur.phasemin, tur.phasemax);
-            double     speed = Random::get(tur.speedmin, tur.speedmax);
-
+            Turbulence tur = Turbulence::ReadFromJson(wpj);
             return [=](const ParticleInfo& info) {
-                // Turbulence is an independent field evaluation for every live particle. Large
-                // authored systems routinely contain tens of thousands of particles, so executing
-                // this operator serially makes the render thread spend an entire frame budget in
-                // CurlNoise alone. The shared executor partitions one immutable ParticleInfo span
-                // into disjoint ranges; each worker mutates only its own particles and the render
-                // thread waits before the next operator observes the updated velocities.
+                const double audio_scale = audio_factor ? audio_factor() : 1.0;
+                if (! std::isfinite(audio_scale) || audio_scale == 0.0) return;
+
+                const float  audio_scale_f = static_cast<float>(audio_scale);
+                const float  time_phase    = static_cast<float>(tur.timescale * info.time);
+                const float  scale_f       = tur.scale;
+                const float  dt_f          = static_cast<float>(info.time_pass);
+
                 ParticleParallelExecutor::Instance().ParallelFor(
                     info.particles.size(), [&](size_t begin, size_t end) {
-                    for (size_t particle_index = begin; particle_index < end; particle_index++) {
-                        auto& p = info.particles[particle_index];
-                        if (! PM::LifetimeOk(p)) continue;
-
-                        Vector3d pos = PM::GetPos(p).cast<double>();
-                        pos.x() += phase + tur.timescale * info.time;
-                        Vector3d result =
-                            speed * algorism::CurlNoise(pos * tur.scale * 2).normalized();
+                    const auto apply_curl = [&](Particle& p, Vector3f curl, float speed) {
+                        const float curl_norm = curl.norm();
+                        if (! std::isfinite(curl_norm) || curl_norm <= 0.0f) return;
+                        Vector3f result = curl * (speed / curl_norm);
                         for (usize i = 0; i < 3; i++) {
                             if (tur.mask[i] == 0) result[i] = 0;
                         }
-                        PM::Accelerate(p, result, info.time_pass);
+                        PM::Accelerate(p, result * audio_scale_f, dt_f);
+                    };
+
+                    const auto phase_and_speed = [&](const Particle& particle) {
+                        const float random = StableParticleRandom01(particle.spawnSequence);
+                        return std::array<float, 2> {
+                            static_cast<float>(
+                                algorism::lerp(random, tur.phasemin, tur.phasemax)) +
+                                time_phase,
+                            static_cast<float>(
+                                algorism::lerp(random, tur.speedmin, tur.speedmax)),
+                        };
+                    };
+
+                    const auto apply_batch = [&](const std::array<size_t, 8>& particle_indices) {
+                        float px[8], py[8], pz[8], cx[8], cy[8], cz[8];
+                        float speeds[8];
+                        for (int lane = 0; lane < 8; lane++) {
+                            const auto& particle = info.particles[particle_indices[lane]];
+                            const auto [phase, speed] = phase_and_speed(particle);
+                            speeds[lane] = speed;
+
+                            Vector3f pos = PM::GetPos(particle);
+                            pos.array() += phase;
+                            pos *= scale_f;
+                            px[lane] = pos.x();
+                            py[lane] = pos.y();
+                            pz[lane] = pos.z();
+                        }
+                        algorism::CurlNoise8(px, py, pz, cx, cy, cz);
+                        for (int lane = 0; lane < 8; lane++) {
+                            apply_curl(info.particles[particle_indices[lane]],
+                                       Vector3f { cx[lane], cy[lane], cz[lane] },
+                                       speeds[lane]);
+                        }
+                    };
+
+                    // Particle storage keeps reusable dead slots. Compact only live indices into
+                    // SIMD batches so sparse systems do not evaluate stale slots merely to discard
+                    // their result after the noise calculation.
+                    std::array<size_t, 8> live_indices;
+                    size_t live_lane_count = 0;
+                    for (size_t particle_index = begin; particle_index < end; particle_index++) {
+                        if (! PM::LifetimeOk(info.particles[particle_index])) continue;
+                        live_indices[live_lane_count++] = particle_index;
+                        if (live_lane_count == live_indices.size()) {
+                            apply_batch(live_indices);
+                            live_lane_count = 0;
+                        }
                     }
-                });
+
+                    for (size_t lane = 0; lane < live_lane_count; lane++) {
+                        auto& p = info.particles[live_indices[lane]];
+                        const auto [phase, speed] = phase_and_speed(p);
+                        Vector3f pos = PM::GetPos(p);
+                        pos.array() += phase;
+                        apply_curl(p, algorism::CurlNoise(pos * scale_f), speed);
+                    }
+                }, 1);
             };
-        } else if (name == "vortex") {
+        } else if (name == "vortex" || name == "vortex_v2") {
             Vortex v = Vortex::ReadFromJson(wpj);
+            const bool extended = name == "vortex_v2";
             return [=](const ParticleInfo& info) {
+                const double audio_scale = audio_factor ? audio_factor() : 1.0;
+                if (! std::isfinite(audio_scale) ||
+                    static_cast<usize>(v.controlpoint) >= info.controlpoints.size()) {
+                    return;
+                }
+
                 Vector3d offset = info.controlpoints[v.controlpoint].offset +
                                   (Vector3f { v.offset.data() }).cast<double>();
-                Vector3d axis    = (Vector3f { v.axis.data() }).cast<double>();
-                // Cherry_Blossoms_2.json uses the default Z axis. Normalize anyway to match
-                // linux-wallpaperengine's vortex math and to keep malformed current-wallpaper data
-                // from scaling or poisoning the tangent.
-                axis             = NormalizeOr(axis, Vector3d::UnitZ());
-                double   dis_mid = v.distanceouter - v.distanceinner + 0.1f;
+                Vector3d axis = NormalizeOr((Vector3f { v.axis.data() }).cast<double>(),
+                                            Vector3d::UnitZ());
+                const bool infinite_axis = v.flags[Vortex::FlagEnum::infinit_axis];
+                const bool maintain_distance =
+                    extended && v.flags[Vortex::FlagEnum::maintain_distance];
+                const bool ring_shape = extended && v.flags[Vortex::FlagEnum::ring_shape];
+                const double distance_span = static_cast<double>(v.distanceouter) -
+                                             static_cast<double>(v.distanceinner);
                 const double min_distance_squared =
                     kControlPointForceMinDistance * kControlPointForceMinDistance;
 
                 for (auto& p : info.particles) {
-                    Vector3d pos      = p.position.cast<double>();
-                    Vector3d relative = pos - offset;
-                    double   distance = relative.norm();
-                    if (distance <= kControlPointForceMinDistance) continue;
-
-                    // The cursor blossom's vortex is centered on control point 0, so tangent must be
-                    // computed from particle-relative-to-cursor, not from scene origin. Hanabi's
-                    // screen-space handedness makes axis-cross-radial bend each emitted arm to the
-                    // viewer's left; reverse the tangent so every petal turns right toward the next
-                    // pentagram segment.
-                    Vector3d tangent = relative.cross(axis);
-                    const double tangent_squared = tangent.squaredNorm();
-                    if (tangent_squared <= min_distance_squared) continue;
-                    Vector3d direct = tangent / std::sqrt(tangent_squared);
-                    if (dis_mid < 0 || distance < v.distanceinner) {
-                        PM::Accelerate(p, direct * v.speedinner, info.time_pass);
-                    } else if (distance > v.distanceouter) {
-                        PM::Accelerate(p, direct * v.speedouter, info.time_pass);
-                    } else if (distance > v.distanceinner) {
-                        double t = (distance - v.distanceinner) / dis_mid;
-                        PM::Accelerate(p,
-                                       direct * algorism::lerp(t, v.speedinner, v.speedouter),
-                                       info.time_pass);
+                    if (! PM::LifetimeOk(p)) continue;
+                    const Vector3d relative = p.position.cast<double>() - offset;
+                    const Vector3d radial   = relative - axis * relative.dot(axis);
+                    const double radial_distance = radial.norm();
+                    const double distance = infinite_axis ? radial_distance : relative.norm();
+                    if (distance <= kControlPointForceMinDistance ||
+                        radial_distance <= kControlPointForceMinDistance) {
+                        continue;
                     }
+
+                    const Vector3d tangent         = relative.cross(axis);
+                    const double   tangent_squared = tangent.squaredNorm();
+                    if (tangent_squared <= min_distance_squared) continue;
+                    const Vector3d direct = tangent / std::sqrt(tangent_squared);
+
+                    Vector3d acceleration = Vector3d::Zero();
+                    if (ring_shape) {
+                        const double half_width =
+                            std::max(0.0, static_cast<double>(v.ringwidth) * 0.5);
+                        const double ring_delta =
+                            radial_distance - static_cast<double>(v.ringradius);
+                        const double distance_to_ring = std::abs(ring_delta);
+
+                        if (distance_to_ring <= half_width) {
+                            double t = half_width > kControlPointForceMinDistance
+                                ? (ring_delta + half_width) / (half_width * 2.0)
+                                : 0.0;
+                            t = std::clamp(t, 0.0, 1.0);
+                            acceleration +=
+                                direct * algorism::lerp(t, v.speedinner, v.speedouter);
+                        } else if (v.ringpulldistance > 0.0f &&
+                                   distance_to_ring <=
+                                       half_width + static_cast<double>(v.ringpulldistance)) {
+                            const double pull =
+                                1.0 - (distance_to_ring - half_width) /
+                                          static_cast<double>(v.ringpulldistance);
+                            const Vector3d radial_direction = radial / radial_distance;
+                            acceleration +=
+                                (ring_delta > 0.0 ? -radial_direction : radial_direction) *
+                                static_cast<double>(v.ringpullforce) * pull;
+                            acceleration += direct * static_cast<double>(v.speedouter) * pull;
+                        }
+                    } else {
+                        double t = 0.0;
+                        if (std::abs(distance_span) > kControlPointForceMinDistance) {
+                            t = (distance - static_cast<double>(v.distanceinner)) / distance_span;
+                        }
+                        t = std::clamp(t, 0.0, 1.0);
+                        acceleration +=
+                            direct * algorism::lerp(t, v.speedinner, v.speedouter);
+                    }
+
+                    if (maintain_distance && IsFiniteNonZeroVector(relative)) {
+                        acceleration -=
+                            relative.normalized() * static_cast<double>(v.centerforce);
+                    }
+
+                    PM::Accelerate(p, acceleration * audio_scale, info.time_pass);
                 }
             };
         } else if (name == "controlpointattract") {
@@ -739,66 +866,76 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
 
                 Vector3d offset = info.controlpoints[c.controlpoint].offset +
                                   Vector3f { c.origin.data() }.cast<double>();
-                // linux-wallpaperengine halves the authored threshold before applying the two
-                // Cherry_Blossoms_2.json controlpointattract operators. Without that, the broad
-                // attract/repel pair overreaches and pulls the blossom into center-to-arm lines.
-                const double threshold = static_cast<double>(c.threshold) * 0.5;
+                /*
+                 * Attract within the authored threshold with linear falloff
+                 * (1 - distance/threshold) * scale. Flags bit 1 replaces that impulse with the
+                 * remaining distance when the step would overshoot.
+                 */
+                const double threshold = static_cast<double>(c.threshold);
                 if (!std::isfinite(threshold) || threshold <= 0.0 || !std::isfinite(c.scale))
                     return;
 
-                const double threshold_squared = threshold * threshold;
-                const double min_distance_squared =
-                    kControlPointForceMinDistance * kControlPointForceMinDistance;
+                const bool delete_in_center = (c.flags & 0x1) != 0;
+                const bool limit_overshoot = (c.flags & 0x2) != 0;
                 for (auto& p : info.particles) {
-                    const Vector3d diff = offset - PM::GetPos(p).cast<double>();
-                    const double distance_squared = diff.squaredNorm();
-                    if (distance_squared >= threshold_squared ||
-                        distance_squared <= min_distance_squared)
+                    if (! PM::LifetimeOk(p)) continue;
+                    const Vector3d diff     = offset - PM::GetPos(p).cast<double>();
+                    const double   distance = diff.norm();
+
+                    if (delete_in_center && std::isfinite(c.deletethreshold) &&
+                        c.deletethreshold >= 0.0f &&
+                        distance < static_cast<double>(c.deletethreshold)) {
+                        PM::Delete(p);
+                        continue;
+                    }
+                    if (distance >= threshold || distance <= kControlPointForceMinDistance)
                         continue;
 
-                    // Control Point Force accelerates toward the selected control point. Negative
-                    // authored scale naturally reverses that direction, producing the expected
-                    // mouse-repel behavior for pointer-locked control points.
-                    const Vector3d direction = diff / std::sqrt(distance_squared);
-                    PM::Accelerate(p, direction * static_cast<double>(c.scale), info.time_pass);
+                    Vector3d direction = diff / distance;
+                    double   accel = (1.0 - distance / threshold) * static_cast<double>(c.scale);
+                    if (limit_overshoot && info.time_pass > 0.0) {
+                        const double step = accel * info.time_pass;
+                        if (distance < step)
+                            accel = distance / info.time_pass;
+                    }
+                    PM::Accelerate(p, direction * accel, info.time_pass);
                 }
             };
         }
     } while (false);
+    LOG_ERROR("unsupported particle operator '%s'",
+              wpj.value("name", std::string("(missing)")).c_str());
     return [](const ParticleInfo&) {
     };
 }
 
-ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe) {
+ParticleEmittOp WPParticleParser::genParticleEmittOp(const wpscene::Emitter& wpe,
+                                                     ParticleAudioResponseFactor  audio_rate_factor) {
     if (wpe.name == "boxrandom") {
         ParticleBoxEmitterArgs box;
-        box.emitSpeed     = wpe.rate;
         box.minDistance   = wpe.distancemin;
         box.maxDistance   = wpe.distancemax;
         box.directions    = wpe.directions;
         box.orgin         = wpe.origin;
         box.controlpoint  = wpe.controlpoint;
-        box.one_per_frame = wpe.flags[wpscene::Emitter::FlagEnum::one_per_frame];
-        box.instantaneous = wpe.instantaneous;
         box.minSpeed      = wpe.speedmin;
         box.maxSpeed      = wpe.speedmax;
+        box.timing        = MakeEmitterTiming(wpe, std::move(audio_rate_factor));
         return ParticleBoxEmitterArgs::MakeEmittOp(box);
     } else if (wpe.name == "sphererandom") {
         ParticleSphereEmitterArgs sphere;
-        sphere.emitSpeed     = wpe.rate;
         sphere.minDistance   = wpe.distancemin[0];
         sphere.maxDistance   = wpe.distancemax[0];
         sphere.directions    = wpe.directions;
         sphere.orgin         = wpe.origin;
         sphere.controlpoint  = wpe.controlpoint;
         sphere.sign          = wpe.sign;
-        sphere.one_per_frame = wpe.flags[wpscene::Emitter::FlagEnum::one_per_frame];
-        sphere.instantaneous = wpe.instantaneous;
         sphere.minSpeed      = wpe.speedmin;
         sphere.maxSpeed      = wpe.speedmax;
+        sphere.timing        = MakeEmitterTiming(wpe, std::move(audio_rate_factor));
         return ParticleSphereEmitterArgs::MakeEmittOp(sphere);
     } else
         return [](std::vector<Particle>&, std::vector<ParticleInitOp>&,
-                  std::span<const ParticleControlpoint>, uint32_t, double, uint64_t&) {
+                  std::span<const ParticleControlpoint>, uint32_t, double, double, uint64_t&) {
         };
 }

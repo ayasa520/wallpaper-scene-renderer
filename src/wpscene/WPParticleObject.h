@@ -8,6 +8,7 @@
 #include <optional>
 #include "Utils/BitFlags.hpp"
 #include "Core/Literals.hpp"
+#include "Particle/ParticleAudioResponse.h"
 #include "wpscene/WPParallaxDepth.hpp"
 
 namespace wallpaper
@@ -63,6 +64,7 @@ public:
     enum class FlagEnum : uint32_t
     {
         one_per_frame = 1,
+        periodic      = 2,
     };
     using EFlags = BitFlags<FlagEnum>;
 
@@ -74,14 +76,21 @@ public:
     std::array<float, 3>   origin { 0, 0, 0 };
     std::array<int32_t, 3> sign { 0, 0, 0 };
     u32                    instantaneous { 0 };
+    u32                    maxtoemitperperiod { 0 };
     float                  speedmin { 0 };
     float                  speedmax { 0 };
-    u32                    audioprocessingmode { 0 };
+    ParticleAudioResponseParams audio_response;
     i32                    controlpoint { 0 };
     i32                    id;
     EFlags                 flags;
     std::string            name;
-    float                  rate { 5.0f };
+    float                  rate { 0.0f };
+    float                  duration { 0.0f };
+    float                  delay { 0.0f };
+    float                  minperiodicduration { 0.0f };
+    float                  maxperiodicduration { 0.0f };
+    float                  minperiodicdelay { 0.0f };
+    float                  maxperiodicdelay { 0.0f };
 };
 
 class ParticleChild;

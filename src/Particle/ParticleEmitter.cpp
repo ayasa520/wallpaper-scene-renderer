@@ -4,6 +4,9 @@
 #include "Core/Random.hpp"
 
 #include <Eigen/src/Core/Matrix.h>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <random>
 #include <tuple>
 
@@ -19,13 +22,119 @@ inline std::tuple<u32, bool> FindDeadParticle(std::span<const Particle> particle
     return { 0, false };
 }
 
-inline u32 GetEmitNum(double& timer, float speed) {
-    double emitDur = 1.0f / speed;
-    if (emitDur > timer) return 0;
-    u32 num = timer / emitDur;
-    while (emitDur < timer) timer -= emitDur;
-    if (timer < 0) timer = 0;
-    return num;
+struct EmitRuntime {
+    float  credit { 0.0f };
+    u32    instantaneous { 0 };
+    float  periodic_timer { 0.0f };
+    u32    emitted_this_period { 0 };
+    float  delay_remaining { 0.0f };
+    float  duration_remaining { 0.0f };
+    bool   duration_limited { false };
+    bool   inactive { false };
+};
+
+inline float SampleInclusiveRange(float min_value, float max_value) {
+    return min_value + Random::get(0.0f, 1.0f) * (max_value - min_value);
+}
+
+inline u32 ResolveEmitNum(EmitRuntime& runtime, const ParticleEmitterTiming& timing,
+                          double time_pass) {
+    if (runtime.inactive) return 0;
+
+    const bool  valid_time = std::isfinite(time_pass);
+    const float frame_time = valid_time ? static_cast<float>(time_pass) : 0.0f;
+
+    // A frame which starts inside the authored delay never emits. Crossing zero only arms the
+    // following frame.
+    if (runtime.delay_remaining > 0.0f) {
+        runtime.delay_remaining -= frame_time;
+        return 0;
+    }
+
+    if (runtime.duration_limited && runtime.duration_remaining < 0.0f) {
+        runtime.inactive = true;
+        return 0;
+    }
+
+    const float factor =
+        static_cast<float>(timing.audio_rate_factor ? timing.audio_rate_factor() : 1.0);
+    float rate = timing.emit_speed * factor;
+
+    if (timing.periodic) {
+        if (runtime.periodic_timer > 0.0f) {
+            runtime.periodic_timer -= frame_time;
+            if (runtime.periodic_timer < 0.0f) {
+                runtime.periodic_timer =
+                    -SampleInclusiveRange(timing.min_periodic_delay, timing.max_periodic_delay);
+            }
+        } else {
+            runtime.periodic_timer += frame_time;
+            if (runtime.periodic_timer < 0.0f) {
+                rate = 0.0f;
+            } else {
+                runtime.instantaneous        = timing.instantaneous;
+                runtime.emitted_this_period  = 0;
+                runtime.periodic_timer       = SampleInclusiveRange(
+                    timing.min_periodic_duration, timing.max_periodic_duration);
+            }
+        }
+    }
+
+    const u32 instantaneous_count = runtime.instantaneous;
+    runtime.instantaneous         = 0;
+
+    if (std::isfinite(rate) && valid_time) runtime.credit += rate * frame_time;
+
+    u32 continuous_count = 0;
+    if (std::isfinite(runtime.credit) && runtime.credit >= 1.0f) {
+        const float integral_credit = std::floor(runtime.credit);
+        continuous_count           = integral_credit > 0.0f
+            ? static_cast<u32>(std::min(
+                  integral_credit, static_cast<float>(std::numeric_limits<i32>::max())))
+            : 0;
+
+        runtime.credit -=
+            static_cast<float>(continuous_count) + static_cast<float>(instantaneous_count);
+        if (timing.one_per_frame) continuous_count = std::min<u32>(continuous_count, 1);
+
+        if (timing.periodic && timing.max_to_emit_per_period != 0) {
+            const i32 remaining = static_cast<i32>(timing.max_to_emit_per_period) -
+                                  static_cast<i32>(runtime.emitted_this_period);
+            const u32 cap = remaining > 0 ? static_cast<u32>(remaining) : 0;
+            if (continuous_count > cap) continuous_count = cap;
+            runtime.emitted_this_period += continuous_count;
+        }
+    } else {
+        runtime.credit -= static_cast<float>(instantaneous_count);
+    }
+
+    const u32 count = continuous_count > std::numeric_limits<u32>::max() - instantaneous_count
+        ? std::numeric_limits<u32>::max()
+        : continuous_count + instantaneous_count;
+
+    // Duration is tested at frame start and consumed after this frame's emission. Once it expires,
+    // the whole emitter stays inactive, including future periodic instantaneous bursts.
+    if (runtime.duration_limited && valid_time) {
+        runtime.duration_remaining -= frame_time;
+        if (runtime.duration_remaining < 0.0f) runtime.inactive = true;
+    }
+    return count;
+}
+
+inline EmitRuntime MakeEmitRuntime(const ParticleEmitterTiming& timing) {
+    EmitRuntime runtime;
+    runtime.instantaneous      = timing.instantaneous;
+    runtime.delay_remaining    = timing.delay;
+    runtime.duration_remaining = timing.duration;
+    runtime.duration_limited   = timing.duration > 0.0f;
+    return runtime;
+}
+
+inline bool HasParticleCapacity(std::span<const Particle> particles, u32 maxcount) {
+    if (particles.size() < maxcount) return true;
+    return std::any_of(particles.begin(), particles.end(), [](const Particle& particle) {
+        return ! ParticleModify::LifetimeOk(particle);
+    });
 }
 
 template<typename SpawnOp>
@@ -56,8 +165,6 @@ template<typename GenerateOp>
 Particle SpawnParticle(GenerateOp&& generate, std::vector<ParticleInitOp>& initializers,
                        const ParticleInitInfo& info) {
     auto particle = generate();
-    // Cherry_Blossoms_2.json relies on all initializers for one spawned particle seeing the same
-    // control-point snapshot and sequence slot; otherwise the five cursor petals drift into noise.
     for (auto& initializer : initializers) initializer(particle, info);
     return particle;
 }
@@ -76,17 +183,15 @@ inline void ApplySign(Eigen::Vector3d& p, int32_t x, int32_t y, int32_t z) noexc
 } // namespace
 
 ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
-    double timer { 0.0f };
-    // Keep a per-emitter sequence counter so mapsequencearoundcontrolpoint repeats the authored
-    // five slots independently of reusable particle storage indices.
+    EmitRuntime runtime = MakeEmitRuntime(a.timing);
     uint64_t sequence { 0 };
-    return [a, timer, sequence](std::vector<Particle>&       ps,
+    return [a, runtime, sequence](std::vector<Particle>&       ps,
                                 std::vector<ParticleInitOp>& inis,
                                 std::span<const ParticleControlpoint> controlpoints,
                                 u32                          maxcount,
                                 double                       timepass,
+                                double                       time,
                                 uint64_t&                    next_spawn_sequence) mutable {
-        timer += timepass;
         auto GenBox = [&]() {
             Eigen::Vector3d pos;
             for (int32_t i = 0; i < 3; i++)
@@ -104,12 +209,12 @@ ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
             ParticleModify::Move(p, origin);
             return p;
         };
-        u32 emit_num = GetEmitNum(timer, a.emitSpeed);
-        emit_num     = a.one_per_frame ? 1 : emit_num;
-        emit_num     = a.instantaneous > 0 && ps.empty() ? a.instantaneous : emit_num;
-        EmitParticles(ps, emit_num, maxcount, next_spawn_sequence, [&]() {
+        if (! HasParticleCapacity(ps, maxcount)) return;
+        const u32 emission_count = ResolveEmitNum(runtime, a.timing, timepass);
+        EmitParticles(ps, emission_count, maxcount, next_spawn_sequence, [&]() {
             ParticleInitInfo init_info;
-            init_info.duration      = 1.0f / a.emitSpeed;
+            init_info.duration      = a.timing.emit_speed > 0.0f ? 1.0 / a.timing.emit_speed : 0.0;
+            init_info.time          = time;
             init_info.controlpoints = controlpoints;
             init_info.sequence      = sequence++;
             return SpawnParticle(GenBox, inis, init_info);
@@ -119,18 +224,15 @@ ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
 
 ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs a) {
     using namespace Eigen;
-    double timer { 0.0f };
-    // Cherry_Blossoms_2.json uses this sphere emitter. The sequence counter is intentionally tied to
-    // the emitter instance, not to particle array indices, so each burst stays in the fixed 5-point
-    // order expected by mapsequencearoundcontrolpoint.
+    EmitRuntime runtime = MakeEmitRuntime(a.timing);
     uint64_t sequence { 0 };
-    return [a, timer, sequence](std::vector<Particle>&       ps,
+    return [a, runtime, sequence](std::vector<Particle>&       ps,
                                 std::vector<ParticleInitOp>& inis,
                                 std::span<const ParticleControlpoint> controlpoints,
                                 u32                          maxcount,
                                 double                       timepass,
+                                double                       time,
                                 uint64_t&                    next_spawn_sequence) mutable {
-        timer += timepass;
         auto GenSphere = [&]() {
             auto   p = Particle();
             double r = algorism::lerp(
@@ -153,12 +255,12 @@ ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs
             ParticleModify::Move(p, origin);
             return p;
         };
-        u32 emit_num = GetEmitNum(timer, a.emitSpeed);
-        emit_num     = a.one_per_frame ? 1 : emit_num;
-        emit_num     = a.instantaneous > 0 && ps.empty() ? a.instantaneous : emit_num;
-        EmitParticles(ps, emit_num, maxcount, next_spawn_sequence, [&]() {
+        if (! HasParticleCapacity(ps, maxcount)) return;
+        const u32 emission_count = ResolveEmitNum(runtime, a.timing, timepass);
+        EmitParticles(ps, emission_count, maxcount, next_spawn_sequence, [&]() {
             ParticleInitInfo init_info;
-            init_info.duration      = 1.0f / a.emitSpeed;
+            init_info.duration      = a.timing.emit_speed > 0.0f ? 1.0 / a.timing.emit_speed : 0.0;
+            init_info.time          = time;
             init_info.controlpoints = controlpoints;
             init_info.sequence      = sequence++;
             return SpawnParticle(GenSphere, inis, init_info);

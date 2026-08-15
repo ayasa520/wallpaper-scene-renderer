@@ -61,16 +61,15 @@ using namespace Eigen;
 
 std::string getAddr(void* p) { return std::to_string(reinterpret_cast<intptr_t>(p)); }
 
+uint32_t HashParticleFrameU32(uint32_t seed, uint32_t bits) {
+    seed ^= bits + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
+    return seed;
+}
+
 uint32_t HashParticleFrameFloat(uint32_t seed, float value) {
     uint32_t bits { 0 };
     std::memcpy(&bits, &value, sizeof(bits));
-    // Cherry_Blossoms_2.json uses animationmode=randomframe on a 13-frame GIF atlas. The shader
-    // only receives one float named "lifetime", so randomframe needs a stable per-particle value
-    // encoded into that float instead of the current age-based lifetime. Hashing immutable
-    // initializer output keeps each petal on one visual frame for its whole life while still
-    // distributing petals across the atlas.
-    seed ^= bits + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
-    return seed;
+    return HashParticleFrameU32(seed, bits);
 }
 
 float RandomParticleFrameLifetime(const Particle& p, float sprite_frame_count_value) {
@@ -78,20 +77,19 @@ float RandomParticleFrameLifetime(const Particle& p, float sprite_frame_count_va
         static_cast<uint32_t>(std::max(1.0f, std::round(sprite_frame_count_value)));
     if (sprite_frame_count <= 1u) return 0.0f;
 
+    // The shader only receives one float named "lifetime", so randomframe encodes a stable
+    // atlas cell into that float. Hash spawn-time identity rather than live velocity, which
+    // changes every operator tick.
     uint32_t seed = 2166136261u;
     seed          = HashParticleFrameFloat(seed, p.init.lifetime);
     seed          = HashParticleFrameFloat(seed, p.init.size);
     seed          = HashParticleFrameFloat(seed, p.init.color.x());
     seed          = HashParticleFrameFloat(seed, p.init.color.y());
     seed          = HashParticleFrameFloat(seed, p.init.color.z());
-    seed          = HashParticleFrameFloat(seed, p.renderVelocity.x());
-    seed          = HashParticleFrameFloat(seed, p.renderVelocity.y());
-    seed          = HashParticleFrameFloat(seed, p.renderVelocity.z());
+    seed          = HashParticleFrameU32(seed, static_cast<uint32_t>(p.spawnSequence));
+    seed          = HashParticleFrameU32(seed, static_cast<uint32_t>(p.spawnSequence >> 32));
 
     const uint32_t frame = seed % sprite_frame_count;
-    // Center the encoded value inside the chosen atlas cell. That matches the way
-    // linux-wallpaperengine avoids boundary precision issues for randomframe sprites and prevents
-    // frame blending from sampling the neighboring petal shape.
     return (static_cast<float>(frame) + 0.5f) / static_cast<float>(sprite_frame_count);
 }
 
@@ -1191,29 +1189,77 @@ wpscene::ParticleInstanceoverride ResolveParticleSubsystemOverride(
     return child_override;
 }
 
+ParticleAudioResponseParams ReadParticleAudioResponse(const nlohmann::json& json) {
+    /*
+     * Keep audio-response parsing in one helper so emitter, initializer, and operator paths share
+     * the same defaults, endpoint clamping, and reversed frequency-interval handling.
+     */
+    ParticleAudioResponseParams response;
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingmode", response.mode);
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingexponent", response.exponent);
+    if (json.contains("audioprocessingbounds") && json.at("audioprocessingbounds").is_string()) {
+        AssignAudioBoundsFromAuthoredString(json.at("audioprocessingbounds").get<std::string>(),
+                                            response.bounds);
+    } else {
+        GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingbounds", response.bounds);
+    }
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingfrequencystart", response.frequency_start);
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingfrequencyend", response.frequency_end);
+    response.frequency_start = std::min<uint32_t>(response.frequency_start, 15);
+    response.frequency_end   = std::min<uint32_t>(response.frequency_end, 15);
+    if (response.frequency_end < response.frequency_start)
+        std::swap(response.frequency_start, response.frequency_end);
+    return response;
+}
+
+ParticleAudioResponseFactor BindParticleAudioResponse(ParticleSystem& system,
+                                                      ParticleAudioResponseParams response) {
+    if (response.mode == 0) return {};
+
+    system.MarkNeedsAudioSpectrum();
+    ParticleSystem* system_ptr = &system;
+    return [system_ptr, response]() { return system_ptr->AudioResponseFactor(response); };
+}
+
 void LoadInitializer(ParticleSubSystem& pSys, const wpscene::Particle& wp,
-                     const wpscene::ParticleInstanceoverride& over) {
+                     const wpscene::ParticleInstanceoverride& over, ParticleSystem& system) {
     for (const auto& ini : wp.initializers) {
         // A layer color override depends on colorrandom's authored endpoints and their RGB midpoint.
         // Wallpaper Engine shifts those endpoints by the override/reference delta in HSV space and
         // performs the existing per-particle interpolation afterward, so the initializer must remain
         // in the stream instead of being replaced by the requested layer color.
-        pSys.AddInitializer(WPParticleParser::genParticleInitOp(ini));
+        ParticleAudioResponseFactor audio_factor =
+            BindParticleAudioResponse(system, ReadParticleAudioResponse(ini));
+        pSys.AddInitializer(WPParticleParser::genParticleInitOp(ini, std::move(audio_factor)));
     }
     if (over.enabled) pSys.AddInitializer(WPParticleParser::genOverrideInitOp(over));
 }
-void LoadOperator(ParticleSubSystem& pSys, const wpscene::Particle& wp,
+void LoadOperator(ParticleSystem& system, ParticleSubSystem& pSys, const wpscene::Particle& wp,
                   const wpscene::ParticleInstanceoverride& over) {
     for (const auto& op : wp.operators) {
-        pSys.AddOperator(WPParticleParser::genParticleOperatorOp(op, over));
+        ParticleAudioResponseFactor audio_factor =
+            BindParticleAudioResponse(system, ReadParticleAudioResponse(op));
+        pSys.AddOperator(WPParticleParser::genParticleOperatorOp(op, over, std::move(audio_factor)));
     }
 }
-void LoadEmitter(ParticleSubSystem& pSys, const wpscene::Particle& wp, float count) {
+void LoadEmitter(ParticleSystem& system, ParticleSubSystem& pSys, const wpscene::Particle& wp,
+                 float count) {
     for (const auto& em : wp.emitters) {
         auto newEm = em;
         newEm.rate *= count;
         // newEm.origin[2] -= perspectiveZ;
-        pSys.AddEmitter(WPParticleParser::genParticleEmittOp(newEm));
+
+        /*
+         * Wallpaper Engine's audio-responsive emitters ("Custom BEAT Particle" style assets) are
+         * only active while audio is playing: the authored rate is scaled by the live loudness of
+         * the selected channel through the authored bounds window. Without this factor such
+         * emitters run at full authored rate forever; assets author beat-burst rates in the
+         * thousands per second, which floods the simulation with tens of thousands of permanent
+         * particles and dominates both CPU and GPU frame time.
+         */
+        ParticleAudioResponseFactor audio_rate_factor =
+            BindParticleAudioResponse(system, em.audio_response);
+        pSys.AddEmitter(WPParticleParser::genParticleEmittOp(newEm, std::move(audio_rate_factor)));
     }
 }
 
@@ -1268,6 +1314,7 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const
                 STRTONUM(std::string(match[1]), wpid);
             }
             name = GenLinkTex((u32)wpid);
+        } else if (name == SpecTex_DefaultPingPong) {
         } else if (sstart_with(name, WE_MIP_MAPPED_FRAME_BUFFER)) {
         } else if (sstart_with(name, WE_EFFECT_PPONG_PREFIX)) {
         } else if (sstart_with(name, WE_HALF_COMPO_BUFFER_PREFIX)) {
@@ -4223,6 +4270,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     // output turns blank.
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
     bool use_detached_effect_world_node = hasEffect && ! isCompose;
+    // Screen-bound effect sources are only the fullscreen flag and assets that already mark
+    // themselves that way (direct-draw shapes without an authored size). An ortho-sized image
+    // layer keeps its authored ping-pong; object scale is applied when that result is composited.
     const bool effect_source_screen_bound =
         wpimgobj.fullscreen || wpimgobj.effectSourceScreenBound;
     const std::array<float, 2> effect_source_size =
@@ -4595,9 +4645,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             };
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_a);
             scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_b);
-            if (wpimgobj.effectSourceScreenBound) {
+            if (effect_source_screen_bound) {
                 LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
-                         "pingpong-a='%s' pingpong-b='%s' size=[%.3f, %.3f] "
+                         "pingpong-a='%s' pingpong-b='%s' authored-size=[%.3f, %.3f] "
                          "screen-bound=true fullscreen=%s",
                          wpimgobj.id,
                          wpimgobj.name.c_str(),
@@ -5112,9 +5162,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0]))),
             .mapHeight = std::max(
                 1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1]))),
-            // Text targets keep stable logical names while their physical backing follows runtime
-            // projection. Persisting the cache entry replaces the old image in place; transient
-            // aliasing would retain one reusable image for every historical projected size.
+            // Text targets keep the authored letter box for both the physical backing and the
+            // logical effect grid. Persisting the cache entry replaces the old image in place.
             .allowReuse = false,
         };
         scene.renderTargets[primitive->bridge.pingpong_b] =
@@ -5447,6 +5496,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                                                      Vector3f(wppartobj.scale.data()),
                                                      Vector3f(wppartobj.angles.data()),
                                                      wppartobj.name);
+        spNode->ID()   = wppartobj.id;
     }
 
     const auto override =
@@ -5583,11 +5633,8 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     if (! particle_obj.flags[wpscene::Particle::FlagEnum::spritenoframeblending] &&
         particle_obj.animationmode != "randomframe") {
-        // Cherry_Blossoms_2.json uses animationmode=randomframe on a multi-shape petal GIF. A
-        // random frame is supposed to be one stable silhouette per particle; enabling
-        // SPRITESHEETBLEND makes the encoded half-frame value mix the selected frame with the next
-        // one, which visually becomes two overlapping petals. Sequence-style sprite particles keep
-        // blending, but randomframe particles must sample a single frame.
+        // randomframe encodes one atlas cell per particle. Frame blending would mix that cell with
+        // the next one, so keep SPRITESHEETBLEND for sequenced sprite playback only.
         shaderInfo.combos["SPRITESHEETBLEND"] = "1";
     }
 
@@ -5619,9 +5666,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     float sprite_frame_count = 0.0f;
     if (const auto it = material.customShader.constValues.find("g_RenderVar1");
         it != material.customShader.constValues.end() && it->second.size() >= 3) {
-        // g_RenderVar1.z is filled from the current particle texture's SpriteAnimation. For the
-        // cursor blossom material this is the 13-frame particle/3.gif atlas, and randomframe must
-        // pick one of those petal silhouettes per emitted particle.
+        // g_RenderVar1.z is the SpriteAnimation frame count of the current particle texture.
         sprite_frame_count = it->second[2];
     }
 
@@ -5683,9 +5728,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
             }
             switch (animationmode) {
             case ParticleAnimationMode::RANDOMONE:
-                // Only sprite-atlas particles, such as Cherry_Blossoms_2.json's particle/3.gif,
-                // need encoded random frame selection. Non-sprite randomframe content keeps the
-                // previous fallback so this petal fix does not alter unrelated particle materials.
                 lifetime = sprite_frame_count > 1.0f
                                ? RandomParticleFrameLifetime(p, sprite_frame_count)
                                : std::floor(p.init.lifetime);
@@ -5705,9 +5747,9 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     // particles by ratio instead of mistaking the multiplier for an absolute particle size.
     particleSub->SetRuntimeSizeReference(override.size);
 
-    LoadEmitter(*particleSub, particle_obj, override.count);
-    LoadInitializer(*particleSub, particle_obj, override);
-    LoadOperator(*particleSub, particle_obj, override);
+    LoadEmitter(*context.scene->paritileSys, *particleSub, particle_obj, override.count);
+    LoadInitializer(*particleSub, particle_obj, override, *context.scene->paritileSys);
+    LoadOperator(*context.scene->paritileSys, *particleSub, particle_obj, override);
     LoadControlPoint(*particleSub, particle_obj, override);
 
     mesh.AddMaterial(std::move(material));
@@ -7940,10 +7982,10 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     InitContext(context, vfs, sc, scene_id);
     context.layer_visibility_contracts = std::move(layer_visibility_contracts);
     context.scene->soundManager        = &sm;
-    // Parse text layers at the final renderer scale whenever the caller already knows it.
-    // This removes the guaranteed scene-load rerender that used to happen later on the
-    // render thread just to rebuild the same text at a different device scale.
-    context.scene->textRenderScale             = std::max(1.0, text_render_scale);
+    // Text atlases and effect ping-pong stay in the authored letter box. Desktop density is
+    // applied when those results are composited, not by rebuilding glyphs at the output scale.
+    (void)text_render_scale;
+    context.scene->textRenderScale             = 1.0;
     context.scene->offscreenDependencyLayerIds = dependency_source_ids;
     if (user_properties) {
         context.scene->userProperties = *user_properties;
@@ -7954,6 +7996,15 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     {
         context.scene->renderTargets[SpecTex_Default.data()] = {
+            .width     = context.ortho_w,
+            .height    = context.ortho_h,
+            .mapWidth  = context.ortho_w,
+            .mapHeight = context.ortho_h,
+            .bind      = { .enable = true, .screen = true },
+        };
+        // Stable compose snapshot for `_rt_default` self-writes. Screen-bound so a live output
+        // resize keeps the snapshot the same extent as the compose target it mirrors.
+        context.scene->renderTargets[SpecTex_DefaultPingPong.data()] = {
             .width     = context.ortho_w,
             .height    = context.ortho_h,
             .mapWidth  = context.ortho_w,

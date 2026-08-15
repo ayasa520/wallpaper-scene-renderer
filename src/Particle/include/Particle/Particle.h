@@ -32,10 +32,7 @@ struct Particle {
 
     Eigen::Vector3f rotation { 0.0f, 0.0f, 0.0f }; // radian  z x y
     Eigen::Vector3f velocity { 0.0f, 0.0f, 0.0f };
-    // Cherry_Blossoms_2.json is a spritetrail particle: the shader consumes the velocity attribute
-    // as a visual trail axis. mapsequencearoundcontrolpoint must keep physics velocity deterministic
-    // for the five-point star, so this optional render-only axis lets that one visual path randomize
-    // petal facing without changing simulation.
+    // Optional shader-facing trail axis. When unset, spritetrail uses the physics velocity.
     Eigen::Vector3f renderVelocity { 0.0f, 0.0f, 0.0f };
     Eigen::Vector3f acceleration { 0.0f, 0.0f, 0.0f };
     Eigen::Vector3f angularVelocity { 0.0f, 0.0f, 0.0f };
@@ -43,6 +40,7 @@ struct Particle {
 
     bool      mark_new { true };
     bool      hasRenderVelocity { false };
+    bool      operatorDeleted { false };
     // Slot indices are reusable and therefore cannot define rope connectivity. Every spawn gets a
     // subsystem-wide monotonic sequence so the current rope chain can be reconstructed without
     // reordering ParticleInstance::m_particles (which ropetrail history keeps parallel to slots).
