@@ -18,12 +18,6 @@ bool ClearPass::referencesRenderTarget(std::string_view render_target) const {
     return m_desc.target == render_target;
 }
 
-GpuPassDiagInfo ClearPass::gpuDiagInfo() const {
-    GpuPassDiagInfo info;
-    info.category = GpuPassCategory::Clear;
-    return info;
-}
-
 void ClearPass::prepare(Scene& scene, const Device& device, RenderingResources&) {
     if (scene.renderTargets.count(m_desc.target) == 0) {
         LOG_ERROR("ClearPass: target render target not found: %s", m_desc.target.c_str());

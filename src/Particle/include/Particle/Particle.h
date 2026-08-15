@@ -45,6 +45,9 @@ struct Particle {
     // subsystem-wide monotonic sequence so the current rope chain can be reconstructed without
     // reordering ParticleInstance::m_particles (which ropetrail history keeps parallel to slots).
     uint64_t  spawnSequence { 0 };
+    // First spawn unit sample in [0, 1], stored as IEEE bits. Remapvalue simplex/fbm mixes
+    // these bits into the lattice hash so each particle keeps a stable noise identity.
+    uint32_t  remap_seed { 0 };
     InitValue init {};
 };
 } // namespace wallpaper

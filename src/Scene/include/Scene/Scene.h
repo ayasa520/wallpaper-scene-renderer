@@ -279,6 +279,8 @@ public:
     float                cameraParallaxDelay { 0.0f };
     float                cameraParallaxMouseInfluence { 0.0f };
     bool                 cameraOrthographic { true };
+    // Particle perspective camera. Copied from scene `general.perspectiveoverridefov` (default 95).
+    float                perspectiveOverrideFov { 95.0f };
     bool                 cameraShake { false };
     float                cameraShakeAmplitude { 0.5f };
     float                cameraShakeRoughness { 1.0f };

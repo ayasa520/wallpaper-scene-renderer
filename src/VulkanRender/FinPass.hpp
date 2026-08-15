@@ -47,7 +47,6 @@ public:
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
     bool referencesRenderTarget(std::string_view) const override;
-    GpuPassDiagInfo gpuDiagInfo() const override;
 
 private:
     Desc m_desc;

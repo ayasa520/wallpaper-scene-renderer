@@ -14,20 +14,6 @@ namespace wallpaper
 namespace vulkan
 {
 
-struct FrameDrawStats {
-    uint32_t shader_draws { 0 };
-    uint32_t shader_vertices { 0 };
-    uint32_t shader_indices { 0 };
-    uint32_t prepared_passes { 0 };
-
-    void reset() {
-        shader_draws     = 0;
-        shader_vertices  = 0;
-        shader_indices   = 0;
-        prepared_passes  = 0;
-    }
-};
-
 struct RenderingResources {
     vvk::CommandBuffer command;
 
@@ -37,8 +23,6 @@ struct RenderingResources {
 
     StagingBuffer* vertex_buf;
     StagingBuffer* dyn_buf;
-
-    FrameDrawStats* frame_draw_stats { nullptr };
 
     std::shared_ptr<GraphicsPipelineStateCache> pipeline_cache;
 

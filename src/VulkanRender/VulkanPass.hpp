@@ -26,38 +26,6 @@ enum class DeferredPrepareResourcesState
     Waiting,
 };
 
-enum class GpuPassCategory : uint8_t {
-    Particle,
-    Video,
-    Effect,
-    Copy,
-    Clear,
-    Text,
-    Composite,
-    Other,
-};
-
-inline const char* GpuPassCategoryName(GpuPassCategory category) {
-    switch (category) {
-    case GpuPassCategory::Particle:  return "particle";
-    case GpuPassCategory::Video:     return "video";
-    case GpuPassCategory::Effect:    return "effect";
-    case GpuPassCategory::Copy:      return "copy";
-    case GpuPassCategory::Clear:     return "clear";
-    case GpuPassCategory::Text:      return "text";
-    case GpuPassCategory::Composite: return "composite";
-    case GpuPassCategory::Other:     return "other";
-    }
-    return "other";
-}
-
-struct GpuPassDiagInfo {
-    GpuPassCategory category { GpuPassCategory::Other };
-    int32_t         layer_id { -1 };
-    const char*     primitive { "none" };
-    const char*     blend { "none" };
-};
-
 class VulkanPass : public rg::Pass {
 public:
     VulkanPass()                                                     = default;
@@ -100,7 +68,6 @@ public:
     virtual void absorbResidencyGraphState(const VulkanPass&) {}
     virtual bool referencesRenderTarget(std::string_view) const { return false; }
     virtual bool referencesTextLayer(int32_t) const { return false; }
-    virtual GpuPassDiagInfo gpuDiagInfo() const { return {}; }
 
     bool referencesAnyRenderTarget(const std::unordered_set<std::string>& render_targets) const {
         // Selective resource refreshes are driven by render-target keys. A pass only needs to run

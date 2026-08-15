@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <functional>
 #include <cassert>
 #include <cmath>
@@ -12,6 +13,21 @@ namespace algorism
 {
 double CalculatePersperctiveDistance(double fov, double height) noexcept;
 double CalculatePersperctiveFov(double distence, double height) noexcept;
+
+// Particle perspective camera. Use the authored override when it is a finite positive angle;
+// otherwise derive an equivalent FOV for a camera 1000 units in front of the framed height.
+inline float ResolvePerspectiveFov(float authored_override, double framed_height) noexcept {
+    if (std::isfinite(authored_override) && authored_override > 0.0001f)
+        return authored_override;
+    return static_cast<float>(CalculatePersperctiveFov(1000.0, framed_height));
+}
+
+// 2D simplex used by particle remapvalue. `seed` is mixed into the lattice hash so
+// each particle (and each vector component) can sample a distinct field.
+float SimplexNoise2D(float x, float y, uint32_t seed) noexcept;
+// Octave sum of SimplexNoise2D. Later octaves double the domain and add 1 to `seed`.
+// Persistence is 1/2; the first weight is 1 / sum(1/2^i) so the amplitudes add to 1.
+float FbmNoise2D(float x, float y, uint32_t seed, int octaves) noexcept;
 
 constexpr u32 PowOfTwo(u32 x) {
     u32 pow2 { 8 };

@@ -5,6 +5,7 @@
 
 #include <Eigen/src/Core/Matrix.h>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <random>
@@ -164,7 +165,9 @@ void EmitParticles(std::vector<Particle>& particles, u32 num, u32 maxcount,
 template<typename GenerateOp>
 Particle SpawnParticle(GenerateOp&& generate, std::vector<ParticleInitOp>& initializers,
                        const ParticleInitInfo& info) {
-    auto particle = generate();
+    const float    unit = Random::get(0.0f, 1.0f);
+    auto           particle = generate();
+    particle.remap_seed     = std::bit_cast<uint32_t>(unit);
     for (auto& initializer : initializers) initializer(particle, info);
     return particle;
 }

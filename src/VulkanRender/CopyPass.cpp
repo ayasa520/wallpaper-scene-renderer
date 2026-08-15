@@ -24,12 +24,6 @@ void CopyPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.should_execute = next->m_desc.should_execute;
 }
 
-GpuPassDiagInfo CopyPass::gpuDiagInfo() const {
-    GpuPassDiagInfo info;
-    info.category = GpuPassCategory::Copy;
-    return info;
-}
-
 bool CopyPass::referencesRenderTarget(std::string_view render_target) const {
     // Copy passes only need a resource refresh when their source or destination render target was
     // resized/recreated. Skipping unrelated copies keeps text bridge updates from walking the

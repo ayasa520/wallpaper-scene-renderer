@@ -47,6 +47,7 @@ public:
     std::string name;
     float       length { 0.05f };
     float       maxlength { 10.0f };
+    float       minlength { 0.0f };
     float       subdivision { 3.0f };
     i32         segments { 4 };
 };
@@ -120,7 +121,7 @@ public:
     std::string animationmode;
     float       sequencemultiplier { 1.0f };
     uint32_t    maxcount { 1 };
-    uint32_t    starttime { 0 };
+    float       starttime { 0.0f };
     EFlags      flags { 0 };
 };
 class ParticleChild {

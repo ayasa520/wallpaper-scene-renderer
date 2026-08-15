@@ -348,6 +348,20 @@ static bool NodeMaterialSamplesFramebuffer(SceneNode* node) {
         textures.end();
 }
 
+static bool NodeUsesPerspectiveCamera(const Scene& scene, SceneNode* node) {
+    // Uniform updates walk ancestors for the effective camera. Keep the same walk here so a
+    // child that inherits a perspective camera is not flattened back to the active ortho view.
+    for (auto* current = node; current != nullptr; current = current->Parent()) {
+        if (current->Camera().empty()) continue;
+        const auto camera_it = scene.cameras.find(current->Camera());
+        if (camera_it != scene.cameras.end() && camera_it->second != nullptr &&
+            camera_it->second->IsPerspective()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct EffectSourceRoutingDecision {
     OwnerNodeSourceFallbackReason owner_node_fallback_reason {
         OwnerNodeSourceFallbackReason::None
@@ -355,6 +369,7 @@ struct EffectSourceRoutingDecision {
     bool        owner_node_source_fallback { false };
     bool        owner_node_source_fallback_samples_framebuffer { false };
     bool        owner_node_samples_framebuffer { false };
+    bool        owner_node_uses_perspective_camera { false };
     bool        owner_node_contributes_to_effect_source { false };
     bool        proxy_children_contribute_to_effect_source { false };
     std::string active_compose_source_camera;
@@ -381,6 +396,8 @@ static EffectSourceRoutingDecision ResolveEffectSourceRouting(SceneNode* node,
     decision.owner_node_source_fallback_samples_framebuffer =
         decision.owner_node_source_fallback && NodeMaterialSamplesFramebuffer(node);
     decision.owner_node_samples_framebuffer = NodeMaterialSamplesFramebuffer(node);
+    decision.owner_node_uses_perspective_camera =
+        extra.scene != nullptr && NodeUsesPerspectiveCamera(*extra.scene, node);
     decision.owner_node_contributes_to_effect_source =
         EffectSourceUsesOwnerNode(imgeff) || decision.owner_node_source_fallback;
     decision.proxy_children_contribute_to_effect_source = EffectSourceUsesProxyChildren(imgeff);
@@ -410,6 +427,9 @@ static NodePassOptions BuildOwnerSourcePassOptions(
     const EffectSourceRoutingDecision& source_route) {
     const bool clear_private_effect_source =
         route.compose_source && imgeff != nullptr && output != inherited_output;
+    const bool evaluate_framebuffer_source_with_active_camera =
+        source_route.owner_node_samples_framebuffer &&
+        !source_route.owner_node_uses_perspective_camera;
 
     // Owner-source emission is the one place where source routing affects actual pass state. Keep
     // these side effects grouped so future route types can extend the pass contract without adding
@@ -417,11 +437,14 @@ static NodePassOptions BuildOwnerSourcePassOptions(
     //
     // - Composition source routes write child layers into a parent-local source target. Their alpha
     //   policy comes from the parent composition layer's copybackground contract.
-    // - Any owner material that samples the live framebuffer must evaluate world geometry against
-    //   the active scene camera even though the pass writes a private source target. The
+    // - An owner material that samples the live framebuffer normally evaluates world geometry
+    //   against the active scene camera, including while writing a private source target. The
     //   composelayer vertex shader separately turns authored texture coordinates into the fullscreen
     //   output quad, so using the private effect camera for both roles creates the cursor-following
-    //   rectangular region seen in incorrect implementations.
+    //   rectangular region seen in incorrect implementations. An explicitly perspective node is
+    //   the exception: its authored camera remains the draw camera even when its material samples
+    //   the framebuffer. Forcing refractive perspective particles through the active orthographic
+    //   camera removes all authored depth scaling and makes foreground rain appear uniformly small.
     // - Private effect source targets are cleared only at the seed step; clearing later authored
     //   effect passes would erase intermediate waterwaves/foliagesway/opacity results.
     return NodePassOptions {
@@ -434,7 +457,8 @@ static NodePassOptions BuildOwnerSourcePassOptions(
             : std::string(),
         .use_active_camera_for_parallax = source_route.use_compose_camera_override,
         .premultiplied_source_blend = route.premultiplied_source_blend,
-        .use_active_camera_for_uniforms = source_route.owner_node_samples_framebuffer,
+        .use_active_camera_for_uniforms =
+            evaluate_framebuffer_source_with_active_camera,
     };
 }
 

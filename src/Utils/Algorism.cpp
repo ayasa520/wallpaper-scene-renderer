@@ -1,6 +1,7 @@
 #include "Algorism.h"
 #include "Eigen.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -559,4 +560,84 @@ float algorism::HashNoise1D(float x) noexcept {
     const float w1s = w1 * w1;
     constexpr float kHashNoise1DScale = 0.395f;
     return (g1 * tm1 * w1s * w1s + g0 * t * w0s * w0s) * kHashNoise1DScale;
+}
+
+namespace
+{
+constexpr float    kSimplexF2       = 0.366025388f;
+constexpr float    kSimplexG2       = 0.211324871f;
+constexpr float    kSimplexCorner2  = -0.577350259f;
+constexpr float    kSimplexGradSkew = 2.41421366f;
+constexpr float    kSimplexNorm     = 38.2836876f;
+constexpr uint32_t kSimplexHashI    = 501125321u;
+constexpr uint32_t kSimplexHashJ    = 0x43c42e4du;
+constexpr uint32_t kSimplexHashMix  = 0x27d4eb2du;
+
+int32_t FloorTowardNegInf(float value) noexcept {
+    const int32_t truncated = static_cast<int32_t>(value);
+    return value < static_cast<float>(truncated) ? truncated - 1 : truncated;
+}
+
+uint32_t MixLatticeHash(int32_t i, int32_t j, uint32_t seed) noexcept {
+    const uint32_t hashed = kSimplexHashMix * ((kSimplexHashI * static_cast<uint32_t>(i)) ^
+                                               (kSimplexHashJ * static_cast<uint32_t>(j)) ^ seed);
+    return (hashed >> 15) ^ hashed;
+}
+
+float SimplexCorner(float x, float y, uint32_t hash) noexcept {
+    float falloff = 0.5f - x * x - y * y;
+    if (falloff <= 0.0f) return 0.0f;
+    falloff *= falloff;
+    falloff *= falloff;
+
+    const uint32_t signed_x = std::bit_cast<uint32_t>(x) ^ (hash << 31);
+    const uint32_t signed_y = std::bit_cast<uint32_t>(y) ^ ((hash >> 1) << 31);
+    const uint32_t select =
+        static_cast<uint32_t>(static_cast<int32_t>(hash << 29) >> 31) & (signed_x ^ signed_y);
+    const float gx = std::bit_cast<float>(select ^ signed_x);
+    const float gy = std::bit_cast<float>(select ^ signed_y);
+    return (gx * kSimplexGradSkew + gy) * falloff;
+}
+} // namespace
+
+float algorism::SimplexNoise2D(float x, float y, uint32_t seed) noexcept {
+    const float   skew = (x + y) * kSimplexF2;
+    const int32_t i    = FloorTowardNegInf(x + skew);
+    const int32_t j    = FloorTowardNegInf(y + skew);
+    const float   unskew =
+        (static_cast<float>(i) + static_cast<float>(j)) * kSimplexG2;
+    const float x0 = x - (static_cast<float>(i) - unskew);
+    const float y0 = y - (static_cast<float>(j) - unskew);
+    const int32_t i1 = y0 < x0 ? 1 : 0;
+    const int32_t j1 = y0 < x0 ? 0 : 1;
+    const float   x1 = x0 - static_cast<float>(i1) + kSimplexG2;
+    const float   y1 = y0 - static_cast<float>(j1) + kSimplexG2;
+    const float   x2 = x0 + kSimplexCorner2;
+    const float   y2 = y0 + kSimplexCorner2;
+    return (SimplexCorner(x0, y0, MixLatticeHash(i, j, seed)) +
+            SimplexCorner(x1, y1, MixLatticeHash(i + i1, j + j1, seed)) +
+            SimplexCorner(x2, y2, MixLatticeHash(i + 1, j + 1, seed))) *
+           kSimplexNorm;
+}
+
+float algorism::FbmNoise2D(float x, float y, uint32_t seed, int octaves) noexcept {
+    if (octaves < 1) octaves = 1;
+    float weight_sum = 1.0f;
+    float persist    = 0.5f;
+    for (int octave = 1; octave < octaves; ++octave) {
+        weight_sum += persist;
+        persist *= 0.5f;
+    }
+    float amp  = 1.0f / weight_sum;
+    float last = SimplexNoise2D(x, y, seed);
+    float sum  = last * amp;
+    for (int octave = 1; octave < octaves; ++octave) {
+        x *= 2.0f;
+        y *= 2.0f;
+        seed += 1u;
+        amp *= 0.5f;
+        last = SimplexNoise2D(x, y, seed);
+        sum += last * amp;
+    }
+    return sum;
 }
