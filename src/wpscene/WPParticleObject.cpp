@@ -76,6 +76,7 @@ bool ParticleRender::FromJson(const nlohmann::json& json) {
     if (name == "spritetrail" || name == "ropetrail") {
         GET_JSON_NAME_VALUE_NOWARN(json, "length", length);
         GET_JSON_NAME_VALUE_NOWARN(json, "maxlength", maxlength);
+        GET_JSON_NAME_VALUE_NOWARN(json, "minlength", minlength);
         GET_JSON_NAME_VALUE_NOWARN(json, "segments", segments);
     }
     return true;

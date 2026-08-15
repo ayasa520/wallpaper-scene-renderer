@@ -66,15 +66,8 @@ void RecordCopyBufferRange(const BufferParameters& dst_buf, const BufferParamete
 }
 } // namespace
 
-void StagingBuffer::setCollectFrameStats(bool enabled) { m_collect_frame_stats = enabled; }
-
-void StagingBuffer::resetFrameStats() { m_frame_stats = {}; }
-
-const StagingBuffer::FrameStats& StagingBuffer::frameStats() const { return m_frame_stats; }
-
 void StagingBuffer::markDirty(VkDeviceSize offset, VkDeviceSize size) {
     if (size == 0) return;
-    if (m_collect_frame_stats) m_frame_stats.mark_dirty_calls++;
 
     // Shader uniform updates write hundreds of tiny std140 slots per frame. Merging those ranges
     // on every write is quadratic in the live dirty list. Record the interval here and collapse
@@ -286,10 +279,6 @@ bool StagingBuffer::writeToBuf(const StagingBufferRef& ref, std::span<uint8_t> d
     VkDeviceSize size = std::min(ref.size - offset, data.size());
     uint8_t*     raw  = (uint8_t*)m_stage_raw;
     std::copy(data.begin(), data.begin() + size, raw + ref.offset + offset);
-    if (m_collect_frame_stats) {
-        m_frame_stats.write_calls++;
-        m_frame_stats.memcpy_bytes += size;
-    }
     markDirty(ref.offset + offset, size);
     return true;
 }
@@ -304,10 +293,6 @@ bool StagingBuffer::fillBuf(const StagingBufferRef& ref, size_t offset, size_t s
     uint8_t*     raw       = (uint8_t*)m_stage_raw;
     uint8_t*     raw_begin = raw + ref.offset + offset;
     std::fill(raw_begin, raw_begin + size_, c);
-    if (m_collect_frame_stats) {
-        m_frame_stats.fill_calls++;
-        m_frame_stats.fill_bytes += size_;
-    }
     markDirty(ref.offset + offset, size_);
     return true;
 }
@@ -328,17 +313,12 @@ bool StagingBuffer::recordUpload(vvk::CommandBuffer& cmd) {
         m_stage_buf.handle.UnMapMemory();
         m_stage_raw = nullptr;
     }
-    if (m_collect_frame_stats) {
-        m_frame_stats.dirty_range_count = static_cast<uint32_t>(m_dirty_ranges.size());
-        m_frame_stats.copy_commands     = static_cast<uint32_t>(m_dirty_ranges.size());
-    }
     for (const auto& range : m_dirty_ranges) {
         VVK_CHECK_BOOL_RE(vmaFlushAllocation(m_device.vma_allocator(),
                                              m_stage_buf.handle.Allocation(),
                                              range.offset,
                                              range.size));
         RecordCopyBufferRange(m_gpu_buf, m_stage_buf, range.offset, range.size, cmd);
-        if (m_collect_frame_stats) m_frame_stats.flush_bytes += range.size;
     }
     m_dirty_ranges.clear();
     return true;

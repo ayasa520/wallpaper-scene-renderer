@@ -1774,16 +1774,8 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
                 .push_visible_descriptors = push_visible_descriptors,
             });
         }
-        if (rr.frame_draw_stats != nullptr) {
-            rr.frame_draw_stats->shader_draws++;
-            rr.frame_draw_stats->shader_indices += m_desc.draw_count;
-        }
     } else {
         cmd.Draw(m_desc.draw_count, 1, 0, 0);
-        if (rr.frame_draw_stats != nullptr) {
-            rr.frame_draw_stats->shader_draws++;
-            rr.frame_draw_stats->shader_vertices += m_desc.draw_count;
-        }
     }
 
     cmd.EndRenderPass();

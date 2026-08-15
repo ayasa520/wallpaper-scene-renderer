@@ -61,12 +61,6 @@ bool FinPass::referencesRenderTarget(std::string_view render_target) const {
     return m_desc.result == render_target;
 }
 
-GpuPassDiagInfo FinPass::gpuDiagInfo() const {
-    GpuPassDiagInfo info;
-    info.category  = GpuPassCategory::Composite;
-    info.primitive = "copy";
-    return info;
-}
 namespace
 {
 std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFormat format,

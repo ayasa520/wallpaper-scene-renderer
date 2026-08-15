@@ -6,7 +6,10 @@
 #include <random>
 #include <memory>
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdint>
+#include <string>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -98,12 +101,32 @@ inline Eigen::Vector3f DecodeParticleColorEndpoint(
              encoded_color[2] * kByteToNormalized };
 }
 
-inline Vector3d GenRandomVec3(const std::array<float, 3>& min, const std::array<float, 3>& max) {
+inline float SampleRangedRandom(float min, float max, float exponent) {
+    float t = Random::get(0.0f, 1.0f);
+    if (exponent != 1.0f && std::isfinite(exponent)) t = std::pow(t, exponent);
+    return min + (max - min) * t;
+}
+
+inline Vector3d GenRandomVec3(const std::array<float, 3>& min, const std::array<float, 3>& max,
+                              float exponent = 1.0f) {
     Vector3d result(3);
     for (int32_t i = 0; i < 3; i++) {
-        result[i] = Random::get(min[i], max[i]);
+        result[i] = SampleRangedRandom(min[i], max[i], exponent);
     }
     return result;
+}
+
+inline Vector3f ReadJsonVec3OrScalar(const nlohmann::json& j, const char* key,
+                                     const Vector3f& fallback) {
+    if (! j.contains(key)) return fallback;
+    const auto& node = j.at(key);
+    if (node.is_number()) {
+        const float scalar = node.get<float>();
+        return { scalar, scalar, scalar };
+    }
+    std::array<float, 3> value { fallback.x(), fallback.y(), fallback.z() };
+    GET_JSON_NAME_VALUE_NOWARN(j, key, value);
+    return { value[0], value[1], value[2] };
 }
 
 } // namespace
@@ -115,6 +138,7 @@ struct SingleRandom {
     static void ReadFromJson(const nlohmann::json& j, SingleRandom& r) {
         GET_JSON_NAME_VALUE_NOWARN(j, "min", r.min);
         GET_JSON_NAME_VALUE_NOWARN(j, "max", r.max);
+        GET_JSON_NAME_VALUE_NOWARN(j, "exponent", r.exponent);
     };
 };
 struct VecRandom {
@@ -125,6 +149,7 @@ struct VecRandom {
     static void ReadFromJson(const nlohmann::json& j, VecRandom& r) {
         GET_JSON_NAME_VALUE_NOWARN(j, "min", r.min);
         GET_JSON_NAME_VALUE_NOWARN(j, "max", r.max);
+        GET_JSON_NAME_VALUE_NOWARN(j, "exponent", r.exponent);
     };
 };
 struct TurbulentRandom {
@@ -209,19 +234,19 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       w
             SingleRandom r = { 0.0f, 1.0f };
             SingleRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
-                PM::InitLifetime(p, Random::get(r.min, r.max));
+                PM::InitLifetime(p, SampleRangedRandom(r.min, r.max, r.exponent));
             };
         } else if (name == "sizerandom") {
-            SingleRandom r = { 0.0f, 20.0f };
+            SingleRandom r = { 5.0f, 50.0f };
             SingleRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
-                PM::InitSize(p, Random::get(r.min, r.max));
+                PM::InitSize(p, SampleRangedRandom(r.min, r.max, r.exponent));
             };
         } else if (name == "alpharandom") {
             SingleRandom r = { 0.05f, 1.0f };
             SingleRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
-                PM::InitAlpha(p, Random::get(r.min, r.max));
+                PM::InitAlpha(p, SampleRangedRandom(r.min, r.max, r.exponent));
             };
         } else if (name == "velocityrandom") {
             VecRandom r;
@@ -229,7 +254,7 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       w
             r.max[0] = r.max[1] = 32.0f;
             VecRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
-                auto result = GenRandomVec3(r.min, r.max);
+                auto result = GenRandomVec3(r.min, r.max, r.exponent);
                 // Simulation is in the particle node's local space; the node transform is applied
                 // at render, so this velocity stays local.
                 PM::ChangeVelocity(p, result[0], result[1], result[2]);
@@ -239,7 +264,7 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       w
             r.max[2] = 2 * M_PI;
             VecRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
-                auto result = GenRandomVec3(r.min, r.max);
+                auto result = GenRandomVec3(r.min, r.max, r.exponent);
                 PM::ChangeRotation(p, result[0], result[1], result[2]);
             };
         } else if (name == "angularvelocityrandom") {
@@ -248,7 +273,7 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       w
             r.max[2] = 5.0f;
             VecRandom::ReadFromJson(wpj, r);
             return [=](Particle& p, const ParticleInitInfo&) {
-                auto result = GenRandomVec3(r.min, r.max);
+                auto result = GenRandomVec3(r.min, r.max, r.exponent);
                 PM::ChangeAngularVelocity(p, result[0], result[1], result[2]);
             };
         } else if (name == "mapsequencearoundcontrolpoint") {
@@ -387,9 +412,12 @@ struct FrequencyValue {
     float scalemax { 1.0f };
     float phasemin { 0.0f };
     float phasemax { static_cast<float>(2 * M_PI) };
+    // Layer instanceoverride.speed is baked into oscillateposition frequency.
+    float speed { 1.0f };
 
     struct StorageRandom {
         bool  reset { true };
+        float unit { 0.0f };
         float frequency { 0.0f };
         float scale { 1.0f };
         float phase { 0.0f };
@@ -403,7 +431,11 @@ struct FrequencyValue {
             v.scalemin = 0.8f;
             v.scalemax = 1.2f;
         } else if (name == "oscillateposition") {
+            v.frequencymin = 1.0f;
             v.frequencymax = 5.0f;
+            // Missing scalemax is 10 on a sized orthogonal scene and 0.5
+            // only when both canvas width and height stay zero.
+            v.scalemax = 10.0f;
         }
         GET_JSON_NAME_VALUE_NOWARN(j, "frequencymin", v.frequencymin);
         GET_JSON_NAME_VALUE_NOWARN(j, "frequencymax", v.frequencymax);
@@ -422,23 +454,27 @@ struct FrequencyValue {
         auto& st = storage.at(index);
         if (! PM::LifetimeOk(p)) st.reset = true;
         if (st.reset) {
-            st.frequency = Random::get(frequencymin, frequencymax);
-            st.scale     = Random::get(scalemin, scalemax);
-            st.phase     = (float)Random::get((double)phasemin, phasemax + 2.0 * M_PI);
+            // Frequency, phase, and scale share the spawn unit already stored for remapvalue.
+            const float unit = std::bit_cast<float>(p.remap_seed);
+            st.unit      = unit;
+            st.frequency = (frequencymin + unit * (frequencymax - frequencymin)) * speed;
+            st.scale     = scalemin + unit * (scalemax - scalemin);
+            st.phase     = phasemin + unit * (phasemax - phasemin);
             st.reset     = false;
         }
     }
     inline double GetScale(uint32_t index, double time) {
         const auto& st = storage.at(index);
-        double      f  = st.frequency / (2.0f * M_PI);
-        double      w  = 2.0f * M_PI * f;
-        return algorism::lerp((std::cos(w * time + st.phase) + 1.0f) * 0.5f, scalemin, scalemax);
+        const double angle = st.frequency * (time + st.phase);
+        return algorism::lerp((std::cos(angle) + 1.0f) * 0.5f, scalemin, scalemax);
     }
-    inline double GetMove(uint32_t index, double time, double timePass) {
+    inline double GetMove(uint32_t index, uint32_t axis, double time, double timePass) {
         const auto& st = storage.at(index);
-        double      f  = st.frequency / (2.0f * M_PI);
-        double      w  = 2.0f * M_PI * f;
-        return -1.0f * st.scale * w * std::sin(w * time + st.phase) * timePass;
+        // Y uses the same sine, but the time base is shifted by a full turn of the spawn unit.
+        const double extra = (axis == 1) ? (2.0 * M_PI * static_cast<double>(st.unit)) : 0.0;
+        const double base  = time + st.phase + extra;
+        return st.scale * (std::sin(st.frequency * base) -
+                           std::sin(st.frequency * (base - timePass)));
     }
 };
 
@@ -676,21 +712,18 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
             };
 
         } else if (name == "oscillateposition") {
-            std::vector<Vector3f>         lastMove;
-            FrequencyValue                fvx = FrequencyValue::ReadFromJson(wpj, name);
-            std::array<FrequencyValue, 3> fxp = { fvx, fvx, fvx };
+            FrequencyValue fv = FrequencyValue::ReadFromJson(wpj, name);
+            fv.speed          = over.speed;
             return [=](const ParticleInfo& info) mutable {
-                for (auto& f : fxp) f.CheckAndResize(info.particles.size());
+                fv.CheckAndResize(info.particles.size());
                 for (uint i = 0; i < info.particles.size(); i++) {
-                    auto&    p = info.particles[i];
-                    Vector3d del { Vector3d::Zero() };
-                    auto     time = PM::LifetimePassed(p);
+                    auto& p = info.particles[i];
+                    fv.GenFrequency(p, i);
+                    const auto time = PM::LifetimePassed(p);
+                    Vector3d   del { Vector3d::Zero() };
                     for (uint d = 0; d < 3; d++) {
-                        if (fxp[0].mask[d] < 0.01) continue;
-                        fxp[d].GenFrequency(p, i);
-                        del[d] = fxp[d].GetMove(i, time, info.time_pass);
+                        del[d] = fv.GetMove(i, d, time, info.time_pass) * fv.mask[d];
                     }
-
                     PM::Move(p, del);
                 }
             };
@@ -899,6 +932,248 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
                             accel = distance / info.time_pass;
                     }
                     PM::Accelerate(p, direction * accel, info.time_pass);
+                }
+            };
+        } else if (name == "remapvalue") {
+            std::string input { "lifetimefraction" };
+            std::string output { "size" };
+            std::string operation { "multiply" };
+            std::string transform { "none" };
+            std::string input_component { "all" };
+            std::string output_component { "all" };
+            float       transform_scale { 2.0f };
+            i32         transform_octaves { 3 };
+            i32         flags { 1 };
+            i32         input_control_point { 0 };
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "input", input);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "output", output);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "operation", operation);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "transformfunction", transform);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "inputcomponent", input_component);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "outputcomponent", output_component);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "transforminputscale", transform_scale);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "transformoctaves", transform_octaves);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "flags", flags);
+            GET_JSON_NAME_VALUE_NOWARN(wpj, "inputcontrolpoint0", input_control_point);
+            input_control_point = NormalizeControlPointIndex(input_control_point);
+            if (transform_octaves < 1) transform_octaves = 1;
+
+            const Vector3f input_min  = ReadJsonVec3OrScalar(wpj, "inputrangemin", Vector3f::Zero());
+            const Vector3f input_max  = ReadJsonVec3OrScalar(wpj, "inputrangemax", Vector3f::Ones());
+            const Vector3f output_min = ReadJsonVec3OrScalar(wpj, "outputrangemin", Vector3f::Zero());
+            const Vector3f output_max = ReadJsonVec3OrScalar(wpj, "outputrangemax", Vector3f::Ones());
+            const bool     clamp_input  = (flags & 0x1) != 0;
+            const bool     clamp_output = (flags & 0x2) != 0;
+            const bool     output_is_vector =
+                output == "color" || output == "position" || output == "velocity";
+
+            return [=](const ParticleInfo& info) {
+                auto attribute_id = [](const std::string& name) -> int {
+                    static const char* kNames[] = {
+                        "lifetimefraction",
+                        "maxlifetime",
+                        "size",
+                        "opacity",
+                        "speed",
+                        "rotation",
+                        "angularspeed",
+                        "distancetocontrolpoint",
+                        "positionbetweentwocontrolpoints",
+                        "runtime",
+                        "timeofday",
+                        "particlesystemtime",
+                        "layertime",
+                        "color",
+                        "position",
+                        "velocity",
+                        "controlpoint",
+                        "deltatocontrolpoint",
+                        "directiontocontrolpoint",
+                        "layerorigin",
+                    };
+                    for (int i = 0; i < 20; ++i) {
+                        if (name == kNames[i]) return i;
+                    }
+                    return 21;
+                };
+
+                auto read_input = [&](const Particle& p) -> Vector3f {
+                    if (input == "position") return PM::GetPos(p);
+                    if (input == "velocity") return PM::GetVelocity(p);
+                    if (input == "color") return p.color;
+                    if (input == "rotation") return p.rotation;
+                    if (input == "size") return Vector3f::Constant(p.size);
+                    if (input == "opacity") return Vector3f::Constant(p.alpha);
+                    if (input == "speed")
+                        return Vector3f::Constant(PM::GetVelocity(p).norm());
+                    if (input == "maxlifetime")
+                        return Vector3f::Constant(p.init.lifetime);
+                    if (input == "lifetimefraction")
+                        return Vector3f::Constant(PM::LifetimePos(p));
+                    if (input == "particlesystemtime" || input == "runtime" ||
+                        input == "layertime")
+                        return Vector3f::Constant(static_cast<float>(info.time));
+                    if (input == "angularspeed")
+                        return Vector3f::Constant(p.angularVelocity.norm());
+                    if (input == "distancetocontrolpoint") {
+                        Vector3d center = Vector3d::Zero();
+                        if (static_cast<usize>(input_control_point) < info.controlpoints.size()) {
+                            center = info.controlpoints[static_cast<usize>(input_control_point)]
+                                         .offset;
+                        }
+                        return Vector3f::Constant(
+                            static_cast<float>((PM::GetPos(p).cast<double>() - center).norm()));
+                    }
+                    return Vector3f::Constant(PM::LifetimePos(p));
+                };
+
+                auto reduce_component = [](const Vector3f& value,
+                                           const std::string& component) -> Vector3f {
+                    if (component == "x") return Vector3f::Constant(value.x());
+                    if (component == "y") return Vector3f::Constant(value.y());
+                    if (component == "z") return Vector3f::Constant(value.z());
+                    if (component == "sum")
+                        return Vector3f::Constant(value.x() + value.y() + value.z());
+                    if (component == "average")
+                        return Vector3f::Constant((value.x() + value.y() + value.z()) / 3.0f);
+                    if (component == "max")
+                        return Vector3f::Constant(value.maxCoeff());
+                    if (component == "min")
+                        return Vector3f::Constant(value.minCoeff());
+                    return value;
+                };
+
+                auto clamp01 = [](Vector3f value) {
+                    return value.cwiseMax(0.0f).cwiseMin(1.0f);
+                };
+
+                auto operate_scalar = [&](float current, float mapped, bool* wrote) -> float {
+                    *wrote = true;
+                    if (operation == "multiply") return current * mapped;
+                    if (operation == "add") return current + mapped;
+                    if (operation == "subtract") return current - mapped;
+                    if (operation == "remap") return mapped;
+                    *wrote = false;
+                    return current;
+                };
+
+                auto operate_vector = [&](const Vector3f& current, const Vector3f& mapped,
+                                          bool write_x, bool write_y, bool write_z) {
+                    Vector3f next = current;
+                    auto     one  = [&](int c) {
+                        bool wrote = false;
+                        next[c]    = operate_scalar(current[c], mapped[c], &wrote);
+                    };
+                    if (write_x) one(0);
+                    if (write_y) one(1);
+                    if (write_z) one(2);
+                    return next;
+                };
+
+                auto apply_speed = [&](Particle& p, float mapped) {
+                    const Vector3f velocity = PM::GetVelocity(p);
+                    const float    current  = velocity.norm();
+                    bool           wrote    = false;
+                    const float    next     = operate_scalar(current, mapped, &wrote);
+                    if (! wrote) return;
+                    if (current > 0.0f)
+                        PM::MutiplyVelocity(p, static_cast<double>(next / current));
+                };
+
+                auto shape_unit = [&](float t, uint32_t seed) {
+                    const float domain = t * transform_scale;
+                    if (transform == "sine") {
+                        constexpr float kPi = 3.14159274f;
+                        return 0.5f - 0.5f * std::cos(domain * kPi);
+                    }
+                    if (transform == "square") {
+                        const float frac = domain - std::trunc(domain);
+                        return std::nearbyint(frac) + (domain < 0.0f ? 1.0f : 0.0f);
+                    }
+                    if (transform == "saw") {
+                        return (domain - std::trunc(domain)) + (t < 0.0f ? 1.0f : 0.0f);
+                    }
+                    if (transform == "triangle") {
+                        const float x    = std::fabs(domain);
+                        const float frac = x - std::trunc(x);
+                        return 1.0f - std::fabs(2.0f * frac - 1.0f);
+                    }
+                    if (transform == "fbmnoise")
+                        return 0.5f * algorism::FbmNoise2D(domain, 0.0f, seed, transform_octaves) +
+                               0.5f;
+                    if (transform == "simplexnoise")
+                        return 0.5f * algorism::SimplexNoise2D(domain, 0.0f, seed) + 0.5f;
+                    return t;
+                };
+
+                constexpr uint32_t kComponentSeedY = 0x0b3924adu;
+                constexpr uint32_t kComponentSeedZ = 0x493a8e83u;
+
+                const bool write_x =
+                    output_component == "all" || output_component == "x";
+                const bool write_y =
+                    output_component == "all" || output_component == "y";
+                const bool write_z =
+                    output_component == "all" || output_component == "z";
+                const bool write_vector_any = write_x || write_y || write_z;
+
+                for (auto& p : info.particles) {
+                    if (! PM::LifetimeOk(p)) continue;
+
+                    Vector3f source = read_input(p);
+                    if (attribute_id(input) > 12)
+                        source = reduce_component(source, input_component);
+
+                    Vector3f unit;
+                    for (int c = 0; c < 3; ++c) {
+                        const float span = input_max[c] - input_min[c];
+                        unit[c]          = span != 0.0f ? (source[c] - input_min[c]) / span : 0.0f;
+                    }
+                    if (clamp_input) unit = clamp01(unit);
+
+                    if (transform == "sine" || transform == "square" || transform == "saw" ||
+                        transform == "triangle" || transform == "simplexnoise" ||
+                        transform == "fbmnoise") {
+                        const uint32_t seed  = p.remap_seed;
+                        const int      count = output_is_vector ? 3 : 1;
+                        for (int c = 0; c < count; ++c) {
+                            uint32_t lane_seed = seed;
+                            if (c == 1) lane_seed ^= kComponentSeedY;
+                            if (c == 2) lane_seed ^= kComponentSeedZ;
+                            unit[c] = shape_unit(unit[c], lane_seed);
+                        }
+                        if (! output_is_vector) unit = Vector3f::Constant(unit.x());
+                    }
+
+                    Vector3f mapped = output_min + unit.cwiseProduct(output_max - output_min);
+                    if (clamp_output) mapped = clamp01(mapped);
+
+                    if (output == "velocity") {
+                        if (! write_vector_any) continue;
+                        PM::InitVelocity(p, operate_vector(PM::GetVelocity(p), mapped, write_x,
+                                                           write_y, write_z)
+                                                .cast<double>());
+                    } else if (output == "position") {
+                        if (! write_vector_any) continue;
+                        PM::MoveTo(p, operate_vector(PM::GetPos(p), mapped, write_x, write_y,
+                                                     write_z)
+                                          .cast<double>());
+                    } else if (output == "color") {
+                        if (! write_vector_any) continue;
+                        p.color = operate_vector(p.color, mapped, write_x, write_y, write_z);
+                    } else if (output == "speed") {
+                        apply_speed(p, mapped.x());
+                    } else if (output == "opacity") {
+                        bool wrote = false;
+                        p.alpha    = operate_scalar(p.alpha, mapped.x(), &wrote);
+                    } else if (output == "size") {
+                        bool wrote = false;
+                        p.size     = operate_scalar(p.size, mapped.x(), &wrote);
+                    } else if (output == "maxlifetime") {
+                        bool wrote = false;
+                        p.init.lifetime =
+                            operate_scalar(p.init.lifetime, mapped.x(), &wrote);
+                    }
                 }
             };
         }

@@ -37,7 +37,6 @@ public:
     std::string residencyKey() const override;
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
-    GpuPassDiagInfo gpuDiagInfo() const override;
 
 private:
     Desc m_desc;
