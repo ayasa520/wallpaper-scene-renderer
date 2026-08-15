@@ -407,6 +407,14 @@ bool TextPass::referencesTextLayer(int32_t layer_id) const {
     return layer_id != 0 && m_desc.layer_id == layer_id;
 }
 
+GpuPassDiagInfo TextPass::gpuDiagInfo() const {
+    GpuPassDiagInfo info;
+    info.category  = GpuPassCategory::Text;
+    info.layer_id  = m_desc.layer_id;
+    info.primitive = "triangle";
+    return info;
+}
+
 bool TextPass::refreshTextures(const Device& device) {
     const auto* primitive =
         m_desc.node != nullptr ? m_desc.node->Text() : nullptr;

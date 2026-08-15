@@ -30,6 +30,7 @@ public:
     void destory(const Device&, RenderingResources&) override;
     std::string residencyKey() const override;
     bool referencesRenderTarget(std::string_view) const override;
+    GpuPassDiagInfo gpuDiagInfo() const override;
 
 private:
     Desc m_desc;

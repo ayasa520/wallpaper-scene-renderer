@@ -87,6 +87,10 @@ constexpr std::string_view G_SCREEN { "g_Screen" };
 constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
 
 constexpr std::string_view SpecTex_Default { "_rt_default" };
+// Second physical compose image. Shader color-blend and refraction sample this snapshot while
+// writing `_rt_default`, instead of allocating a unique `_rt_default_<version>_copy` for every
+// self-write.
+constexpr std::string_view SpecTex_DefaultPingPong { "_rt_default_pingpong" };
 constexpr std::string_view SpecTex_Link { "_rt_link_" };
 
 inline bool IsSpecTex(const std::string_view name) { return sstart_with(name, WE_SPEC_PREFIX); }

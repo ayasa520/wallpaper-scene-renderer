@@ -769,17 +769,13 @@ bool UpdateTextDependencyRenderTarget(SceneRenderTarget&  render_target,
                                       std::array<float, 2> physical_extent,
                                       std::array<float, 2> logical_extent) {
     /*
-     * Projected text bridges deliberately decouple two resolution domains:
+     * Text effect targets keep two names for the same authored letter box:
      *
-     *  - width/height are the Vulkan backing pixels needed for projected screen coverage at the
-     *    text raster density;
-     *  - mapWidth/mapHeight are the authored effect grid represented by that backing.
+     *  - width/height are the Vulkan backing pixels;
+     *  - mapWidth/mapHeight are the effect grid sampled by g_TextureNResolution.
      *
-     * Wallpaper Engine shaders derive kernel offsets from g_TextureNResolution. Collapsing the
-     * logical grid to the projected backing makes blur, displacement, and convolution strength
-     * change whenever a parent scales the layer. Retaining the authored grid preserves the effect
-     * contract while the physical extent avoids allocating the full authored rectangle for text
-     * that occupies only a small portion of the final output.
+     * Both stay on the authored box plus any FBO scale or fit. Object scale is applied when the
+     * result is composited, so kernel offsets do not change when a parent scales the layer.
      */
     const auto physical = RoundTextExtent(physical_extent);
     const auto logical = RoundTextExtent(logical_extent);
@@ -872,21 +868,13 @@ int ResolvePadding(const wpscene::WPTextObject& object) {
     return MaxTextPaddingEdge(ClampTextPaddingEdges(object.padding_edges));
 }
 
-float ResolveTextVisualScaleFactor(const wpscene::WPTextObject& object) {
-    return std::max(
-        { std::abs(object.scale[0]), std::abs(object.scale[1]), kMinTextVisualScaleFactor });
-}
-
 float ResolveTextRasterDensityFactor(const wpscene::WPTextObject& object,
                                      const TextLayerRenderContract& render_contract) {
-    const float visual_scale = ResolveTextVisualScaleFactor(object);
-    // Effect-backed text always goes through at least one extra filtered pass,
-    // so dropping its backing texture below 1:1 screen density makes it visibly
-    // softer than plain text. Keep the existing sqrt() heuristic for larger
-    // scales, but clamp effect layers to full density so we preserve sharpness
-    // without changing any display-size math.
-    if (render_contract.RequiresBridge()) return std::max(1.0f, std::sqrt(visual_scale));
-    return std::sqrt(visual_scale);
+    (void)object;
+    (void)render_contract;
+    // Object scale is applied when the text is composited onto the scene. The atlas and
+    // effect ping-pong stay at the authored letter box.
+    return 1.0f;
 }
 
 bool HasExplicitTextScreenAnchor(const wpscene::WPTextObject& object) {
@@ -1828,18 +1816,17 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
 
     const auto  font_family      = ResolveFontFamily(vfs, object.font).value_or("Sans");
     const auto  authored_padding = ResolveTextLayoutPadding(object, render_contract);
+    (void)render_scale;
     const float raster_density = ResolveTextRasterDensityFactor(object, render_contract);
     const double backing_density =
         std::max(static_cast<double>(kMinTextVisualScaleFactor),
-                 std::max(1.0, render_scale) * static_cast<double>(raster_density));
+                 static_cast<double>(raster_density));
     const double raster_scale = backing_density;
     const double display_scale = 1.0 / backing_density;
 
-    // Wallpaper Engine pointsize is converted once, linearly, into authored text geometry. Object
-    // scale remains on SceneNode, scene projection remains on SceneCamera, and render_scale only
-    // changes `backing_density`; none of those independent quantities may feed back into the
-    // point-size conversion or the logical text box. This is why desktop density can sharpen an
-    // atlas without changing the text's visible scene-space size.
+    // pointsize is converted once, linearly, into authored text geometry. Object scale remains
+    // on SceneNode and scene projection remains on SceneCamera. Neither desktop density nor
+    // object scale may feed back into the point-size conversion or the letter box.
     auto scale_display_metric_to_layout_pixels = [&](double value, int minimum) {
         if (value <= 0.0) return minimum;
         return std::max(minimum, static_cast<int>(std::lround(value)));
@@ -2250,31 +2237,16 @@ std::array<uint32_t, 2> ResolveTextBridgeRasterExtent(
     std::array<uint32_t, 2> projected_extent,
     std::array<float, 2>    source_extent,
     float                   backing_density) {
-    const double density = std::isfinite(backing_density)
-        ? std::max(1.0, static_cast<double>(backing_density))
-        : 1.0;
+    (void)projected_extent;
+    (void)backing_density;
 
-    /*
-     * A bridge is followed by at least one linearly filtered effect/composite pass. Allocating it
-     * at exactly one texel per final output pixel throws away the supersampling already carried by
-     * the glyph atlas, so small text becomes visibly softer even though its final quad dimensions
-     * are correct. That supersampling is only meaningful up to the rasterized source resolution:
-     * multiplying a large screen projection by the full atlas density creates texels that contain
-     * no additional glyph detail and makes every downstream effect process the same interpolation
-     * repeatedly. The source raster is also the stable ownership boundary for this resource:
-     * audio-driven node scale changes must not turn a transform update into ping-pong image
-     * replacement. Once final screen coverage exceeds the source raster, the scene-space
-     * publication pass performs that unavoidable enlargement; allocating more bridge texels would
-     * only pre-upsample the same source and force every authored effect to process the extra pixels.
-     * Use the atlas density as antialiasing headroom while the layer is downscaled, then stop at the
-     * source raster on each axis.
-     */
+    // Effect ping-pong follows the authored source raster. Object scale and desktop density are
+    // applied when that result is composited, so audio-driven node scale must not recreate the
+    // ping-pong images.
     std::array<uint32_t, 2> raster_extent {};
     for (size_t axis = 0; axis < raster_extent.size(); axis++) {
-        const double projected = static_cast<double>(projected_extent[axis]);
-        const double source = std::max(1.0, static_cast<double>(source_extent[axis]));
-        const double supersampled = std::min(projected * density, source);
-        raster_extent[axis] = ResolveProjectedPixelLength(supersampled);
+        raster_extent[axis] = ResolveProjectedPixelLength(
+            std::max(1.0, static_cast<double>(source_extent[axis])));
     }
     return raster_extent;
 }
@@ -2458,17 +2430,9 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
 
         const auto target_logical_extent =
             ResolveTextBridgeRenderTargetExtent(bridge_target, bridge_logical_extent);
-        // Fixed-fit targets are authored absolute resolutions, while feedback targets retain
-        // history across frames. Both remain in the authored effect domain. Ordinary transient
-        // targets follow projected coverage and carry the authored grid separately in mapWidth/
-        // mapHeight so shader kernel strength remains unchanged.
-        const auto target_physical_extent =
-            bridge_target.fit > 0 || bridge_target.persistent_feedback
-            ? target_logical_extent
-            : ResolveTextBridgeRenderTargetExtent(
-                  bridge_target,
-                  { static_cast<float>(next_backing_extent[0]),
-                    static_cast<float>(next_backing_extent[1]) });
+        // Fit, feedback, and ordinary transient targets all stay in the authored letter box
+        // plus any FBO scale. Object scale is applied when the result is composited.
+        const auto target_physical_extent = target_logical_extent;
 
         const auto previous_extent = std::array<int32_t, 4> {
             render_target.width,

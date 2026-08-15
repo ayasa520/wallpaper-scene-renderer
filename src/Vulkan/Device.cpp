@@ -175,6 +175,12 @@ bool Device::Create(Instance& inst,
     }
     VkPhysicalDeviceFeatures enabled_features {};
     enabled_features.geometryShader = VK_TRUE;
+    // Pipeline-statistics queries are opt-in at record time. Enabling the device feature here is
+    // required so T4 can split vertex/geometry invocations from fragment overdraw without changing
+    // the default rendering path.
+    if (supported_features.pipelineStatisticsQuery) {
+        enabled_features.pipelineStatisticsQuery = VK_TRUE;
+    }
     VVK_CHECK_BOOL_RE(vvk::Device::Create(device.m_device,
                                           *device.m_gpu,
                                           device.ChooseDeviceQueue(*inst.surface()),

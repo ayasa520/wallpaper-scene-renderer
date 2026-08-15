@@ -4,6 +4,7 @@
 #include "Fs/VFS.h"
 #include "Core/StringHelper.hpp"
 
+#include <algorithm>
 #include <string>
 
 using namespace wallpaper::wpscene;
@@ -87,13 +88,35 @@ bool Emitter::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE_NOWARN(json, "speedmin", speedmin);
     GET_JSON_NAME_VALUE_NOWARN(json, "speedmax", speedmax);
     GET_JSON_NAME_VALUE_NOWARN(json, "instantaneous", instantaneous);
+    GET_JSON_NAME_VALUE_NOWARN(json, "maxtoemitperperiod", maxtoemitperperiod);
     GET_JSON_NAME_VALUE_NOWARN(json, "distancemax", distancemax);
     GET_JSON_NAME_VALUE_NOWARN(json, "distancemin", distancemin);
     GET_JSON_NAME_VALUE_NOWARN(json, "rate", rate);
+    GET_JSON_NAME_VALUE_NOWARN(json, "duration", duration);
+    GET_JSON_NAME_VALUE_NOWARN(json, "delay", delay);
+    GET_JSON_NAME_VALUE_NOWARN(json, "minperiodicduration", minperiodicduration);
+    GET_JSON_NAME_VALUE_NOWARN(json, "maxperiodicduration", maxperiodicduration);
+    GET_JSON_NAME_VALUE_NOWARN(json, "minperiodicdelay", minperiodicdelay);
+    GET_JSON_NAME_VALUE_NOWARN(json, "maxperiodicdelay", maxperiodicdelay);
     GET_JSON_NAME_VALUE_NOWARN(json, "directions", directions);
     GET_JSON_NAME_VALUE_NOWARN(json, "origin", origin);
     GET_JSON_NAME_VALUE_NOWARN(json, "sign", sign);
-    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingmode", audioprocessingmode);
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingmode", audio_response.mode);
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingexponent", audio_response.exponent);
+    if (json.contains("audioprocessingbounds") && json.at("audioprocessingbounds").is_string()) {
+        AssignAudioBoundsFromAuthoredString(json.at("audioprocessingbounds").get<std::string>(),
+                                            audio_response.bounds);
+    } else {
+        GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingbounds", audio_response.bounds);
+    }
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingfrequencystart",
+                               audio_response.frequency_start);
+    GET_JSON_NAME_VALUE_NOWARN(json, "audioprocessingfrequencyend",
+                               audio_response.frequency_end);
+    audio_response.frequency_start = std::min<uint32_t>(audio_response.frequency_start, 15);
+    audio_response.frequency_end   = std::min<uint32_t>(audio_response.frequency_end, 15);
+    if (audio_response.frequency_end < audio_response.frequency_start)
+        std::swap(audio_response.frequency_start, audio_response.frequency_end);
     GET_JSON_NAME_VALUE_NOWARN(json, "controlpoint", controlpoint);
 
     if (controlpoint >= static_cast<i32>(kParticleControlpointSlotCount))
@@ -103,6 +126,11 @@ bool Emitter::FromJson(const nlohmann::json& json) {
     uint32_t _raw_flags { 0 };
     GET_JSON_NAME_VALUE_NOWARN(json, "flags", _raw_flags);
     flags = EFlags(_raw_flags);
+
+    // Keep each periodic min at or below its max. A missing max stays 0 and therefore
+    // collapses the authored min to 0.
+    minperiodicduration = std::min(minperiodicduration, maxperiodicduration);
+    minperiodicdelay    = std::min(minperiodicdelay, maxperiodicdelay);
 
     std::transform(sign.begin(), sign.end(), sign.begin(), [](int32_t v) {
         if (v != 0)

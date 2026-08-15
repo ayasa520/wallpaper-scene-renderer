@@ -45,14 +45,50 @@ struct ParticleRenderDiagnostics {
     const char*      expansion_name;
 };
 
-struct ParticleVertexLayout {
-    struct Attribute {
-        usize offset;
-        usize width;
+/*
+ * The particle generators write a fixed, known set of shader input attributes for every vertex of
+ * every live particle each frame. Resolving those names through a string-keyed map per Write()
+ * call showed up in whole-process profiles on emitter-heavy scenes, so the layout is resolved once
+ * per GenGLData() into a dense enum-indexed table and the per-vertex path only performs array
+ * indexing.
+ */
+enum class ParticleVertexAttr : usize {
+    Position,
+    PositionVec4,
+    Color,
+    TexCoordVec4,
+    TexCoordC2,
+    TexCoordVec4C1,
+    TexCoordVec4C2,
+    TexCoordVec4C3,
+    TexCoordVec3C2,
+    Count,
+};
+
+constexpr std::array<std::string_view, static_cast<usize>(ParticleVertexAttr::Count)>
+    kParticleVertexAttrNames {
+        WE_IN_POSITION,       WE_IN_POSITIONVEC4,   WE_IN_COLOR,
+        WE_IN_TEXCOORDVEC4,   WE_IN_TEXCOORDC2,     WE_IN_TEXCOORDVEC4C1,
+        WE_IN_TEXCOORDVEC4C2, WE_IN_TEXCOORDVEC4C3, WE_IN_TEXCOORDVEC3C2,
     };
 
-    usize                       stride { 0 };
-    wallpaper::Map<std::string, Attribute> attributes;
+constexpr std::string_view ParticleVertexAttrName(ParticleVertexAttr attr) noexcept {
+    return kParticleVertexAttrNames[static_cast<usize>(attr)];
+}
+
+struct ParticleVertexLayout {
+    struct Attribute {
+        usize offset { 0 };
+        // Zero width marks an attribute the current mesh layout does not contain.
+        usize width { 0 };
+    };
+
+    usize stride { 0 };
+    std::array<Attribute, static_cast<usize>(ParticleVertexAttr::Count)> attributes {};
+
+    const Attribute& At(ParticleVertexAttr attr) const noexcept {
+        return attributes[static_cast<usize>(attr)];
+    }
 };
 
 std::optional<ParticleVertexLayout> ResolveParticleVertexLayout(const SceneVertexArray& vertices,
@@ -60,10 +96,15 @@ std::optional<ParticleVertexLayout> ResolveParticleVertexLayout(const SceneVerte
     ParticleVertexLayout layout;
     for (const auto& attribute : vertices.Attributes()) {
         const usize width = SceneVertexArray::TypeCount(attribute.type);
-        layout.attributes[attribute.name] = ParticleVertexLayout::Attribute {
-            .offset = layout.stride,
-            .width  = width,
-        };
+        for (usize index = 0; index < kParticleVertexAttrNames.size(); index++) {
+            if (kParticleVertexAttrNames[index] == attribute.name) {
+                layout.attributes[index] = ParticleVertexLayout::Attribute {
+                    .offset = layout.stride,
+                    .width  = width,
+                };
+                break;
+            }
+        }
         layout.stride += SceneVertexArray::RealAttributeSize(attribute);
     }
     if (layout.stride == 0 || layout.stride != vertices.OneSize()) {
@@ -98,16 +139,11 @@ public:
         std::fill(storage_.begin(), storage_.end(), 0.0f);
     }
 
-    bool Write(std::string_view name, std::span<const float> values) {
-        const auto attribute = layout_.attributes.find(name);
-        const usize expected_width = attribute == layout_.attributes.end()
-            ? 0
-            : attribute->second.width;
-        const usize offset = attribute == layout_.attributes.end()
-            ? storage_.size()
-            : attribute->second.offset;
-        if (attribute == layout_.attributes.end() || values.size() != expected_width ||
-            offset + values.size() > storage_.size()) {
+    bool Write(ParticleVertexAttr attr, std::span<const float> values) {
+        const auto& attribute = layout_.At(attr);
+        if (attribute.width != values.size() ||
+            attribute.offset + values.size() > storage_.size()) {
+            const std::string_view name = ParticleVertexAttrName(attr);
             LOG_ERROR("particle vertex attribute mismatch object='%.*s' material='%.*s' "
                       "renderer=%s expansion=%s attribute='%.*s' values=%zu expected=%zu "
                       "stride=%zu",
@@ -120,17 +156,17 @@ public:
                       static_cast<int>(name.size()),
                       name.data(),
                       values.size(),
-                      expected_width,
+                      attribute.width,
                       layout_.stride);
             return false;
         }
-        std::copy(values.begin(), values.end(), storage_.begin() + offset);
+        std::copy(values.begin(), values.end(), storage_.begin() + attribute.offset);
         return true;
     }
 
     template<size_t N>
-    bool Write(std::string_view name, const std::array<float, N>& values) {
-        return Write(name, std::span<const float>(values));
+    bool Write(ParticleVertexAttr attr, const std::array<float, N>& values) {
+        return Write(attr, std::span<const float>(values));
     }
 
     bool EnsureCapacity(size_t additional_vertices, std::string_view operation) const {
@@ -239,12 +275,12 @@ SpriteParticleRenderData PrepareSpriteParticleData(const ParticleInstance& insta
 bool WriteSpriteCommonAttributes(ParticleVertexWriter& writer,
                                  const SpriteParticleRenderData& data, bool thick_format) {
     if (! writer.Write(
-            WE_IN_POSITION,
+            ParticleVertexAttr::Position,
             std::array { data.position[0], data.position[1], data.position[2] }) ||
-        ! writer.Write(WE_IN_COLOR, data.color)) {
+        ! writer.Write(ParticleVertexAttr::Color, data.color)) {
         return false;
     }
-    return ! thick_format || writer.Write(WE_IN_TEXCOORDVEC4C1, data.velocity_lifetime);
+    return ! thick_format || writer.Write(ParticleVertexAttr::TexCoordVec4C1, data.velocity_lifetime);
 }
 
 bool GenParticlePointData(std::span<const std::unique_ptr<ParticleInstance>> instances,
@@ -259,7 +295,7 @@ bool GenParticlePointData(std::span<const std::unique_ptr<ParticleInstance>> ins
         // Point-expanded materials receive simulation rotation and size directly; their geometry
         // stage creates the four authored corners after the vertex shader has run once.
         return WriteSpriteCommonAttributes(writer, data, thick_format) &&
-            writer.Write(WE_IN_TEXCOORDVEC4,
+            writer.Write(ParticleVertexAttr::TexCoordVec4,
                          std::array { particle.rotation[0],
                                       particle.rotation[1],
                                       particle.rotation[2],
@@ -306,12 +342,12 @@ bool GenParticleQuadData(std::span<const std::unique_ptr<ParticleInstance>> inst
         for (const auto& corner : kCorners) {
             writer.BeginVertex();
             if (! WriteSpriteCommonAttributes(writer, data, thick_format) ||
-                ! writer.Write(WE_IN_TEXCOORDVEC4,
+                ! writer.Write(ParticleVertexAttr::TexCoordVec4,
                                std::array { corner[0],
                                             corner[1],
                                             particle.rotation[2],
                                             particle.size / 2.0f }) ||
-                ! writer.Write(WE_IN_TEXCOORDC2,
+                ! writer.Write(ParticleVertexAttr::TexCoordC2,
                                std::array { particle.rotation[0], particle.rotation[1] }) ||
                 ! writer.Commit()) {
                 return false;
@@ -430,33 +466,33 @@ bool GenRopeParticleData(const ParticleInstance& instance, bool thick_format,
          */
         writer.BeginVertex();
         if (! writer.Write(
-                WE_IN_POSITIONVEC4,
+                ParticleVertexAttr::PositionVec4,
                 std::array { p1[0], p1[1], p1[2], p1_src.size / 2.0f }) ||
             ! writer.Write(
-                WE_IN_TEXCOORDVEC4,
+                ParticleVertexAttr::TexCoordVec4,
                 std::array { p2[0], p2[1], p2[2], trail_length }) ||
             ! writer.Write(
-                WE_IN_TEXCOORDVEC4C1,
+                ParticleVertexAttr::TexCoordVec4C1,
                 std::array { p0[0], p0[1], p0[2], static_cast<float>(i) })) {
             return false;
         }
         if (thick_format) {
             if (! writer.Write(
-                    WE_IN_TEXCOORDVEC4C2,
+                    ParticleVertexAttr::TexCoordVec4C2,
                     std::array { p3[0], p3[1], p3[2], p2_src.size / 2.0f }) ||
                 ! writer.Write(
-                    WE_IN_TEXCOORDVEC4C3,
+                    ParticleVertexAttr::TexCoordVec4C3,
                     std::array { p2_src.color[0], p2_src.color[1], p2_src.color[2],
                                  p2_src.alpha })) {
                 return false;
             }
         } else if (! writer.Write(
-                       WE_IN_TEXCOORDVEC3C2,
+                       ParticleVertexAttr::TexCoordVec3C2,
                        std::array { p3[0], p3[1], p3[2] })) {
             return false;
         }
         if (! writer.Write(
-                WE_IN_COLOR,
+                ParticleVertexAttr::Color,
                 std::array { p1_src.color[0], p1_src.color[1], p1_src.color[2], p1_src.alpha }) ||
             ! writer.Commit()) {
             return false;
@@ -490,35 +526,35 @@ bool GenRopeTrailSegments(const ParticleInstance& instance, const Particle& part
 
         writer.BeginVertex();
         if (! writer.Write(
-                WE_IN_POSITIONVEC4,
+                ParticleVertexAttr::PositionVec4,
                 std::array { start[0], start[1], start[2], size }) ||
             ! writer.Write(
-                WE_IN_TEXCOORDVEC4,
+                ParticleVertexAttr::TexCoordVec4,
                 std::array { end[0], end[1], end[2],
                              static_cast<float>(trail.sample_count) }) ||
             ! writer.Write(
-                WE_IN_TEXCOORDVEC4C1,
+                ParticleVertexAttr::TexCoordVec4C1,
                 std::array { before[0], before[1], before[2],
                              static_cast<float>(sample_index) })) {
             return false;
         }
         if (thick_format) {
             if (! writer.Write(
-                    WE_IN_TEXCOORDVEC4C2,
+                    ParticleVertexAttr::TexCoordVec4C2,
                     std::array { after[0], after[1], after[2], size }) ||
                 ! writer.Write(
-                    WE_IN_TEXCOORDVEC4C3,
+                    ParticleVertexAttr::TexCoordVec4C3,
                     std::array { particle.color[0], particle.color[1], particle.color[2],
                                  particle.alpha })) {
                 return false;
             }
         } else if (! writer.Write(
-                       WE_IN_TEXCOORDVEC3C2,
+                       ParticleVertexAttr::TexCoordVec3C2,
                        std::array { after[0], after[1], after[2] })) {
             return false;
         }
         if (! writer.Write(
-                WE_IN_COLOR,
+                ParticleVertexAttr::Color,
                 std::array { particle.color[0], particle.color[1], particle.color[2],
                              particle.alpha }) ||
             ! writer.Commit()) {

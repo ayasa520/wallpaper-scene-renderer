@@ -64,10 +64,14 @@ inline void RotatePos(Particle& p, double x, double y, double z) noexcept {
 }
 
 inline void ChangeLifetime(Particle& p, double l) noexcept { p.lifetime += l; }
+inline void Delete(Particle& p) noexcept {
+    p.lifetime        = 0.0f;
+    p.operatorDeleted = true;
+}
 
-inline double LifetimePos(const Particle& p) {
-    if (p.lifetime < 0) return 1.0;
-    return 1.0 - (p.lifetime / p.init.lifetime);
+inline float LifetimePos(const Particle& p) {
+    if (p.lifetime < 0) return 1.0f;
+    return 1.0f - (p.lifetime / p.init.lifetime);
 }
 
 inline double LifetimePassed(const Particle& p) noexcept { return p.init.lifetime - p.lifetime; }
@@ -97,6 +101,9 @@ inline void ChangeVelocity(Particle& p, double x, double y, double z) noexcept {
 inline void Accelerate(Particle& p, const Eigen::Vector3d& acc, double t) noexcept {
     ChangeVelocity(p, acc * t);
 }
+inline void Accelerate(Particle& p, const Eigen::Vector3f& acc, float t) noexcept {
+    p.velocity += acc * t;
+}
 
 inline void ChangeAngularVelocity(Particle& p, const Eigen::Vector3d& v) noexcept {
     p.angularVelocity = (p.angularVelocity.cast<double>() + v).cast<float>();
@@ -117,14 +124,26 @@ inline void RotateByTime(Particle& p, double t) noexcept {
     Rotate(p, p.angularVelocity.cast<double>() * t);
 }
 
-inline void MutiplyAlpha(Particle& p, double a) { p.alpha *= a; }
-inline void MutiplySize(Particle& p, double s) { p.size *= s; }
+inline void MutiplyAlpha(Particle& p, double a) { p.alpha *= static_cast<float>(a); }
+inline void MutiplyAlpha(Particle& p, float a) { p.alpha *= a; }
+inline void MutiplySize(Particle& p, double s) { p.size *= static_cast<float>(s); }
+inline void MutiplySize(Particle& p, float s) { p.size *= s; }
 
 inline void MutiplyColor(Particle& p, const Eigen::Vector3d& c) {
     p.color = c.cwiseProduct(p.color.cast<double>()).cast<float>();
 }
 inline void MutiplyColor(Particle& p, double r, double g, double b) {
     MutiplyColor(p, { r, g, b });
+}
+inline void MutiplyColor(Particle& p, const Eigen::Vector3f& c) {
+    p.color.x() *= c.x();
+    p.color.y() *= c.y();
+    p.color.z() *= c.z();
+}
+inline void MutiplyColor(Particle& p, float r, float g, float b) {
+    p.color.x() *= r;
+    p.color.y() *= g;
+    p.color.z() *= b;
 }
 inline void MutiplyVelocity(Particle& p, double m) { p.velocity *= m; }
 
@@ -228,8 +247,6 @@ inline void InitVelocity(Particle& p, double x, double y, double z) {
 }
 
 inline void InitRenderVelocity(Particle& p, const Eigen::Vector3d& v) {
-    // This is only a shader-facing axis for spritetrail particles such as Cherry_Blossoms_2.json.
-    // Operators keep reading p.velocity, so the five-point motion remains matched to the reference.
     p.renderVelocity    = v.cast<float>();
     p.hasRenderVelocity = true;
 }

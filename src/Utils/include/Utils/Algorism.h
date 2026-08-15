@@ -73,6 +73,17 @@ constexpr double lerp(double t, double a, double b) noexcept { return a + t * (b
 
 constexpr double PerlinEase(double t) noexcept { return t * t * t * (t * (t * 6 - 15) + 10); };
 double           PerlinNoise(double x, double y, double z) noexcept;
+Eigen::Vector3d  PerlinNoiseGradient(double x, double y, double z) noexcept;
+Eigen::Vector3f  PerlinNoiseGradient(float x, float y, float z) noexcept;
+// Eight analytic gradients at once. Same lattice, fade, and 16-entry table as the scalar
+// float overload. Supported x86 CPUs use AVX2/FMA after a runtime feature check; every other
+// target uses the scalar implementation.
+void             PerlinNoiseGradient8(const float x[8], const float y[8], const float z[8],
+                                      float gx[8], float gy[8], float gz[8]) noexcept;
+void             CurlNoise8(const float px[8], const float py[8], const float pz[8],
+                            float cx[8], float cy[8], float cz[8]) noexcept;
+// 1D hashed-gradient interpolant used by turbulentvelocityrandom, not a 3D curl sample.
+float            HashNoise1D(float x) noexcept;
 
 // curl need a vec
 inline Eigen::Vector3d PerlinNoiseVec3(Eigen::Vector3d p) noexcept {
@@ -80,20 +91,19 @@ inline Eigen::Vector3d PerlinNoiseVec3(Eigen::Vector3d p) noexcept {
                              PerlinNoise(p[0] + 89.2, p[1] + 33.1, p[2] + 57.3),
                              PerlinNoise(p[0] + 100.3, p[1] + 120.1, p[2] + 142.2) };
 }
-inline Eigen::Vector3d CurlNoise(Eigen::Vector3d p) noexcept {
-    using namespace Eigen;
-    constexpr double e = 1e-5;
-
-    Vector3d dx(e, 0, 0), dy(0, e, 0), dz(0, 0, e);
-    Vector3d x0 = PerlinNoiseVec3(p - dx), x1 = PerlinNoiseVec3(p + dx),
-             y0 = PerlinNoiseVec3(p - dy), y1 = PerlinNoiseVec3(p + dy),
-             z0 = PerlinNoiseVec3(p - dz), z1 = PerlinNoiseVec3(p + dz);
-    // curl = (dfzdy - dfydz, dfxdz - dfzdx, dfydx - dfxdy)
-    double x = y1.z() - y0.z() - z1.y() + z0.y();
-    double y = z1.x() - z0.x() - x1.z() + x0.z();
-    double z = x1.y() - x0.y() - y1.x() + y0.x();
-
-    return Vector3d(x, y, z) / (2.0 * e);
+inline Eigen::Vector3f CurlNoise(Eigen::Vector3f p) noexcept {
+    /*
+     * The three vector-field components use the same fixed offsets as PerlinNoiseVec3. Analytic
+     * gradients replace the previous six-point central difference (18 PerlinNoise evaluations);
+     * the turbulence particle operator calls this once per live particle per frame, which made
+     * PerlinNoise the single largest CPU consumer on emitter-heavy scenes. The hot path stays in
+     * float because particle positions and velocities are already stored as float3.
+     */
+    const Eigen::Vector3f gx = PerlinNoiseGradient(p[0], p[1], p[2]);
+    const Eigen::Vector3f gy = PerlinNoiseGradient(p[0] + 89.2f, p[1] + 33.1f, p[2] + 57.3f);
+    const Eigen::Vector3f gz = PerlinNoiseGradient(p[0] + 100.3f, p[1] + 120.1f, p[2] + 142.2f);
+    // curl = (dFz/dy - dFy/dz, dFx/dz - dFz/dx, dFy/dx - dFx/dy)
+    return { gz.y() - gy.z(), gx.z() - gz.x(), gy.x() - gx.y() };
 }
 
 } // namespace algorism

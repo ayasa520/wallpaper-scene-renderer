@@ -73,6 +73,14 @@ bool MaskedMeshPass::referencesRenderTarget(std::string_view render_target) cons
     return m_visible_draw.referencesRenderTarget(render_target);
 }
 
+GpuPassDiagInfo MaskedMeshPass::gpuDiagInfo() const {
+    GpuPassDiagInfo info;
+    info.category  = GpuPassCategory::Other;
+    info.layer_id  = m_visible_draw.data().layer_id;
+    info.primitive = "triangle";
+    return info;
+}
+
 void MaskedMeshPass::setDescTex(u32 index, std::string_view texture_key) {
     m_visible_draw.setTexture(index, texture_key);
 }

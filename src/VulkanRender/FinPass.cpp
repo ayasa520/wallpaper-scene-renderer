@@ -3,6 +3,8 @@
 #include "Resource.hpp"
 #include "PassCommon.hpp"
 
+#include <array>
+
 using namespace wallpaper::vulkan;
 
 constexpr std::string_view vert_code = R"(
@@ -57,6 +59,13 @@ bool FinPass::referencesRenderTarget(std::string_view render_target) const {
     // The final present pass samples only the render-graph result target. Text bridge target
     // resizes never need to rebind this pass unless the default result image itself was recreated.
     return m_desc.result == render_target;
+}
+
+GpuPassDiagInfo FinPass::gpuDiagInfo() const {
+    GpuPassDiagInfo info;
+    info.category  = GpuPassCategory::Composite;
+    info.primitive = "copy";
+    return info;
 }
 namespace
 {
@@ -224,122 +233,136 @@ void FinPass::refreshResources(Scene& scene, const Device& device, RenderingReso
 }
 
 void FinPass::execute(const Device& device, RenderingResources& rr) {
-    auto& cmd    = rr.command;
-    auto& outext = m_desc.vk_present.extent;
+    auto& cmd = rr.command;
+    auto& src = m_desc.vk_result;
+    auto& dst = m_desc.vk_present;
+    if (!(src.handle && dst.handle) || src.extent.width == 0 || src.extent.height == 0 ||
+        dst.extent.width == 0 || dst.extent.height == 0) {
+        return;
+    }
 
-    VkImageSubresourceRange base_srang {
+    // Present used to be a fullscreen sample+draw that also cleared the DMA-BUF
+    // image. At 3200x2000 that pass alone was about half of gpu_draw. The
+    // shader is an identity copy (negative viewport cancels the mesh UVs), so
+    // a transfer matches the pixels and skips the fragment work plus the
+    // per-frame framebuffer allocate.
+    const uint32_t gfx_family = device.graphics_queue().family_index;
+    const bool     qf_release = m_desc.present_queue_index != gfx_family;
+    const uint32_t src_w      = src.extent.width;
+    const uint32_t src_h      = src.extent.height;
+    const uint32_t dst_w      = dst.extent.width;
+    const uint32_t dst_h      = dst.extent.height;
+
+    VkImageSubresourceRange srang {
         .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
         .baseMipLevel   = 0,
-        .levelCount     = VK_REMAINING_ARRAY_LAYERS,
+        .levelCount     = 1,
         .baseArrayLayer = 0,
-        .layerCount     = VK_REMAINING_MIP_LEVELS,
-
+        .layerCount     = 1,
     };
-    {
-        m_desc.fb = {};
-        VkFramebufferCreateInfo info {
-            .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .pNext           = nullptr,
-            .renderPass      = *m_desc.pipeline.pass,
-            .attachmentCount = 1,
-            .pAttachments    = &m_desc.vk_present.view,
-            .width           = m_desc.vk_present.extent.width,
-            .height          = m_desc.vk_present.extent.height,
-            .layers          = 1,
-        };
-        (void)device.handle().CreateFramebuffer(info, m_desc.fb);
-    }
-    {
-        VkDescriptorImageInfo desc_img {
-            .sampler     = m_desc.vk_result.sampler,
-            .imageView   = m_desc.vk_result.view,
-            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        };
-        VkWriteDescriptorSet wset {
-            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext           = nullptr,
-            .dstSet          = {},
-            .dstBinding      = 1,
-            .descriptorCount = 1,
-            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo      = &desc_img,
-        };
-        cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, wset);
-    }
-
-    // do queue family transfer operation
-    if (m_desc.present_queue_index != device.graphics_queue().family_index) {
-        VkImageMemoryBarrier imb {
-            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext               = nullptr,
-            .srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT,
-            .dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .oldLayout           = m_desc.present_layout,
-            .newLayout           = m_desc.present_layout,
-            .srcQueueFamilyIndex = m_desc.present_queue_index,
-            .dstQueueFamilyIndex = device.graphics_queue().family_index,
-            .image               = m_desc.vk_present.handle,
-            .subresourceRange    = base_srang,
-        };
-
-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            VK_DEPENDENCY_BY_REGION_BIT,
-                            imb);
-    }
-    VkRenderPassBeginInfo pass_begin_info {
-        .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .pNext       = nullptr,
-        .renderPass  = *m_desc.pipeline.pass,
-        .framebuffer = *m_desc.fb,
-        .renderArea =
-            VkRect2D {
-                .offset = { 0, 0 },
-                .extent = { outext.width, outext.height },
-            },
-        .clearValueCount = 1,
-        .pClearValues    = &m_desc.clear_value,
+    VkImageMemoryBarrier in_bar {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext               = nullptr,
+        .srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT,
+        .dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = src.handle,
+        .subresourceRange    = srang,
     };
-    cmd.BeginRenderPass(pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
-
-    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
-    VkViewport viewport {
-        .x        = 0,
-        .y        = (float)outext.height,
-        .width    = (float)outext.width,
-        .height   = -(float)outext.height,
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f,
+    VkImageMemoryBarrier out_bar {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext               = nullptr,
+        .srcAccessMask       = 0,
+        .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = qf_release ? m_desc.present_queue_index : VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = qf_release ? gfx_family : VK_QUEUE_FAMILY_IGNORED,
+        .image               = dst.handle,
+        .subresourceRange    = srang,
     };
-    VkRect2D scissor { { 0, 0 }, { outext.width, outext.height } };
-    cmd.SetViewport(0, viewport);
-    cmd.SetScissor(0, scissor);
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_DEPENDENCY_BY_REGION_BIT,
+                        {},
+                        {},
+                        std::array { in_bar, out_bar });
 
-    cmd.BindVertexBuffers(
-        0, 1, std::array { rr.vertex_buf->gpuBuf() }.data(), &m_desc.vertex_buf.offset);
-    cmd.Draw(4, 1, 0, 0);
-    cmd.EndRenderPass();
-
-    // do queue family transfer operation
-    if (m_desc.present_queue_index != device.graphics_queue().family_index) {
-        VkImageMemoryBarrier imb {
-            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext               = nullptr,
-            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask       = VK_ACCESS_MEMORY_READ_BIT,
-            .oldLayout           = m_desc.present_layout,
-            .newLayout           = m_desc.present_layout,
-            .srcQueueFamilyIndex = device.graphics_queue().family_index,
-            .dstQueueFamilyIndex = m_desc.present_queue_index,
-            .image               = m_desc.vk_present.handle,
-            .subresourceRange    = base_srang,
+    if (src_w == dst_w && src_h == dst_h) {
+        VkImageCopy copy {
+            .srcSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+            .dstSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+            .extent = { src_w, src_h, 1 },
         };
-
-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_DEPENDENCY_BY_REGION_BIT,
-                            imb);
+        cmd.CopyImage(src.handle,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      dst.handle,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      copy);
+    } else {
+        VkImageBlit blit {
+            .srcSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+            .srcOffsets     = { VkOffset3D { 0, 0, 0 },
+                                VkOffset3D { static_cast<int32_t>(src_w),
+                                             static_cast<int32_t>(src_h),
+                                             1 } },
+            .dstSubresource =
+                VkImageSubresourceLayers {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
+            .dstOffsets     = { VkOffset3D { 0, 0, 0 },
+                                VkOffset3D { static_cast<int32_t>(dst_w),
+                                             static_cast<int32_t>(dst_h),
+                                             1 } },
+        };
+        cmd.BlitImage(src.handle,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      dst.handle,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      blit,
+                      VK_FILTER_LINEAR);
     }
+
+    in_bar.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    in_bar.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+    in_bar.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    in_bar.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    out_bar.srcAccessMask      = VK_ACCESS_TRANSFER_WRITE_BIT;
+    out_bar.dstAccessMask      = VK_ACCESS_MEMORY_READ_BIT;
+    out_bar.oldLayout          = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    out_bar.newLayout          = m_desc.present_layout;
+    out_bar.srcQueueFamilyIndex = qf_release ? gfx_family : VK_QUEUE_FAMILY_IGNORED;
+    out_bar.dstQueueFamilyIndex = qf_release ? m_desc.present_queue_index : VK_QUEUE_FAMILY_IGNORED;
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        VK_DEPENDENCY_BY_REGION_BIT,
+                        {},
+                        {},
+                        std::array { in_bar, out_bar });
 }
 void FinPass::destory(const Device&, RenderingResources& rr) {
     setPrepared(false);

@@ -75,6 +75,20 @@ TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc =
     return copy;
 }
 
+TexNode* addDefaultComposeSnapshot(RenderGraph& rgraph, TexNode* in) {
+    // `_rt_default` is both the compose write target and the FullFrameBuffer sampler. A unique
+    // `_rt_default_<version>_copy` per self-write keeps a screen-sized image alive for every
+    // overlapping letter. Reuse one screen-sized partner for that snapshot instead.
+    //
+    // The transfer itself stays. Shader color-blend and refraction must sample the current
+    // compose, including earlier letters, while Preserve/LOAD keeps uncovered pixels. Writing
+    // an unseeded partner and publishing a mesh from it drops or smears those pixels.
+    TexNode::Desc snapshot = in->genDesc();
+    snapshot.key           = std::string(SpecTex_DefaultPingPong);
+    snapshot.name          = snapshot.key;
+    return addCopyPass(rgraph, in, &snapshot);
+}
+
 void addClearPass(RenderGraph& rgraph, const TexNode::Desc& target,
                   std::array<float, 4> color = { 0.0f, 0.0f, 0.0f, 0.0f }) {
     rgraph.addPass<vulkan::ClearPass>(
@@ -608,7 +622,11 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
 
                 if (url == output_key) {
                     builder.markSelfWrite(input);
-                    input = rg::addCopyPass(rgraph, input);
+                    // Compose self-writes reuse one screen-sized snapshot. Other self-writes
+                    // still get a versioned copy name because their destinations are not a
+                    // shared compose buffer.
+                    input = url == SpecTex_Default ? rg::addDefaultComposeSnapshot(rgraph, input)
+                                                   : rg::addCopyPass(rgraph, input);
                 }
                 builder.read(input);
                 pdesc.textures.emplace_back(input->key());

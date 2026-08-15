@@ -93,6 +93,7 @@ bool Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdPushConstants);
     X(vkCmdPushDescriptorSetKHR);
     X(vkCmdPushDescriptorSetWithTemplateKHR);
+    X(vkCmdResetQueryPool);
     X(vkCmdSetBlendConstants);
     X(vkCmdSetDepthBias);
     X(vkCmdSetDepthBounds);
@@ -103,6 +104,7 @@ bool Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetStencilWriteMask);
     X(vkCmdSetViewport);
     X(vkCmdWaitEvents);
+    X(vkCmdWriteTimestamp);
     X(vkCmdSetLineWidth);
     X(vkCmdResolveImage);
     X(vkCreateBuffer);
@@ -240,6 +242,10 @@ void Destroy(VkDevice device, VkFence handle, const DeviceDispatch& dld) noexcep
 
 void Destroy(VkDevice device, VkFramebuffer handle, const DeviceDispatch& dld) noexcept {
     dld.vkDestroyFramebuffer(device, handle, nullptr);
+}
+
+void Destroy(VkDevice device, VkQueryPool handle, const DeviceDispatch& dld) noexcept {
+    dld.vkDestroyQueryPool(device, handle, nullptr);
 }
 
 void Destroy(VkInstance instance, VkSurfaceKHR handle, const InstanceDispatch& dld) noexcept {
@@ -439,6 +445,20 @@ VkResult Device::CreateFence(const VkFenceCreateInfo& ci, Fence& fe) const noexc
     VkResult res = dld->vkCreateFence(handle, &ci, nullptr, &object);
     if (res == VK_SUCCESS) fe = Fence(object, handle, *dld);
     return res;
+}
+
+VkResult Device::CreateQueryPool(const VkQueryPoolCreateInfo& ci, QueryPool& pool) const noexcept {
+    VkQueryPool object;
+    VkResult    res = dld->vkCreateQueryPool(handle, &ci, nullptr, &object);
+    if (res == VK_SUCCESS) pool = QueryPool(object, handle, *dld);
+    return res;
+}
+
+VkResult Device::GetQueryPoolResults(VkQueryPool pool, uint32_t first_query, uint32_t query_count,
+                                     size_t data_size, void* data, VkDeviceSize stride,
+                                     VkQueryResultFlags flags) const noexcept {
+    return dld->vkGetQueryPoolResults(
+        handle, pool, first_query, query_count, data_size, data, stride, flags);
 }
 
 VkResult Device::CreateSampler(const VkSamplerCreateInfo& ci, Sampler& sam) const noexcept {

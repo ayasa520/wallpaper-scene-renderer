@@ -164,10 +164,9 @@ std::vector<float> BuildSceneSpectrumChannel(const std::vector<float>& values,
     if (resolution == 64) return values;
 
     /*
-     * Wallpaper Engine derives the lower Scene resolutions from the 64-band
-     * cache with adjacent max-pooling. Average must be pooled independently
-     * after it is built at 64 bands; averaging already-pooled left/right data
-     * produces different results when their peaks occupy different bins.
+     * Lower Scene resolutions come from the 64-band cache with adjacent max-pooling. Average
+     * must be pooled independently after it is built at 64 bands; averaging already-pooled
+     * left/right data produces different results when their peaks occupy different bins.
      */
     const size_t bucket_size = values.size() / target_size;
     for (size_t i = 0; i < target_size; i++) {
@@ -235,9 +234,8 @@ void AdvanceExternalSceneAudio(ExternalSceneAudioState* state, double frame_time
     if (state == nullptr || ! state->has_snapshot) return;
 
     /*
-     * Wallpaper Engine's Scene path does not publish the shared Web 128-band snapshot directly.
-     * The renderer executes this stateful stage once per render frame before SceneScript buffers
-     * and shader uniforms are updated (wallpaper64.exe 0x140111720-0x1401125e2):
+     * Scene audio has one source: the desktop capture snapshot. Wallpaper decoder PCM is never
+     * mixed in. Once per render frame, before SceneScript buffers and shader uniforms are updated:
      *
      *   1. Find a peak for every contiguous group of eight bands across Left64 + Right64.
      *   2. Keep sixteen asymmetric attack/release envelopes, with one third of the frame-global
@@ -245,9 +243,8 @@ void AdvanceExternalSceneAudio(ExternalSceneAudioState* state, double frame_time
      *   3. Normalize each band by its group envelope, apply a 20 Hz temporal filter, then limit
      *      the published band's rise and fall to 40 units per second.
      *
-     * The input snapshot is intentionally retained separately from the filtered state. External
-     * audio arrives at the Web-compatible callback cadence, while this function must continue
-     * advancing the same snapshot at the Scene render cadence just like the native renderer.
+     * The input snapshot is retained separately from the filtered state so a capture callback
+     * can stay slower than the Scene render cadence.
      */
     std::array<float, kSceneAudioEnvelopeGroupCount> group_peak {};
     float                                             global_peak = 0.0f;
@@ -8097,11 +8094,7 @@ bool UpdateJSFloat32Array(JSContext* context, JSValueConst target,
 }
 
 void UpdateAudioBufferBindings(WPSceneScriptHost::Opaque* opaque) {
-    if (opaque == nullptr || opaque->runtime.context == nullptr ||
-        (! opaque->external_audio.cache.valid &&
-         (opaque->scene == nullptr || opaque->scene->soundManager == nullptr))) {
-        return;
-    }
+    if (opaque == nullptr || opaque->runtime.context == nullptr) return;
 
     struct CachedSpectrum {
         std::vector<float> left;
@@ -8120,12 +8113,9 @@ void UpdateAudioBufferBindings(WPSceneScriptHost::Opaque* opaque) {
                                            &spectrum.left,
                                            &spectrum.right,
                                            &spectrum.average)) {
-            if (opaque->scene != nullptr && opaque->scene->soundManager != nullptr) {
-                opaque->scene->soundManager->GetSpectrum(binding.resolution,
-                                                         &spectrum.left,
-                                                         &spectrum.right,
-                                                         &spectrum.average);
-            }
+            spectrum.left.assign(binding.resolution, 0.0f);
+            spectrum.right.assign(binding.resolution, 0.0f);
+            spectrum.average.assign(binding.resolution, 0.0f);
         }
 
         // Audio buffers are registered per script instance, but every registration with the same
@@ -9095,9 +9085,14 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
 }
 
 void WPSceneScriptHost::FrameBegin(double frame_time) {
+    if (m_impl != nullptr) {
+        // Scene audio is the capture snapshot only. Advance the envelope at the render cadence
+        // even before the script runtime is ready so particles and shaders read the same filtered
+        // bands, including a silent capture.
+        AdvanceExternalSceneAudio(&m_impl->external_audio, frame_time);
+    }
     if (! Ready()) return;
 
-    AdvanceExternalSceneAudio(&m_impl->external_audio, frame_time);
     ProcessPendingSceneLayerDestroy(m_impl);
     m_impl->runtime_seconds += std::max(0.0, frame_time);
 
@@ -9213,11 +9208,7 @@ bool WPSceneScriptHost::GetAudioSpectrum(uint32_t resolution, std::vector<float>
     if (left == nullptr || right == nullptr || average == nullptr || m_impl == nullptr)
         return false;
 
-    if (GetExternalAudioBufferValues(m_impl, resolution, left, right, average)) return true;
-    if (m_scene == nullptr || m_scene->soundManager == nullptr) return false;
-
-    m_scene->soundManager->GetSpectrum(resolution, left, right, average);
-    return ! left->empty() || ! right->empty() || ! average->empty();
+    return GetExternalAudioBufferValues(m_impl, resolution, left, right, average);
 }
 
 void WPSceneScriptHost::ApplyUserProperties(const UserPropertyMap& user_properties,

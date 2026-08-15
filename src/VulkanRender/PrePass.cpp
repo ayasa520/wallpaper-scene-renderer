@@ -14,6 +14,12 @@ bool PrePass::referencesRenderTarget(std::string_view render_target) const {
     return m_desc.result == render_target;
 }
 
+GpuPassDiagInfo PrePass::gpuDiagInfo() const {
+    GpuPassDiagInfo info;
+    info.category = GpuPassCategory::Composite;
+    return info;
+}
+
 void PrePass::prepare(Scene& scene, const Device& device, RenderingResources&) {
     {
         auto tex_name = std::string(m_desc.result);

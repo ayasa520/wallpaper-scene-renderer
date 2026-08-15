@@ -66,37 +66,54 @@ void RecordCopyBufferRange(const BufferParameters& dst_buf, const BufferParamete
 }
 } // namespace
 
+void StagingBuffer::setCollectFrameStats(bool enabled) { m_collect_frame_stats = enabled; }
+
+void StagingBuffer::resetFrameStats() { m_frame_stats = {}; }
+
+const StagingBuffer::FrameStats& StagingBuffer::frameStats() const { return m_frame_stats; }
+
 void StagingBuffer::markDirty(VkDeviceSize offset, VkDeviceSize size) {
     if (size == 0) return;
+    if (m_collect_frame_stats) m_frame_stats.mark_dirty_calls++;
 
-    // Writes can arrive as many small adjacent updates from vertex/index streaming. Merge eagerly
-    // so recordUpload() emits a short, ordered list of flush/copy commands instead of one command
-    // per write call.
-    DirtyRange merged { .offset = offset, .size = size };
-    const auto mergedEnd = [&merged]() { return merged.offset + merged.size; };
+    // Shader uniform updates write hundreds of tiny std140 slots per frame. Merging those ranges
+    // on every write is quadratic in the live dirty list. Record the interval here and collapse
+    // once in recordUpload() so the write path stays O(1).
+    m_dirty_ranges.push_back(DirtyRange { .offset = offset, .size = size });
+}
 
-    for (auto it = m_dirty_ranges.begin(); it != m_dirty_ranges.end();) {
-        const VkDeviceSize it_end = it->offset + it->size;
-        if (mergedEnd() < it->offset || it_end < merged.offset) {
-            ++it;
+void StagingBuffer::coalesceDirtyRanges() {
+    if (m_dirty_ranges.size() <= 1) return;
+
+    std::sort(m_dirty_ranges.begin(),
+              m_dirty_ranges.end(),
+              [](const DirtyRange& lhs, const DirtyRange& rhs) {
+                  if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+                  return lhs.size > rhs.size;
+              });
+
+    // std140 float arrays store one value every 16 bytes, so adjacent uniform writes leave 12-byte
+    // holes. Absorbing a small gap keeps GPU copies proportional to the UBO or vertex live prefix
+    // instead of one vkCmdCopyBuffer per member. 256 bytes is well below a typical uniform block
+    // and will not swallow a neighbouring 2 MiB particle mesh unless that mesh is already dirty.
+    constexpr VkDeviceSize kMergeGap = 256;
+
+    std::vector<DirtyRange> merged;
+    merged.reserve(m_dirty_ranges.size());
+    DirtyRange current = m_dirty_ranges.front();
+    for (size_t i = 1; i < m_dirty_ranges.size(); ++i) {
+        const DirtyRange& next        = m_dirty_ranges[i];
+        const VkDeviceSize current_end = current.offset + current.size;
+        if (next.offset <= current_end + kMergeGap) {
+            const VkDeviceSize next_end = next.offset + next.size;
+            if (next_end > current_end) current.size = next_end - current.offset;
             continue;
         }
-
-        const VkDeviceSize new_begin = std::min(merged.offset, it->offset);
-        const VkDeviceSize new_end   = std::max(mergedEnd(), it_end);
-        merged.offset = new_begin;
-        merged.size   = new_end - new_begin;
-        it = m_dirty_ranges.erase(it);
+        merged.push_back(current);
+        current = next;
     }
-
-    auto insert_pos =
-        std::lower_bound(m_dirty_ranges.begin(),
-                         m_dirty_ranges.end(),
-                         merged.offset,
-                         [](const DirtyRange& range, VkDeviceSize range_offset) {
-                             return range.offset < range_offset;
-                         });
-    m_dirty_ranges.insert(insert_pos, merged);
+    merged.push_back(current);
+    m_dirty_ranges.swap(merged);
 }
 
 void StagingBuffer::markAllDirty() {
@@ -167,6 +184,7 @@ bool StagingBuffer::allocate() {
     if (! CreateStagingBuffer(m_device.vma_allocator(), m_size_step, m_stage_buf)) return false;
     VVK_CHECK_BOOL_RE(m_stage_buf.handle.MapMemory(&m_stage_raw));
     auto* block = newVirtualBlock(m_size_step);
+    m_dirty_ranges.reserve(2048);
     return block != nullptr;
 }
 
@@ -268,6 +286,10 @@ bool StagingBuffer::writeToBuf(const StagingBufferRef& ref, std::span<uint8_t> d
     VkDeviceSize size = std::min(ref.size - offset, data.size());
     uint8_t*     raw  = (uint8_t*)m_stage_raw;
     std::copy(data.begin(), data.begin() + size, raw + ref.offset + offset);
+    if (m_collect_frame_stats) {
+        m_frame_stats.write_calls++;
+        m_frame_stats.memcpy_bytes += size;
+    }
     markDirty(ref.offset + offset, size);
     return true;
 }
@@ -282,6 +304,10 @@ bool StagingBuffer::fillBuf(const StagingBufferRef& ref, size_t offset, size_t s
     uint8_t*     raw       = (uint8_t*)m_stage_raw;
     uint8_t*     raw_begin = raw + ref.offset + offset;
     std::fill(raw_begin, raw_begin + size_, c);
+    if (m_collect_frame_stats) {
+        m_frame_stats.fill_calls++;
+        m_frame_stats.fill_bytes += size_;
+    }
     markDirty(ref.offset + offset, size_);
     return true;
 }
@@ -297,9 +323,14 @@ bool StagingBuffer::recordUpload(vvk::CommandBuffer& cmd) {
     if (m_dirty_ranges.empty()) {
         return true;
     }
+    coalesceDirtyRanges();
     if (m_stage_raw != nullptr) {
         m_stage_buf.handle.UnMapMemory();
         m_stage_raw = nullptr;
+    }
+    if (m_collect_frame_stats) {
+        m_frame_stats.dirty_range_count = static_cast<uint32_t>(m_dirty_ranges.size());
+        m_frame_stats.copy_commands     = static_cast<uint32_t>(m_dirty_ranges.size());
     }
     for (const auto& range : m_dirty_ranges) {
         VVK_CHECK_BOOL_RE(vmaFlushAllocation(m_device.vma_allocator(),
@@ -307,6 +338,7 @@ bool StagingBuffer::recordUpload(vvk::CommandBuffer& cmd) {
                                              range.offset,
                                              range.size));
         RecordCopyBufferRange(m_gpu_buf, m_stage_buf, range.offset, range.size, cmd);
+        if (m_collect_frame_stats) m_frame_stats.flush_bytes += range.size;
     }
     m_dirty_ranges.clear();
     return true;
