@@ -42,5 +42,19 @@ bool WPLightObject::FromJson(const nlohmann::json& json,  fs::VFS&) {
     GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
     GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
     GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
+    GET_JSON_NAME_VALUE_NOWARN(json, "castvolumetrics", castvolumetrics);
+    GET_JSON_NAME_VALUE_NOWARN(json, "density", density);
+    GET_JSON_NAME_VALUE_NOWARN(json, "volumetricsexponent", volumetricsexponent);
+    GET_JSON_NAME_VALUE_NOWARN(json, "innercone", innercone);
+    GET_JSON_NAME_VALUE_NOWARN(json, "outercone", outercone);
+    GET_JSON_NAME_VALUE_NOWARN(json, "usecookie", usecookie);
+    GET_JSON_NAME_VALUE_NOWARN(json, "cookie", cookie);
+    // Workshop and editor assets write `castshadow`. Accept the plural alias
+    // so older hand-authored scene.json still enables the same light flag.
+    if (json.contains("castshadow")) {
+        GET_JSON_NAME_VALUE_NOWARN(json, "castshadow", castshadows);
+    } else {
+        GET_JSON_NAME_VALUE_NOWARN(json, "castshadows", castshadows);
+    }
     return true;
 }

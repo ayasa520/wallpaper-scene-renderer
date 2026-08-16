@@ -38,6 +38,8 @@ struct ShaderDrawRequest {
     bool                     depth_test { false };
     bool                     depth_write { false };
     bool                     clear_depth { true };
+    bool                     depth_greater { false };
+    float                    depth_clear { 1.0f };
 };
 
 struct ShaderDrawState {

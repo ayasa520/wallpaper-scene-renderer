@@ -47,7 +47,7 @@ inline TextureKey ToTexKey(wallpaper::SceneRenderTarget rt) {
     return TextureKey {
         .width        = rt.width,
         .height       = rt.height,
-        .usage        = {},
+        .usage        = rt.comparisonDepth ? TexUsage::DEPTH : TexUsage::COLOR,
         .format       = wallpaper::TextureFormat::RGBA8,
         .sample       = rt.sample,
         .mipmap_level = rt.mipmap_level,

@@ -28,6 +28,14 @@ public:
     std::string          light;
     float                radius { 1000.0f };
     float                intensity { 1.0f };
+    bool                 castvolumetrics { false };
+    float                density { 1.0f };
+    float                volumetricsexponent { 1.0f };
+    float                innercone { 0.0f };
+    float                outercone { 45.0f };
+    bool                 usecookie { false };
+    std::string          cookie;
+    bool                 castshadows { false }; // scene.json key is `castshadow`
     bool                 visible { true };
     VisibleBinding       visible_binding;
     int32_t              parent { 0 };

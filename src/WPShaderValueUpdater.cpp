@@ -110,6 +110,16 @@ bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
     return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
 }
 
+Matrix4d ToD3dClipZViewProjection(const Matrix4d& view_projection) {
+    // Vivid Ortho() maps near→NDC z=1 and far→NDC z=0 (GL-like reverse Z after the Vulkan
+    // [0,1] remap). Official volumetricsfront.vert FULLSCREEN writes gl_Position.z=0 when
+    // REVERSEDEPTH is off, which is D3D near. clip_z' = clip_w - clip_z makes NDC' = 1 - NDC
+    // so the hull window Z and g_EffectModelMatrix unprojection share that D3D convention.
+    Matrix4d d3d = view_projection;
+    d3d.row(2)   = view_projection.row(3) - view_projection.row(2);
+    return d3d;
+}
+
 ShaderValue ToDxcCBufferMatrixUniform(const Matrix4d& matrix) {
     // The DXC WE prologue maps authored `mul(v, M)` to native `mul(M, v)` so shader code observes
     // the same column-vector transform contract as the renderer. Keep Eigen's column-major matrix
@@ -324,6 +334,13 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_MI                 = existsOp(G_MI);
     info.has_M                  = existsOp(G_M);
     info.has_AM                 = existsOp(G_AM);
+    info.has_AVP                = existsOp(G_AVP);
+    info.has_EM                 = existsOp(G_EM);
+    info.has_RV0                = existsOp(G_RV0);
+    info.has_RV1                = existsOp(G_RV1);
+    info.has_RV2                = existsOp(G_RV2);
+    info.has_RV3                = existsOp(G_RV3);
+    info.has_RV4                = existsOp(G_RV4);
     info.has_MVP                = existsOp(G_MVP);
     info.has_LMM                = existsOp(G_LMM);
     info.has_EMVP               = existsOp(G_EMVP);
@@ -625,6 +642,66 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                 } else {
                     updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(Matrix4d::Identity()));
                 }
+            }
+        }
+    }
+
+    if (hasNodeData) {
+        const auto& vol = m_nodeDataMap.at(pNode);
+        if (vol.volumetric_pass && vol.volumetric_light != nullptr) {
+            const SceneLight& light = *vol.volumetric_light;
+            const Matrix4d    alt_vp = light.AltViewProjection().cast<double>();
+            const Matrix4d    d3d_vp = ToD3dClipZViewProjection(viewProTrans);
+            if (info.has_VP) updateOp(G_VP, ToDxcCBufferMatrixUniform(d3d_vp));
+            if (info.has_AVP) updateOp(G_AVP, ToDxcCBufferMatrixUniform(alt_vp));
+            if (info.has_EM) {
+                updateOp(G_EM, ToDxcCBufferMatrixUniform(d3d_vp.inverse()));
+            }
+            if (info.has_AM) {
+                if (light.type() == SceneLightType::Point) {
+                    updateOp(G_AM, ToDxcCBufferMatrixUniform(Matrix4d::Identity()));
+                } else {
+                    updateOp(G_AM,
+                             ToDxcCBufferMatrixUniform(light.WorldToLightClip().cast<double>()));
+                }
+            }
+            const Vector3f origin  = light.WorldOrigin();
+            const Vector3f forward = light.WorldForward();
+            const Vector3f color   = light.color();
+            // g_RenderVar1: radius*0.99, cos(inner), cos(outer), intensity.
+            if (info.has_RV0) {
+                const auto atlas = light.ShadowAtlasUv();
+                updateOp(G_RV0, std::array<float, 4> { atlas.x(), atlas.y(), atlas.z(), atlas.w() });
+            }
+            if (info.has_RV1) {
+                updateOp(G_RV1,
+                         std::array<float, 4> { light.radius() * 0.9900000095367432f,
+                                                std::cos(light.innerCone() * SceneLight::Deg2Rad()),
+                                                std::cos(light.outerCone() * SceneLight::Deg2Rad()),
+                                                light.intensity() });
+            }
+            if (info.has_RV2) {
+                updateOp(G_RV2,
+                         std::array<float, 4> {
+                             origin.x(), origin.y(), origin.z(), light.density() });
+            }
+            if (info.has_RV3) {
+                if (light.type() == SceneLightType::Point && light.castsShadows() &&
+                    m_scene->shadows.quality != 0) {
+                    const auto proj = light.ShadowProjectionInfo();
+                    updateOp(G_RV3,
+                             std::array<float, 4> { proj.x(), proj.y(), proj.z(), proj.w() });
+                } else {
+                    updateOp(G_RV3,
+                             std::array<float, 4> { forward.x(), forward.y(), forward.z(), 0.0f });
+                }
+            }
+            if (info.has_RV4) {
+                updateOp(G_RV4,
+                         std::array<float, 4> { color.x(),
+                                                color.y(),
+                                                color.z(),
+                                                light.volumetricsExponent() });
             }
         }
     }

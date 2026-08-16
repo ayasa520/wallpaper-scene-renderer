@@ -38,4 +38,6 @@ bool MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
                                   const UserPropertyMap* user_properties);
 bool MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
                                    const UserPropertyMap* user_properties);
+
+bool ConfigureSceneVolumetrics(Scene& scene, fs::VFS& vfs);
 } // namespace wallpaper

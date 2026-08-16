@@ -86,7 +86,20 @@ constexpr std::string_view G_BONES { "g_Bones" };
 constexpr std::string_view G_SCREEN { "g_Screen" };
 constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
 
+constexpr std::string_view G_AVP { "g_AltViewProjectionMatrix" };
+constexpr std::string_view G_EM { "g_EffectModelMatrix" };
+constexpr std::string_view G_RV0 { "g_RenderVar0" };
+constexpr std::string_view G_RV1 { "g_RenderVar1" };
+constexpr std::string_view G_RV2 { "g_RenderVar2" };
+constexpr std::string_view G_RV3 { "g_RenderVar3" };
+constexpr std::string_view G_RV4 { "g_RenderVar4" };
+
 constexpr std::string_view SpecTex_Default { "_rt_default" };
+constexpr std::string_view SpecTex_VolumetricsBack { "_rt_volumetricsBack" };
+constexpr std::string_view SpecTex_VolumetricsSingle { "_rt_volumetricsSingle" };
+constexpr std::string_view SpecTex_VolumetricsLightBuffer { "_rt_volumetricsLightBuffer" };
+constexpr std::string_view SpecTex_VolumetricsLightBufferB { "_rt_volumetricsLightBufferB" };
+constexpr std::string_view SpecTex_ShadowAtlas { "_rt_shadowAtlas" };
 // Official model-reflection target. Receivers sample this RT; reflected producers write it.
 constexpr std::string_view SpecTex_Reflection { "_rt_Reflection" };
 // Second physical compose image. Shader color-blend and refraction sample this snapshot while

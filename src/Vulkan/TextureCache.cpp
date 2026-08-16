@@ -99,6 +99,7 @@ VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
         ? static_cast<float>(key.mipmap_level - 1)
         : 0.0f;
 
+    const bool compare = key.usage == TexUsage::DEPTH;
     VkSamplerCreateInfo sampler_info { .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                                        .pNext            = nullptr,
                                        .magFilter        = ToVkType(sam.magFilter),
@@ -111,8 +112,9 @@ VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
                                        .addressModeW     = (ToVkType(sam.wrapT)),
                                        .anisotropyEnable = (false),
                                        .maxAnisotropy    = (1.0f),
-                                       .compareEnable    = (false),
-                                       .compareOp        = VK_COMPARE_OP_NEVER,
+                                       .compareEnable    = compare,
+                                       .compareOp        = compare ? VK_COMPARE_OP_LESS
+                                                                   : VK_COMPARE_OP_NEVER,
                                        .minLod           = (0.0f),
                                        .maxLod           = max_lod,
                                        .borderColor      = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
@@ -473,7 +475,8 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, 
 inline std::optional<VmaImageParameters>
 CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat format,
             VkSamplerCreateInfo sampler_info, VkImageUsageFlags usage,
-            VmaMemoryUsage mem_usage = VMA_MEMORY_USAGE_GPU_ONLY) {
+            VmaMemoryUsage mem_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
     VmaImageParameters image;
     do {
         VkImageCreateInfo info {
@@ -507,7 +510,7 @@ CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat form
                 .format   = format,
                 .subresourceRange =
                     VkImageSubresourceRange {
-                        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .aspectMask     = aspect,
                         .baseMipLevel   = 0,
                         .levelCount     = miplevel,
                         .baseArrayLayer = 0,
@@ -1002,9 +1005,26 @@ std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
     VmaImageParameters image_paras;
     do {
         VkSamplerCreateInfo sam_info = GenSamplerInfo(tex_key);
-        VkFormat            format   = ToVkType(tex_key.format);
         VkExtent3D          ext { (u32)tex_key.width, (u32)tex_key.height, 1 };
 
+        if (tex_key.usage == TexUsage::DEPTH) {
+            if (auto opt = CreateImage(m_device,
+                                       ext,
+                                       1,
+                                       VK_FORMAT_D32_SFLOAT,
+                                       sam_info,
+                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                           VK_IMAGE_USAGE_SAMPLED_BIT,
+                                       VMA_MEMORY_USAGE_GPU_ONLY,
+                                       VK_IMAGE_ASPECT_DEPTH_BIT);
+                opt.has_value()) {
+                image_paras = std::move(opt.value());
+            } else
+                break;
+            return image_paras;
+        }
+
+        VkFormat format = ToVkType(tex_key.format);
         if (auto opt =
                 CreateImage(m_device,
                             ext,
@@ -1108,6 +1128,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
     const std::string key_string(key);
     const TexHash     tex_hash = TextureKey::HashValue(content_hash);
     auto queue_initial_clear = [&](const VmaImageParameters& image) {
+        if (content_hash.usage == TexUsage::DEPTH) return;
         // The render target may be sampled by a feedback pass before a writer touches it. Keep the
         // deterministic transparent-black bootstrap, but record it into the renderer's next frame
         // command buffer so visibility changes do not force a synchronous DeviceWaitIdle.

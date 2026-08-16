@@ -1,0 +1,506 @@
+#include "ShadowAtlasPass.hpp"
+
+#include "Core/ArrayHelper.hpp"
+#include "Core/Literals.hpp"
+#include "PassCommon.hpp"
+#include "Resource.hpp"
+#include "Scene/ShadowAtlas.hpp"
+#include "Scene/SceneMaterial.h"
+#include "Scene/SceneMesh.h"
+#include "SpecTexs.hpp"
+#include "Utils/Logging.h"
+#include "Vulkan/Shader.hpp"
+
+#include <Eigen/Dense>
+#include <algorithm>
+#include <array>
+#include <functional>
+#include <optional>
+#include <span>
+#include <utility>
+
+using namespace wallpaper::vulkan;
+
+namespace
+{
+
+constexpr std::string_view kVert = R"(
+struct VSInput {
+    [[vk::location(0)]] float3 Position : POSITION0;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+};
+
+struct ShadowCaster {
+    float4x4 u_MVP;
+};
+
+[[vk::binding(0, 0)]] ConstantBuffer<ShadowCaster> g_cb;
+
+VSOutput main_vs(VSInput input) {
+    VSOutput output;
+    output.position = mul(g_cb.u_MVP, float4(input.Position, 1.0));
+    return output;
+}
+)";
+
+constexpr std::string_view kFrag = R"(
+void main_ps() {}
+)";
+
+std::optional<vvk::RenderPass> CreateShadowRenderPass(const vvk::Device& device) {
+    VkAttachmentDescription attachment {
+        .format         = VK_FORMAT_D32_SFLOAT,
+        .samples        = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkAttachmentReference depth_ref {
+        .attachment = 0,
+        .layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    VkSubpassDescription subpass {
+        .pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount    = 0,
+        .pDepthStencilAttachment = &depth_ref,
+    };
+    std::array deps {
+        VkSubpassDependency {
+            .srcSubpass    = VK_SUBPASS_EXTERNAL,
+            .dstSubpass    = 0,
+            .srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        },
+        VkSubpassDependency {
+            .srcSubpass    = 0,
+            .dstSubpass    = VK_SUBPASS_EXTERNAL,
+            .srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            .dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        },
+    };
+    VkRenderPassCreateInfo info {
+        .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments    = &attachment,
+        .subpassCount    = 1,
+        .pSubpasses      = &subpass,
+        .dependencyCount = static_cast<uint32_t>(deps.size()),
+        .pDependencies   = deps.data(),
+    };
+    vvk::RenderPass pass;
+    if (device.CreateRenderPass(info, pass) != VK_SUCCESS) return std::nullopt;
+    return pass;
+}
+
+bool ExtractPositions(const wallpaper::SceneVertexArray& vertex, std::vector<float>& packed) {
+    const auto attrs = vertex.GetAttrOffsetMap();
+    const auto it    = attrs.find(std::string(wallpaper::WE_IN_POSITION));
+    if (it == attrs.end() || vertex.VertexCount() == 0 || vertex.Data() == nullptr) return false;
+    const wallpaper::usize stride = vertex.OneSize();
+    const wallpaper::usize offset = it->second.offset / sizeof(float);
+    packed.resize(vertex.VertexCount() * 3);
+    for (wallpaper::usize i = 0; i < vertex.VertexCount(); ++i) {
+        const float* src      = vertex.Data() + i * stride + offset;
+        packed[i * 3 + 0]     = src[0];
+        packed[i * 3 + 1]     = src[1];
+        packed[i * 3 + 2]     = src[2];
+    }
+    return true;
+}
+
+void WalkCasters(wallpaper::SceneNode* node,
+                 const std::function<void(wallpaper::SceneNode&, wallpaper::SceneMesh&)>& fn) {
+    if (node == nullptr) return;
+    const auto& name = node->Name();
+    if (name.rfind("volumetrics_", 0) == 0) return;
+    if (auto* mesh = node->Mesh(); mesh != nullptr) {
+        auto* material = mesh->Material();
+        if (material != nullptr && material->modelRenderState.has_value() &&
+            mesh->Skinning().boneCount == 0 && mesh->VertexCount() > 0) {
+            fn(*node, *mesh);
+        }
+    }
+    for (auto& child : node->GetChildren()) {
+        WalkCasters(child.get(), fn);
+    }
+}
+
+} // namespace
+
+ShadowAtlasPass::ShadowAtlasPass(const Desc& desc): m_desc(desc) {}
+
+ShadowAtlasPass::~ShadowAtlasPass() = default;
+
+std::string ShadowAtlasPass::residencyKey() const {
+    return "ShadowAtlas|target=" + m_desc.target;
+}
+
+bool ShadowAtlasPass::referencesRenderTarget(std::string_view render_target) const {
+    return m_desc.target == render_target;
+}
+
+bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& rr) {
+    if (m_pipeline.handle) return true;
+
+    ShaderCompOpt opt;
+    opt.target_env = ShaderTargetEnv::VULKAN_1_1;
+    std::array<ShaderCompUnit, 2> units {
+        ShaderCompUnit {
+            .stage           = wallpaper::ShaderType::VERTEX,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name      = "ShadowAtlas.vert",
+            .entry_point     = "main_vs",
+            .src             = std::string(kVert),
+        },
+        ShaderCompUnit {
+            .stage           = wallpaper::ShaderType::FRAGMENT,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name      = "ShadowAtlas.frag",
+            .entry_point     = "main_ps",
+            .src             = std::string(kFrag),
+        },
+    };
+    std::vector<Uni_ShaderSpv> spvs;
+    if (! CompileAndLinkShaderUnits(units, opt, spvs)) {
+        LOG_ERROR("ShadowAtlas: shader compile failed");
+        return false;
+    }
+
+    auto pass_opt = CreateShadowRenderPass(device.handle());
+    if (! pass_opt.has_value()) return false;
+    auto pass = std::move(pass_opt.value());
+
+    VkVertexInputBindingDescription bind {
+        .binding   = 0,
+        .stride    = sizeof(float) * 3,
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+    VkVertexInputAttributeDescription attr {
+        .location = 0,
+        .binding  = 0,
+        .format   = VK_FORMAT_R32G32B32_SFLOAT,
+        .offset   = 0,
+    };
+
+    DescriptorSetInfo descriptor_info;
+    descriptor_info.push_descriptor = true;
+    descriptor_info.bindings        = {
+        VkDescriptorSetLayoutBinding {
+            .binding         = 0,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_VERTEX_BIT,
+        },
+    };
+
+    GraphicsPipeline pipeline;
+    pipeline.toDefault();
+    pipeline.depth.depthTestEnable  = VK_TRUE;
+    pipeline.depth.depthWriteEnable = VK_TRUE;
+    pipeline.depth.depthCompareOp   = VK_COMPARE_OP_LESS;
+    m_pipeline.debug_name           = "ShadowAtlas";
+    m_pipeline.cache_key            = "ShadowAtlas|d32|less|no-color";
+    pipeline.addDescriptorSetInfo(spanone { descriptor_info })
+        .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>())
+        .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+        .addInputBindingDescription(spanone { bind })
+        .addInputAttributeDescription(spanone { attr });
+    for (auto& spv : spvs) pipeline.addStage(std::move(spv));
+    if (! pipeline.create(device, pass, m_pipeline, rr.pipeline_cache.get())) {
+        LOG_ERROR("ShadowAtlas: pipeline create failed");
+        return false;
+    }
+    return true;
+}
+
+bool ShadowAtlasPass::ensureFramebuffer(const Device& device) {
+    const VkExtent2D extent { m_desc.vk_target.extent.width, m_desc.vk_target.extent.height };
+    if (m_fb && m_fb_extent.width == extent.width && m_fb_extent.height == extent.height) {
+        return true;
+    }
+    m_fb.reset();
+    if (! m_pipeline.pass || m_desc.vk_target.view == VK_NULL_HANDLE) return false;
+    VkFramebufferCreateInfo info {
+        .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass      = *m_pipeline.pass,
+        .attachmentCount = 1,
+        .pAttachments    = &m_desc.vk_target.view,
+        .width           = extent.width,
+        .height          = extent.height,
+        .layers          = 1,
+    };
+    if (device.handle().CreateFramebuffer(info, m_fb) != VK_SUCCESS) return false;
+    m_fb_extent = extent;
+    return true;
+}
+
+void ShadowAtlasPass::releaseCasters(RenderingResources& rr) {
+    if (rr.vertex_buf == nullptr) {
+        m_casters.clear();
+        return;
+    }
+    for (auto& caster : m_casters) {
+        if (caster.vertex) rr.vertex_buf->unallocateSubRef(caster.vertex);
+        if (caster.index) rr.vertex_buf->unallocateSubRef(caster.index);
+    }
+    m_casters.clear();
+}
+
+void ShadowAtlasPass::collectCasters(Scene& scene, const Device&, RenderingResources& rr) {
+    releaseCasters(rr);
+    if (scene.sceneGraph == nullptr || rr.vertex_buf == nullptr) return;
+
+    WalkCasters(scene.sceneGraph.get(), [&](SceneNode& node, SceneMesh& mesh) {
+        const auto& vertex = mesh.GetVertexArray(0);
+        std::vector<float> packed;
+        if (! ExtractPositions(vertex, packed)) return;
+
+        CasterMesh caster;
+        caster.node         = &node;
+        caster.vertex_count = static_cast<uint32_t>(packed.size() / 3);
+        if (! rr.vertex_buf->allocateSubRef(packed.size() * sizeof(float), caster.vertex)) return;
+        if (! rr.vertex_buf->writeToBuf(caster.vertex,
+                                        { reinterpret_cast<uint8_t*>(packed.data()),
+                                          packed.size() * sizeof(float) })) {
+            rr.vertex_buf->unallocateSubRef(caster.vertex);
+            return;
+        }
+        if (mesh.IndexCount() > 0) {
+            const auto& indice = mesh.GetIndexArray(0);
+            const auto  bytes  = indice.DataSizeOf();
+            if (bytes > 0 && rr.vertex_buf->allocateSubRef(bytes, caster.index) &&
+                rr.vertex_buf->writeToBuf(caster.index,
+                                          { reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(
+                                                indice.Data())),
+                                            bytes })) {
+                const size_t count  = (indice.DataCount() * 2) / 3;
+                caster.index_count  = static_cast<uint32_t>(count * 3);
+                caster.indexed      = caster.index_count > 0;
+            }
+        }
+        m_casters.push_back(std::move(caster));
+    });
+}
+
+void ShadowAtlasPass::rebuildDrawList() {
+    m_draws.clear();
+    auto* scene = m_desc.scene;
+    if (scene == nullptr) return;
+
+    uint32_t slot = 0;
+    for (auto& light_ptr : scene->lights) {
+        if (! light_ptr) continue;
+        SceneLight& light = *light_ptr;
+        const auto& atlas = light.shadowAtlasSlot();
+        if (! atlas.packed) continue;
+
+        const Eigen::Vector3f origin = light.WorldOrigin();
+
+        for (uint32_t ci = 0; ci < m_casters.size(); ++ci) {
+            auto* node = m_casters[ci].node;
+            if (node == nullptr || ! node->Visible()) continue;
+            node->UpdateTrans();
+            Eigen::Matrix4f model = node->ModelTrans().cast<float>();
+            if (auto* mesh = node->Mesh(); mesh != nullptr) {
+                model = model * mesh->GeometryTransform().matrix();
+            }
+
+            if (atlas.point) {
+                const Eigen::Matrix4f proj = ShadowPointProjection(
+                    light.ShadowNearPlane(), light.ShadowFarPlane(),
+                    ShadowPointFovDegrees(atlas.quality), true);
+                for (int face = 0; face < 6; ++face) {
+                    const auto vp = ShadowPointFaceViewport(atlas.x, atlas.y, atlas.size, face);
+                    DrawItem item;
+                    item.caster_index = ci;
+                    item.ubo_slot     = slot++;
+                    item.vp_x         = vp.x;
+                    item.vp_y         = vp.y;
+                    item.vp_w         = vp.width;
+                    item.vp_h         = vp.height;
+                    item.scissor_x    = vp.scissor_x;
+                    item.scissor_y    = vp.scissor_y;
+                    item.scissor_w    = vp.scissor_w;
+                    item.scissor_h    = vp.scissor_h;
+                    item.mvp = proj * ShadowPointView(face, origin) * model;
+                    m_draws.push_back(item);
+                }
+            } else {
+                const auto vp = ShadowSpotViewport(atlas.x, atlas.y, atlas.size);
+                DrawItem item;
+                item.caster_index = ci;
+                item.ubo_slot     = slot++;
+                item.vp_x         = vp.x;
+                item.vp_y         = vp.y;
+                item.vp_w         = vp.width;
+                item.vp_h         = vp.height;
+                item.scissor_x    = vp.scissor_x;
+                item.scissor_y    = vp.scissor_y;
+                item.scissor_w    = vp.scissor_w;
+                item.scissor_h    = vp.scissor_h;
+                item.mvp          = light.ShadowWorldToLightClip() * model;
+                m_draws.push_back(item);
+            }
+        }
+    }
+}
+
+void ShadowAtlasPass::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
+    m_desc.scene = &scene;
+    m_dyn_buf    = rr.dyn_buf;
+    m_ubo_align  = std::max(device.limits().minUniformBufferOffsetAlignment, VkDeviceSize { 64 });
+
+    if (scene.renderTargets.count(m_desc.target) == 0) {
+        LOG_ERROR("ShadowAtlas: missing target '%s'", m_desc.target.c_str());
+        return;
+    }
+    const auto& rt = scene.renderTargets.at(m_desc.target);
+    auto        opt = device.tex_cache().Query(m_desc.target, ToTexKey(rt), ! rt.allowReuse);
+    if (! opt.has_value()) {
+        LOG_ERROR("ShadowAtlas: query target failed");
+        return;
+    }
+    m_desc.vk_target = opt.value();
+    if (! ensurePipeline(device, rr)) return;
+    if (! ensureFramebuffer(device)) return;
+    collectCasters(scene, device, rr);
+    setPrepared();
+}
+
+void ShadowAtlasPass::refreshResources(Scene& scene, const Device& device, RenderingResources&) {
+    m_desc.scene = &scene;
+    if (scene.renderTargets.count(m_desc.target) == 0) {
+        setPrepared(false);
+        return;
+    }
+    const auto& rt = scene.renderTargets.at(m_desc.target);
+    auto        opt = device.tex_cache().Query(m_desc.target, ToTexKey(rt), ! rt.allowReuse);
+    if (! opt.has_value()) {
+        setPrepared(false);
+        return;
+    }
+    m_desc.vk_target = opt.value();
+    m_fb.reset();
+    m_fb_extent = {};
+}
+
+void ShadowAtlasPass::updateBeforeUpload() {
+    rebuildDrawList();
+    if (m_dyn_buf == nullptr) return;
+    const VkDeviceSize bytes =
+        m_draws.empty() ? m_ubo_align : static_cast<VkDeviceSize>(m_draws.size()) * m_ubo_align;
+    if (m_ubo_buf && m_ubo_buf.size < bytes) {
+        m_dyn_buf->unallocateSubRef(m_ubo_buf);
+    }
+    if (! m_ubo_buf) {
+        if (! m_dyn_buf->allocateSubRef(bytes, m_ubo_buf, m_ubo_align)) {
+            LOG_ERROR("ShadowAtlas: ubo allocate failed draws=%zu", m_draws.size());
+            m_draws.clear();
+            return;
+        }
+    }
+    for (const auto& draw : m_draws) {
+        const auto offset = static_cast<size_t>(draw.ubo_slot) * static_cast<size_t>(m_ubo_align);
+        Eigen::Matrix4f mvp = draw.mvp;
+        m_dyn_buf->writeToBuf(m_ubo_buf,
+                              { reinterpret_cast<uint8_t*>(mvp.data()), sizeof(float) * 16 },
+                              offset);
+    }
+}
+
+void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
+    if (m_desc.vk_target.handle == VK_NULL_HANDLE) return;
+    // First bind always far-clears the atlas (depth 1.0), including zero casters.
+    // Empty tiles stay at far so comparison sampling keeps the unoccluded path.
+    if (! ensurePipeline(device, rr) || ! ensureFramebuffer(device) || ! m_fb) return;
+
+    const VkExtent2D extent { m_desc.vk_target.extent.width, m_desc.vk_target.extent.height };
+    VkClearValue     clear {};
+    clear.depthStencil = { 1.0f, 0 };
+    VkRenderPassBeginInfo begin {
+        .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass      = *m_pipeline.pass,
+        .framebuffer     = *m_fb,
+        .renderArea      = VkRect2D { { 0, 0 }, extent },
+        .clearValueCount = 1,
+        .pClearValues    = &clear,
+    };
+    rr.command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
+    rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_pipeline.handle);
+
+    const VkBuffer gpu = rr.vertex_buf != nullptr ? rr.vertex_buf->gpuBuf() : VK_NULL_HANDLE;
+    for (const auto& draw : m_draws) {
+        if (draw.caster_index >= m_casters.size()) continue;
+        const auto& caster = m_casters[draw.caster_index];
+        if (! caster.vertex || gpu == VK_NULL_HANDLE) continue;
+
+        const int32_t max_w = static_cast<int32_t>(extent.width);
+        const int32_t max_h = static_cast<int32_t>(extent.height);
+        const int32_t sx    = std::clamp(draw.scissor_x, 0, std::max(max_w - 1, 0));
+        const int32_t sy    = std::clamp(draw.scissor_y, 0, std::max(max_h - 1, 0));
+        const int32_t sw    = std::clamp(draw.scissor_w, 1, std::max(max_w - sx, 1));
+        const int32_t sh    = std::clamp(draw.scissor_h, 1, std::max(max_h - sy, 1));
+
+        VkViewport viewport {
+            .x        = draw.vp_x,
+            .y        = draw.vp_y,
+            .width    = draw.vp_w,
+            .height   = draw.vp_h,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+        VkRect2D scissor {
+            .offset = { sx, sy },
+            .extent = { static_cast<uint32_t>(sw), static_cast<uint32_t>(sh) },
+        };
+        rr.command.SetViewport(0, viewport);
+        rr.command.SetScissor(0, scissor);
+
+        if (m_dyn_buf != nullptr && m_ubo_buf) {
+            VkDescriptorBufferInfo buffer_info {
+                .buffer = m_dyn_buf->gpuBuf(),
+                .offset = m_ubo_buf.offset + static_cast<VkDeviceSize>(draw.ubo_slot) * m_ubo_align,
+                .range  = sizeof(float) * 16,
+            };
+            VkWriteDescriptorSet write {
+                .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding      = 0,
+                .descriptorCount = 1,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo     = &buffer_info,
+            };
+            rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_pipeline.layout, 0,
+                                            write);
+        }
+
+        rr.command.BindVertexBuffers(0, 1, &gpu, &caster.vertex.offset);
+        if (caster.indexed && caster.index) {
+            rr.command.BindIndexBuffer(gpu, caster.index.offset, VK_INDEX_TYPE_UINT16);
+            rr.command.DrawIndexed(caster.index_count, 1, 0, 0, 0);
+        } else {
+            rr.command.Draw(caster.vertex_count, 1, 0, 0);
+        }
+    }
+    rr.command.EndRenderPass();
+}
+
+void ShadowAtlasPass::destory(const Device&, RenderingResources& rr) {
+    setPrepared(false);
+    clearReleaseTexs();
+    m_fb.reset();
+    m_fb_extent = {};
+    m_draws.clear();
+    if (m_dyn_buf != nullptr && m_ubo_buf) m_dyn_buf->unallocateSubRef(m_ubo_buf);
+    releaseCasters(rr);
+    m_dyn_buf = nullptr;
+}

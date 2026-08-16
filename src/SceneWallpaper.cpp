@@ -24,6 +24,7 @@
 
 #include "VulkanRender/SceneToRenderGraph.hpp"
 #include "VulkanRender/VulkanRender.hpp"
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <malloc.h>
@@ -239,6 +240,8 @@ private:
     std::shared_ptr<std::vector<float>>      m_audio_samples;
     bool                                     m_gen_graphviz { false };
     bool                                     m_reflections_enabled { true };
+    int32_t                                  m_volumetrics_quality { 2 };
+    int32_t                                  m_shadows_quality { 2 };
 
     WPSceneParser                        m_scene_parser;
     std::unique_ptr<audio::SoundManager> m_sound_manager;
@@ -266,6 +269,8 @@ public:
         CMD_APPLY_AUDIO_SAMPLES,
         CMD_SET_FILLMODE,
         CMD_SET_REFLECTIONS,
+        CMD_SET_VOLUMETRICS,
+        CMD_SET_SHADOWS,
         CMD_SET_SPEED,
         CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
         CMD_RECONFIGURE_OFFSCREEN_EXPORT,
@@ -302,6 +307,8 @@ public:
                 CASE_CMD(MOUSE_LEFT_BUTTON);
                 CASE_CMD(SET_FILLMODE);
                 CASE_CMD(SET_REFLECTIONS);
+                CASE_CMD(SET_VOLUMETRICS);
+                CASE_CMD(SET_SHADOWS);
                 CASE_CMD(SET_SCENE);
                 CASE_CMD(APPLY_USER_PROPERTIES);
                 CASE_CMD(APPLY_MEDIA_STATE);
@@ -534,6 +541,34 @@ private:
         m_scene->reflectionsEnabled = enabled;
         LOG_INFO("SceneWallpaper: reflections %s (live pass gate, RT kept)",
                  enabled ? "enabled" : "disabled");
+    }
+    MHANDLER_CMD(SET_VOLUMETRICS) {
+        int32_t quality { 2 };
+        if (! msg->findInt32("value", &quality) || ! m_scene) return;
+        quality = std::clamp(quality, 0, 4);
+        if (m_scene->volumetrics.quality == quality &&
+            m_scene->volumetrics.built_quality == quality)
+            return;
+        m_scene->volumetrics.quality = quality;
+        if (m_scene->vfs) {
+            ConfigureSceneVolumetrics(*m_scene, *m_scene->vfs);
+        }
+        m_scene->MarkRenderGraphTopologyDirty();
+        LOG_INFO("SceneWallpaper: volumetrics quality=%d (rebuild graph)", quality);
+    }
+    MHANDLER_CMD(SET_SHADOWS) {
+        int32_t quality { 2 };
+        if (! msg->findInt32("value", &quality) || ! m_scene) return;
+        quality = std::clamp(quality, 0, 4);
+        if (m_scene->shadows.quality == quality && m_scene->shadows.built_quality == quality &&
+            m_scene->volumetrics.built_quality == m_scene->volumetrics.quality)
+            return;
+        m_scene->shadows.quality = quality;
+        if (m_scene->vfs) {
+            ConfigureSceneVolumetrics(*m_scene, *m_scene->vfs);
+        }
+        m_scene->MarkRenderGraphTopologyDirty();
+        LOG_INFO("SceneWallpaper: shadows quality=%d (rebuild graph)", quality);
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
@@ -804,6 +839,24 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                 nmsg->setBool("value", enabled);
                 nmsg->post();
             }
+        } else if (property == PROPERTY_VOLUMETRICS) {
+            int32_t quality { 2 };
+            if (msg->findInt32("value", &quality)) {
+                m_volumetrics_quality = std::clamp(quality, 0, 4);
+                auto nmsg =
+                    CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_VOLUMETRICS);
+                nmsg->setInt32("value", m_volumetrics_quality);
+                nmsg->post();
+            }
+        } else if (property == PROPERTY_SHADOWS) {
+            int32_t quality { 2 };
+            if (msg->findInt32("value", &quality)) {
+                m_shadows_quality = std::clamp(quality, 0, 4);
+                auto nmsg =
+                    CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_SHADOWS);
+                nmsg->setInt32("value", m_shadows_quality);
+                nmsg->post();
+            }
         } else if (property == PROPERTY_FILLMODE) {
             int32_t value;
             if (msg->findInt32("value", &value)) {
@@ -980,7 +1033,13 @@ void MainHandler::loadScene() {
                                      &m_user_properties,
                                      m_render_handler->textRenderScale());
         scene->reflectionsEnabled = m_reflections_enabled;
+        scene->volumetrics.quality = m_volumetrics_quality;
+        scene->shadows.quality     = m_shadows_quality;
         scene->vfs.swap(pVfs);
+        if (scene->vfs && (scene->volumetrics.built_quality != m_volumetrics_quality ||
+                           scene->shadows.built_quality != m_shadows_quality)) {
+            ConfigureSceneVolumetrics(*scene, *scene->vfs);
+        }
     }
 
     {
