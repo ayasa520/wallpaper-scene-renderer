@@ -32,10 +32,11 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
-    // Prepared shader sources now normalize malformed conditional directives before DXC sees
-    // them. Include that transform in the cache identity so an older prepared-source entry cannot
-    // bypass the sanitizer and reproduce the original preprocessing failure.
-    "prepared-shader-v22-dxc-conditional-directive-sanitize\n"
+    // v23: texLoad2D / texSample2DBackBuffer must emit Texture2D.Load(int3). The previous
+    // Load(int2, mip) form is not a DXC SPIR-V overload, and the prepared-source cache key
+    // hashes only authored WE text, so a prologue-only fix was reused from disk and
+    // volumetricsfront.frag kept failing (Rainy Day SceneVolumetrics compile).
+    "prepared-shader-v23-texload-int3\n"
 };
 
 using namespace wallpaper;
@@ -433,7 +434,8 @@ inline void ForEachDeclLine(std::string_view src,
 
 inline bool IsSamplerType(std::string_view type) {
     return type == "sampler2D" || type == "sampler3D" || type == "samplerCube" ||
-        type == "sampler2DComparison" || type == "sampler2DShadow";
+        type == "sampler2DComparison" || type == "sampler2DShadow" ||
+        type == "sampler2DBackBuffer";
 }
 
 inline std::string ToHLSLType(std::string_view type) {
@@ -1454,6 +1456,16 @@ float    _ww_mul(float4 a, float4 b) { return dot(a, b); }
 #define texSample2D(t, uv)         ((t).Sample(_ww_sampler_name(t), (uv)))
 #define texSample2DLod(t, uv, lod) ((t).SampleLevel(_ww_sampler_name(t), (uv), (lod)))
 #define texSample2DCompare(t, uv, ref) ((t).SampleCmpLevelZero(_ww_sampler_name(t), (uv), (ref)))
+// Official texLoad2D / texSample2DBackBuffer are integer texel fetches at mip 0.
+// DXC Texture2D.Load takes a single int3 (xy + mip). The two-argument
+// Load(int2, mip) form is not a SPIR-V candidate. Build the address with three
+// scalars so a later int3(float2, 0) rewrite cannot become Load(int2, 0).
+float4 ww_texLoad2D(Texture2D<float4> s, float2 u, float2 r) {
+    const int2 coord = int2(u * r);
+    return s.Load(int3(coord.x, coord.y, 0));
+}
+#define texLoad2D(s, u, r) (ww_texLoad2D((s), (u), (r)))
+#define texSample2DBackBuffer(s, u, r) (ww_texLoad2D((s), (u), (r)))
 #define texture(t, uv)             texSample2D(t, uv)
 #define textureLod(t, uv, lod)     texSample2DLod(t, uv, lod)
 

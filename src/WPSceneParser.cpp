@@ -10,6 +10,8 @@
 #include "Core/StringHelper.hpp"
 #include "Core/ArrayHelper.hpp"
 #include "SpecTexs.hpp"
+#include "Scene/ShadowAtlas.hpp"
+#include "Scene/SceneTexture.h"
 
 #include "WPShaderParser.hpp"
 #include "WPTexImageParser.hpp"
@@ -54,6 +56,7 @@
 #include <variant>
 #include <limits>
 #include <cstring>
+#include <span>
 #include <Eigen/Dense>
 
 using namespace wallpaper;
@@ -1348,6 +1351,19 @@ void ApplyKnownShaderSourceFixes(std::string_view shader_name, ShaderType stage,
         if (pos != std::string::npos) {
             source.replace(pos, broken.size(), "position += right * (uvs.x * 2.0 - 1.0);");
         }
+    }
+
+    // Stock volumetricsback.frag is empty. The engine writes window Z into a
+    // depth RT and volumetricsfront samples it with texSample2DBackBuffer.
+    // This renderer exposes RTs as color images, so publish the same gl_FragCoord.z into .r.
+    // The Steam copy is CRLF (`void main() {\r\n}`), so a LF-only search never matched and the
+    // empty main left glOutColor at 0 — every ray then had length 0.
+    if (shader_name == "volumetricsback" && stage == ShaderType::FRAGMENT &&
+        source.find("gl_FragCoord") == std::string::npos) {
+        source = "void main() {\n"
+                 "\tgl_FragColor = vec4(gl_FragCoord.z, gl_FragCoord.z, gl_FragCoord.z, 1.0);\n"
+                 "}\n";
+        LOG_INFO("SceneVolumetrics: rewrote volumetricsback.frag to publish window Z");
     }
 
 }
@@ -3583,6 +3599,459 @@ void main() {
              quarter_height,
              eighth_width,
              eighth_height);
+    return true;
+}
+
+void ConfigureSceneShadows(Scene& scene) {
+    for (auto& light : scene.lights) {
+        if (light) light->clearShadowAtlasSlot();
+    }
+    const int quality = scene.shadows.quality;
+    scene.shadows.built_quality = quality;
+    scene.shadows.atlas_active  = false;
+    if (quality <= 0) {
+        scene.renderTargets[std::string(SpecTex_ShadowAtlas)] = {
+            .width            = 2,
+            .height           = 2,
+            .mapWidth         = 2,
+            .mapHeight        = 2,
+            .allowReuse       = false,
+            .comparisonDepth  = true,
+        };
+        return;
+    }
+
+    const int face = ShadowFaceSize(quality);
+    std::vector<SceneLight*> casters;
+    for (auto& light : scene.lights) {
+        if (! light || ! light->castsShadows()) continue;
+        if (light->type() != SceneLightType::Point && light->type() != SceneLightType::Spot) {
+            continue;
+        }
+        casters.push_back(light.get());
+    }
+    const int n = std::max(1, static_cast<int>(casters.size()));
+    const int w = std::max(2, n * face);
+    const int h = std::max(2, face);
+    for (int i = 0; i < static_cast<int>(casters.size()); ++i) {
+        SceneLight::ShadowAtlasSlot slot;
+        slot.packed  = true;
+        slot.point   = casters[static_cast<size_t>(i)]->type() == SceneLightType::Point;
+        slot.quality = quality;
+        slot.x       = i * face;
+        slot.y       = 0;
+        slot.size    = face;
+        slot.atlas_w = w;
+        slot.atlas_h = h;
+        casters[static_cast<size_t>(i)]->setShadowAtlasSlot(slot);
+    }
+    scene.renderTargets[std::string(SpecTex_ShadowAtlas)] = {
+        .width           = w,
+        .height          = h,
+        .mapWidth        = w,
+        .mapHeight       = h,
+        .allowReuse      = false,
+        .comparisonDepth = true,
+        .sample          = { TextureWrap::CLAMP_TO_EDGE,
+                             TextureWrap::CLAMP_TO_EDGE,
+                             TextureFilter::LINEAR,
+                             TextureFilter::LINEAR },
+    };
+    scene.shadows.atlas_active = true;
+}
+
+void ClearSceneVolumetrics(Scene& scene) {
+    scene.renderTargets.erase(std::string(SpecTex_VolumetricsBack));
+    scene.renderTargets.erase(std::string(SpecTex_VolumetricsSingle));
+    scene.renderTargets.erase(std::string(SpecTex_VolumetricsLightBuffer));
+    scene.renderTargets.erase(std::string(SpecTex_VolumetricsLightBufferB));
+    scene.volumetrics.lights.clear();
+    scene.volumetrics.nodes.clear();
+    scene.volumetrics.outputs.clear();
+    scene.volumetrics.blur_h.reset();
+    scene.volumetrics.blur_v.reset();
+    scene.volumetrics.combine.reset();
+    scene.volumetrics.active        = false;
+    scene.volumetrics.built_quality = scene.volumetrics.quality == 0 ? 0 : -1;
+}
+
+void AddInwardUnitCube(SceneMesh& mesh) {
+    // Cookie hull: eight float3 corners. Combined with AltVP = inverse(light clip)
+    // this is the unit cube in [-1,1]. Inward winding + cullmode "normal" writes
+    // the far faces that volumetricsfront treats as backDepth.
+    constexpr float p[8 * 3] = {
+        -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1, -1,
+        -1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1,  1,
+    };
+    const uint16_t idx[] = {
+        0, 3, 2, 0, 2, 1, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4,
+        3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+    };
+    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 } }, 8);
+    vertex.SetVertex(WE_IN_POSITION, std::span<const float>(p, 24));
+    mesh.AddVertexArray(std::move(vertex));
+    SceneIndexArray indices((sizeof(idx) / sizeof(idx[0]) + 1) / 2);
+    indices.AssignHalf(0, std::span<const uint16_t>(idx, sizeof(idx) / sizeof(idx[0])));
+    mesh.AddIndexArray(std::move(indices));
+}
+
+void AddInwardPointSphere(SceneMesh& mesh) {
+    // Point hull: unit sphere. AltVP is T(origin)*S(radius).
+    // Latitude step π/24, longitude step 2π/24.
+    // Poles at (0, ±1, 0), then 23 rings × 25 verts (last duplicates first).
+    // Inward winding: (north[j], north[j+1], south[j]) is CW from outside.
+    constexpr int    rings       = 23;
+    constexpr int    slices      = 24;
+    constexpr int    ring_stride = slices + 1;
+    constexpr float  lat_step    = 0.1308997f;
+    constexpr float  lon_step    = 0.2617994f;
+    std::vector<float>    pos;
+    std::vector<uint16_t> idx;
+    pos.reserve(static_cast<size_t>((2 + rings * ring_stride) * 3));
+    pos.insert(pos.end(), { 0.0f, 1.0f, 0.0f });
+    pos.insert(pos.end(), { 0.0f, -1.0f, 0.0f });
+    for (int ring = 1; ring <= rings; ++ring) {
+        const float lat = static_cast<float>(ring) * lat_step;
+        const float sl  = std::sin(lat);
+        const float cl  = std::cos(lat);
+        for (int slice = 0; slice < ring_stride; ++slice) {
+            const float lon = static_cast<float>(slice) * lon_step;
+            pos.insert(pos.end(), { std::cos(lon) * sl, cl, std::sin(lon) * sl });
+        }
+    }
+    const auto ring_start = [](int ring_index) -> uint16_t {
+        return static_cast<uint16_t>(2 + ring_index * ring_stride);
+    };
+    for (int ring = 0; ring < rings - 1; ++ring) {
+        const uint16_t curr = ring_start(ring);
+        const uint16_t next = ring_start(ring + 1);
+        for (int slice = 0; slice < slices; ++slice) {
+            const uint16_t a = static_cast<uint16_t>(curr + slice);
+            const uint16_t b = static_cast<uint16_t>(curr + slice + 1);
+            const uint16_t c = static_cast<uint16_t>(next + slice);
+            const uint16_t d = static_cast<uint16_t>(next + slice + 1);
+            idx.insert(idx.end(), { a, b, c, b, d, c });
+        }
+    }
+    const uint16_t first = ring_start(0);
+    const uint16_t last  = ring_start(rings - 1);
+    for (int slice = 0; slice < slices; ++slice) {
+        idx.insert(idx.end(),
+                   { 0, static_cast<uint16_t>(first + slice + 1),
+                     static_cast<uint16_t>(first + slice) });
+        idx.insert(idx.end(),
+                   { 1, static_cast<uint16_t>(last + slice),
+                     static_cast<uint16_t>(last + slice + 1) });
+    }
+    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 } },
+                            static_cast<uint32_t>(pos.size() / 3));
+    vertex.SetVertex(WE_IN_POSITION, std::span<const float>(pos.data(), pos.size()));
+    mesh.AddVertexArray(std::move(vertex));
+    SceneIndexArray indices((idx.size() + 1) / 2);
+    indices.AssignHalf(0, std::span<const uint16_t>(idx.data(), idx.size()));
+    mesh.AddIndexArray(std::move(indices));
+}
+
+void AddInwardSpotCone(SceneMesh& mesh) {
+    // Spot hull: 32 slices, rings at z=1 and z=0 when reverse-depth is off.
+    // Apex at z=0, unit base at z=1.
+    constexpr int slices = 32;
+    std::vector<float>    pos;
+    std::vector<uint16_t> idx;
+    pos.reserve(static_cast<size_t>((slices + 2) * 3));
+    pos.insert(pos.end(), { 0.0f, 0.0f, 0.0f });
+    pos.insert(pos.end(), { 0.0f, 0.0f, 1.0f });
+    for (int i = 0; i < slices; ++i) {
+        const float a = (static_cast<float>(i) / static_cast<float>(slices)) * 6.283185307179586f;
+        pos.insert(pos.end(), { std::cos(a), std::sin(a), 1.0f });
+    }
+    for (int i = 0; i < slices; ++i) {
+        const uint16_t a = static_cast<uint16_t>(2 + i);
+        const uint16_t b = static_cast<uint16_t>(2 + ((i + 1) % slices));
+        idx.insert(idx.end(), { 0, b, a });
+        idx.insert(idx.end(), { 1, a, b });
+    }
+    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 } },
+                            static_cast<uint32_t>(pos.size() / 3));
+    vertex.SetVertex(WE_IN_POSITION, std::span<const float>(pos.data(), pos.size()));
+    mesh.AddVertexArray(std::move(vertex));
+    SceneIndexArray indices((idx.size() + 1) / 2);
+    indices.AssignHalf(0, std::span<const uint16_t>(idx.data(), idx.size()));
+    mesh.AddIndexArray(std::move(indices));
+}
+
+bool LoadVolumetricUtilMaterial(fs::VFS& vfs, Scene& scene, WPShaderValueUpdater* updater,
+                                SceneNode& node, std::string_view json_path,
+                                const std::unordered_map<std::string, int32_t>& extra_combos,
+                                SceneLight* light, const std::string& cookie,
+                                const std::optional<SceneModelRenderState>& render_state,
+                                std::shared_ptr<SceneMesh> mesh) {
+    nlohmann::json json;
+    if (! PARSE_JSON(fs::GetFileContent(vfs, std::string(json_path)), json)) {
+        LOG_ERROR("SceneVolumetrics: failed to parse '%.*s'",
+                  static_cast<int>(json_path.size()),
+                  json_path.data());
+        return false;
+    }
+    wpscene::WPMaterial wpmat;
+    if (! wpmat.FromJson(json)) {
+        LOG_ERROR("SceneVolumetrics: invalid material '%.*s'",
+                  static_cast<int>(json_path.size()),
+                  json_path.data());
+        return false;
+    }
+    for (const auto& [name, value] : extra_combos) {
+        wpmat.combos[name] = value;
+    }
+    if (! cookie.empty()) {
+        if (wpmat.textures.size() < 3) wpmat.textures.resize(3);
+        wpmat.textures[2] = cookie;
+    }
+
+    SceneMaterial     material;
+    WPShaderValueData sv_data;
+    sv_data.volumetric_light = light;
+    sv_data.volumetric_pass  = light != nullptr;
+    WPShaderInfo shader_info;
+    if (! LoadMaterial(vfs, wpmat, &scene, &node, &material, &sv_data, nullptr, &shader_info)) {
+        LOG_ERROR("SceneVolumetrics: compile failed '%.*s'",
+                  static_cast<int>(json_path.size()),
+                  json_path.data());
+        return false;
+    }
+    if (render_state.has_value()) material.modelRenderState = *render_state;
+    mesh->AddMaterial(std::move(material));
+    node.AddMesh(mesh);
+    updater->SetNodeData(&node, sv_data);
+    scene.nodeOwners[&node] = 0;
+    return true;
+}
+
+bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
+    auto* updater = dynamic_cast<WPShaderValueUpdater*>(scene.shaderValueUpdater.get());
+    if (updater == nullptr) return false;
+
+    ConfigureSceneShadows(scene);
+    ClearSceneVolumetrics(scene);
+    const int quality = scene.volumetrics.quality;
+    if (quality <= 0) {
+        scene.volumetrics.built_quality = 0;
+        return true;
+    }
+
+    std::vector<SceneLight*> lights;
+    for (auto& light : scene.lights) {
+        if (light && light->castVolumetrics() && light->typeSupportsVolumetrics()) {
+            lights.push_back(light.get());
+        }
+    }
+    if (lights.empty()) {
+        scene.volumetrics.built_quality = quality;
+        return true;
+    }
+
+    // LightBuffer scale: 1/8 below high quality, 1/4 at high/ultra. Back stays full-res.
+    const double scale = quality < 3 ? 0.125 : 0.25;
+    const i32    full_w = std::max(1, scene.ortho[0]);
+    const i32    full_h = std::max(1, scene.ortho[1]);
+    const i32    buf_w  = std::max(1, static_cast<i32>(full_w * scale));
+    const i32    buf_h  = std::max(1, static_cast<i32>(full_h * scale));
+
+    scene.renderTargets[std::string(SpecTex_VolumetricsBack)] = {
+        .width     = full_w,
+        .height    = full_h,
+        .mapWidth  = full_w,
+        .mapHeight = full_h,
+        .withDepth = true,
+        .bind      = { .enable = true, .screen = true, .scale = 1.0 },
+    };
+    scene.renderTargets[std::string(SpecTex_VolumetricsSingle)] = {
+        .width     = buf_w,
+        .height    = buf_h,
+        .mapWidth  = buf_w,
+        .mapHeight = buf_h,
+        .bind      = { .enable = true, .screen = true, .scale = scale },
+    };
+    scene.renderTargets[std::string(SpecTex_VolumetricsLightBuffer)] = {
+        .width     = buf_w,
+        .height    = buf_h,
+        .mapWidth  = buf_w,
+        .mapHeight = buf_h,
+        .bind      = { .enable = true, .screen = true, .scale = scale },
+    };
+    if (quality < 3) {
+        scene.renderTargets[std::string(SpecTex_VolumetricsLightBufferB)] = {
+            .width     = buf_w,
+            .height    = buf_h,
+            .mapWidth  = buf_w,
+            .mapHeight = buf_h,
+            .bind      = { .enable = true, .screen = true, .scale = scale },
+        };
+    }
+
+    SceneModelRenderState back_state;
+    back_state.depthTest     = true;
+    back_state.depthWrite    = true;
+    back_state.cullMode      = SceneCullMode::Back;
+    back_state.colorLoadMode = SceneModelColorLoadMode::Clear;
+    // The hull is drawn before the camera-inside test, so both hemispheres rasterize
+    // when the eye is inside the volume. Default LESS keeps the near wall and the
+    // fullscreen ray (shader z=0 = D3D near) never enters the light. GREATER + clear 0
+    // keeps max window Z, matching a D3D depth RT sampled as backDepth.
+    back_state.depthGreater  = true;
+    back_state.depthClear    = 0.0f;
+
+    SceneModelRenderState front_hull_state;
+    front_hull_state.depthTest     = false;
+    front_hull_state.depthWrite    = false;
+    front_hull_state.cullMode      = SceneCullMode::Back;
+    front_hull_state.colorLoadMode = SceneModelColorLoadMode::Load;
+
+    SceneModelRenderState fullscreen_state;
+    fullscreen_state.depthTest     = false;
+    fullscreen_state.depthWrite    = false;
+    fullscreen_state.cullMode      = SceneCullMode::None;
+    fullscreen_state.colorLoadMode = SceneModelColorLoadMode::Load;
+
+    for (SceneLight* light : lights) {
+        std::unordered_map<std::string, int32_t> combos;
+        const bool shadow =
+            light->castsShadows() && scene.shadows.quality != 0;
+        combos["QUALITY"] = quality;
+        combos["SHADOW"]  = shadow ? 1 : 0;
+        if (light->hasCookie()) combos["COOKIE"] = 1;
+        if (light->type() == SceneLightType::Point) {
+            combos["POINTLIGHT"]                    = 1;
+            combos["LIGHTS_SHADOW_MAPPING_QUALITY"] = scene.shadows.quality;
+        }
+        const std::string cookie = light->hasCookie() ? light->cookie() : std::string();
+
+        auto back_node        = std::make_shared<SceneNode>();
+        auto front_node       = std::make_shared<SceneNode>();
+        auto fullscreen_node  = std::make_shared<SceneNode>();
+        back_node->SetName("volumetrics_back");
+        front_node->SetName("volumetrics_front");
+        fullscreen_node->SetName("volumetrics_fullscreen");
+
+        auto back_mesh  = std::make_shared<SceneMesh>();
+        auto front_mesh = std::make_shared<SceneMesh>();
+        auto fs_mesh    = std::make_shared<SceneMesh>();
+        if (light->type() == SceneLightType::Point) {
+            AddInwardPointSphere(*back_mesh);
+            AddInwardPointSphere(*front_mesh);
+        } else if (light->hasCookie()) {
+            AddInwardUnitCube(*back_mesh);
+            AddInwardUnitCube(*front_mesh);
+        } else {
+            AddInwardSpotCone(*back_mesh);
+            AddInwardSpotCone(*front_mesh);
+        }
+        fs_mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
+
+        if (! LoadVolumetricUtilMaterial(vfs,
+                                         scene,
+                                         updater,
+                                         *back_node,
+                                         "/assets/materials/util/volumetrics_back.json",
+                                         {},
+                                         light,
+                                         {},
+                                         back_state,
+                                         back_mesh) ||
+            ! LoadVolumetricUtilMaterial(vfs,
+                                         scene,
+                                         updater,
+                                         *front_node,
+                                         "/assets/materials/util/volumetrics_front.json",
+                                         combos,
+                                         light,
+                                         cookie,
+                                         front_hull_state,
+                                         front_mesh) ||
+            ! LoadVolumetricUtilMaterial(vfs,
+                                         scene,
+                                         updater,
+                                         *fullscreen_node,
+                                         "/assets/materials/util/volumetrics_fullscreen.json",
+                                         combos,
+                                         light,
+                                         cookie,
+                                         fullscreen_state,
+                                         fs_mesh)) {
+            ClearSceneVolumetrics(scene);
+            return false;
+        }
+
+        Scene::VolumetricLightPass pass;
+        pass.light      = light;
+        pass.back       = back_node;
+        pass.front      = front_node;
+        pass.fullscreen = fullscreen_node;
+        scene.volumetrics.lights.push_back(std::move(pass));
+        scene.volumetrics.nodes.push_back(back_node);
+        scene.volumetrics.nodes.push_back(front_node);
+        scene.volumetrics.nodes.push_back(fullscreen_node);
+    }
+
+    if (quality < 3) {
+        auto blur_h = std::make_shared<SceneNode>();
+        auto blur_v = std::make_shared<SceneNode>();
+        blur_h->SetName("volumetrics_blur_h");
+        blur_v->SetName("volumetrics_blur_v");
+        auto blur_h_mesh = std::make_shared<SceneMesh>();
+        auto blur_v_mesh = std::make_shared<SceneMesh>();
+        blur_h_mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
+        blur_v_mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
+        if (! LoadVolumetricUtilMaterial(vfs,
+                                         scene,
+                                         updater,
+                                         *blur_h,
+                                         "/assets/materials/util/volumetrics_blur_h.json",
+                                         {},
+                                         nullptr,
+                                         {},
+                                         std::nullopt,
+                                         blur_h_mesh) ||
+            ! LoadVolumetricUtilMaterial(vfs,
+                                         scene,
+                                         updater,
+                                         *blur_v,
+                                         "/assets/materials/util/volumetrics_blur_v.json",
+                                         {},
+                                         nullptr,
+                                         {},
+                                         std::nullopt,
+                                         blur_v_mesh)) {
+            ClearSceneVolumetrics(scene);
+            return false;
+        }
+        scene.volumetrics.blur_h = blur_h;
+        scene.volumetrics.blur_v = blur_v;
+        scene.volumetrics.nodes.push_back(blur_h);
+        scene.volumetrics.nodes.push_back(blur_v);
+    }
+
+    auto combine = std::make_shared<SceneNode>();
+    combine->SetName("volumetrics_combine");
+    auto combine_mesh = std::make_shared<SceneMesh>();
+    combine_mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
+    if (! LoadVolumetricUtilMaterial(vfs,
+                                     scene,
+                                     updater,
+                                     *combine,
+                                     "/assets/materials/util/volumetrics_combine.json",
+                                     {},
+                                     nullptr,
+                                     {},
+                                     std::nullopt,
+                                     combine_mesh)) {
+        ClearSceneVolumetrics(scene);
+        return false;
+    }
+    scene.volumetrics.combine = combine;
+    scene.volumetrics.nodes.push_back(combine);
+    scene.volumetrics.active        = true;
+    scene.volumetrics.built_quality = quality;
     return true;
 }
 
@@ -5994,6 +6463,29 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
         Vector3f(light_obj.color.data()), light_obj.radius, light_obj.intensity));
 
     auto& light = *(context.scene->lights.back());
+    // Workshop scene.pkg and editor assets write prefixed tokens (lpoint/lspot/
+    // ldirectional/ltube). Unpacked defaultprojects and older scene.json keep the
+    // unprefixed names. Accept both.
+    if (light_obj.light == "lpoint" || light_obj.light == "point") {
+        light.setType(SceneLightType::Point);
+    } else if (light_obj.light == "lspot" || light_obj.light == "spot") {
+        light.setType(SceneLightType::Spot);
+    } else if (light_obj.light == "ldirectional" || light_obj.light == "directional") {
+        light.setType(SceneLightType::Directional);
+    } else if (light_obj.light == "ltube" || light_obj.light == "tube") {
+        light.setType(SceneLightType::Tube);
+    } else {
+        light.setType(SceneLightType::Other);
+    }
+    light.setCastVolumetrics(light_obj.castvolumetrics);
+    light.setDensity(light_obj.density);
+    light.setVolumetricsExponent(light_obj.volumetricsexponent);
+    light.setInnerCone(light_obj.innercone);
+    light.setOuterCone(light_obj.outercone);
+    light.setCastsShadows(light_obj.castshadows);
+    if (light_obj.usecookie && ! light_obj.cookie.empty()) {
+        light.setCookie(light_obj.cookie);
+    }
     context.scene->objectRuntimeLights[light_obj.id].push_back(&light);
     light.setNode(node);
 
@@ -7262,6 +7754,23 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
         RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
 
+        if (object_json.contains("light") && ! object_json.at("light").is_null()) {
+            // Official lighting docs animate Intensity (and optionally Radius) on the light
+            // object itself. These are not material uniforms, so they are scanned only for
+            // authored lights and applied to SceneLight each frame.
+            RegisterScenePropertyBinding(
+                context, object_json, "intensity", WPDynamicValue::Type::Float);
+            RegisterScenePropertyBinding(
+                context, object_json, "radius", WPDynamicValue::Type::Float);
+            RegisterScenePropertyAnimationBinding(
+                context, object_json, "intensity", WPDynamicValue::Type::Float);
+            RegisterScenePropertyAnimationBinding(
+                context, object_json, "radius", WPDynamicValue::Type::Float);
+            RegisterSceneScriptBinding(
+                context, object_json, "intensity", WPDynamicValue::Type::Float);
+            RegisterSceneScriptBinding(context, object_json, "radius", WPDynamicValue::Type::Float);
+        }
+
         if (IsCameraLayerObjectJson(object_json)) {
             // Camera zoom/fov are not normal drawable layer properties, so they are scanned only
             // for authored camera layers and routed through the camera target kind registered
@@ -7446,6 +7955,18 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterSceneScriptBinding(context, object_json, "maxrows", WPDynamicValue::Type::Int32);
     RegisterSceneScriptBinding(context, object_json, "limitwidth", WPDynamicValue::Type::Boolean);
     RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
+
+    if (object_json.contains("light") && ! object_json.at("light").is_null()) {
+        RegisterScenePropertyBinding(
+            context, object_json, "intensity", WPDynamicValue::Type::Float);
+        RegisterScenePropertyBinding(context, object_json, "radius", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "intensity", WPDynamicValue::Type::Float);
+        RegisterScenePropertyAnimationBinding(
+            context, object_json, "radius", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(context, object_json, "intensity", WPDynamicValue::Type::Float);
+        RegisterSceneScriptBinding(context, object_json, "radius", WPDynamicValue::Type::Float);
+    }
 
     if (IsCameraLayerObjectJson(object_json)) {
         // Dynamic camera layers need the same camera-only zoom/fov registration as scene-load
@@ -7654,6 +8175,10 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
     return context.object_nodes.count(object.id) != 0;
 }
 } // namespace
+
+bool wallpaper::ConfigureSceneVolumetrics(Scene& scene, fs::VFS& vfs) {
+    return ConfigureSceneVolumetricsImpl(scene, vfs);
+}
 
 bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
                                               const UserPropertyMap* user_properties) {
@@ -8204,14 +8729,13 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             .has_mipmap = true,
             .bind       = { .enable = true, .name = SpecTex_Default.data() }
         };
-        context.scene->renderTargets["_rt_shadowAtlas"] = {
-            .width      = context.ortho_w,
-            .height     = context.ortho_h,
-            .mapWidth   = context.ortho_w,
-            .mapHeight  = context.ortho_h,
-            .allowReuse = true,
-            .withDepth  = true,
-            .bind       = { .enable = true, .screen = true },
+        context.scene->renderTargets[std::string(SpecTex_ShadowAtlas)] = {
+            .width           = 2,
+            .height          = 2,
+            .mapWidth        = 2,
+            .mapHeight       = 2,
+            .allowReuse      = false,
+            .comparisonDepth = true,
         };
     }
     context.scene->scene_id = scene_id;
@@ -8300,6 +8824,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
 
     context.scene->ApplyAllLayerVisibility();
+
+    ConfigureSceneVolumetricsImpl(*context.scene, *context.vfs);
 
     return context.scene;
 }

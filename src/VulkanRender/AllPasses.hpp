@@ -5,3 +5,5 @@
 #include "CustomShaderPass.hpp"
 #include "MaskedMeshPass.hpp"
 #include "TextPass.hpp"
+#include "VolumetricsSingleFillPass.hpp"
+#include "ShadowAtlasPass.hpp"

@@ -12,6 +12,7 @@
 #include "Core/MapSet.hpp"
 #include "SpriteAnimation.hpp"
 #include "WPPuppet.hpp"
+#include "Scene/SceneLight.hpp"
 
 namespace wallpaper
 {
@@ -25,6 +26,13 @@ struct WPUniformInfo {
     bool has_MI { false };
     bool has_M { false };
     bool has_AM { false };
+    bool has_AVP { false };
+    bool has_EM { false };
+    bool has_RV0 { false };
+    bool has_RV1 { false };
+    bool has_RV2 { false };
+    bool has_RV3 { false };
+    bool has_RV4 { false };
     bool has_MVP { false };
     // Wallpaper Engine effect passes can render through helper meshes while shader math still
     // depends on the authored layer transform. Track these matrix uniforms separately so effect
@@ -121,6 +129,10 @@ struct WPShaderValueData {
     // private effect sources. Keep their parallax anchor for dependents without adding a second
     // local model offset.
     bool                  suppress_model_parallax { false };
+
+    // Volumetric util materials pack g_RenderVar0–4 and the light-volume matrices per light.
+    SceneLight*           volumetric_light { nullptr };
+    bool                  volumetric_pass { false };
 
     void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
 

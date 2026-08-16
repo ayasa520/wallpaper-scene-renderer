@@ -388,6 +388,8 @@ LayerValueHint LayerValueType(std::string_view property_name) {
     if (property_name == "rate") return { WPDynamicValue::Type::Float, true };
     if (property_name == "alpha") return { WPDynamicValue::Type::Float, true };
     if (property_name == "brightness") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "intensity") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "radius") return { WPDynamicValue::Type::Float, true };
     if (property_name == "backgroundcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "backgroundbrightness") return { WPDynamicValue::Type::Float, true };
     if (property_name == "opaquebackground") return { WPDynamicValue::Type::Boolean, true };
@@ -5099,6 +5101,18 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
             image_layer != nullptr && property_name == "size") {
             return WPDynamicValue(image_layer->size);
         }
+        if (opaque->scene != nullptr && layer_id != 0) {
+            if (auto lights_it = opaque->scene->objectRuntimeLights.find(layer_id);
+                lights_it != opaque->scene->objectRuntimeLights.end() &&
+                ! lights_it->second.empty() && lights_it->second.front() != nullptr) {
+                if (property_name == "intensity") {
+                    return WPDynamicValue(lights_it->second.front()->intensity());
+                }
+                if (property_name == "radius") {
+                    return WPDynamicValue(lights_it->second.front()->radius());
+                }
+            }
+        }
     }
 
     if (opaque != nullptr) {
@@ -5428,6 +5442,31 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                         applied = true;
                     });
                 return applied;
+            }
+        }
+    }
+
+    if (opaque != nullptr && opaque->scene != nullptr) {
+        const auto layer_id = FindNodeId(opaque, node);
+        if (layer_id != 0) {
+            if (auto lights_it = opaque->scene->objectRuntimeLights.find(layer_id);
+                lights_it != opaque->scene->objectRuntimeLights.end()) {
+                if (property_name == "intensity") {
+                    float intensity = 0.0f;
+                    if (! value.tryGet(&intensity)) return false;
+                    for (auto* light : lights_it->second) {
+                        if (light != nullptr) light->setIntensity(intensity);
+                    }
+                    return ! lights_it->second.empty();
+                }
+                if (property_name == "radius") {
+                    float radius = 0.0f;
+                    if (! value.tryGet(&radius)) return false;
+                    for (auto* light : lights_it->second) {
+                        if (light != nullptr) light->setRadius(radius);
+                    }
+                    return ! lights_it->second.empty();
+                }
             }
         }
     }

@@ -88,7 +88,10 @@ std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, Vk
         .arrayLayers           = 1,
         .samples               = VK_SAMPLE_COUNT_1_BIT,
         .tiling                = VK_IMAGE_TILING_OPTIMAL,
-        .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        // SAMPLED + TRANSFER_SRC: the volumetrics fill pass blits this scene depth
+        // into `_rt_volumetricsSingle`.
+        .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -144,6 +147,8 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc) {
     m_desc.depth_test          = desc.depth_test;
     m_desc.depth_write         = desc.depth_write;
     m_desc.clear_depth         = desc.clear_depth;
+    m_desc.depth_greater       = desc.depth_greater;
+    m_desc.depth_clear         = desc.depth_clear;
 };
 
 std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
@@ -164,6 +169,8 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
            m_desc.depth_test == next.m_desc.depth_test &&
            m_desc.depth_write == next.m_desc.depth_write &&
            m_desc.clear_depth == next.m_desc.clear_depth &&
+           m_desc.depth_greater == next.m_desc.depth_greater &&
+           m_desc.depth_clear == next.m_desc.depth_clear &&
            // Alpha policy changes the prepared pipeline's color write mask, blend operation, and
            // factors. Reusing a pass across that boundary would keep stale composition coverage.
            m_desc.alpha_write_policy == next.m_desc.alpha_write_policy &&
@@ -447,13 +454,22 @@ wallpaper::SceneCullMode ResolveModelCullMode(wallpaper::SceneCullMode mode,
 
 bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
                                   std::string_view                camera_name,
-                                  wallpaper::AlphaWritePolicy      alpha_write_policy) {
+                                  wallpaper::AlphaWritePolicy      alpha_write_policy,
+                                  std::string_view                output) {
     const bool is_model_pass = material.modelRenderState.has_value();
     // Model shaders may output non-opaque alpha for their own material math even when the authored
     // object is visually opaque. Allowing that alpha into `_rt_default` makes FinPass present a
     // translucent frame and visually crushes the lighting. Keep the RGB blend factors intact for
     // translucent model materials, but preserve the target alpha just like global 2D passes.
-    if (is_model_pass) return false;
+    // Offscreen targets such as `_rt_volumetricsLightBuffer` must keep the shader alpha:
+    // volumetricsfront writes a=1 and the official additive combine (SRC_ALPHA, ONE) multiplies
+    // by the sampled LightBuffer alpha. Suppressing A left the buffer at the clear value 0 and
+    // the passthrough combine added nothing.
+    if (is_model_pass && output == wallpaper::SpecTex_Default) return false;
+    // Volumetric nodes have an empty camera name, so the 2D compositor gate below would still
+    // drop A. Offscreen model targets must store the shader alpha: official additive combine
+    // (SRC_ALPHA, ONE) samples LightBuffer.a, and volumetricsfront writes a=1.
+    if (is_model_pass && output != wallpaper::SpecTex_Default) return true;
 
     // Explicit compositor policies opt in to camera-less alpha writes. Authored effect shaders such
     // as auto_sway otherwise retain the historical camera-derived mask because their helper regions
@@ -518,9 +534,11 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     const auto& model_state = material.modelRenderState;
     if (! model_state.has_value()) return;
 
-    desc.model_pass  = true;
-    desc.depth_test  = model_state->depthTest;
-    desc.depth_write = model_state->depthWrite;
+    desc.model_pass    = true;
+    desc.depth_test    = model_state->depthTest;
+    desc.depth_write   = model_state->depthWrite;
+    desc.depth_greater = model_state->depthGreater;
+    desc.depth_clear   = model_state->depthClear;
     // Model passes are the only custom-shader passes allowed to override the historical load/cull
     // defaults. The parser chooses a color-load mode per output target, so offscreen model buffers
     // can be cleared once per frame before later chunks load and composite into the same image.
@@ -589,7 +607,7 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
     const auto camera_name = EffectiveCustomShaderCamera(desc);
     const bool writes_alpha =
-        ShouldWriteCustomShaderAlpha(material, camera_name, desc.alpha_write_policy);
+        ShouldWriteCustomShaderAlpha(material, camera_name, desc.alpha_write_policy, desc.output);
 
     if (writes_alpha) color_mask |= VK_COLOR_COMPONENT_A_BIT;
     state.color_blend.colorWriteMask = color_mask;
@@ -617,14 +635,16 @@ void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  ma
     // path for shader reflection, descriptors, and mesh buffers.
     pipeline.depth.depthTestEnable       = desc.depth_test;
     pipeline.depth.depthWriteEnable      = desc.depth_write;
-    pipeline.depth.depthCompareOp        = VK_COMPARE_OP_LESS_OR_EQUAL;
+    pipeline.depth.depthCompareOp        = desc.depth_greater ? VK_COMPARE_OP_GREATER
+                                                             : VK_COMPARE_OP_LESS_OR_EQUAL;
     pipeline.depth.depthBoundsTestEnable = false;
     pipeline.depth.stencilTestEnable     = false;
     const auto effective_cull_mode =
         ResolveModelCullMode(model_state->cullMode, model_state->mirroredHandedness);
     pipeline.raster.cullMode = ToVkCullMode(effective_cull_mode);
     LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' color-load=%s "
-             "mirrored-handedness=%s depth-test=%s depth-write=%s depth-clear=%s cull=%u",
+             "mirrored-handedness=%s depth-test=%s depth-write=%s depth-clear=%s "
+             "depth-compare=%s depth-clear-z=%.3f cull=%u",
              desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
              material.customShader.shader != nullptr ? material.customShader.shader->name.c_str()
                                                      : "<null>",
@@ -634,6 +654,8 @@ void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  ma
              desc.depth_test ? "true" : "false",
              desc.depth_write ? "true" : "false",
              desc.clear_depth ? "true" : "false",
+             desc.depth_greater ? "greater" : "less-equal",
+             desc.depth_clear,
              static_cast<unsigned>(pipeline.raster.cullMode));
 }
 
@@ -1649,12 +1671,13 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
 
     auto&                   cmd    = rr.command;
     auto&                   outext = m_desc.vk_output.extent;
-    VkImageSubresourceRange base_srang {
-        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-        .baseMipLevel   = 0,
-        .levelCount     = VK_REMAINING_ARRAY_LAYERS,
-        .baseArrayLayer = 0,
-        .layerCount     = VK_REMAINING_MIP_LEVELS,
+    const auto is_comparison_depth = [&](usize i) {
+        if (i >= m_desc.textures.size()) return false;
+        const auto& name = m_desc.textures[i];
+        if (name == SpecTex_ShadowAtlas) return true;
+        if (m_desc.scene == nullptr) return false;
+        const auto it = m_desc.scene->renderTargets.find(name);
+        return it != m_desc.scene->renderTargets.end() && it->second.comparisonDepth;
     };
     const auto push_visible_descriptors = [&](VkPipelineLayout layout) {
         for (usize i = 0; i < m_desc.vk_textures.size(); i++) {
@@ -1701,31 +1724,39 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         auto& slot = m_desc.vk_textures[i];
         if (slot.slots.empty()) continue;
         auto& img = slot.getActive();
+        const bool comparison_depth = is_comparison_depth(i);
+        VkImageSubresourceRange srang {
+            .aspectMask     = comparison_depth ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                               : VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = VK_REMAINING_ARRAY_LAYERS,
+            .baseArrayLayer = 0,
+            .layerCount     = VK_REMAINING_MIP_LEVELS,
+        };
 
         VkImageMemoryBarrier imb {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
-            // Render-target inputs are often produced by the immediately previous pass in the
-            // same command buffer. That producer writes through the color-attachment path, not the
-            // fragment-shader read path, so the consumer must wait on color attachment writes
-            // before sampling. Without this, first-class text bridges can be drawn correctly by
-            // TextPass and still appear missing when their effect/composite pass samples the
-            // freshly written offscreen image.
-            .srcAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            // Color inputs wait on the previous color-attachment write. The shadow atlas is a
+            // depth comparison target written by late fragment tests, then sampled with
+            // texSample2DCompare.
+            .srcAccessMask    = comparison_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                                 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
             .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .image            = img.handle,
-            .subresourceRange = base_srang,
+            .subresourceRange = srang,
         };
 
-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        cmd.PipelineBarrier(comparison_depth ? VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                                             : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                             VK_DEPENDENCY_BY_REGION_BIT,
                             imb);
     }
 
-    m_desc.depth_clear_value.depthStencil = { 1.0f, 0 };
+    m_desc.depth_clear_value.depthStencil = { m_desc.depth_clear, 0 };
     std::array<VkClearValue, 2> clear_values { m_desc.clear_value, m_desc.depth_clear_value };
     VkRenderPassBeginInfo       pass_begin_info {
         .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,

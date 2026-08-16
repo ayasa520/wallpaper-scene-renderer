@@ -5,6 +5,8 @@ STATIC
 ClearPass.cpp
 CopyPass.cpp
 CustomShaderPass.cpp
+VolumetricsSingleFillPass.cpp
+ShadowAtlasPass.cpp
 ShaderDrawCore.cpp
 MaskedDrawAttachmentCache.cpp
 MaskedDrawRenderer.cpp

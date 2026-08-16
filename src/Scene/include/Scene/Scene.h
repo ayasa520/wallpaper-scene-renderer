@@ -277,6 +277,52 @@ public:
     // Official quality checkbox `reflection`. The RT stays registered when receivers exist;
     // this flag only gates the mirrored producer pass that populates `_rt_Reflection`.
     bool                 reflectionsEnabled { true };
+
+    struct VolumetricLightPass {
+        SceneLight*                light { nullptr };
+        std::shared_ptr<SceneNode> back;
+        std::shared_ptr<SceneNode> front;
+        std::shared_ptr<SceneNode> fullscreen;
+    };
+
+    // volumetricsfront QUALITY + (SHADOW||COOKIE): 12/24/32/64 vs 2/3/5/8.
+    static int VolumetricRaySampleCount(int quality, bool shadow_or_cookie) {
+        if (quality <= 0) return 0;
+        if (shadow_or_cookie) {
+            if (quality >= 4) return 64;
+            if (quality >= 3) return 32;
+            if (quality >= 2) return 24;
+            return 12;
+        }
+        if (quality >= 4) return 8;
+        if (quality >= 3) return 5;
+        if (quality >= 2) return 3;
+        return 2;
+    }
+
+    struct VolumetricSettings {
+        // QUALITY combo is the host enum 1–4. Disabled (0) skips the entire graph
+        // and allocates no volumetric render targets.
+        int  quality { 2 };
+        int  built_quality { -1 };
+        bool active { false };
+        std::vector<VolumetricLightPass>          lights;
+        std::vector<std::shared_ptr<SceneNode>>   nodes;
+        std::vector<std::string>                  outputs;
+        std::shared_ptr<SceneNode>                blur_h;
+        std::shared_ptr<SceneNode>                blur_v;
+        std::shared_ptr<SceneNode>                combine;
+    };
+
+    VolumetricSettings   volumetrics;
+
+    struct ShadowSettings {
+        // Shadows quality: disabled=0, low=1, medium=2 (default), high=3, ultra=4.
+        int  quality { 2 };
+        int  built_quality { -1 };
+        bool atlas_active { false };
+    };
+    ShadowSettings       shadows;
     bool                 cameraParallax { false };
     float                cameraParallaxAmount { 0.0f };
     float                cameraParallaxDelay { 0.0f };

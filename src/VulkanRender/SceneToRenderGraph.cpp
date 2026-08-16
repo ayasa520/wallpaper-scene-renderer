@@ -119,6 +119,37 @@ static TexNode::Desc createTexDesc(std::string path, const Scene* scene = nullpt
                            .type = IsRuntimeRenderTarget(scene, path) ? TexNode::TexType::Temp
                                                                       : TexNode::TexType::Imported };
 }
+
+void addShadowAtlasPass(RenderGraph& rgraph, Scene* scene) {
+    rgraph.addPass<vulkan::ShadowAtlasPass>(
+        "shadow_atlas",
+        PassNode::Type::CustomShader,
+        [scene](RenderGraphBuilder& builder, vulkan::ShadowAtlasPass::Desc& desc) {
+            auto* dst =
+                builder.createTexNode(createTexDesc(std::string(SpecTex_ShadowAtlas), scene), true);
+            builder.write(dst);
+            desc.target = dst->key();
+            desc.scene  = scene;
+        });
+}
+
+void addVolumetricsSingleFillPass(RenderGraph& rgraph, const Scene* scene) {
+    // Scene-depth blit into `_rt_volumetricsSingle`.
+    // Read `_rt_default` so this runs after model chunks have written shared scene depth.
+    rgraph.addPass<vulkan::VolumetricsSingleFillPass>(
+        "volumetrics_single_fill",
+        PassNode::Type::CustomShader,
+        [scene](RenderGraphBuilder& builder, vulkan::VolumetricsSingleFillPass::Desc& desc) {
+            auto* src = builder.createTexNode(createTexDesc(std::string(SpecTex_Default), scene));
+            auto* dst =
+                builder.createTexNode(createTexDesc(std::string(SpecTex_VolumetricsSingle), scene),
+                                      true);
+            builder.read(src);
+            builder.write(dst);
+            desc.dst          = dst->key();
+            desc.scene_output = src->key();
+        });
+}
 } // namespace wallpaper::rg
 
 static void CheckAndSetSprite(Scene& scene, vulkan::ShaderDrawRequest& desc,
@@ -621,7 +652,12 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
                 pdesc.model_pass = true;
                 pdesc.depth_test = model_state->depthTest;
                 pdesc.depth_write = model_state->depthWrite;
-                pdesc.clear_depth = clear_model_depth;
+                pdesc.depth_greater = model_state->depthGreater;
+                pdesc.depth_clear = model_state->depthClear;
+                // The shared Back RT is rebound per light, so each hull must start
+                // from a cleared depth instead of the first-writer-wins model-chunk rule.
+                pdesc.clear_depth = clear_model_depth ||
+                    output_key == SpecTex_VolumetricsBack;
             }
             CheckAndSetSprite(scene, pdesc, material->textures);
             for (usize i = 0; i < material->textures.size(); i++) {
@@ -1257,6 +1293,53 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
                         rg::TexNode::Desc { .name = WE_MIP_MAPPED_FRAME_BUFFER.data(),
                                             .key  = WE_MIP_MAPPED_FRAME_BUFFER.data(),
                                             .type = rg::TexNode::TexType::Temp });
+    }
+
+    if (scene.shadows.quality != 0) {
+        rg::addShadowAtlasPass(*rgraph, &scene);
+    }
+
+    if (scene.volumetrics.active && !scene.volumetrics.lights.empty()) {
+        // Volumetrics then bloom/HDR. Each light writes LightBuffer additively; blur/combine
+        // run after every light has finished.
+        rg::addClearPass(*rgraph,
+                         rg::createTexDesc(std::string(SpecTex_VolumetricsLightBuffer), &scene),
+                         { 0.0f, 0.0f, 0.0f, 0.0f });
+        rg::addVolumetricsSingleFillPass(*rgraph, &scene);
+        for (const auto& pass : scene.volumetrics.lights) {
+            if (pass.light == nullptr) continue;
+            SceneLight* light = pass.light;
+            auto camera_inside = [&scene, light]() {
+                if (scene.activeCamera == nullptr || light == nullptr) return false;
+                return light->CameraInsideVolume(scene.activeCamera->GetPosition().cast<float>(),
+                                                 scene.activeCamera->GetDirection().cast<float>());
+            };
+            if (pass.back) {
+                AddNodePass(pass.back.get(), SpecTex_VolumetricsBack, 0, extra);
+            }
+            if (pass.front) {
+                AddNodePass(pass.front.get(),
+                            SpecTex_VolumetricsLightBuffer,
+                            0,
+                            extra,
+                            [camera_inside]() { return ! camera_inside(); });
+            }
+            if (pass.fullscreen) {
+                AddNodePass(pass.fullscreen.get(),
+                            SpecTex_VolumetricsLightBuffer,
+                            0,
+                            extra,
+                            camera_inside);
+            }
+        }
+        if (scene.volumetrics.quality < 3 && scene.volumetrics.blur_h &&
+            scene.volumetrics.blur_v) {
+            AddNodePass(scene.volumetrics.blur_h.get(), SpecTex_VolumetricsLightBufferB, 0, extra);
+            AddNodePass(scene.volumetrics.blur_v.get(), SpecTex_VolumetricsLightBuffer, 0, extra);
+        }
+        if (scene.volumetrics.combine) {
+            AddNodePass(scene.volumetrics.combine.get(), SpecTex_Default, 0, extra);
+        }
     }
 
     if (scene.bloom.enabled && !scene.bloom.nodes.empty()) {

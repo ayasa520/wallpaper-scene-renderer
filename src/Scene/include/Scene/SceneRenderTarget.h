@@ -20,6 +20,8 @@ struct SceneRenderTarget {
     i32           mapHeight { 0 };
     bool          allowReuse { false };
     bool          withDepth { false };
+    // Depth-only comparison target sampled with texSample2DCompare.
+    bool          comparisonDepth { false };
     // Model reflection buffers are sampled by authored shaders that derive UVs from clip-space
     // screen coordinates rather than ordinary mesh texture coordinates. This opt-in sampling
     // convention lets material-bound slots fix that Y direction at shader preparation time without
