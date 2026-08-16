@@ -238,6 +238,7 @@ private:
     std::shared_ptr<WPSceneScriptMediaState> m_media_state;
     std::shared_ptr<std::vector<float>>      m_audio_samples;
     bool                                     m_gen_graphviz { false };
+    bool                                     m_reflections_enabled { true };
 
     WPSceneParser                        m_scene_parser;
     std::unique_ptr<audio::SoundManager> m_sound_manager;
@@ -264,6 +265,7 @@ public:
         CMD_APPLY_MEDIA_STATE,
         CMD_APPLY_AUDIO_SAMPLES,
         CMD_SET_FILLMODE,
+        CMD_SET_REFLECTIONS,
         CMD_SET_SPEED,
         CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
         CMD_RECONFIGURE_OFFSCREEN_EXPORT,
@@ -299,6 +301,7 @@ public:
                 CASE_CMD(MOUSE_INPUT);
                 CASE_CMD(MOUSE_LEFT_BUTTON);
                 CASE_CMD(SET_FILLMODE);
+                CASE_CMD(SET_REFLECTIONS);
                 CASE_CMD(SET_SCENE);
                 CASE_CMD(APPLY_USER_PROPERTIES);
                 CASE_CMD(APPLY_MEDIA_STATE);
@@ -523,6 +526,14 @@ private:
                 m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
             }
         }
+    }
+    MHANDLER_CMD(SET_REFLECTIONS) {
+        bool enabled { true };
+        if (! msg->findBool("value", &enabled) || ! m_scene) return;
+        if (m_scene->reflectionsEnabled == enabled) return;
+        m_scene->reflectionsEnabled = enabled;
+        LOG_INFO("SceneWallpaper: reflections %s (live pass gate, RT kept)",
+                 enabled ? "enabled" : "disabled");
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
@@ -784,6 +795,15 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             if (fps >= 5) {
                 m_render_handler->frame_timer.SetRequiredFps((uint8_t)fps);
             }
+        } else if (property == PROPERTY_REFLECTIONS) {
+            bool enabled { true };
+            if (msg->findBool("value", &enabled)) {
+                m_reflections_enabled = enabled;
+                auto nmsg =
+                    CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_REFLECTIONS);
+                nmsg->setBool("value", enabled);
+                nmsg->post();
+            }
         } else if (property == PROPERTY_FILLMODE) {
             int32_t value;
             if (msg->findInt32("value", &value)) {
@@ -959,6 +979,7 @@ void MainHandler::loadScene() {
                                      *m_sound_manager,
                                      &m_user_properties,
                                      m_render_handler->textRenderScale());
+        scene->reflectionsEnabled = m_reflections_enabled;
         scene->vfs.swap(pVfs);
     }
 

@@ -2,6 +2,7 @@
 
 #include "VulkanPass.hpp"
 
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -16,9 +17,10 @@ namespace vulkan
 class ClearPass : public VulkanPass {
 public:
     struct Desc {
-        std::string     target;
-        ImageParameters vk_target;
-        VkClearValue    clear_value {};
+        std::string           target;
+        ImageParameters       vk_target;
+        VkClearValue          clear_value {};
+        std::function<bool()> should_execute;
     };
 
     explicit ClearPass(const Desc&);

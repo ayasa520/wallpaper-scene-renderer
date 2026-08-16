@@ -87,6 +87,8 @@ constexpr std::string_view G_SCREEN { "g_Screen" };
 constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
 
 constexpr std::string_view SpecTex_Default { "_rt_default" };
+// Official model-reflection target. Receivers sample this RT; reflected producers write it.
+constexpr std::string_view SpecTex_Reflection { "_rt_Reflection" };
 // Second physical compose image. Shader color-blend and refraction sample this snapshot while
 // writing `_rt_default`, instead of allocating a unique `_rt_default_<version>_copy` for every
 // self-write.
