@@ -52,6 +52,9 @@ void ClearPass::refreshResources(Scene& scene, const Device& device, RenderingRe
 }
 
 void ClearPass::execute(const Device&, RenderingResources& rr) {
+    if (m_desc.should_execute && !m_desc.should_execute())
+        return;
+
     auto& img = m_desc.vk_target;
     if (!img.handle) {
         setPrepared(false);

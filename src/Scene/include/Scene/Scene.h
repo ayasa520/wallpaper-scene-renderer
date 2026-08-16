@@ -274,6 +274,9 @@ public:
     std::array<float, 3> ambientColor { 0.2f, 0.2f, 0.2f };
     std::array<float, 3> skylightColor { 0.3f, 0.3f, 0.3f };
     BloomSettings        bloom;
+    // Official quality checkbox `reflection`. The RT stays registered when receivers exist;
+    // this flag only gates the mirrored producer pass that populates `_rt_Reflection`.
+    bool                 reflectionsEnabled { true };
     bool                 cameraParallax { false };
     float                cameraParallaxAmount { 0.0f };
     float                cameraParallaxDelay { 0.0f };

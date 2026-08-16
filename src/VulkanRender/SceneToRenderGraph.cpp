@@ -90,15 +90,18 @@ TexNode* addDefaultComposeSnapshot(RenderGraph& rgraph, TexNode* in) {
 }
 
 void addClearPass(RenderGraph& rgraph, const TexNode::Desc& target,
-                  std::array<float, 4> color = { 0.0f, 0.0f, 0.0f, 0.0f }) {
+                  std::array<float, 4> color = { 0.0f, 0.0f, 0.0f, 0.0f },
+                  std::function<bool()> should_execute = {}) {
     rgraph.addPass<vulkan::ClearPass>(
         "clear",
         PassNode::Type::Clear,
-        [target, color](RenderGraphBuilder& builder, vulkan::ClearPass::Desc& desc) {
+        [target, color, should_execute = std::move(should_execute)](
+            RenderGraphBuilder& builder, vulkan::ClearPass::Desc& desc) {
             auto* target_node = builder.createTexNode(target, true);
             builder.write(target_node);
-            desc.target      = target_node->key();
-            desc.clear_value = VkClearValue { .color = { color[0], color[1], color[2], color[3] } };
+            desc.target         = target_node->key();
+            desc.clear_value    = VkClearValue { .color = { color[0], color[1], color[2], color[3] } };
+            desc.should_execute = should_execute;
         });
 }
 
@@ -558,6 +561,16 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
     const bool is_model_pass = material->modelRenderState.has_value();
     const bool clear_model_depth = is_model_pass &&
         extra.model_depth_outputs_seen.insert(output_key).second;
+
+    // Official quality `reflection=false` keeps `_rt_Reflection` allocated and sampled, but
+    // skips the mirrored producer draw. Gate execution here so the checkbox is live without a
+    // topology rebuild; a companion clear pass empties the RT while the switch is off.
+    if (output_key == SpecTex_Reflection) {
+        should_execute = [inner = std::move(should_execute), &scene]() {
+            if (!scene.reflectionsEnabled) return false;
+            return !inner || inner();
+        };
+    }
 
     std::string passName = material->name;
     rgraph.addPass<PassT>(
@@ -1204,6 +1217,15 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
              scene.detachedEffectSourceNodesByWorldNode.size(),
              scene.detachedEffectSourceNodes.size(),
              include_hidden_for_pipeline_warmup ? "true" : "false");
+    if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
+        // Keep the official empty-buffer contract when reflections are off: receivers still
+        // sample `_rt_Reflection`, so the target stays registered and is cleared instead of
+        // destroyed. The clear is a no-op while the quality checkbox is on.
+        rg::addClearPass(*rgraph,
+                         rg::createTexDesc(std::string(SpecTex_Reflection), &scene),
+                         { 0.0f, 0.0f, 0.0f, 0.0f },
+                         [&scene]() { return !scene.reflectionsEnabled; });
+    }
     ToGraphPass(scene.sceneGraph.get(), SpecTex_Default, scene.sceneGraph->ID(), extra);
 
     for (auto& info : extra.link_info) {
