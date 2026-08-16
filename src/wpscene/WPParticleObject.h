@@ -85,7 +85,7 @@ public:
     i32                    id;
     EFlags                 flags;
     std::string            name;
-    float                  rate { 0.0f };
+    float                  rate { 10.0f };
     float                  duration { 0.0f };
     float                  delay { 0.0f };
     float                  minperiodicduration { 0.0f };
