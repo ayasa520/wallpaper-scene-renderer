@@ -20,6 +20,8 @@ public:
 
         // prepared
         ImageParameters vk_result;
+        ImageParameters vk_msaa;
+        bool            has_msaa { false };
         VkClearValue    clear_value;
     };
 

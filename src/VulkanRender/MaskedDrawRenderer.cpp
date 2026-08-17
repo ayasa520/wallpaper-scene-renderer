@@ -184,7 +184,7 @@ VmaImageParameters* MaskedDrawRenderer::acquireAttachment(const Device& device,
                                                           RenderingResources& resources,
                                                           const ShaderDrawData& data) {
     auto* stencil_image = resources.masked_draw_attachments.acquire(
-        device, data.output, data.vk_output.extent, m_stencil_format);
+        device, data.output, data.vk_output.extent, m_stencil_format, data.sample_count);
     if (stencil_image == nullptr) {
         LOG_ERROR("MaskedDrawAttachment: allocation failed node='%s' output='%s' "
                   "extent=[%u,%u] format=%d",
@@ -211,11 +211,14 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
                                                 VK_FORMAT_R8G8B8A8_UNORM,
                                                 context.render_state.color_load_op,
                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                attachmentDescription());
+                                                attachmentDescription(),
+                                                context.data.sample_count,
+                                                context.data.resolve_msaa);
     if (! test_pass.has_value()) return false;
 
     GraphicsPipeline test_pipeline;
     test_pipeline.toDefault();
+    test_pipeline.multisample.rasterizationSamples = context.data.sample_count;
     test_pipeline.depth.stencilTestEnable = true;
     test_pipeline.depth.front = VkStencilOpState {
         .failOp      = VK_STENCIL_OP_KEEP,
@@ -235,7 +238,9 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
         context.render_state.color_load_op,
         false,
         VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        attachmentDescription());
+        attachmentDescription(),
+        context.data.sample_count,
+        context.data.resolve_msaa);
     test_pipeline.addDescriptorSetInfo(spanone { context.descriptor_info })
         .setColorBlendStates(spanone { context.render_state.color_blend })
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -330,13 +335,16 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
                                                 VK_FORMAT_R8G8B8A8_UNORM,
                                                 context.render_state.color_load_op,
                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                attachmentDescription());
+                                                attachmentDescription(),
+                                                context.data.sample_count,
+                                                context.data.resolve_msaa);
     if (! mask_pass.has_value()) return false;
 
     VkPipelineColorBlendAttachmentState mask_color {};
     mask_color.colorWriteMask = 0;
     GraphicsPipeline mask_pipeline;
     mask_pipeline.toDefault();
+    mask_pipeline.multisample.rasterizationSamples = context.data.sample_count;
     mask_pipeline.depth.stencilTestEnable = true;
     mask_pipeline.depth.front = VkStencilOpState {
         .failOp      = VK_STENCIL_OP_KEEP,
@@ -356,7 +364,9 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
         context.render_state.color_load_op,
         false,
         VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        attachmentDescription());
+        attachmentDescription(),
+        context.data.sample_count,
+        context.data.resolve_msaa);
     mask_pipeline.addDescriptorSetInfo(spanone { mask_descriptor_info })
         .setColorBlendStates(spanone { mask_color })
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)

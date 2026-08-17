@@ -22,6 +22,7 @@
 
 #include "RenderGraph/RenderGraph.hpp"
 
+#include "VulkanRender/Msaa.hpp"
 #include "VulkanRender/SceneToRenderGraph.hpp"
 #include "VulkanRender/VulkanRender.hpp"
 #include <algorithm>
@@ -243,6 +244,7 @@ private:
     int32_t                                  m_volumetrics_quality { 2 };
     int32_t                                  m_shadows_quality { 2 };
     int32_t                                  m_postprocessing_quality { 1 };
+    int32_t                                  m_antialiasing_quality { 1 };
 
     WPSceneParser                        m_scene_parser;
     std::unique_ptr<audio::SoundManager> m_sound_manager;
@@ -273,6 +275,7 @@ public:
         CMD_SET_VOLUMETRICS,
         CMD_SET_SHADOWS,
         CMD_SET_POSTPROCESSING,
+        CMD_SET_ANTIALIASING,
         CMD_SET_SPEED,
         CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
         CMD_RECONFIGURE_OFFSCREEN_EXPORT,
@@ -312,6 +315,7 @@ public:
                 CASE_CMD(SET_VOLUMETRICS);
                 CASE_CMD(SET_SHADOWS);
                 CASE_CMD(SET_POSTPROCESSING);
+                CASE_CMD(SET_ANTIALIASING);
                 CASE_CMD(SET_SCENE);
                 CASE_CMD(APPLY_USER_PROPERTIES);
                 CASE_CMD(APPLY_MEDIA_STATE);
@@ -584,6 +588,19 @@ private:
         }
         m_scene->MarkRenderGraphTopologyDirty();
         LOG_INFO("SceneWallpaper: postprocessing quality=%d (rebuild graph)", quality);
+    }
+    MHANDLER_CMD(SET_ANTIALIASING) {
+        int32_t quality { 1 };
+        if (! msg->findInt32("value", &quality) || ! m_scene) return;
+        quality = std::clamp(quality, 0, 3);
+        if (m_scene->msaa.quality == quality && m_scene->msaa.built_quality == quality) return;
+        m_scene->msaa.quality        = quality;
+        m_scene->msaa.device_samples = 0;
+        ConfigureSceneMsaa(*m_scene);
+        m_scene->MarkRenderGraphResourcesDirty();
+        LOG_INFO("SceneWallpaper: antialiasing quality=%d samples=%d (refresh resources)",
+                 quality,
+                 m_scene->msaa.SampleCount());
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
@@ -881,6 +898,15 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                 nmsg->setInt32("value", m_postprocessing_quality);
                 nmsg->post();
             }
+        } else if (property == PROPERTY_ANTIALIASING) {
+            int32_t quality { 1 };
+            if (msg->findInt32("value", &quality)) {
+                m_antialiasing_quality = std::clamp(quality, 0, 3);
+                auto nmsg =
+                    CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_ANTIALIASING);
+                nmsg->setInt32("value", m_antialiasing_quality);
+                nmsg->post();
+            }
         } else if (property == PROPERTY_FILLMODE) {
             int32_t value;
             if (msg->findInt32("value", &value)) {
@@ -1060,6 +1086,8 @@ void MainHandler::loadScene() {
         scene->volumetrics.quality = m_volumetrics_quality;
         scene->shadows.quality     = m_shadows_quality;
         scene->bloom.quality       = m_postprocessing_quality;
+        scene->msaa.quality        = m_antialiasing_quality;
+        ConfigureSceneMsaa(*scene);
         scene->vfs.swap(pVfs);
         if (scene->vfs && (scene->volumetrics.built_quality != m_volumetrics_quality ||
                            scene->shadows.built_quality != m_shadows_quality)) {

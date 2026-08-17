@@ -29,6 +29,8 @@ struct SceneRenderTarget {
     bool          screenSpaceSampleYFlip { false };
     bool          has_mipmap { false };
     uint          mipmap_level { 1 };
+    // 1 = no MSAA. Compose color uses 2/4/8 when the host anti-aliasing tier is x2/x4/x8.
+    int           sample_count { 1 };
     TextureSample sample { TextureWrap::CLAMP_TO_EDGE,
                            TextureWrap::CLAMP_TO_EDGE,
                            TextureFilter::LINEAR,

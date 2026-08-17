@@ -22,6 +22,8 @@ void MaskedMeshPass::refreshResources(Scene& scene, const Device& device,
     if (! m_visible_draw.refreshResources(scene, device, resources)) setPrepared(false);
 }
 
+void MaskedMeshPass::dropOutputFramebuffers() { m_visible_draw.dropOutputFramebuffers(); }
+
 void MaskedMeshPass::updateBeforeUpload() { m_visible_draw.updateBeforeUpload(); }
 
 DeferredPrepareResourcesState

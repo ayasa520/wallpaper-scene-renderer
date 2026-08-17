@@ -336,6 +336,27 @@ public:
     };
     ShadowSettings       shadows;
 
+    struct MsaaSettings {
+        // Official msaa strings: none=0, x2=1, x4=2, x8=3. Sample count is 1 << quality.
+        int quality { 1 };
+        int built_quality { -1 };
+        // Device-clamped sample count written by the Vulkan backend. 0 means not yet queried.
+        int device_samples { 0 };
+
+        static int RequestedSampleCount(int quality) {
+            if (quality <= 0) return 1;
+            if (quality >= 3) return 8;
+            return 1 << quality;
+        }
+
+        int SampleCount() const {
+            if (quality <= 0) return 1;
+            if (device_samples > 1) return device_samples;
+            return RequestedSampleCount(quality);
+        }
+    };
+    MsaaSettings         msaa;
+
     struct LightingInventory {
         int point { 0 };
         int spot { 0 };

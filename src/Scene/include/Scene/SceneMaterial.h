@@ -66,7 +66,8 @@ public:
           hasSprite(o.hasSprite),
           customShader(std::move(o.customShader)),
           blenmode(o.blenmode),
-          modelRenderState(o.modelRenderState) {};
+          modelRenderState(o.modelRenderState),
+          alpha_to_coverage(o.alpha_to_coverage) {};
 
     std::string              name;
     std::vector<std::string> textures;
@@ -83,5 +84,9 @@ public:
     SceneMaterialCustomShader customShader;
     BlendMode                 blenmode { BlendMode::Disable };
     std::optional<SceneModelRenderState> modelRenderState;
+    // True when the material blending mode is alphatocoverage. The ALPHATOCOVERAGE
+    // combo is fixed at material compile from that blending value; rasterizer A2C
+    // is enabled only while the compose target is multisampled.
+    bool                      alpha_to_coverage { false };
 };
 } // namespace wallpaper

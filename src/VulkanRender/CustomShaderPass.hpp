@@ -19,6 +19,7 @@ public:
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void prepareDeferred(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
+    void dropOutputFramebuffers() override;
     void updateBeforeUpload() override;
     DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) override;
     void execute(const Device&, RenderingResources&) override;

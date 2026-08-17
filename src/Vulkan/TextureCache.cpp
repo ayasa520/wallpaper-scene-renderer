@@ -203,20 +203,25 @@ void RecordClearNewRenderTargetToTransparentBlack(vvk::CommandBuffer& cmd,
                         subresourceRange);
 
     {
-        VkImageMemoryBarrier to_shader_read {
+        const bool msaa = image.samples > 1;
+        VkImageMemoryBarrier after_clear {
             .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext            = nullptr,
             .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask    = msaa ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                  : VK_ACCESS_SHADER_READ_BIT,
             .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout        = msaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .image            = image.handle,
             .subresourceRange = subresourceRange,
         };
         cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            msaa ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                 : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                             VK_DEPENDENCY_BY_REGION_BIT,
-                            to_shader_read);
+                            after_clear);
     }
 }
 
@@ -476,18 +481,20 @@ inline std::optional<VmaImageParameters>
 CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat format,
             VkSamplerCreateInfo sampler_info, VkImageUsageFlags usage,
             VmaMemoryUsage mem_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+            VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+            VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
     VmaImageParameters image;
     do {
+        const u32 mip_levels = samples > VK_SAMPLE_COUNT_1_BIT ? 1u : miplevel;
         VkImageCreateInfo info {
             .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext                 = nullptr,
             .imageType             = VK_IMAGE_TYPE_2D,
             .format                = format,
             .extent                = extent,
-            .mipLevels             = miplevel,
+            .mipLevels             = mip_levels,
             .arrayLayers           = 1,
-            .samples               = VK_SAMPLE_COUNT_1_BIT,
+            .samples               = samples,
             .tiling                = VK_IMAGE_TILING_OPTIMAL,
             .usage                 = usage,
             .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
@@ -495,12 +502,13 @@ CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat form
             .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
         };
         image.extent = info.extent;
+        image.samples = static_cast<uint>(samples);
         VmaAllocationCreateInfo vma_info {};
         vma_info.usage = mem_usage;
         VVK_CHECK_ACT(break,
                       vvk::CreateImage(device.vma_allocator(), info, vma_info, image.handle));
 
-        image.mipmap_level = miplevel;
+        image.mipmap_level = mip_levels;
         {
             VkImageViewCreateInfo createinfo {
                 .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -512,7 +520,7 @@ CreateImage(const Device& device, VkExtent3D extent, u32 miplevel, VkFormat form
                     VkImageSubresourceRange {
                         .aspectMask     = aspect,
                         .baseMipLevel   = 0,
-                        .levelCount     = miplevel,
+                        .levelCount     = mip_levels,
                         .baseArrayLayer = 0,
                         .layerCount     = 1,
                     },
@@ -734,6 +742,7 @@ std::size_t TextureKey::HashValue(const TextureKey& k) {
     utils::hash_combine(seed, (int)k.sample.wrapT);
     utils::hash_combine(seed, (int)k.sample.magFilter);
     utils::hash_combine(seed, (int)k.sample.minFilter);
+    utils::hash_combine(seed, (int)k.sample_count);
     return seed;
 }
 
@@ -1006,6 +1015,8 @@ std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
     do {
         VkSamplerCreateInfo sam_info = GenSamplerInfo(tex_key);
         VkExtent3D          ext { (u32)tex_key.width, (u32)tex_key.height, 1 };
+        const auto samples = static_cast<VkSampleCountFlagBits>(
+            tex_key.sample_count > 0 ? tex_key.sample_count : 1u);
 
         if (tex_key.usage == TexUsage::DEPTH) {
             if (auto opt = CreateImage(m_device,
@@ -1015,9 +1026,11 @@ std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
                                        sam_info,
                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                            VK_IMAGE_USAGE_SAMPLED_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                        VMA_MEMORY_USAGE_GPU_ONLY,
-                                       VK_IMAGE_ASPECT_DEPTH_BIT);
+                                       VK_IMAGE_ASPECT_DEPTH_BIT,
+                                       samples);
                 opt.has_value()) {
                 image_paras = std::move(opt.value());
             } else
@@ -1033,7 +1046,10 @@ std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
                             format,
                             sam_info,
                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            VMA_MEMORY_USAGE_GPU_ONLY,
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            samples);
             opt.has_value()) {
             image_paras = std::move(opt.value());
         } else

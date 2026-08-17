@@ -4,6 +4,7 @@
 #include "Utils/Logging.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "Scene/Scene.h"
+#include "SpecTexs.hpp"
 #include "Interface/IImageParser.h"
 #include "Interface/IShaderValueUpdater.h"
 
@@ -15,11 +16,14 @@
 #include "Vulkan/VideoTextureCache.hpp"
 #include "Vulkan/VulkanExSwapchain.hpp"
 
+#include "Msaa.hpp"
+#include "PassCommon.hpp"
 #include "VulkanPass.hpp"
 #include "PrePass.hpp"
 #include "FinPass.hpp"
 #include "CopyPass.hpp"
 #include "Resource.hpp"
+#include "Vulkan/Util.hpp"
 
 #include "Core/ArrayHelper.hpp"
 
@@ -27,7 +31,6 @@
 #include <array>
 #include <cassert>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -129,8 +132,10 @@ struct VulkanRender::Impl {
 
     bool initRes();
     void drawFrameSwapchain();
-    void drawFrameOffscreen();
+    void drawFrameOffscreen(Scene&);
+    int  m_compiled_msaa_samples { -1 };
     void processDeferredGraphPreparation(Scene&);
+    void dropCompiledPassFramebuffers();
     void setRenderTargetSize(Scene&, rg::RenderGraph&);
     bool isDeviceFaultResult(VkResult) const;
     bool checkVkResult(VkResult, const char* operation);
@@ -424,6 +429,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
         image.handle.abandon();
     }
     m_rendering_resources.model_depth_images.clear();
+    m_rendering_resources.model_depth_resolved.clear();
     m_rendering_resources.masked_draw_attachments.abandon();
     if (m_rendering_resources.pipeline_cache) {
         m_rendering_resources.pipeline_cache->abandon();
@@ -478,6 +484,7 @@ void VulkanRender::Impl::destroy() {
         }
         m_rendering_resources.pipeline_cache.reset();
         m_rendering_resources.model_depth_images.clear();
+        m_rendering_resources.model_depth_resolved.clear();
         m_rendering_resources.masked_draw_attachments.clear();
         m_vertex_buf->destroy();
         m_dyn_buf->destroy();
@@ -538,7 +545,6 @@ void VulkanRender::Impl::DestroyRenderingResource(RenderingResources& rr) {}
 void VulkanRender::Impl::drawFrame(Scene& scene) {
     if (m_device_faulted) return;
     if (! (m_inited && m_pass_loaded)) return;
-
     // The QuickJS host records getVideoTexture().play()/pause() decisions on Scene before the
     // renderer polls GStreamer. Applying them here keeps hidden authored videos from decoding
     // while prepared passes can still reuse the last uploaded frame when they are invisible.
@@ -552,6 +558,7 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
     m_device->video_tex_cache().PublishRuntimeStates(
         scene.videoTextureRuntimeStates, scene.videoTextureRuntimeStateRequests);
     processDeferredGraphPreparation(scene);
+    m_rendering_resources.scene = &scene;
 
 #if ENABLE_RENDERDOC_API
     if (rdoc_api)
@@ -560,7 +567,7 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
 #endif
 
     if (m_instance.offscreen()) {
-        drawFrameOffscreen();
+        drawFrameOffscreen(scene);
     } else {
         drawFrameSwapchain();
     }
@@ -816,7 +823,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         return;
 }
 
-void VulkanRender::Impl::drawFrameOffscreen() {
+void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     RenderingResources& rr = m_rendering_resources;
     if (!m_ex_swapchain) {
         return;
@@ -845,6 +852,8 @@ void VulkanRender::Impl::drawFrameOffscreen() {
 
     ImageParameters image = m_ex_swapchain->GetInprogressImage();
 
+    rr.msaa_compose_dirty = false;
+    rr.scene = &scene;
     m_finpass->setPresent(image);
 
     for (auto* p : m_passes) {
@@ -894,6 +903,7 @@ void VulkanRender::Impl::drawFrameOffscreen() {
 }
 
 void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) {
+    SyncSceneMsaa(scene, *m_device);
     auto& ext = m_device->out_extent();
     for (auto& item : scene.renderTargets) {
         auto& rt = item.second;
@@ -1113,6 +1123,7 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     // full graph rebuilds keeps 3D model depth opt-in and avoids stale depth attachments surviving
     // after scene topology or render-target ownership changes.
     m_rendering_resources.model_depth_images.clear();
+    m_rendering_resources.model_depth_resolved.clear();
     m_rendering_resources.masked_draw_attachments.clear();
 
     m_vertex_buf->destroy();
@@ -1182,10 +1193,30 @@ void VulkanRender::Impl::clearRenderGraphResources() {
     // unrelated offscreen images and reintroduce the minute-rollover hitch.
 }
 
+void VulkanRender::Impl::dropCompiledPassFramebuffers() {
+    for (auto& pass_ref : m_compiled_pass_refs) {
+        if (auto* pass = dynamic_cast<VulkanPass*>(pass_ref.get())) {
+            pass->dropOutputFramebuffers();
+        }
+    }
+    for (auto* pass : m_passes) {
+        if (pass != nullptr) pass->dropOutputFramebuffers();
+    }
+}
+
 void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                                             bool refresh_resources_only) {
     if (m_device_faulted) return;
     if (! m_inited) return;
+    SyncSceneMsaa(scene, *m_device);
+    const int msaa_samples = scene.msaa.SampleCount();
+    if (msaa_samples != m_compiled_msaa_samples) {
+        dropCompiledPassFramebuffers();
+        m_rendering_resources.model_depth_images.clear();
+        m_rendering_resources.model_depth_resolved.clear();
+        m_rendering_resources.masked_draw_attachments.clear();
+        m_compiled_msaa_samples = msaa_samples;
+    }
     m_pass_loaded = false;
     const bool had_resident_graph = !m_compiled_pass_refs.empty();
 
