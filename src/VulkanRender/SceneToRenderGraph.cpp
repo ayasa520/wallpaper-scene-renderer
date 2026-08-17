@@ -1342,7 +1342,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
         }
     }
 
-    if (scene.bloom.enabled && !scene.bloom.nodes.empty()) {
+    if (scene.bloom.quality > 0 && scene.bloom.enabled && !scene.bloom.nodes.empty()) {
         // Wallpaper Engine treats `general.bloom` as the execution switch for the complete Bloom
         // chain. Authored strength and threshold values remain stored while the switch is off, but
         // they do not make the post-process execute. Keeping disabled Bloom out of the graph avoids
@@ -1374,7 +1374,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
                 AddNodePass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra);
             }
         }
-    } else if (scene.bloom.enabled && scene.bloom.node != nullptr) {
+    } else if (scene.bloom.quality > 0 && scene.bloom.enabled && scene.bloom.node != nullptr) {
         // This fallback is intentionally retained for older parsed scene objects that may still
         // populate only the legacy single-node field before a full reparse has occurred.
         LOG_INFO("SceneBloomGraphBind: legacy-output='%s' enabled=%s strength=%.3f threshold=%.3f",

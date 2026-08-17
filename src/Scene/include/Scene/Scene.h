@@ -87,9 +87,8 @@ public:
         float                      strength { 0.0f };
         float                      threshold { 1.0f };
         std::array<float, 3>       tint { 1.0f, 1.0f, 1.0f };
-        // Authored HDR bloom metadata is kept for future HDR support, but today it is not a render
-        // capability flag. The LDR bloom graph must decide from the ordinary Bloom controls only,
-        // otherwise a scene-level `hdr=true` would silently change rendering before HDR exists.
+        // Authored HDR bloom metadata. Ultra/displayhdr host quality selects the HDR chain
+        // when this flag is set; enabled quality stays on the LDR chain.
         bool                       hdr { false };
         float                      hdrStrength { 0.0f };
         float                      hdrThreshold { 1.0f };
@@ -102,6 +101,9 @@ public:
         // pass nodes plus their output targets so SceneToRenderGraph can reproduce the chain.
         std::vector<std::shared_ptr<SceneNode>> nodes;
         std::vector<std::string>                outputs;
+        // Host post-processing quality: 0 disabled, 1 enabled, 2 ultra, 3 displayhdr.
+        int                        quality { 1 };
+        int                        built_quality { -1 };
     };
 
     enum class ParsedImageRequestState
