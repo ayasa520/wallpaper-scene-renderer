@@ -34,6 +34,9 @@ public:
         AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
 
         ImageParameters          vk_output;
+        ImageParameters          vk_resolve;
+        VkSampleCountFlagBits    sample_count { VK_SAMPLE_COUNT_1_BIT };
+        bool                     resolve_msaa { false };
         vvk::Framebuffer         framebuffer;
         PipelineParameters       pipeline;
         StagingBufferRef         ubo_buf;
@@ -48,6 +51,7 @@ public:
 
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
+    void dropOutputFramebuffers() override;
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
     bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;

@@ -63,7 +63,8 @@ enum class BlendMode
     Disable,
     Translucent,
     Additive,
-    Normal
+    Normal,
+    AlphaToCoverage
 };
 
 // Alpha writes need an explicit compositor contract independent from the material's RGB blend.

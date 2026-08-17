@@ -13,6 +13,7 @@ MaskedDrawRenderer.cpp
 MaskedDrawShaderContract.cpp
 MaskedMeshPass.cpp
 FinPass.cpp
+Msaa.cpp
 PrePass.cpp
 SceneToRenderGraph.cpp
 TextPass.cpp

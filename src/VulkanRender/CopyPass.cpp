@@ -4,6 +4,7 @@
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
 #include "PassCommon.hpp"
+#include "Msaa.hpp"
 
 using namespace wallpaper::vulkan;
 
@@ -103,6 +104,10 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
         // visible toggles cheap and avoids rebuilding the graph just to skip one effect branch.
         releaseFinalReadTexs(device);
         return;
+    }
+
+    if (rr.scene != nullptr && m_desc.src == SpecTex_Default) {
+        ResolveComposeMsaaIfNeeded(*rr.scene, device, rr);
     }
 
     auto& cmd = rr.command;

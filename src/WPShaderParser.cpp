@@ -32,11 +32,10 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
-    // v23: texLoad2D / texSample2DBackBuffer must emit Texture2D.Load(int3). The previous
-    // Load(int2, mip) form is not a DXC SPIR-V overload, and the prepared-source cache key
-    // hashes only authored WE text, so a prologue-only fix was reused from disk and
-    // volumetricsfront.frag kept failing (Rainy Day SceneVolumetrics compile).
-    "prepared-shader-v24-lighting-v1\n"
+    // Official 1x texSample2DBackBuffer is texSample2D. Texture2DMS.Load is only
+    // emitted with BACKBUFFER_MS, which Vivid does not run (volumetricsfront binds
+    // 1x `_rt_volumetricsBack`).
+    "prepared-shader-v26-a2c-blending\n"
 };
 
 using namespace wallpaper;
@@ -1456,16 +1455,14 @@ float    _ww_mul(float4 a, float4 b) { return dot(a, b); }
 #define texSample2D(t, uv)         ((t).Sample(_ww_sampler_name(t), (uv)))
 #define texSample2DLod(t, uv, lod) ((t).SampleLevel(_ww_sampler_name(t), (uv), (lod)))
 #define texSample2DCompare(t, uv, ref) ((t).SampleCmpLevelZero(_ww_sampler_name(t), (uv), (ref)))
-// Official texLoad2D / texSample2DBackBuffer are integer texel fetches at mip 0.
-// DXC Texture2D.Load takes a single int3 (xy + mip). The two-argument
-// Load(int2, mip) form is not a SPIR-V candidate. Build the address with three
-// scalars so a later int3(float2, 0) rewrite cannot become Load(int2, 0).
+// Official texLoad2D is Texture2D.Load(int3). Official 1x texSample2DBackBuffer
+// is texSample2D; the Texture2DMS.Load form is only used with BACKBUFFER_MS.
 float4 ww_texLoad2D(Texture2D<float4> s, float2 u, float2 r) {
     const int2 coord = int2(u * r);
     return s.Load(int3(coord.x, coord.y, 0));
 }
 #define texLoad2D(s, u, r) (ww_texLoad2D((s), (u), (r)))
-#define texSample2DBackBuffer(s, u, r) (ww_texLoad2D((s), (u), (r)))
+#define texSample2DBackBuffer(s, u, r) texSample2D((s), (u))
 #define texture(t, uv)             texSample2D(t, uv)
 #define textureLod(t, uv, lod)     texSample2DLod(t, uv, lod)
 

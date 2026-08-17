@@ -2,6 +2,7 @@
 #include "Vulkan/Shader.hpp"
 #include "Resource.hpp"
 #include "PassCommon.hpp"
+#include "Msaa.hpp"
 
 #include <array>
 
@@ -227,6 +228,10 @@ void FinPass::refreshResources(Scene& scene, const Device& device, RenderingReso
 }
 
 void FinPass::execute(const Device& device, RenderingResources& rr) {
+    if (rr.scene != nullptr) {
+        ResolveComposeMsaaIfNeeded(*rr.scene, device, rr);
+    }
+
     auto& cmd = rr.command;
     auto& src = m_desc.vk_result;
     auto& dst = m_desc.vk_present;

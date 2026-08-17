@@ -46,6 +46,10 @@ struct ShaderDrawState {
     std::vector<ImageSlotsRef> vk_textures;
     std::vector<i32>           vk_tex_binding;
     ImageParameters            vk_output;
+    ImageParameters            vk_resolve;
+    VkSampleCountFlagBits      sample_count { VK_SAMPLE_COUNT_1_BIT };
+    bool                       resolve_msaa { false };
+    bool                       alpha_to_coverage { false };
 
     bool                          dyn_vertex { false };
     bool                          force_dyn_upload { false };
@@ -108,10 +112,12 @@ struct ShaderDrawRecordContext {
 
 std::optional<vvk::RenderPass> CreateShaderDrawRenderPass(
     const vvk::Device&, VkFormat, VkAttachmentLoadOp, VkImageLayout,
-    const ShaderDrawAttachmentDescription& = {});
+    const ShaderDrawAttachmentDescription& = {},
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool resolve_msaa = false);
 std::string ShaderDrawPipelineCompatibilityKey(
     VkAttachmentLoadOp, bool model_pass, VkAttachmentLoadOp model_depth_load_op,
-    const ShaderDrawAttachmentDescription& = {});
+    const ShaderDrawAttachmentDescription& = {},
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool resolve_msaa = false);
 void UpdateShaderDrawUniform(StagingBuffer*, const StagingBufferRef&,
                              const ShaderReflected::Block&, std::string_view,
                              const ShaderValue&);
@@ -143,6 +149,7 @@ public:
     bool prepare(Scene&, const Device&, RenderingResources&);
     bool prepareDeferred(Scene&, const Device&, RenderingResources&);
     bool refreshResources(Scene&, const Device&, RenderingResources&);
+    void dropOutputFramebuffers();
     void updateBeforeUpload();
     DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&);
     bool warmupPipeline(Scene&, const Device&, RenderingResources&);

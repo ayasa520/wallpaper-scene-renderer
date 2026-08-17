@@ -36,6 +36,7 @@ public:
     // framebuffers. The default implementation is intentionally empty so passes without external
     // GPU resources can stay prepared and skip all extra work on minute-level text updates.
     virtual void refreshResources(Scene&, const Device&, RenderingResources&) {}
+    virtual void dropOutputFramebuffers() {}
     // Dynamic passes write their current CPU-side vertex/index bytes into the shared staging
     // buffer. VulkanRender calls this before recording the frame's staging-buffer upload, so
     // particle systems that grow into newly allocated dynamic subranges after a reused-scene source

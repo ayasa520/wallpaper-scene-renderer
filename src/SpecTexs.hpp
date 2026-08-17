@@ -112,6 +112,9 @@ constexpr std::string_view G_RV3 { "g_RenderVar3" };
 constexpr std::string_view G_RV4 { "g_RenderVar4" };
 
 constexpr std::string_view SpecTex_Default { "_rt_default" };
+// Multisampled compose color. Scene geometry writes this when MSAA is on, then
+// one resolve copies it into `_rt_default` for sampling, bloom, and present.
+constexpr std::string_view SpecTex_DefaultMS { "_rt_FullFrameBufferMultiSampled" };
 constexpr std::string_view SpecTex_VolumetricsBack { "_rt_volumetricsBack" };
 constexpr std::string_view SpecTex_VolumetricsSingle { "_rt_volumetricsSingle" };
 constexpr std::string_view SpecTex_VolumetricsLightBuffer { "_rt_volumetricsLightBuffer" };

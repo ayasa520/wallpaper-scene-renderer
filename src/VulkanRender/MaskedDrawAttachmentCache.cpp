@@ -13,7 +13,8 @@ namespace
 
 std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& device,
                                                              VkExtent3D extent,
-                                                             VkFormat format) {
+                                                             VkFormat format,
+                                                             VkSampleCountFlagBits samples) {
     VmaImageParameters image;
     VkImageCreateInfo info {
         .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -23,7 +24,7 @@ std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& devic
         .extent                = extent,
         .mipLevels             = 1,
         .arrayLayers           = 1,
-        .samples               = VK_SAMPLE_COUNT_1_BIT,
+        .samples               = samples,
         .tiling                = VK_IMAGE_TILING_OPTIMAL,
         .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
         .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
@@ -32,6 +33,7 @@ std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& devic
     };
     image.extent       = extent;
     image.mipmap_level = 1;
+    image.samples      = static_cast<uint>(samples);
 
     VmaAllocationCreateInfo allocation_info {};
     allocation_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
@@ -62,14 +64,15 @@ std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& devic
 VmaImageParameters* MaskedDrawAttachmentCache::acquire(const Device& device,
                                                        std::string_view output,
                                                        VkExtent3D extent,
-                                                       VkFormat format) {
+                                                       VkFormat format,
+                                                       VkSampleCountFlagBits samples) {
     auto& entry = m_entries[std::string(output)];
     const bool missing = ! entry.image.view || ! entry.image.handle;
     const bool wrong_size = entry.image.extent.width != extent.width ||
                             entry.image.extent.height != extent.height ||
                             entry.image.extent.depth != extent.depth;
-    if (missing || wrong_size || entry.format != format) {
-        auto replacement = CreateMaskedDrawAttachment(device, extent, format);
+    if (missing || wrong_size || entry.format != format || entry.samples != samples) {
+        auto replacement = CreateMaskedDrawAttachment(device, extent, format, samples);
         if (! replacement.has_value()) return nullptr;
 
         // Log only allocation boundaries, never cache hits. This keeps normal frame preparation
@@ -83,8 +86,9 @@ VmaImageParameters* MaskedDrawAttachmentCache::acquire(const Device& device,
                  extent.height,
                  extent.depth,
                  static_cast<int>(format));
-        entry.format = format;
-        entry.image  = std::move(*replacement);
+        entry.format  = format;
+        entry.samples = samples;
+        entry.image   = std::move(*replacement);
     }
     return &entry.image;
 }

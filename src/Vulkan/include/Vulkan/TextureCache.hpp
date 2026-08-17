@@ -60,6 +60,7 @@ struct TextureKey {
     TextureFormat format { TextureFormat::RGBA8 };
     TextureSample sample {};
     uint          mipmap_level { 1 };
+    uint          sample_count { 1 };
 
     static TexHash HashValue(const TextureKey&);
 

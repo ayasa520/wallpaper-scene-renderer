@@ -7,10 +7,14 @@
 #include "Utils/Logging.h"
 #include "Vulkan/ShaderComp.hpp"
 #include "PassCommon.hpp"
+#include "Msaa.hpp"
 #include "Resource.hpp"
+#include "ShaderDrawCore.hpp"
 #include "WPSceneScriptMedia.hpp"
 
 #include <Eigen/Dense>
+#include <algorithm>
+#include <array>
 #include <cstdint>
 
 using namespace wallpaper::vulkan;
@@ -21,7 +25,9 @@ constexpr std::string_view kTextBackgroundTextureKey { "__text_layer_background_
 
 std::string TextPipelineCompatibilityKey(bool offscreen_output,
                                          wallpaper::BlendMode blend_mode,
-                                         wallpaper::AlphaWritePolicy alpha_write_policy) {
+                                         wallpaper::AlphaWritePolicy alpha_write_policy,
+                                         VkSampleCountFlagBits sample_count,
+                                         bool resolve_msaa) {
     // Text PSOs are shared by render-pass compatibility plus the full GraphicsPipeline descriptor,
     // not by the layer that first requested them. This keeps visibility toggles on the same model
     // as engine-level PSO caches while still letting hidden text release atlas/framebuffer memory.
@@ -29,7 +35,19 @@ std::string TextPipelineCompatibilityKey(bool offscreen_output,
            std::to_string(static_cast<int>(offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                             : VK_ATTACHMENT_LOAD_OP_LOAD)) +
            "|blend=" + std::to_string(static_cast<int>(blend_mode)) +
-           "|alpha-policy=" + std::to_string(static_cast<int>(alpha_write_policy));
+           "|alpha-policy=" + std::to_string(static_cast<int>(alpha_write_policy)) +
+           "|samples=" + std::to_string(static_cast<int>(sample_count)) +
+           "|resolve=" + (resolve_msaa ? std::string("1") : std::string("0"));
+}
+
+int IntendedTextSampleCount(const wallpaper::Scene* scene, std::string_view output) {
+    // Official compose text writes `_rt_FullFrameBufferMultiSampled`. Effect
+    // ping-pong / text-bridge targets stay 1x: official effect shaders sample
+    // them as Texture2D, and the exe has no multisampled ping-pong RT name.
+    if (scene != nullptr && wallpaper::vulkan::ComposeOutputUsesMsaa(*scene, output)) {
+        return std::max(1, scene->msaa.SampleCount());
+    }
+    return 1;
 }
 
 struct TextPassUniforms {
@@ -173,53 +191,45 @@ float4 main_ps(PSInput input) : SV_Target0 {
     return prepared;
 }
 
-std::optional<vvk::RenderPass> CreateTextRenderPass(const vvk::Device& device,
-                                                    VkFormat           format,
-                                                    VkAttachmentLoadOp load_op) {
-    VkAttachmentDescription attachment {
-        .format         = format,
-        .samples        = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp         = load_op,
-        .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout  = load_op == VK_ATTACHMENT_LOAD_OP_LOAD
-                            ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                            : VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
+bool BindTextPassOutput(wallpaper::Scene& scene, const Device& device, TextPass::Desc& desc) {
+    desc.sample_count = VK_SAMPLE_COUNT_1_BIT;
+    desc.resolve_msaa = false;
+    desc.vk_resolve   = {};
 
-    VkAttachmentReference color_ref {
-        .attachment = 0,
-        .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    };
-    VkSubpassDescription subpass {
-        .pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .colorAttachmentCount = 1,
-        .pColorAttachments    = &color_ref,
-    };
-    VkSubpassDependency dependency {
-        .srcSubpass    = VK_SUBPASS_EXTERNAL,
-        .dstSubpass    = 0,
-        .srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask = {},
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-    };
+    auto output_it = scene.renderTargets.find(desc.output);
+    if (output_it == scene.renderTargets.end()) return false;
+    auto& rt = output_it->second;
 
-    VkRenderPassCreateInfo create_info {
-        .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments    = &attachment,
-        .subpassCount    = 1,
-        .pSubpasses      = &subpass,
-        .dependencyCount = 1,
-        .pDependencies   = &dependency,
-    };
+    // Direct clock/text that composites to `_rt_default` writes the same MS color
+    // target as CustomShaderPass. A 1x write into the resolved image is overwritten
+    // by the later compose resolve of `_rt_FullFrameBufferMultiSampled`.
+    if (ComposeOutputUsesMsaa(scene, desc.output)) {
+        const auto ms_name = std::string(wallpaper::SpecTex_DefaultMS);
+        const auto ms_it   = scene.renderTargets.find(ms_name);
+        if (ms_it != scene.renderTargets.end()) {
+            if (auto ms_opt = device.tex_cache().Query(
+                    ms_name, ToTexKey(ms_it->second), ! ms_it->second.allowReuse);
+                ms_opt.has_value()) {
+                desc.vk_output    = ms_opt.value();
+                desc.sample_count = static_cast<VkSampleCountFlagBits>(
+                    std::max(1u, ms_it->second.sample_count > 0
+                                     ? static_cast<uint>(ms_it->second.sample_count)
+                                     : 1u));
+                desc.resolve_msaa = false;
+                return true;
+            }
+        }
+        LOG_ERROR("TextPass: MSAA compose target missing node='%s' output='%s'",
+                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  desc.output.c_str());
+    }
 
-    vvk::RenderPass pass;
-    if (device.CreateRenderPass(create_info, pass) != VK_SUCCESS) return std::nullopt;
-    return pass;
+    if (auto opt = device.tex_cache().Query(desc.output, ToTexKey(rt), ! rt.allowReuse);
+        opt.has_value()) {
+        desc.vk_output = opt.value();
+        return true;
+    }
+    return false;
 }
 
 void WriteMatrixToUniform(TextPassUniforms& uniforms, const Eigen::Matrix4f& matrix) {
@@ -257,12 +267,18 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
                                     wallpaper::AlphaWritePolicy           alpha_write_policy,
+                                    VkSampleCountFlagBits                 sample_count,
+                                    bool                                  resolve_msaa,
                                     std::string                           debug_name,
                                     PipelineParameters&                   pipeline_parameters) {
-    auto render_pass =
-        CreateTextRenderPass(device.handle(),
-                             VK_FORMAT_R8G8B8A8_UNORM,
-                             offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
+    auto render_pass = CreateShaderDrawRenderPass(
+        device.handle(),
+        VK_FORMAT_R8G8B8A8_UNORM,
+        offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        {},
+        sample_count,
+        resolve_msaa);
     if (!render_pass.has_value()) return false;
 
     const auto compiled_shaders = CompileTextShaders();
@@ -316,9 +332,11 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
 
     GraphicsPipeline pipeline;
     pipeline.toDefault();
+    pipeline.multisample.rasterizationSamples =
+        sample_count > VK_SAMPLE_COUNT_1_BIT ? sample_count : VK_SAMPLE_COUNT_1_BIT;
     pipeline_parameters.debug_name = std::move(debug_name);
-    pipeline_parameters.cache_key =
-        TextPipelineCompatibilityKey(offscreen_output, blend_mode, alpha_write_policy);
+    pipeline_parameters.cache_key = TextPipelineCompatibilityKey(
+        offscreen_output, blend_mode, alpha_write_policy, sample_count, resolve_msaa);
     pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -377,9 +395,13 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
     // The text pipeline depends on the text primitive's vertex layout and output target, both
     // represented by the stable node/layer/output residency key. Visibility gates and the live
     // scene pointer are safe to absorb without recreating shader modules or descriptor layouts.
+    const int this_samples = static_cast<int>(m_desc.sample_count);
+    const int next_samples = IntendedTextSampleCount(next->m_desc.scene, next->m_desc.output);
     return residencyKey() == next->residencyKey() &&
            m_desc.execute_when_hidden == next->m_desc.execute_when_hidden &&
-           m_desc.alpha_write_policy == next->m_desc.alpha_write_policy;
+           m_desc.alpha_write_policy == next->m_desc.alpha_write_policy &&
+           this_samples == next_samples &&
+           ! m_desc.resolve_msaa;
 }
 
 void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
@@ -394,10 +416,12 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
 }
 
 bool TextPass::referencesRenderTarget(std::string_view render_target) const {
-    // A text pass only owns its bridge output. Glyph atlas pages are imported texture-cache entries,
-    // not render-graph targets, so they must not make unrelated text passes participate in a
-    // render-target resize refresh.
-    return m_desc.output == render_target;
+    // A text pass only owns its compose/bridge output. Glyph atlas pages are imported texture-cache
+    // entries, not render-graph targets. Compose text also writes `_rt_FullFrameBufferMultiSampled`
+    // when MSAA is on, so that RT must refresh this pass.
+    return m_desc.output == render_target ||
+           (m_desc.output == wallpaper::SpecTex_Default &&
+            render_target == wallpaper::SpecTex_DefaultMS);
 }
 
 bool TextPass::referencesTextLayer(int32_t layer_id) const {
@@ -442,11 +466,18 @@ bool TextPass::recreateFramebuffer(const Device& device) {
                   m_desc.vk_output.extent.height);
         return false;
     }
+    if (m_desc.resolve_msaa && m_desc.vk_resolve.view == VK_NULL_HANDLE) {
+        LOG_ERROR("TextPassRefresh: missing MSAA resolve view node='%s' output='%s'",
+                  m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+                  m_desc.output.c_str());
+        return false;
+    }
+    std::array<VkImageView, 2> attachments { m_desc.vk_output.view, m_desc.vk_resolve.view };
     VkFramebufferCreateInfo info {
         .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass      = *m_desc.pipeline.pass,
-        .attachmentCount = 1,
-        .pAttachments    = &m_desc.vk_output.view,
+        .attachmentCount = m_desc.resolve_msaa ? 2u : 1u,
+        .pAttachments    = attachments.data(),
         .width           = m_desc.vk_output.extent.width,
         .height          = m_desc.vk_output.extent.height,
         .layers          = 1,
@@ -529,17 +560,11 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
 
     if (!refreshTextures(device)) return;
 
-    auto output_it = scene.renderTargets.find(m_desc.output);
-    if (output_it == scene.renderTargets.end()) return;
     // Text bridge render targets can resize while the TextPass object is intentionally kept alive.
     // The existing framebuffer references the old TextureCache image view, so it must be released
     // before `Query()` is allowed to replace the backing image for this output.
     m_desc.framebuffer.reset();
-    auto output = device.tex_cache().Query(m_desc.output,
-                                           ToTexKey(output_it->second),
-                                           !output_it->second.allowReuse);
-    if (!output.has_value()) return;
-    m_desc.vk_output = output.value();
+    if (!BindTextPassOutput(scene, device, m_desc)) return;
 
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
     m_desc.clear_output = offscreen_output;
@@ -552,6 +577,8 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             *primitive,
             offscreen_output,
             m_desc.alpha_write_policy,
+            m_desc.sample_count,
+            m_desc.resolve_msaa,
             debug_name,
             m_desc.pipeline)) {
         return;
@@ -599,12 +626,14 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
 }
 
 bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResources& rr) {
-    (void)scene;
     const auto* primitive =
         m_desc.node != nullptr ? m_desc.node->Text() : nullptr;
     if (primitive == nullptr) return false;
 
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
+    const int intended_samples = IntendedTextSampleCount(&scene, m_desc.output);
+    const auto sample_count = static_cast<VkSampleCountFlagBits>(intended_samples);
+    const bool resolve_msaa = false;
     const auto debug_name =
         "TextPassWarmup[node=" +
         (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
@@ -614,12 +643,20 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
                                           *primitive,
                                           offscreen_output,
                                           m_desc.alpha_write_policy,
+                                          sample_count,
+                                          resolve_msaa,
                                           debug_name,
                                           m_desc.pipeline);
 }
 
+void TextPass::dropOutputFramebuffers() { m_desc.framebuffer.reset(); }
+
 void TextPass::refreshResources(Scene& scene, const Device& device, RenderingResources& rr) {
-    (void)scene;
+    const int intended_samples = IntendedTextSampleCount(&scene, m_desc.output);
+    if (static_cast<int>(m_desc.sample_count) != intended_samples || m_desc.resolve_msaa) {
+        destory(device, rr);
+        return;
+    }
     if (!refreshTextures(device)) {
         LOG_ERROR("TextPassRefresh: texture refresh failed node='%s' output='%s'",
                   m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
@@ -664,34 +701,26 @@ void TextPass::refreshResources(Scene& scene, const Device& device, RenderingRes
             return;
         }
     }
-    auto output_it = scene.renderTargets.find(m_desc.output);
-    if (output_it == scene.renderTargets.end()) {
-        setPrepared(false);
-        return;
-    }
     const auto previous_output_view = m_desc.vk_output.view;
     const auto previous_output_extent = m_desc.vk_output.extent;
-    const auto desired_output_key = ToTexKey(output_it->second);
-    const bool output_extent_changed =
-        previous_output_extent.width != static_cast<uint32_t>(desired_output_key.width) ||
-        previous_output_extent.height != static_cast<uint32_t>(desired_output_key.height);
-    if (output_extent_changed) {
-        // TextPass follows the same stable-resource rule as CustomShaderPass: keep the framebuffer
-        // when only sampled atlas/input content changes, but release it before TextureCache is
-        // allowed to replace a resized bridge output image.
+    const auto bind_name = ComposeOutputUsesMsaa(scene, m_desc.output)
+                               ? std::string(wallpaper::SpecTex_DefaultMS)
+                               : m_desc.output;
+    if (const auto bind_it = scene.renderTargets.find(bind_name);
+        bind_it != scene.renderTargets.end() &&
+        (previous_output_extent.width != static_cast<uint32_t>(bind_it->second.width) ||
+         previous_output_extent.height != static_cast<uint32_t>(bind_it->second.height))) {
         m_desc.framebuffer.reset();
     }
-    auto output = device.tex_cache().Query(m_desc.output,
-                                           ToTexKey(output_it->second),
-                                           !output_it->second.allowReuse);
-    if (!output.has_value()) {
+    if (!BindTextPassOutput(scene, device, m_desc)) {
         setPrepared(false);
         return;
     }
-    m_desc.vk_output = output.value();
+    const bool output_extent_changed =
+        previous_output_extent.width != m_desc.vk_output.extent.width ||
+        previous_output_extent.height != m_desc.vk_output.extent.height;
     const bool output_view_changed = previous_output_view != m_desc.vk_output.view;
-    const bool framebuffer_missing = !m_desc.framebuffer;
-    if (framebuffer_missing || output_extent_changed || output_view_changed) {
+    if (output_extent_changed || output_view_changed || !m_desc.framebuffer) {
         if (!recreateFramebuffer(device)) {
             setPrepared(false);
             return;
@@ -703,6 +732,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     auto* node = m_desc.node;
     auto* primitive = node != nullptr ? node->Text() : nullptr;
     if (primitive == nullptr) return;
+    if (!m_desc.pipeline.handle || !m_desc.framebuffer) return;
     if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) return;
 
     if (primitive->atlas_version != m_loaded_atlas_version ||
@@ -795,13 +825,14 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         .width = m_desc.vk_output.extent.width,
         .height = m_desc.vk_output.extent.height,
     };
+    std::array<VkClearValue, 2> clear_values { m_desc.clear_value, {} };
     VkRenderPassBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = *m_desc.pipeline.pass,
         .framebuffer = *m_desc.framebuffer,
         .renderArea = VkRect2D { .offset = { 0, 0 }, .extent = output_extent },
-        .clearValueCount = 1,
-        .pClearValues = &m_desc.clear_value,
+        .clearValueCount = m_desc.resolve_msaa ? 2u : 1u,
+        .pClearValues = clear_values.data(),
     };
     rr.command.BeginRenderPass(begin_info, VK_SUBPASS_CONTENTS_INLINE);
     rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
@@ -853,6 +884,11 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     }
 
     rr.command.EndRenderPass();
+
+    if (m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
+        m_desc.output == wallpaper::SpecTex_Default) {
+        NoteComposeMsaaDraw(rr, m_desc.sample_count);
+    }
 }
 
 void TextPass::destory(const Device&, RenderingResources& rr) {
@@ -860,6 +896,9 @@ void TextPass::destory(const Device&, RenderingResources& rr) {
     // object that points at hidden-layer textures, render targets, or dynamic-buffer suballocations.
     m_desc.framebuffer.reset();
     m_desc.vk_output = {};
+    m_desc.vk_resolve = {};
+    m_desc.sample_count = VK_SAMPLE_COUNT_1_BIT;
+    m_desc.resolve_msaa = false;
     m_desc.background_texture = {};
     m_desc.page_textures.clear();
     for (auto& subref : m_background_buffers.vertex_bufs) {

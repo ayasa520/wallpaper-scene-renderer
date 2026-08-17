@@ -10,6 +10,7 @@
 #include "Core/StringHelper.hpp"
 #include "Core/ArrayHelper.hpp"
 #include "SpecTexs.hpp"
+#include "VulkanRender/Msaa.hpp"
 #include "Scene/ShadowAtlas.hpp"
 #include "Scene/LightingV1.hpp"
 #include "Scene/SceneTexture.h"
@@ -1294,6 +1295,8 @@ BlendMode ParseBlendMode(std::string_view str) {
         bm = BlendMode::Additive;
     } else if (str == "normal") {
         bm = BlendMode::Normal;
+    } else if (str == "alphatocoverage") {
+        bm = BlendMode::AlphaToCoverage;
     } else if (str == "disabled") {
         // seems disabled is normal
         bm = BlendMode::Normal;
@@ -1570,6 +1573,17 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
         }
     }
 
+    // ALPHATOCOVERAGE is a compile-time combo injected when the material blending
+    // mode is alphatocoverage. Live msaa changes do not recompile materials;
+    // rasterizer A2C is a separate draw-state bit and follows the current sample
+    // count. Shaders may contain an unused #if ALPHATOCOVERAGE block without
+    // this blending mode; those stay combo-off so 2D translucent layers are not
+    // coverage-tested.
+    const bool blending_alpha_to_coverage = wpmat.blending == "alphatocoverage";
+    if (blending_alpha_to_coverage) {
+        pWPShaderInfo->combos["ALPHATOCOVERAGE"] = "1";
+    }
+
     if (pWPShaderInfo->defTexs.size() > 0) {
         for (auto& t : pWPShaderInfo->defTexs) {
             if (textures.size() > t.first) {
@@ -1652,6 +1666,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
     }
 
     material.blenmode = ParseBlendMode(wpmat.blending);
+    material.alpha_to_coverage = blending_alpha_to_coverage;
 
     const auto& fragment_unit = sd_units.back();
     assert(fragment_unit.stage == ShaderType::FRAGMENT);
@@ -9181,6 +9196,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             .mapHeight = context.ortho_h,
             .bind      = { .enable = true, .screen = true },
         };
+        ConfigureSceneMsaa(*context.scene);
         context.scene->renderTargets[WE_MIP_MAPPED_FRAME_BUFFER.data()] = {
             .width      = context.ortho_w,
             .height     = context.ortho_h,

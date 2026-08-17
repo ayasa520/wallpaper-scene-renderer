@@ -11,10 +11,15 @@
 
 namespace wallpaper
 {
+class Scene;
+
 namespace vulkan
 {
 
 struct RenderingResources {
+    Scene* scene { nullptr };
+    bool   msaa_compose_dirty { false };
+
     vvk::CommandBuffer command;
 
     vvk::Semaphore sem_swap_wait_image;
@@ -30,6 +35,7 @@ struct RenderingResources {
     // rely on them sharing one depth buffer per output target. Keeping that depth storage here makes
     // the behavior opt-in for model passes and leaves all legacy 2D render targets color-only.
     std::unordered_map<std::string, VmaImageParameters> model_depth_images;
+    std::unordered_map<std::string, VmaImageParameters> model_depth_resolved;
 
     MaskedDrawAttachmentCache masked_draw_attachments;
 };

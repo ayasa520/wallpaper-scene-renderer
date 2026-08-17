@@ -14,7 +14,8 @@ const char* BlendModeName(wallpaper::BlendMode mode) {
     case wallpaper::BlendMode::Disable:     return "disable";
     case wallpaper::BlendMode::Translucent: return "translucent";
     case wallpaper::BlendMode::Additive:    return "additive";
-    case wallpaper::BlendMode::Normal:      return "normal";
+    case wallpaper::BlendMode::Normal:           return "normal";
+    case wallpaper::BlendMode::AlphaToCoverage:  return "alphatocoverage";
     }
     return "unknown";
 }
@@ -38,6 +39,8 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
                                         RenderingResources& resources) {
     if (! m_core.refreshResources(scene, device, resources)) setPrepared(false);
 }
+
+void CustomShaderPass::dropOutputFramebuffers() { m_core.dropOutputFramebuffers(); }
 
 void CustomShaderPass::updateBeforeUpload() { m_core.updateBeforeUpload(); }
 

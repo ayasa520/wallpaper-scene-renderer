@@ -11,6 +11,7 @@
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
 #include "PassCommon.hpp"
+#include "Msaa.hpp"
 #include "Interface/IImageParser.h"
 
 #include "Core/ArrayHelper.hpp"
@@ -24,7 +25,8 @@ using namespace wallpaper::vulkan;
 
 std::string wallpaper::vulkan::ShaderDrawPipelineCompatibilityKey(
     VkAttachmentLoadOp load_op, bool model_pass, VkAttachmentLoadOp depth_load_op,
-    const ShaderDrawAttachmentDescription& attachment) {
+    const ShaderDrawAttachmentDescription& attachment, VkSampleCountFlagBits samples,
+    bool resolve_msaa) {
     // Keep this key limited to Vulkan render-pass compatibility. GraphicsPipeline adds the shader,
     // descriptor, vertex-input, blend, depth, and topology state to the final cache key, matching
     // the descriptor-driven PSO caches used by larger renderers instead of tying immutable PSOs to
@@ -38,7 +40,9 @@ std::string wallpaper::vulkan::ShaderDrawPipelineCompatibilityKey(
            "|extra-depth-load=" +
            std::to_string(static_cast<int>(attachment.depth_load_op)) +
            "|extra-stencil-load=" +
-           std::to_string(static_cast<int>(attachment.stencil_load_op));
+           std::to_string(static_cast<int>(attachment.stencil_load_op)) +
+           "|samples=" + std::to_string(static_cast<int>(samples)) +
+           "|resolve=" + (resolve_msaa ? std::string("1") : std::string("0"));
 }
 
 namespace
@@ -73,7 +77,8 @@ VkPrimitiveTopology ToTopology(const wallpaper::SceneMesh& mesh) {
     return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
-std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent) {
+std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent,
+                                                        VkSampleCountFlagBits samples) {
     // Model depth is allocated only for opt-in 3D model passes. The existing 2D render-target cache
     // remains color-only, while separate model chunk passes can still behave like one depth-tested
     // scene when they share the same output texture.
@@ -86,18 +91,20 @@ std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, Vk
         .extent                = extent,
         .mipLevels             = 1,
         .arrayLayers           = 1,
-        .samples               = VK_SAMPLE_COUNT_1_BIT,
+        .samples               = samples,
         .tiling                = VK_IMAGE_TILING_OPTIMAL,
         // SAMPLED + TRANSFER_SRC: the volumetrics fill pass blits this scene depth
         // into `_rt_volumetricsSingle`.
         .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     image.extent       = extent;
     image.mipmap_level = 1;
+    image.samples      = static_cast<uint>(samples);
 
     VmaAllocationCreateInfo vma_info {};
     vma_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
@@ -157,10 +164,19 @@ std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
            "|output=" + m_desc.output;
 }
 
+static int IntendedShaderDrawSampleCount(const ShaderDrawData& desc) {
+    if (desc.scene != nullptr && ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.node)) {
+        return std::max(1, desc.scene->msaa.SampleCount());
+    }
+    return 1;
+}
+
 bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
     // A prepared pass may be reused only when its immutable GPU contract is the same. Runtime
     // visibility gates and descriptor texture keys can be refreshed in place, but changing model
     // depth/blend state or the owning SceneNode would require a different render pass/pipeline.
+    const int this_samples = static_cast<int>(m_desc.sample_count);
+    const int next_samples = IntendedShaderDrawSampleCount(next.m_desc);
     return m_desc.layer_id == next.m_desc.layer_id &&
            m_desc.node == next.m_desc.node &&
            m_desc.output == next.m_desc.output &&
@@ -185,6 +201,8 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
                next.m_desc.use_active_camera_for_uniforms &&
            m_desc.use_active_camera_for_parallax ==
                next.m_desc.use_active_camera_for_parallax &&
+           this_samples == next_samples &&
+           ! m_desc.resolve_msaa &&
            m_desc.textures.size() == next.m_desc.textures.size();
 }
 
@@ -225,20 +243,27 @@ bool ShaderDrawCore::referencesRenderTarget(std::string_view render_target) cons
 
 std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
     const vvk::Device& device, VkFormat format, VkAttachmentLoadOp loadOp,
-    VkImageLayout finalLayout, const ShaderDrawAttachmentDescription& extra_attachment) {
+    VkImageLayout finalLayout, const ShaderDrawAttachmentDescription& extra_attachment,
+    VkSampleCountFlagBits samples, bool resolve_msaa) {
+    const bool store_ms = samples > VK_SAMPLE_COUNT_1_BIT;
+    const bool msaa     = store_ms && resolve_msaa;
+    const VkSampleCountFlagBits color_samples =
+        store_ms ? samples : VK_SAMPLE_COUNT_1_BIT;
+
     VkAttachmentDescription attachment {
         .format         = format,
-        .samples        = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp         = loadOp, // VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .samples        = color_samples,
+        .loadOp         = loadOp,
         .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout    = finalLayout, // ShaderReadOnlyOptimal
+        .finalLayout    = store_ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : finalLayout,
     };
 
     if (loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
-        attachment.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        attachment.initialLayout = store_ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     VkAttachmentReference attachment_ref {
@@ -248,7 +273,7 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
 
     VkAttachmentDescription depth_attachment {
         .format         = extra_attachment.format,
-        .samples        = VK_SAMPLE_COUNT_1_BIT,
+        .samples        = color_samples,
         .loadOp         = extra_attachment.depth_load_op,
         .storeOp        = extra_attachment.depth_store_op,
         .stencilLoadOp  = extra_attachment.stencil_load_op,
@@ -260,12 +285,34 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
         .attachment = 1,
         .layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     };
-    std::array<VkAttachmentDescription, 2> attachments { attachment, depth_attachment };
+
+    VkAttachmentDescription resolve_attachment {
+        .format         = format,
+        .samples        = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout    = finalLayout,
+    };
+    const uint32_t resolve_index = extra_attachment.enabled() ? 2u : 1u;
+    VkAttachmentReference resolve_ref {
+        .attachment = resolve_index,
+        .layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+
+    std::array<VkAttachmentDescription, 3> attachments {
+        attachment,
+        extra_attachment.enabled() ? depth_attachment : resolve_attachment,
+        resolve_attachment,
+    };
 
     VkSubpassDescription subpass {
         .pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
         .colorAttachmentCount    = 1,
         .pColorAttachments       = &attachment_ref,
+        .pResolveAttachments     = msaa ? &resolve_ref : nullptr,
         .pDepthStencilAttachment = extra_attachment.enabled() ? &depth_attachment_ref : nullptr,
     };
 
@@ -283,9 +330,13 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
     };
 
+    uint32_t attachment_count = 1;
+    if (extra_attachment.enabled()) attachment_count++;
+    if (msaa) attachment_count++;
+
     VkRenderPassCreateInfo creatinfo {
         .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = extra_attachment.enabled() ? 2u : 1u,
+        .attachmentCount = attachment_count,
         .pAttachments    = attachments.data(),
         .subpassCount    = 1,
         .pSubpasses      = &subpass,
@@ -621,6 +672,12 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
     SetAttachmentLoadOp(blend_mode, state.color_load_op);
     ApplyModelPassDesc(material, desc, state.color_load_op);
     ApplyExplicitClearPolicy(desc, material, state.color_load_op);
+    if (desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
+        state.color_load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
+        // Compose shaders usually omit alpha. DONT_CARE would drop the opaque
+        // MSAA clear and leave uncovered samples at A=0.
+        state.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    }
     return state;
 }
 
@@ -787,6 +844,33 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
         return false;
     }
     auto& rt = output_it->second;
+    desc.sample_count      = VK_SAMPLE_COUNT_1_BIT;
+    desc.resolve_msaa      = false;
+    desc.alpha_to_coverage = false;
+    desc.vk_resolve        = {};
+    if (ShaderDrawCanUseMsaa(scene, tex_name, desc.node)) {
+        const auto ms_name = std::string(wallpaper::SpecTex_DefaultMS);
+        const auto ms_it   = scene.renderTargets.find(ms_name);
+        if (ms_it != scene.renderTargets.end()) {
+            if (auto ms_opt = device.tex_cache().Query(
+                    ms_name, wallpaper::vulkan::ToTexKey(ms_it->second), ! ms_it->second.allowReuse);
+                ms_opt.has_value()) {
+                desc.vk_output    = ms_opt.value();
+                desc.sample_count = static_cast<VkSampleCountFlagBits>(
+                    std::max(1u, ms_it->second.sample_count > 0
+                                     ? static_cast<uint>(ms_it->second.sample_count)
+                                     : 1u));
+                if (desc.node != nullptr && desc.node->Mesh() != nullptr &&
+                    desc.node->Mesh()->Material() != nullptr) {
+                    desc.alpha_to_coverage = desc.node->Mesh()->Material()->alpha_to_coverage;
+                }
+                return true;
+            }
+        }
+        LOG_ERROR("CustomShaderPassRefresh: MSAA compose target missing node='%s' output='%s'",
+                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  tex_name.c_str());
+    }
     if (auto opt =
             device.tex_cache().Query(tex_name, wallpaper::vulkan::ToTexKey(rt), ! rt.allowReuse);
         opt.has_value()) {
@@ -854,21 +938,37 @@ VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingRe
     const bool wrong_size = depth.extent.width != desc.vk_output.extent.width ||
                             depth.extent.height != desc.vk_output.extent.height ||
                             depth.extent.depth != desc.vk_output.extent.depth;
-    if (missing || wrong_size) {
+    const bool wrong_samples = depth.samples != static_cast<uint>(desc.sample_count);
+    if (missing || wrong_size || wrong_samples) {
         // A single output can receive many model chunk passes. Recreate the shared depth image only
-        // when the output extent changes, then later chunks can load the same depth written by the
-        // earlier chunks in render-graph order.
-        auto replacement = CreateModelDepthImage(device, desc.vk_output.extent);
+        // when the output extent or sample count changes, then later chunks can load the same depth
+        // written by the earlier chunks in render-graph order.
+        auto replacement = CreateModelDepthImage(device, desc.vk_output.extent, desc.sample_count);
         if (! replacement.has_value()) {
             LOG_ERROR("CustomShaderPassRefresh: cannot create shared model depth image node='%s' "
-                      "output='%s' extent=[%u,%u]",
+                      "output='%s' extent=[%u,%u] samples=%u",
                       desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
                       desc.output.c_str(),
                       desc.vk_output.extent.width,
-                      desc.vk_output.extent.height);
+                      desc.vk_output.extent.height,
+                      static_cast<unsigned>(desc.sample_count));
             return nullptr;
         }
         depth = std::move(replacement.value());
+        rr.model_depth_resolved.erase(desc.output);
+    }
+    if (desc.sample_count > VK_SAMPLE_COUNT_1_BIT) {
+        auto&      resolved      = rr.model_depth_resolved[desc.output];
+        const bool res_missing   = ! resolved.view || ! resolved.handle;
+        const bool res_wrong_size = resolved.extent.width != desc.vk_output.extent.width ||
+                                    resolved.extent.height != desc.vk_output.extent.height;
+        if (res_missing || res_wrong_size) {
+            auto replacement =
+                CreateModelDepthImage(device, desc.vk_output.extent, VK_SAMPLE_COUNT_1_BIT);
+            if (replacement.has_value()) {
+                resolved = std::move(replacement.value());
+            }
+        }
     }
     return &depth;
 }
@@ -921,17 +1021,32 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
     }
     if (attachment.enabled() && desc.depth_stencil_image_ref == nullptr) return false;
 
-    std::array<VkImageView, 2> attachments {
+    std::array<VkImageView, 3> attachments {
         desc.vk_output.view,
         desc.depth_stencil_image_ref != nullptr && desc.depth_stencil_image_ref->view
             ? *desc.depth_stencil_image_ref->view
             : VK_NULL_HANDLE,
+        desc.vk_resolve.view,
     };
+    if (desc.resolve_msaa && desc.vk_resolve.view == VK_NULL_HANDLE) {
+        LOG_ERROR("CustomShaderPassRefresh: missing MSAA resolve view node='%s' output='%s'",
+                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  desc.output.c_str());
+        return false;
+    }
+    uint32_t attachment_count = 1;
+    if (attachment.enabled()) attachment_count++;
+    if (desc.resolve_msaa) {
+        if (! attachment.enabled()) {
+            attachments[1] = desc.vk_resolve.view;
+        }
+        attachment_count++;
+    }
     VkFramebufferCreateInfo info {
         .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .pNext           = nullptr,
         .renderPass      = *desc.pipeline.pass,
-        .attachmentCount = attachment.enabled() ? 2u : 1u,
+        .attachmentCount = attachment_count,
         .pAttachments    = attachments.data(),
         .width           = desc.vk_output.extent.width,
         .height          = desc.vk_output.extent.height,
@@ -1086,13 +1201,18 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                                               VK_FORMAT_R8G8B8A8_UNORM,
                                               render_state.color_load_op,
                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                              attachment);
+                                              attachment,
+                                              m_desc.sample_count,
+                                              m_desc.resolve_msaa);
         if (! opt.has_value()) return false;
         auto& pass = opt.value();
 
         descriptor_info.push_descriptor = true;
         GraphicsPipeline pipeline;
         pipeline.toDefault();
+        pipeline.multisample.rasterizationSamples = m_desc.sample_count;
+        pipeline.multisample.alphaToCoverageEnable =
+            m_desc.alpha_to_coverage && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT;
         ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
         m_desc.pipeline.debug_name =
             "CustomShaderPass[node=" +
@@ -1109,7 +1229,9 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             render_state.color_load_op,
             m_desc.model_pass,
             m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-            attachment);
+            attachment,
+            m_desc.sample_count,
+            m_desc.resolve_msaa);
         if (! pipeline.create(device, pass, m_desc.pipeline, rr.pipeline_cache.get())) return false;
 
         if (m_extension != nullptr &&
@@ -1515,20 +1637,32 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
             });
         }
     }
+    if (ShaderDrawCanUseMsaa(scene, m_desc.output, m_desc.node)) {
+        m_desc.sample_count = static_cast<VkSampleCountFlagBits>(
+            std::max(1, scene.msaa.SampleCount()));
+        m_desc.resolve_msaa = false;
+        if (mesh.Material() != nullptr) {
+            m_desc.alpha_to_coverage = mesh.Material()->alpha_to_coverage;
+        }
+    }
     auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
-
     const auto attachment = ResolveShaderDrawAttachment(m_desc, m_extension);
     auto opt = CreateShaderDrawRenderPass(device.handle(),
                                           VK_FORMAT_R8G8B8A8_UNORM,
                                           render_state.color_load_op,
                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                          attachment);
+                                          attachment,
+                                          m_desc.sample_count,
+                                          m_desc.resolve_msaa);
     if (! opt.has_value()) return false;
     auto& pass = opt.value();
 
     descriptor_info.push_descriptor = true;
     GraphicsPipeline pipeline;
     pipeline.toDefault();
+    pipeline.multisample.rasterizationSamples = m_desc.sample_count;
+    pipeline.multisample.alphaToCoverageEnable =
+        m_desc.alpha_to_coverage && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT;
     ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
     m_desc.pipeline.debug_name =
         "CustomShaderPassWarmup[node=" +
@@ -1538,7 +1672,9 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
         render_state.color_load_op,
         m_desc.model_pass,
         m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-        attachment);
+        attachment,
+        m_desc.sample_count,
+        m_desc.resolve_msaa);
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
         .setColorBlendStates(spanone { render_state.color_blend })
         .setTopology(ToTopology(mesh))
@@ -1585,21 +1721,27 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     }
     const auto previous_output_view   = m_desc.vk_output.view;
     const auto previous_output_extent = m_desc.vk_output.extent;
+    const auto previous_samples       = m_desc.sample_count;
+    const auto previous_resolve       = m_desc.resolve_msaa;
     const auto desired_output_key     = wallpaper::vulkan::ToTexKey(output_target_it->second);
     const bool output_extent_changed =
         previous_output_extent.width != static_cast<uint32_t>(desired_output_key.width) ||
         previous_output_extent.height != static_cast<uint32_t>(desired_output_key.height);
-    if (output_extent_changed) {
-        // Only an output size change requires releasing the framebuffer before TextureCache::Query.
-        // Recreating every framebuffer on every resource refresh was both wasteful and unsafe for
-        // unchanged `_rt_default` passes: those passes can keep their attachment while only their
-        // sampled input texture changes, exactly like a particle pass consuming a live source.
+    const int intended_samples = IntendedShaderDrawSampleCount(m_desc);
+    if (output_extent_changed || intended_samples != static_cast<int>(previous_samples)) {
+        // Drop the framebuffer before TextureCache replaces `_rt_FullFrameBufferMultiSampled`.
+        // Keeping a live framebuffer across that resize leaves a destroyed MSAA image attached
+        // and the next submit waits on the frame fence forever.
         m_desc.fb.reset();
     }
     if (! RefreshCustomShaderPassTextures(scene, device, m_desc)) {
         LOG_ERROR("CustomShaderPassRefresh: texture refresh failed node='%s' output='%s'",
                   m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
                   m_desc.output.c_str());
+        return false;
+    }
+    if (m_desc.sample_count != previous_samples || m_desc.resolve_msaa != previous_resolve) {
+        destroy(rr);
         return false;
     }
     if (m_extension != nullptr && ! m_extension->refreshTextures(scene, device, m_desc)) {
@@ -1623,6 +1765,8 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     }
     return true;
 }
+
+void ShaderDrawCore::dropOutputFramebuffers() { m_desc.fb.reset(); }
 
 void ShaderDrawCore::updateBeforeUpload() {
     if (! m_desc.update_dynamic_mesh_op) return;
@@ -1673,6 +1817,11 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     }
 
     if (m_desc.update_op) m_desc.update_op();
+
+    if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;
+        scene != nullptr && ShaderDrawSamplesResolvedDefault(m_desc.textures)) {
+        ResolveComposeMsaaIfNeeded(*scene, device, rr);
+    }
 
     auto&                   cmd    = rr.command;
     auto&                   outext = m_desc.vk_output.extent;
@@ -1762,7 +1911,10 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     }
 
     m_desc.depth_clear_value.depthStencil = { m_desc.depth_clear, 0 };
-    std::array<VkClearValue, 2> clear_values { m_desc.clear_value, m_desc.depth_clear_value };
+    std::array<VkClearValue, 3> clear_values { m_desc.clear_value, m_desc.depth_clear_value, {} };
+    uint32_t clear_count = 1;
+    if (ResolveShaderDrawAttachment(m_desc, m_extension).enabled()) clear_count++;
+    if (m_desc.resolve_msaa) clear_count++;
     VkRenderPassBeginInfo       pass_begin_info {
         .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .pNext       = nullptr,
@@ -1773,7 +1925,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
                 .offset = { 0, 0 },
                 .extent = { outext.width, outext.height },
             },
-        .clearValueCount = ResolveShaderDrawAttachment(m_desc, m_extension).enabled() ? 2u : 1u,
+        .clearValueCount = clear_count,
         .pClearValues    = clear_values.data(),
     };
     cmd.BeginRenderPass(pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
@@ -1818,6 +1970,92 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     }
 
     cmd.EndRenderPass();
+
+    if (m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
+        m_desc.output == wallpaper::SpecTex_Default) {
+        NoteComposeMsaaDraw(rr, m_desc.sample_count);
+    }
+
+    if (m_desc.model_pass && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
+        m_desc.depth_stencil_image_ref != nullptr && m_desc.depth_stencil_image_ref->handle) {
+        auto resolved_it = rr.model_depth_resolved.find(m_desc.output);
+        if (resolved_it != rr.model_depth_resolved.end() && resolved_it->second.handle) {
+            auto& src = *m_desc.depth_stencil_image_ref;
+            auto& dst = resolved_it->second;
+            VkImageSubresourceRange range {
+                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
+                .baseMipLevel   = 0,
+                .levelCount     = 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            };
+            VkImageMemoryBarrier bars[2] {
+                {
+                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    .dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+                    .oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    .image            = *src.handle,
+                    .subresourceRange = range,
+                },
+                {
+                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask    = 0,
+                    .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .image            = *dst.handle,
+                    .subresourceRange = range,
+                },
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                {},
+                                {},
+                                std::array { bars[0], bars[1] });
+            VkImageResolve region {
+                .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                .extent         = src.extent,
+            };
+            std::array<VkImageResolve, 1> regions { region };
+            cmd.ResolveImage(*src.handle,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             *dst.handle,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             regions);
+            VkImageMemoryBarrier after[2] {
+                {
+                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+                    .dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    .newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    .image            = *src.handle,
+                    .subresourceRange = range,
+                },
+                {
+                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+                    .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    .image            = *dst.handle,
+                    .subresourceRange = range,
+                },
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                {},
+                                {},
+                                std::array { after[0], after[1] });
+        }
+    }
     // Temporary render targets may only be returned to TextureCache after the pass has actually
     // consumed them in the recorded frame. Releasing during prepare/resource-refresh is unsafe:
     // all passes are prepared before any pass executes, so a later pass can accidentally bind a

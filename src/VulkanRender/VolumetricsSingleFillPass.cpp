@@ -315,9 +315,17 @@ void VolumetricsSingleFillPass::clearFar(RenderingResources& rr) const {
 void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources& rr) {
     if (! m_desc.vk_dst.handle) return;
 
-    auto depth_it = rr.model_depth_images.find(m_desc.scene_output);
-    if (depth_it == rr.model_depth_images.end() || ! depth_it->second.handle ||
-        ! depth_it->second.view) {
+    VmaImageParameters* depth_image = nullptr;
+    if (auto resolved = rr.model_depth_resolved.find(m_desc.scene_output);
+        resolved != rr.model_depth_resolved.end() && resolved->second.handle &&
+        resolved->second.view) {
+        depth_image = &resolved->second;
+    } else if (auto raw = rr.model_depth_images.find(m_desc.scene_output);
+               raw != rr.model_depth_images.end() && raw->second.handle && raw->second.view &&
+               raw->second.samples <= 1) {
+        depth_image = &raw->second;
+    }
+    if (depth_image == nullptr) {
         // A cleared scene depth is far 1.0 when reverse-depth is off.
         clearFar(rr);
         return;
@@ -327,7 +335,12 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
         return;
     }
 
-    auto& depth = depth_it->second;
+    auto& depth = *depth_image;
+    bool  from_resolved = false;
+    if (auto it = rr.model_depth_resolved.find(m_desc.scene_output);
+        it != rr.model_depth_resolved.end() && &it->second == depth_image) {
+        from_resolved = true;
+    }
     VkImageSubresourceRange depth_range {
         .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
         .baseMipLevel   = 0,
@@ -345,10 +358,12 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
         .image            = *depth.handle,
         .subresourceRange = depth_range,
     };
-    rr.command.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                               VK_DEPENDENCY_BY_REGION_BIT,
-                               depth_to_sample);
+    if (! from_resolved) {
+        rr.command.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_DEPENDENCY_BY_REGION_BIT,
+                                   depth_to_sample);
+    }
 
     const VkExtent2D extent { m_desc.vk_dst.extent.width, m_desc.vk_dst.extent.height };
     VkClearValue     unused {};
@@ -406,11 +421,13 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
         .image            = *depth.handle,
         .subresourceRange = depth_range,
     };
-    rr.command.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                               VK_DEPENDENCY_BY_REGION_BIT,
-                               depth_restore);
+    if (! from_resolved) {
+        rr.command.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                   VK_DEPENDENCY_BY_REGION_BIT,
+                                   depth_restore);
+    }
 }
 
 void VolumetricsSingleFillPass::destory(const Device&, RenderingResources& rr) {

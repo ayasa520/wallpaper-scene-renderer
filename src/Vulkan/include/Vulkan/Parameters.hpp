@@ -42,6 +42,7 @@ struct VmaImageParameters : NoCopy {
     vvk::Sampler   sampler;
     VkExtent3D     extent;
     uint           mipmap_level { 1 };
+    uint           samples { 1 };
 
     VmaImageParameters();
     ~VmaImageParameters();
@@ -78,6 +79,7 @@ struct ImageParameters {
     VkSampler   sampler;
     VkExtent3D  extent;
     uint        mipmap_level { 1 };
+    uint        samples { 1 };
 
     ImageParameters()  = default;
     ~ImageParameters() = default;
@@ -86,7 +88,8 @@ struct ImageParameters {
           view(*o.view),
           sampler(*o.sampler),
           extent(o.extent),
-          mipmap_level(o.mipmap_level) {}
+          mipmap_level(o.mipmap_level),
+          samples(o.samples) {}
     ImageParameters(const ExImageParameters& o) noexcept
         : handle(*o.handle),
           view(*o.view),

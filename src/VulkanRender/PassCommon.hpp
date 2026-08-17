@@ -20,6 +20,11 @@ inline void SetBlend(BlendMode bm, VkPipelineColorBlendAttachmentState& state) {
         state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
         break;
+    case BlendMode::AlphaToCoverage:
+        // Coverage writes opaque samples; the rasterizer A2C bit is applied
+        // separately when the target is multisampled.
+        state.blendEnable = false;
+        break;
     case BlendMode::Translucent:
         state.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
         state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -37,7 +42,8 @@ inline void SetBlend(BlendMode bm, VkPipelineColorBlendAttachmentState& state) {
 inline void SetAttachmentLoadOp(BlendMode bm, VkAttachmentLoadOp& load_op) {
     switch (bm) {
     case BlendMode::Disable:
-    case BlendMode::Normal: load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE; break;
+    case BlendMode::Normal:
+    case BlendMode::AlphaToCoverage: load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE; break;
     case BlendMode::Additive:
     case BlendMode::Translucent: load_op = VK_ATTACHMENT_LOAD_OP_LOAD; break;
     }
@@ -51,6 +57,7 @@ inline TextureKey ToTexKey(wallpaper::SceneRenderTarget rt) {
         .format       = wallpaper::TextureFormat::RGBA8,
         .sample       = rt.sample,
         .mipmap_level = rt.mipmap_level,
+        .sample_count = rt.sample_count > 0 ? static_cast<uint>(rt.sample_count) : 1u,
     };
 }
 } // namespace vulkan
