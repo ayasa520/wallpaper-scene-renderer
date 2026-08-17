@@ -26,6 +26,15 @@ SceneIndexArray::~SceneIndexArray() {
     if (m_pData != nullptr) delete[] m_pData;
 }
 
+usize SceneIndexArray::ReleaseCpuPayload() noexcept {
+    if (m_pData == nullptr) return 0;
+    const usize bytes = m_capacity * Unit_Byte_Size;
+    delete[] m_pData;
+    m_pData    = nullptr;
+    m_capacity = 0;
+    return bytes;
+}
+
 bool SceneIndexArray::IncreaseCheckSet(size_t nsize) {
     if (nsize > CapacitySizeof()) return false;
     if (nsize > DataSizeOf()) {

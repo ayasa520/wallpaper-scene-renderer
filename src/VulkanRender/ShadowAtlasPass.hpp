@@ -5,12 +5,17 @@
 #include "Scene/Scene.h"
 #include "Vulkan/Device.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
+#include "Vulkan/ImmutableMeshStore.hpp"
 #include "Vulkan/Parameters.hpp"
+#include "Vulkan/Spv.hpp"
 #include "Vulkan/StagingBuffer.hpp"
 
 #include <Eigen/Dense>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace wallpaper
@@ -42,13 +47,14 @@ public:
 
 private:
     struct CasterMesh {
-        SceneNode*       node { nullptr };
-        StagingBufferRef vertex;
-        StagingBufferRef index;
-        uint32_t         index_count { 0 };
-        uint32_t         vertex_count { 0 };
-        uint32_t         index_element_bytes { 2 };
-        bool             indexed { false };
+        SceneNode*                        node { nullptr };
+        std::shared_ptr<ImmutableMeshGpu> mesh;
+        uint32_t                          stride { 0 };
+        uint32_t                          position_offset { 0 };
+        uint32_t                          index_count { 0 };
+        uint32_t                          vertex_count { 0 };
+        uint32_t                          index_element_bytes { 2 };
+        bool                              indexed { false };
     };
 
     struct DrawItem {
@@ -65,18 +71,23 @@ private:
         Eigen::Matrix4f mvp { Eigen::Matrix4f::Identity() };
     };
 
-    bool ensurePipeline(const Device&, RenderingResources&);
+    bool ensureClearPass(const Device&);
+    bool ensureShadowShaders();
+    bool ensurePipeline(const Device&, RenderingResources&, uint32_t stride,
+                        uint32_t position_offset);
     bool ensureFramebuffer(const Device&);
     void collectCasters(Scene&, const Device&, RenderingResources&);
-    void releaseCasters(RenderingResources&);
+    void releaseCasters();
     void rebuildDrawList();
 
     Desc               m_desc;
     StagingBuffer*     m_dyn_buf { nullptr };
     StagingBufferRef   m_ubo_buf;
     VkDeviceSize       m_ubo_align { 256 };
+    vvk::RenderPass    m_clear_pass;
     vvk::Framebuffer   m_fb;
-    PipelineParameters m_pipeline;
+    std::vector<Uni_ShaderSpv> m_shader_spvs;
+    std::unordered_map<uint64_t, PipelineParameters> m_pipelines;
     VkExtent2D         m_fb_extent {};
     std::vector<CasterMesh> m_casters;
     std::vector<DrawItem>   m_draws;

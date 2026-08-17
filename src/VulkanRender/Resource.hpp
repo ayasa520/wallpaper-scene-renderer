@@ -2,6 +2,7 @@
 #include "Core/NoCopyMove.hpp"
 #include "MaskedDrawAttachmentCache.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
+#include "Vulkan/ImmutableMeshStore.hpp"
 #include "Vulkan/StagingBuffer.hpp"
 #include "vvk/vma_wrapper.hpp"
 #include <cstdint>
@@ -28,6 +29,7 @@ struct RenderingResources {
 
     StagingBuffer* vertex_buf;
     StagingBuffer* dyn_buf;
+    ImmutableMeshStore immutable_meshes;
 
     std::shared_ptr<GraphicsPipelineStateCache> pipeline_cache;
 

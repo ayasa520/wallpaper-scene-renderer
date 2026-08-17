@@ -7,6 +7,7 @@
 #include "Vulkan/Device.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
 #include "Vulkan/Shader.hpp"
+#include "Vulkan/ImmutableMeshStore.hpp"
 #include "Vulkan/StagingBuffer.hpp"
 #include "VulkanPass.hpp"
 
@@ -53,6 +54,7 @@ struct ShaderDrawState {
 
     bool                          dyn_vertex { false };
     bool                          force_dyn_upload { false };
+    std::shared_ptr<ImmutableMeshGpu> immutable_mesh;
     std::vector<StagingBufferRef> vertex_bufs;
     StagingBufferRef              index_buf;
     StagingBufferRef              ubo_buf;

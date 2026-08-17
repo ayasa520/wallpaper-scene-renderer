@@ -29,6 +29,7 @@ SceneVertexArray::SceneVertexArray(const std::vector<SceneVertexAttribute>& attr
                                    const usize                              count)
     : m_attributes(attrs) {
     for (const auto& el : m_attributes) {
+        if (el.alias) continue;
         usize size = SceneVertexArray::RealAttributeSize(el);
         m_oneSize += size;
     }
@@ -64,6 +65,7 @@ bool SceneVertexArray::AddVertex(const float* data) {
     usize  mpos  = 0;
     float* mData = m_pData + m_size;
     for (const auto& el : m_attributes) {
+        if (el.alias) continue;
         auto typeSize = SceneVertexArray::TypeCount(el.type);
         std::copy(data + pos, data + pos + typeSize, m_pData + mpos);
         pos += typeSize;
@@ -76,6 +78,13 @@ bool SceneVertexArray::AddVertex(const float* data) {
 bool SceneVertexArray::SetVertex(std::string_view name, std::span<const float> data) noexcept {
     u32 offset = 0;
     for (const auto& el : m_attributes) {
+        if (el.alias) {
+            if (el.name == name) {
+                offset = static_cast<u32>(el.alias_byte_offset / sizeof(float));
+            } else {
+                continue;
+            }
+        }
         if (el.name == name) {
             usize typeSize = SceneVertexArray::TypeCount(el.type);
             usize count    = data.size() / typeSize;
@@ -102,6 +111,22 @@ bool SceneVertexArray::SetVertexs(usize index, std::span<const float> data) noex
     return false;
 }
 
+bool SceneVertexArray::SetPackedBytes(std::span<const uint8_t> data) noexcept {
+    if (m_pData == nullptr || data.size() > CapacitySizeOf()) return false;
+    std::memcpy(m_pData, data.data(), data.size());
+    m_size = data.size() / sizeof(float);
+    return m_oneSize > 0 && (data.size() % OneSizeOf()) == 0;
+}
+
+usize SceneVertexArray::ReleaseCpuPayload() noexcept {
+    if (m_pData == nullptr) return 0;
+    const usize bytes = m_capacity * sizeof(float);
+    delete[] m_pData;
+    m_pData    = nullptr;
+    m_capacity = 0;
+    return bytes;
+}
+
 bool SceneVertexArray::TrySetSize(usize new_size) noexcept {
     assert(new_size <= m_capacity);
     if (new_size > m_capacity) {
@@ -116,6 +141,11 @@ SceneVertexArray::GetAttrOffsetMap() const {
     Map<std::string, SceneVertexArray::SceneVertexAttributeOffset> result;
     usize                                                          offset { 0 };
     for (const auto& attr : m_attributes) {
+        if (attr.alias) {
+            result[attr.name] =
+                (SceneVertexAttributeOffset { .attr = attr, .offset = attr.alias_byte_offset });
+            continue;
+        }
         result[attr.name] = (SceneVertexAttributeOffset { .attr = attr, .offset = offset });
         offset += SceneVertexArray::RealAttributeSize(attr) * sizeof(float);
     }

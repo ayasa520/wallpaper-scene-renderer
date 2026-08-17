@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <span>
 #include "Core/MapSet.hpp"
@@ -19,6 +20,10 @@ public:
         std::string name;
         VertexType  type;
         bool        padding { true };
+        // Alias attributes expose another name at an existing packed byte offset. They do not
+        // consume stride, so UV naming variants can bind without padding the GPU vertex layout.
+        bool  alias { false };
+        usize alias_byte_offset { 0 };
     };
     struct SceneVertexAttributeOffset {
         SceneVertexAttribute attr;
@@ -34,6 +39,7 @@ public:
     bool AddVertex(const float*);
     bool SetVertex(std::string_view name, std::span<const float> data) noexcept;
     bool SetVertexs(std::size_t index, std::span<const float> data) noexcept;
+    bool SetPackedBytes(std::span<const uint8_t> data) noexcept;
 
     bool GetOption(std::string_view) const;
     void SetOption(std::string_view, bool);
@@ -41,6 +47,9 @@ public:
     const float* Data() const { return m_pData; }
     usize        DataSize() const { return m_size; }
     usize        DataSizeOf() const { return m_size * sizeof(float); }
+    // Drops the host vertex bytes after the GPU copy. Attribute names, packed stride, and
+    // vertex count stay so pipelines and bounds can bind without a second unpacked clone.
+    usize        ReleaseCpuPayload() noexcept;
     void         ResetSize() noexcept { m_size = 0; }
     usize        VertexCount() const { return m_size / m_oneSize; }
     usize        CapacitySize() const { return m_capacity; }

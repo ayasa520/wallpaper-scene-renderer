@@ -15,8 +15,10 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 
 using namespace wallpaper::vulkan;
@@ -102,22 +104,6 @@ std::optional<vvk::RenderPass> CreateShadowRenderPass(const vvk::Device& device)
     return pass;
 }
 
-bool ExtractPositions(const wallpaper::SceneVertexArray& vertex, std::vector<float>& packed) {
-    const auto attrs = vertex.GetAttrOffsetMap();
-    const auto it    = attrs.find(std::string(wallpaper::WE_IN_POSITION));
-    if (it == attrs.end() || vertex.VertexCount() == 0 || vertex.Data() == nullptr) return false;
-    const wallpaper::usize stride = vertex.OneSize();
-    const wallpaper::usize offset = it->second.offset / sizeof(float);
-    packed.resize(vertex.VertexCount() * 3);
-    for (wallpaper::usize i = 0; i < vertex.VertexCount(); ++i) {
-        const float* src      = vertex.Data() + i * stride + offset;
-        packed[i * 3 + 0]     = src[0];
-        packed[i * 3 + 1]     = src[1];
-        packed[i * 3 + 2]     = src[2];
-    }
-    return true;
-}
-
 void WalkCasters(wallpaper::SceneNode* node,
                  const std::function<void(wallpaper::SceneNode&, wallpaper::SceneMesh&)>& fn) {
     if (node == nullptr) return;
@@ -135,6 +121,10 @@ void WalkCasters(wallpaper::SceneNode* node,
     }
 }
 
+uint64_t ShadowVertexLayoutKey(uint32_t stride, uint32_t position_offset) {
+    return (static_cast<uint64_t>(stride) << 32) | position_offset;
+}
+
 } // namespace
 
 ShadowAtlasPass::ShadowAtlasPass(const Desc& desc): m_desc(desc) {}
@@ -149,8 +139,16 @@ bool ShadowAtlasPass::referencesRenderTarget(std::string_view render_target) con
     return m_desc.target == render_target;
 }
 
-bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& rr) {
-    if (m_pipeline.handle) return true;
+bool ShadowAtlasPass::ensureClearPass(const Device& device) {
+    if (m_clear_pass) return true;
+    auto pass_opt = CreateShadowRenderPass(device.handle());
+    if (! pass_opt.has_value()) return false;
+    m_clear_pass = std::move(pass_opt.value());
+    return true;
+}
+
+bool ShadowAtlasPass::ensureShadowShaders() {
+    if (! m_shader_spvs.empty()) return true;
 
     ShaderCompOpt opt;
     opt.target_env = ShaderTargetEnv::VULKAN_1_1;
@@ -170,11 +168,20 @@ bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& r
             .src             = std::string(kFrag),
         },
     };
-    std::vector<Uni_ShaderSpv> spvs;
-    if (! CompileAndLinkShaderUnits(units, opt, spvs)) {
+    if (! CompileAndLinkShaderUnits(units, opt, m_shader_spvs)) {
         LOG_ERROR("ShadowAtlas: shader compile failed");
+        m_shader_spvs.clear();
         return false;
     }
+    return true;
+}
+
+bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& rr, uint32_t stride,
+                                    uint32_t position_offset) {
+    if (stride == 0) return false;
+    const uint64_t key = ShadowVertexLayoutKey(stride, position_offset);
+    if (auto it = m_pipelines.find(key); it != m_pipelines.end() && it->second.handle) return true;
+    if (! ensureShadowShaders()) return false;
 
     auto pass_opt = CreateShadowRenderPass(device.handle());
     if (! pass_opt.has_value()) return false;
@@ -182,14 +189,14 @@ bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& r
 
     VkVertexInputBindingDescription bind {
         .binding   = 0,
-        .stride    = sizeof(float) * 3,
+        .stride    = stride,
         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
     };
     VkVertexInputAttributeDescription attr {
         .location = 0,
         .binding  = 0,
         .format   = VK_FORMAT_R32G32B32_SFLOAT,
-        .offset   = 0,
+        .offset   = position_offset,
     };
 
     DescriptorSetInfo descriptor_info;
@@ -203,23 +210,29 @@ bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& r
         },
     };
 
-    GraphicsPipeline pipeline;
+    PipelineParameters params;
+    GraphicsPipeline   pipeline;
     pipeline.toDefault();
     pipeline.depth.depthTestEnable  = VK_TRUE;
     pipeline.depth.depthWriteEnable = VK_TRUE;
     pipeline.depth.depthCompareOp   = VK_COMPARE_OP_LESS;
-    m_pipeline.debug_name           = "ShadowAtlas";
-    m_pipeline.cache_key            = "ShadowAtlas|d32|less|no-color";
+    params.debug_name               = "ShadowAtlas";
+    params.cache_key                = "ShadowAtlas|d32|less|no-color|stride=" +
+                       std::to_string(stride) + "|pos=" + std::to_string(position_offset);
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>())
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .addInputBindingDescription(spanone { bind })
         .addInputAttributeDescription(spanone { attr });
-    for (auto& spv : spvs) pipeline.addStage(std::move(spv));
-    if (! pipeline.create(device, pass, m_pipeline, rr.pipeline_cache.get())) {
-        LOG_ERROR("ShadowAtlas: pipeline create failed");
+    for (const auto& spv : m_shader_spvs) {
+        if (! spv) return false;
+        pipeline.addStage(std::make_unique<ShaderSpv>(*spv));
+    }
+    if (! pipeline.create(device, pass, params, rr.pipeline_cache.get())) {
+        LOG_ERROR("ShadowAtlas: pipeline create failed stride=%u pos=%u", stride, position_offset);
         return false;
     }
+    m_pipelines[key] = std::move(params);
     return true;
 }
 
@@ -229,10 +242,10 @@ bool ShadowAtlasPass::ensureFramebuffer(const Device& device) {
         return true;
     }
     m_fb.reset();
-    if (! m_pipeline.pass || m_desc.vk_target.view == VK_NULL_HANDLE) return false;
+    if (! m_clear_pass || m_desc.vk_target.view == VK_NULL_HANDLE) return false;
     VkFramebufferCreateInfo info {
         .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .renderPass      = *m_pipeline.pass,
+        .renderPass      = *m_clear_pass,
         .attachmentCount = 1,
         .pAttachments    = &m_desc.vk_target.view,
         .width           = extent.width,
@@ -244,50 +257,31 @@ bool ShadowAtlasPass::ensureFramebuffer(const Device& device) {
     return true;
 }
 
-void ShadowAtlasPass::releaseCasters(RenderingResources& rr) {
-    if (rr.vertex_buf == nullptr) {
-        m_casters.clear();
-        return;
-    }
-    for (auto& caster : m_casters) {
-        if (caster.vertex) rr.vertex_buf->unallocateSubRef(caster.vertex);
-        if (caster.index) rr.vertex_buf->unallocateSubRef(caster.index);
-    }
-    m_casters.clear();
-}
+void ShadowAtlasPass::releaseCasters() { m_casters.clear(); }
 
-void ShadowAtlasPass::collectCasters(Scene& scene, const Device&, RenderingResources& rr) {
-    releaseCasters(rr);
-    if (scene.sceneGraph == nullptr || rr.vertex_buf == nullptr) return;
+void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, RenderingResources& rr) {
+    releaseCasters();
+    if (scene.sceneGraph == nullptr) return;
 
     WalkCasters(scene.sceneGraph.get(), [&](SceneNode& node, SceneMesh& mesh) {
+        if (mesh.VertexCount() == 0) return;
         const auto& vertex = mesh.GetVertexArray(0);
-        std::vector<float> packed;
-        if (! ExtractPositions(vertex, packed)) return;
+        const auto  attrs  = vertex.GetAttrOffsetMap();
+        const auto  it     = attrs.find(std::string(wallpaper::WE_IN_POSITION));
+        if (it == attrs.end() || vertex.VertexCount() == 0) return;
+
+        auto gpu = rr.immutable_meshes.getOrCreate(device, mesh);
+        if (! gpu || gpu->vertices.empty() || ! gpu->vertices.front()) return;
 
         CasterMesh caster;
-        caster.node         = &node;
-        caster.vertex_count = static_cast<uint32_t>(packed.size() / 3);
-        if (! rr.vertex_buf->allocateSubRef(packed.size() * sizeof(float), caster.vertex)) return;
-        if (! rr.vertex_buf->writeToBuf(caster.vertex,
-                                        { reinterpret_cast<uint8_t*>(packed.data()),
-                                          packed.size() * sizeof(float) })) {
-            rr.vertex_buf->unallocateSubRef(caster.vertex);
-            return;
-        }
-        if (mesh.IndexCount() > 0) {
-            const auto& indice = mesh.GetIndexArray(0);
-            const auto  bytes  = indice.DataSizeOf();
-            if (bytes > 0 && rr.vertex_buf->allocateSubRef(bytes, caster.index) &&
-                rr.vertex_buf->writeToBuf(caster.index,
-                                          { reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(
-                                                indice.Data())),
-                                            bytes })) {
-                caster.index_element_bytes = mesh.IndexElementBytes();
-                caster.index_count         = mesh.LogicalIndexCount();
-                caster.indexed             = caster.index_count > 0;
-            }
-        }
+        caster.node             = &node;
+        caster.mesh             = std::move(gpu);
+        caster.stride           = static_cast<uint32_t>(vertex.OneSizeOf());
+        caster.position_offset  = static_cast<uint32_t>(it->second.offset);
+        caster.vertex_count     = static_cast<uint32_t>(vertex.VertexCount());
+        caster.index_element_bytes = mesh.IndexElementBytes();
+        caster.index_count      = mesh.LogicalIndexCount();
+        caster.indexed          = caster.mesh->has_index && caster.index_count > 0;
         m_casters.push_back(std::move(caster));
     });
 }
@@ -391,9 +385,12 @@ void ShadowAtlasPass::prepare(Scene& scene, const Device& device, RenderingResou
         return;
     }
     m_desc.vk_target = opt.value();
-    if (! ensurePipeline(device, rr)) return;
-    if (! ensureFramebuffer(device)) return;
+    if (! ensureClearPass(device)) return;
     collectCasters(scene, device, rr);
+    for (const auto& caster : m_casters) {
+        if (! ensurePipeline(device, rr, caster.stride, caster.position_offset)) return;
+    }
+    if (! ensureFramebuffer(device)) return;
     setPrepared();
 }
 
@@ -442,27 +439,36 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
     if (m_desc.vk_target.handle == VK_NULL_HANDLE) return;
     // First bind always far-clears the atlas (depth 1.0), including zero casters.
     // Empty tiles stay at far so comparison sampling keeps the unoccluded path.
-    if (! ensurePipeline(device, rr) || ! ensureFramebuffer(device) || ! m_fb) return;
+    if (! ensureClearPass(device) || ! ensureFramebuffer(device) || ! m_fb) return;
 
     const VkExtent2D extent { m_desc.vk_target.extent.width, m_desc.vk_target.extent.height };
     VkClearValue     clear {};
     clear.depthStencil = { 1.0f, 0 };
     VkRenderPassBeginInfo begin {
         .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass      = *m_pipeline.pass,
+        .renderPass      = *m_clear_pass,
         .framebuffer     = *m_fb,
         .renderArea      = VkRect2D { { 0, 0 }, extent },
         .clearValueCount = 1,
         .pClearValues    = &clear,
     };
     rr.command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
-    rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_pipeline.handle);
 
-    const VkBuffer gpu = rr.vertex_buf != nullptr ? rr.vertex_buf->gpuBuf() : VK_NULL_HANDLE;
+    PipelineParameters* bound = nullptr;
     for (const auto& draw : m_draws) {
         if (draw.caster_index >= m_casters.size()) continue;
         const auto& caster = m_casters[draw.caster_index];
-        if (! caster.vertex || gpu == VK_NULL_HANDLE) continue;
+        if (! caster.mesh || caster.mesh->vertices.empty()) continue;
+        VkBuffer gpu = caster.mesh->vertices.front().handle();
+        if (gpu == VK_NULL_HANDLE) continue;
+        if (! ensurePipeline(device, rr, caster.stride, caster.position_offset)) continue;
+        auto pipe_it = m_pipelines.find(ShadowVertexLayoutKey(caster.stride, caster.position_offset));
+        if (pipe_it == m_pipelines.end() || ! pipe_it->second.handle) continue;
+        auto& pipeline = pipe_it->second;
+        if (bound != &pipeline) {
+            rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.handle);
+            bound = &pipeline;
+        }
 
         const int32_t max_w = static_cast<int32_t>(extent.width);
         const int32_t max_h = static_cast<int32_t>(extent.height);
@@ -499,16 +505,17 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
                 .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                 .pBufferInfo     = &buffer_info,
             };
-            rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_pipeline.layout, 0,
+            rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.layout, 0,
                                             write);
         }
 
-        rr.command.BindVertexBuffers(0, 1, &gpu, &caster.vertex.offset);
-        if (caster.indexed && caster.index) {
+        const VkDeviceSize off = 0;
+        rr.command.BindVertexBuffers(0, 1, &gpu, &off);
+        if (caster.indexed && caster.mesh->has_index) {
             const VkIndexType index_type = caster.index_element_bytes == 4
                                                ? VK_INDEX_TYPE_UINT32
                                                : VK_INDEX_TYPE_UINT16;
-            rr.command.BindIndexBuffer(gpu, caster.index.offset, index_type);
+            rr.command.BindIndexBuffer(caster.mesh->index.handle(), 0, index_type);
             rr.command.DrawIndexed(caster.index_count, 1, 0, 0, 0);
         } else {
             rr.command.Draw(caster.vertex_count, 1, 0, 0);
@@ -517,13 +524,15 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
     rr.command.EndRenderPass();
 }
 
-void ShadowAtlasPass::destory(const Device&, RenderingResources& rr) {
+void ShadowAtlasPass::destory(const Device&, RenderingResources&) {
     setPrepared(false);
     clearReleaseTexs();
     m_fb.reset();
     m_fb_extent = {};
     m_draws.clear();
     if (m_dyn_buf != nullptr && m_ubo_buf) m_dyn_buf->unallocateSubRef(m_ubo_buf);
-    releaseCasters(rr);
+    releaseCasters();
+    m_pipelines.clear();
+    m_clear_pass.reset();
     m_dyn_buf = nullptr;
 }

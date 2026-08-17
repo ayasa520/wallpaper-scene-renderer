@@ -4730,11 +4730,6 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
 
     const float* data         = vertex_array.Data();
     const usize  vertex_count = vertex_array.VertexCount();
-    if (data == nullptr || vertex_count == 0) return std::nullopt;
-
-    // Even ordinary mesh bounds use the cursor-specific transform resolver so effect composites
-    // and future runtime-only nodes do not diverge between their rendered model matrix and their
-    // event target matrix.
     const Eigen::Matrix4d model = ResolveCursorHitModelTransform(opaque, node);
 
     double min_x = std::numeric_limits<double>::max();
@@ -4742,14 +4737,34 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
     double max_x = std::numeric_limits<double>::lowest();
     double max_y = std::numeric_limits<double>::lowest();
 
-    for (usize index = 0; index < vertex_count; index++) {
-        const float*          vertex = data + index * stride + position_offset;
-        const Eigen::Vector4d local(vertex[0], vertex[1], vertex[2], 1.0);
+    auto accumulate = [&](const Eigen::Vector4d& local) {
         const Eigen::Vector4d world = model * local;
-        min_x                       = std::min(min_x, world.x());
-        min_y                       = std::min(min_y, world.y());
-        max_x                       = std::max(max_x, world.x());
-        max_y                       = std::max(max_y, world.y());
+        min_x = std::min(min_x, world.x());
+        min_y = std::min(min_y, world.y());
+        max_x = std::max(max_x, world.x());
+        max_y = std::max(max_y, world.y());
+    };
+
+    if (data == nullptr || vertex_count == 0) {
+        auto* mesh = node->Mesh();
+        if (mesh == nullptr || ! mesh->HasBounds()) return std::nullopt;
+        const Eigen::Vector3f bmin = mesh->BoundsMin();
+        const Eigen::Vector3f bmax = mesh->BoundsMax();
+        for (int z = 0; z < 2; ++z) {
+            for (int y = 0; y < 2; ++y) {
+                for (int x = 0; x < 2; ++x) {
+                    accumulate(Eigen::Vector4d(x ? bmax.x() : bmin.x(),
+                                               y ? bmax.y() : bmin.y(),
+                                               z ? bmax.z() : bmin.z(),
+                                               1.0));
+                }
+            }
+        }
+    } else {
+        for (usize index = 0; index < vertex_count; index++) {
+            const float* vertex = data + index * stride + position_offset;
+            accumulate(Eigen::Vector4d(vertex[0], vertex[1], vertex[2], 1.0));
+        }
     }
 
     if (min_x > max_x || min_y > max_y) return std::nullopt;

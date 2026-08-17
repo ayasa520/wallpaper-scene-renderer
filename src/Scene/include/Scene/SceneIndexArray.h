@@ -27,6 +27,7 @@ public:
     const uint32_t* Data() const { return m_pData; }
     usize           DataCount() const { return m_size; }
     usize           DataSizeOf() const { return m_size * Unit_Byte_Size; }
+    usize           ReleaseCpuPayload() noexcept;
 
     usize RenderDataCount() const noexcept {
         return m_render_size > m_size ? m_size : m_render_size;

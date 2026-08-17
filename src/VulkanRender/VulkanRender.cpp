@@ -4,6 +4,7 @@
 #include "Utils/Logging.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "Scene/Scene.h"
+#include "Scene/SceneMesh.h"
 #include "SpecTexs.hpp"
 #include "Interface/IImageParser.h"
 #include "Interface/IShaderValueUpdater.h"
@@ -33,6 +34,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -88,6 +90,25 @@ void DestroyPassOnce(VulkanPass* pass, const Device& device, RenderingResources&
                      std::unordered_set<VulkanPass*>& destroyed) {
     if (pass == nullptr || !destroyed.insert(pass).second) return;
     pass->destory(device, resources);
+}
+
+void WalkSceneMeshes(wallpaper::SceneNode* node,
+                     const std::function<void(wallpaper::SceneMesh&)>& fn) {
+    if (node == nullptr) return;
+    if (auto* mesh = node->Mesh(); mesh != nullptr) fn(*mesh);
+    for (auto& child : node->GetChildren()) {
+        WalkSceneMeshes(child.get(), fn);
+    }
+}
+
+void ReleaseUploadedFileMeshCpu(wallpaper::Scene& scene) {
+    const auto release = [&](wallpaper::SceneMesh& mesh) {
+        if (mesh.FileImmutable() && mesh.HasCpuPayload()) mesh.ReleaseCpuPayload();
+    };
+    WalkSceneMeshes(scene.sceneGraph.get(), release);
+    for (auto& [_, nodes] : scene.objectRuntimeNodes) {
+        for (auto* node : nodes) WalkSceneMeshes(node, release);
+    }
 }
 
 const char* ExternalMemoryPreferenceName(wallpaper::ExternalFrameMemoryPreference preference) {
@@ -437,6 +458,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     if (m_device) {
         m_device->tex_cache().CancelDeferredGraphActivation();
     }
+    m_rendering_resources.immutable_meshes.abandon();
     m_rendering_resources.vertex_buf = nullptr;
     m_rendering_resources.dyn_buf = nullptr;
     m_deferred_prepare_indices.clear();
@@ -486,6 +508,7 @@ void VulkanRender::Impl::destroy() {
         m_rendering_resources.model_depth_images.clear();
         m_rendering_resources.model_depth_resolved.clear();
         m_rendering_resources.masked_draw_attachments.clear();
+        m_rendering_resources.immutable_meshes.clear();
         m_vertex_buf->destroy();
         m_dyn_buf->destroy();
 
@@ -777,6 +800,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     // renderers.
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
+    rr.immutable_meshes.recordUploads(rr.command);
     m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
     for (auto* p : m_passes) {
@@ -819,6 +843,8 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait swapchain frame fence"))
         return;
     m_device->tex_cache().RetireCompletedUploads();
+    rr.immutable_meshes.retireStaging();
+    if (rr.scene != nullptr) ReleaseUploadedFileMeshCpu(*rr.scene);
     if (!checkVkResult(rr.fence_frame.Reset(), "reset swapchain frame fence"))
         return;
 }
@@ -873,6 +899,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         return;
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
+    rr.immutable_meshes.recordUploads(rr.command);
     m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
 
@@ -897,6 +924,8 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
         return;
     m_device->tex_cache().RetireCompletedUploads();
+    rr.immutable_meshes.retireStaging();
+    ReleaseUploadedFileMeshCpu(scene);
     if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
         return;
     m_ex_swapchain->renderFrame();
@@ -1125,6 +1154,12 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     m_rendering_resources.model_depth_images.clear();
     m_rendering_resources.model_depth_resolved.clear();
     m_rendering_resources.masked_draw_attachments.clear();
+    if (clear_scene_caches) {
+        // Scene switches drop GPU file meshes. Ordinary topology rebuilds keep them: the host
+        // vertex bytes are released after the first upload, and the exact-size VB/IB pairs are
+        // the scene-lifetime objects.
+        m_rendering_resources.immutable_meshes.clear();
+    }
 
     m_vertex_buf->destroy();
     m_dyn_buf->destroy();
