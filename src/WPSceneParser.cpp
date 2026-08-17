@@ -3267,19 +3267,377 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
     }
 }
 
+void ClearSceneBloomGraph(Scene& scene) {
+    for (const auto& output : scene.bloom.outputs) {
+        if (output.rfind("__hanabi_scene_bloom", 0) == 0 || output.rfind("_rt_hdr_bloom", 0) == 0 ||
+            output == "_rt_Bloom") {
+            scene.renderTargets.erase(output);
+            scene.pendingRenderTargetReleaseKeys.insert(output);
+        }
+    }
+    scene.bloom.nodes.clear();
+    scene.bloom.outputs.clear();
+    scene.bloom.node.reset();
+    scene.bloom.built_quality = 0;
+}
+
+bool ConfigureSceneHdrBloomPass(ParseContext& context) {
+    auto& scene = *context.scene;
+    const i32 scene_width  = std::max(1, context.ortho_w);
+    const i32 scene_height = std::max(1, context.ortho_h);
+    const int levels =
+        std::max(2, scene.bloom.hdrIterations > 0 ? scene.bloom.hdrIterations : 2);
+    const bool display_hdr = scene.bloom.quality >= 3;
+    ClearSceneBloomGraph(scene);
+
+    constexpr std::string_view fullscreen_vertex_source = R"(
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+varying vec2 v_TexCoord;
+void main() {
+    gl_Position = vec4(a_Position, 1.0);
+    v_TexCoord = a_TexCoord;
+}
+)";
+    constexpr std::string_view hdr_downsample_fragment_source = R"(
+varying vec2 v_TexCoord;
+uniform sampler2D g_Texture0;
+uniform vec4 g_RenderVar0;
+#if BICUBIC
+vec4 cubic(float v)
+{
+    vec4 n = vec4(1.0, 2.0, 3.0, 4.0) - v;
+    vec4 s = n * n * n;
+    float x = s.x;
+    float y = s.y - 4.0 * s.x;
+    float z = s.z - 4.0 * s.y + 6.0 * s.x;
+    float w = 6.0 - x - y - z;
+    return vec4(x, y, z, w) * (1.0/6.0);
+}
+vec4 textureBicubic(vec2 texCoords)
+{
+    float sc = 0.5;
+    vec2 texSize = sc / g_RenderVar0.xy;
+    vec2 invTexSize = g_RenderVar0.xy / sc;
+    texCoords = texCoords * texSize - 0.5;
+    vec2 fxy = frac(texCoords);
+    texCoords -= fxy;
+    vec4 xcubic = cubic(fxy.x);
+    vec4 ycubic = cubic(fxy.y);
+    vec4 c = texCoords.xxyy + vec2 (-0.5, +1.5).xyxy;
+    vec4 s = vec4(xcubic.xz + xcubic.yw, ycubic.xz + ycubic.yw);
+    vec4 offset = c + vec4 (xcubic.yw, ycubic.yw) / s;
+    offset *= invTexSize.xxyy;
+    vec4 sample0 = texSample2D(g_Texture0, offset.xz);
+    vec4 sample1 = texSample2D(g_Texture0, offset.yz);
+    vec4 sample2 = texSample2D(g_Texture0, offset.xw);
+    vec4 sample3 = texSample2D(g_Texture0, offset.yw);
+    float sx = s.x / (s.x + s.y);
+    float sy = s.z / (s.z + s.w);
+    return mix(mix(sample3, sample2, sx), mix(sample1, sample0, sx), sy);
+}
+#endif
+#if BLOOM
+uniform float g_BloomStrength;
+uniform vec4 g_BloomBlendParams;
+uniform vec3 g_BloomTint;
+#endif
+#if UPSAMPLE
+uniform float g_BloomScatter;
+#endif
+void main() {
+#if BICUBIC
+    vec3 albedo = textureBicubic(v_TexCoord + g_RenderVar0.xy).rgb +
+                    textureBicubic(v_TexCoord + g_RenderVar0.zy).rgb +
+                    textureBicubic(v_TexCoord + g_RenderVar0.xw).rgb +
+                    textureBicubic(v_TexCoord + g_RenderVar0.zw).rgb;
+#else
+    vec3 albedo = texSample2D(g_Texture0, v_TexCoord + g_RenderVar0.xy).rgb +
+                    texSample2D(g_Texture0, v_TexCoord + g_RenderVar0.zy).rgb +
+                    texSample2D(g_Texture0, v_TexCoord + g_RenderVar0.xw).rgb +
+                    texSample2D(g_Texture0, v_TexCoord + g_RenderVar0.zw).rgb;
+#endif
+#if UPSAMPLE
+    albedo *= 0.25 * g_BloomScatter;
+#else
+    albedo *= 0.25;
+#endif
+#if BLOOM
+    albedo = max(CAST3(0), albedo);
+    float brightness = max(albedo.r, max(albedo.g, albedo.b));
+    float soft = brightness - g_BloomBlendParams.y;
+    soft = clamp(soft, 0.0, g_BloomBlendParams.z);
+    soft = soft * soft * g_BloomBlendParams.w;
+    float contribution = max(soft, brightness - g_BloomBlendParams.x);
+    contribution /= max(brightness, 0.00001);
+    albedo *= contribution * g_BloomStrength * g_BloomTint;
+#endif
+    gl_FragColor = vec4(albedo, 1.0);
+}
+)";
+    constexpr std::string_view combine_hdr_fragment_source = R"(
+varying vec2 v_TexCoord;
+uniform sampler2D g_Texture0;
+uniform sampler2D g_Texture1;
+uniform vec2 g_TexelSize;
+uniform vec4 g_RenderVar0;
+vec3 lin(vec3 v)
+{
+    vec3 c = step(0.04045, v);
+    return c * (pow((v + 0.055) / 1.055, CAST3(2.4))) + (1.0 - c) * (v / 12.92);
+}
+void main()
+{
+    vec3 albedo = texSample2D(g_Texture0, v_TexCoord).rgb;
+    vec3 bloom1 = texSample2D(g_Texture1, v_TexCoord + g_TexelSize).rgb +
+                texSample2D(g_Texture1, v_TexCoord - g_TexelSize).rgb +
+                texSample2D(g_Texture1, v_TexCoord + vec2(g_TexelSize.x, -g_TexelSize.y)).rgb +
+                texSample2D(g_Texture1, v_TexCoord + vec2(-g_TexelSize.x, g_TexelSize.y)).rgb;
+    bloom1 *= 0.25;
+#if DISPLAYHDR == 1
+    albedo = saturate(albedo);
+    albedo += bloom1;
+    float hdrFactors = g_RenderVar0.y * smoothstep(1.0, 5.0, dot(vec3(0.299, 0.587, 0.114), albedo)) + g_RenderVar0.x;
+    gl_FragColor = vec4(lin((max(CAST3(0.0), albedo))) * hdrFactors, 1.0);
+#else
+    albedo += bloom1;
+    gl_FragColor = vec4(saturate(lin(albedo)) * g_RenderVar0.x, 1.0);
+#endif
+}
+)";
+
+    const auto compile_shader = [&](std::string      name,
+                                    std::string_view vertex_source,
+                                    std::string_view fragment_source,
+                                    usize            texture_count,
+                                    Combos           combos) -> std::shared_ptr<SceneShader> {
+        auto shader  = std::make_shared<SceneShader>();
+        shader->name = std::move(name);
+        WPShaderInfo                 shader_info;
+        shader_info.combos           = std::move(combos);
+        std::array                   units { WPShaderUnit {
+                                                 .stage           = ShaderType::VERTEX,
+                                                 .src             = std::string(vertex_source),
+                                                 .preprocess_info = {},
+                                                 .debug_name      = shader->name + ".vert",
+                                             },
+                                             WPShaderUnit {
+                                                 .stage           = ShaderType::FRAGMENT,
+                                                 .src             = std::string(fragment_source),
+                                                 .preprocess_info = {},
+                                                 .debug_name      = shader->name + ".frag",
+                                             } };
+        std::vector<WPShaderTexInfo> texinfos(texture_count, WPShaderTexInfo { .enabled = true });
+        for (auto& unit : units) {
+            unit.src = WPShaderParser::PreShaderSrc(*context.vfs, unit.src, &shader_info, texinfos);
+        }
+        shader->default_uniforms = shader_info.svs;
+        if (! WPShaderParser::CompileToSpv(
+                scene.scene_id, units, shader->codes, *context.vfs, &shader_info, texinfos)) {
+            LOG_ERROR("SceneBloomConfig: HDR compile failed pass='%s'", shader->name.c_str());
+            return nullptr;
+        }
+        return shader;
+    };
+
+    const auto make_node = [&](std::string name,
+                               std::shared_ptr<SceneShader>
+                                   shader,
+                               std::vector<std::string>
+                                            textures,
+                               ShaderValues const_values,
+                               BlendMode    blend) -> std::shared_ptr<SceneNode> {
+        SceneMaterial material;
+        material.name     = name;
+        material.textures = std::move(textures);
+        material.defines.reserve(material.textures.size());
+        for (usize i = 0; i < material.textures.size(); ++i) {
+            material.defines.push_back("g_Texture" + std::to_string(i));
+        }
+        material.customShader.shader      = std::move(shader);
+        material.customShader.constValues = std::move(const_values);
+        material.blenmode                 = blend;
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
+        mesh->AddMaterial(std::move(material));
+        auto node = std::make_shared<SceneNode>();
+        node->SetName(name);
+        node->AddMesh(mesh);
+        scene.nodeOwners[node.get()] = 0;
+        context.shader_updater->SetNodeData(node.get(), WPShaderValueData {});
+        return node;
+    };
+
+    auto extract_shader = compile_shader("__hanabi_scene_hdr_extract",
+                                         fullscreen_vertex_source,
+                                         hdr_downsample_fragment_source,
+                                         1,
+                                         {{"BLOOM", "1"}});
+    auto down_shader    = compile_shader("__hanabi_scene_hdr_down",
+                                         fullscreen_vertex_source,
+                                         hdr_downsample_fragment_source,
+                                         1,
+                                         {});
+    auto up_shader      = compile_shader("__hanabi_scene_hdr_up",
+                                         fullscreen_vertex_source,
+                                         hdr_downsample_fragment_source,
+                                         1,
+                                         {{"UPSAMPLE", "1"}});
+    auto up_cubic_shader = compile_shader("__hanabi_scene_hdr_up_cubic",
+                                          fullscreen_vertex_source,
+                                          hdr_downsample_fragment_source,
+                                          1,
+                                          {{"UPSAMPLE", "1"}, {"BICUBIC", "1"}});
+    auto combine_shader = compile_shader("__hanabi_scene_hdr_combine",
+                                         fullscreen_vertex_source,
+                                         combine_hdr_fragment_source,
+                                         2,
+                                         {{"DISPLAYHDR", display_hdr ? "1" : "0"}});
+    if (extract_shader == nullptr || down_shader == nullptr || up_shader == nullptr ||
+        up_cubic_shader == nullptr || combine_shader == nullptr) {
+        ClearSceneBloomGraph(scene);
+        return false;
+    }
+
+    const float threshold = scene.bloom.hdrThreshold;
+    const float feather   = scene.bloom.hdrFeather;
+    const float scatter   = scene.bloom.hdrScatter;
+    const float knee      = threshold * feather;
+    const std::array<float, 4> blend_params {
+        threshold,
+        threshold - knee,
+        knee + knee,
+        0.25f / (knee + 1.0e-5f),
+    };
+    // Dual-filter upsample is additive. Extract gain is
+    // strength / (scatter^(levels-2) + 1) so scatter > 1 does not stack raw energy.
+    const float extract_strength =
+        scene.bloom.hdrStrength / (std::pow(scatter, static_cast<float>(levels - 2)) + 1.0f);
+
+    std::vector<std::string> mip_targets;
+    mip_targets.reserve(static_cast<usize>(levels));
+    for (int i = 0; i < levels; ++i) {
+        const int   denom  = 2 << i;
+        const i32   width  = std::max(1, scene_width / denom);
+        const i32   height = std::max(1, scene_height / denom);
+        const float scale  = 1.0f / static_cast<float>(denom);
+        std::string target = (i == 0) ? std::string("_rt_Bloom")
+                                      : ("_rt_hdr_bloom_" + std::to_string(i));
+        scene.renderTargets[target] = {
+            .width     = width,
+            .height    = height,
+            .mapWidth  = width,
+            .mapHeight = height,
+            .bind      = { .enable = true, .name = SpecTex_Default.data(), .scale = scale },
+        };
+        mip_targets.push_back(std::move(target));
+    }
+
+    const auto texel4 = [](i32 w, i32 h) -> std::array<float, 4> {
+        const float tx = 1.0f / static_cast<float>(std::max(1, w));
+        const float ty = 1.0f / static_cast<float>(std::max(1, h));
+        return { tx, ty, -tx, -ty };
+    };
+
+    scene.bloom.nodes.clear();
+    scene.bloom.outputs.clear();
+
+    ShaderValues extract_values;
+    extract_values["g_RenderVar0"]       = ShaderValue(texel4(scene_width, scene_height));
+    extract_values["g_BloomStrength"]    = ShaderValue(extract_strength);
+    extract_values["g_BloomBlendParams"] = ShaderValue(blend_params);
+    extract_values["g_BloomTint"]        = ShaderValue(scene.bloom.tint);
+    auto extract_node                    = make_node("__hanabi_scene_hdr_extract",
+                                  extract_shader,
+                                  { SpecTex_Default.data() },
+                                  std::move(extract_values),
+                                  BlendMode::Disable);
+    scene.bloom.nodes.push_back(extract_node);
+    scene.bloom.outputs.push_back(mip_targets[0]);
+    scene.bloom.node = extract_node;
+
+    for (int i = 1; i < levels; ++i) {
+        const i32 src_w = std::max(1, scene_width / (2 << (i - 1)));
+        const i32 src_h = std::max(1, scene_height / (2 << (i - 1)));
+        ShaderValues down_values;
+        down_values["g_RenderVar0"] = ShaderValue(texel4(src_w, src_h));
+        auto down_node              = make_node("__hanabi_scene_hdr_down_" + std::to_string(i),
+                                   down_shader,
+                                   { mip_targets[static_cast<usize>(i - 1)] },
+                                   std::move(down_values),
+                                   BlendMode::Disable);
+        scene.bloom.nodes.push_back(down_node);
+        scene.bloom.outputs.push_back(mip_targets[static_cast<usize>(i)]);
+    }
+
+    for (int i = levels - 2; i >= 0; --i) {
+        const i32 src_w = std::max(1, scene_width / (2 << (i + 1)));
+        const i32 src_h = std::max(1, scene_height / (2 << (i + 1)));
+        ShaderValues up_values;
+        up_values["g_RenderVar0"]    = ShaderValue(texel4(src_w, src_h));
+        up_values["g_BloomScatter"]  = ShaderValue(scatter);
+        const bool cubic             = (i == 0);
+        auto up_node                 = make_node(cubic ? "__hanabi_scene_hdr_up_cubic"
+                                                      : ("__hanabi_scene_hdr_up_" + std::to_string(i)),
+                                cubic ? up_cubic_shader : up_shader,
+                                { mip_targets[static_cast<usize>(i + 1)] },
+                                std::move(up_values),
+                                BlendMode::Additive);
+        scene.bloom.nodes.push_back(up_node);
+        scene.bloom.outputs.push_back(mip_targets[static_cast<usize>(i)]);
+    }
+
+    const i32 bloom_w = std::max(1, scene_width / 2);
+    const i32 bloom_h = std::max(1, scene_height / 2);
+    ShaderValues combine_values;
+    combine_values["g_TexelSize"]   = ShaderValue(std::array<float, 2> {
+        1.0f / static_cast<float>(bloom_w),
+        1.0f / static_cast<float>(bloom_h),
+    });
+    combine_values["g_RenderVar0"]  = ShaderValue(std::array<float, 4> { 1.0f, 0.0f, 0.0f, 0.0f });
+    auto combine_node               = make_node("__hanabi_scene_hdr_combine",
+                                  combine_shader,
+                                  { SpecTex_Default.data(), mip_targets[0] },
+                                  std::move(combine_values),
+                                  BlendMode::Disable);
+    scene.bloom.nodes.push_back(combine_node);
+    scene.bloom.outputs.push_back(SpecTex_Default.data());
+    scene.bloom.built_quality = scene.bloom.quality;
+
+    LOG_INFO("ScenePostProcess: quality=%d path=%s passes=%zu levels=%d "
+             "mip0=%dx%d strength=%.3f extract=%.5f threshold=%.3f "
+             "scatter=%.3f feather=%.3f",
+             scene.bloom.quality,
+             display_hdr ? "displayhdr" : "hdr",
+             scene.bloom.nodes.size(),
+             levels,
+             bloom_w,
+             bloom_h,
+             scene.bloom.hdrStrength,
+             extract_strength,
+             scene.bloom.hdrThreshold,
+             scatter,
+             scene.bloom.hdrFeather);
+    return true;
+}
+
 bool ConfigureSceneBloomPass(ParseContext& context) {
     if (context.scene == nullptr || context.vfs == nullptr) return false;
 
     auto& scene = *context.scene;
-    // Build the Bloom node even when the authored user toggle currently disables it, as long as the
-    // scene carries non-zero Bloom settings. Runtime toggles can then update `u_enabled` in place
-    // instead of forcing a render-graph rebuild just to add or remove this final post-process pass.
-    //
-    // HDR support is intentionally excluded from this predicate for now. Wallpaper Engine's
-    // `general.hdr` selects an HDR post-processing path, but Hanabi currently has only an LDR Bloom
-    // chain and no HDR render target, tone mapper, or compositor hand-off. Parsing and logging the
-    // authored HDR metadata keeps the future implementation path open without letting `hdr=true`
-    // create or suppress any current LDR rendering.
+    scene.bloom.quality = std::clamp(scene.bloom.quality, 0, 3);
+    if (scene.bloom.quality <= 0) {
+        ClearSceneBloomGraph(scene);
+        LOG_INFO("ScenePostProcess: quality=0 path=none passes=0");
+        return false;
+    }
+    const bool use_hdr = scene.bloom.quality >= 2 && scene.bloom.hdr && scene.bloom.enabled;
+    if (use_hdr) {
+        return ConfigureSceneHdrBloomPass(context);
+    }
+    // Build the LDR Bloom node even when the authored user toggle currently disables it, as long
+    // as the scene carries non-zero Bloom settings. Runtime toggles can then update `u_enabled`
+    // in place. Ultra/displayhdr with authored HDR uses the separate HDR chain above.
     const bool has_ldr_bloom_work = scene.bloom.enabled || scene.bloom.strength > 0.0f;
     if (! has_ldr_bloom_work) {
         LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f "
@@ -3291,6 +3649,7 @@ bool ConfigureSceneBloomPass(ParseContext& context) {
         return false;
     }
 
+    ClearSceneBloomGraph(scene);
     const i32 scene_width    = std::max(1, context.ortho_w);
     const i32 scene_height   = std::max(1, context.ortho_h);
     const i32 quarter_width  = std::max(1, scene_width / 4);
@@ -3601,6 +3960,14 @@ void main() {
         SpecTex_Default.data(),
     };
 
+    scene.bloom.built_quality = scene.bloom.quality;
+    LOG_INFO("ScenePostProcess: quality=%d path=ldr passes=%zu quarter=%dx%d eighth=%dx%d",
+             scene.bloom.quality,
+             scene.bloom.nodes.size(),
+             quarter_width,
+             quarter_height,
+             eighth_width,
+             eighth_height);
     LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f tint=[%.3f,%.3f,%.3f] "
              "hdr-requested=%s render-hdr=false hdr-strength=%.3f hdr-threshold=%.3f "
              "hdr-scatter=%.3f hdr-feather=%.3f hdr-iterations=%d active=true passes=%zu "
@@ -8259,6 +8626,18 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
 
 bool wallpaper::ConfigureSceneVolumetrics(Scene& scene, fs::VFS& vfs) {
     return ConfigureSceneVolumetricsImpl(scene, vfs);
+}
+
+bool wallpaper::ConfigureSceneBloom(Scene& scene, fs::VFS& vfs) {
+    auto* updater = dynamic_cast<WPShaderValueUpdater*>(scene.shaderValueUpdater.get());
+    if (updater == nullptr) return false;
+    ParseContext context;
+    context.scene          = std::shared_ptr<Scene>(&scene, [](Scene*) {});
+    context.shader_updater = updater;
+    context.ortho_w        = std::max(1, scene.ortho[0]);
+    context.ortho_h        = std::max(1, scene.ortho[1]);
+    context.vfs            = &vfs;
+    return ConfigureSceneBloomPass(context);
 }
 
 bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
