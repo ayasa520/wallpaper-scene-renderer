@@ -61,6 +61,15 @@ float SanitizeMouseCoord(double value) {
 MeshBounds2D ComputeMeshBounds2D(const SceneMesh* mesh) {
     if (mesh == nullptr || mesh->VertexCount() == 0) return {};
 
+    if (mesh->HasBounds()) {
+        const auto min_pos = mesh->BoundsMin().cast<double>();
+        const auto max_pos = mesh->BoundsMax().cast<double>();
+        const auto center  = (min_pos + max_pos) * 0.5;
+        const auto halfExtent = Vector2d(std::max((max_pos.x() - min_pos.x()) * 0.5, 1e-6),
+                                         std::max((max_pos.y() - min_pos.y()) * 0.5, 1e-6));
+        return MeshBounds2D { .valid = true, .center = center, .halfExtent = halfExtent };
+    }
+
     const auto& vertexArray = mesh->GetVertexArray(0);
     if (vertexArray.VertexCount() == 0) return {};
 

@@ -421,23 +421,6 @@ static void WriteMaterialUniforms(StagingBuffer* buf, const StagingBufferRef& bu
     write_values(material.customShader.constValues);
 }
 
-void LogStagingAllocRequest(std::string_view kind, const ShaderDrawData& desc,
-                            VkDeviceSize size) {
-    LOG_INFO("StagingAllocRequest: kind=%.*s node='%s' camera='%s' shader='%s' output='%s' "
-             "size=%zu dyn=%s",
-             static_cast<int>(kind.size()),
-             kind.data(),
-             desc.node ? desc.node->Name().c_str() : "<null>",
-             desc.node ? desc.node->Camera().c_str() : "<null>",
-             desc.node && desc.node->Mesh() && desc.node->Mesh()->Material() &&
-                     desc.node->Mesh()->Material()->customShader.shader
-                 ? desc.node->Mesh()->Material()->customShader.shader->name.c_str()
-                 : "<null>",
-             desc.output.c_str(),
-             static_cast<size_t>(size),
-             desc.dyn_vertex ? "true" : "false");
-}
-
 constexpr VkDeviceSize kInitialDynamicSuballocationSize = 64 * 1024;
 constexpr VkDeviceSize kDynamicIndexQuadFloorSize       = sizeof(uint16_t) * 6;
 
@@ -1154,43 +1137,37 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             }
             {
                 auto& buf = m_desc.vertex_bufs[i];
-                if (! m_desc.dyn_vertex) {
-                    if (vertex.CapacitySizeOf() >= 1024 * 1024) {
-                        LogStagingAllocRequest("vertex-static", m_desc, vertex.CapacitySizeOf());
-                    }
+                if (m_desc.dyn_vertex) {
+                    const auto initial_size = DynamicVertexUploadSize(vertex);
+                    if (! rr.dyn_buf->allocateSubRef(initial_size, buf)) return false;
+                } else if (! mesh.FileImmutable()) {
                     if (! rr.vertex_buf->allocateSubRef(vertex.CapacitySizeOf(), buf)) return false;
                     if (! rr.vertex_buf->writeToBuf(buf, { (uint8_t*)vertex.Data(), buf.size }))
                         return false;
-                } else {
-                    if (vertex.CapacitySizeOf() >= 1024 * 1024) {
-                        LogStagingAllocRequest("vertex-dynamic", m_desc, vertex.CapacitySizeOf());
-                    }
-                    const auto initial_size = DynamicVertexUploadSize(vertex);
-                    if (! rr.dyn_buf->allocateSubRef(initial_size, buf)) return false;
                 }
             }
             m_desc.draw_count += (u32)(vertex.DataSize() / vertex.OneSize());
         }
 
+        if (! m_desc.dyn_vertex && mesh.FileImmutable()) {
+            m_desc.immutable_mesh = rr.immutable_meshes.getOrCreate(device, mesh);
+            if (! m_desc.immutable_mesh) return false;
+        }
+
         if (mesh.IndexCount() > 0) {
-            auto&  indice     = mesh.GetIndexArray(0);
             m_desc.index_element_bytes = mesh.IndexElementBytes();
             m_desc.draw_count          = mesh.LogicalIndexCount();
-            auto& buf         = m_desc.index_buf;
-            if (! m_desc.dyn_vertex) {
-                if (indice.CapacitySizeof() >= 1024 * 1024) {
-                    LogStagingAllocRequest("index-static", m_desc, indice.CapacitySizeof());
-                }
+            auto& buf                  = m_desc.index_buf;
+            if (m_desc.dyn_vertex) {
+                auto& indice = mesh.GetIndexArray(0);
+                const auto initial_size = DynamicIndexUploadSize(indice);
+                if (! rr.dyn_buf->allocateSubRef(initial_size, buf)) return false;
+            } else if (! mesh.FileImmutable()) {
+                auto& indice = mesh.GetIndexArray(0);
                 if (! rr.vertex_buf->allocateSubRef(indice.CapacitySizeof(), buf)) return false;
                 if (! rr.vertex_buf->writeToBuf(buf, { (uint8_t*)indice.Data(), buf.size })) {
                     return false;
                 }
-            } else {
-                if (indice.CapacitySizeof() >= 1024 * 1024) {
-                    LogStagingAllocRequest("index-dynamic", m_desc, indice.CapacitySizeof());
-                }
-                const auto initial_size = DynamicIndexUploadSize(indice);
-                if (! rr.dyn_buf->allocateSubRef(initial_size, buf)) return false;
             }
         }
     }
@@ -1261,9 +1238,6 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
 
     if (! ref.blocks.empty()) {
         auto& block = ref.blocks.front();
-        if (block.size >= 1024 * 1024) {
-            LogStagingAllocRequest("ubo", m_desc, block.size);
-        }
         if (! rr.dyn_buf->allocateSubRef(
                 block.size, m_desc.ubo_buf, device.limits().minUniformBufferOffsetAlignment)) {
             return false;
@@ -1944,29 +1918,56 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     cmd.SetViewport(0, viewport);
     cmd.SetScissor(0, scissor);
 
-    auto gpu_buf = m_desc.dyn_vertex ? rr.dyn_buf->gpuBuf() : rr.vertex_buf->gpuBuf();
-
-    for (usize i = 0; i < m_desc.vertex_bufs.size(); i++) {
-        auto& buf = m_desc.vertex_bufs[i];
-        cmd.BindVertexBuffers((u32)i, 1, &gpu_buf, &buf.offset);
-    }
-    if (m_desc.index_buf) {
-        const VkIndexType index_type = m_desc.index_element_bytes == 4
-                                           ? VK_INDEX_TYPE_UINT32
-                                           : VK_INDEX_TYPE_UINT16;
-        cmd.BindIndexBuffer(gpu_buf, m_desc.index_buf.offset, index_type);
-        if (m_extension == nullptr) {
-            cmd.DrawIndexed(m_desc.draw_count, 1, 0, 0, 0);
+    if (m_desc.immutable_mesh) {
+        for (usize i = 0; i < m_desc.immutable_mesh->vertices.size(); i++) {
+            VkBuffer           gpu = m_desc.immutable_mesh->vertices[i].handle();
+            const VkDeviceSize off = 0;
+            if (gpu == VK_NULL_HANDLE) continue;
+            cmd.BindVertexBuffers((u32)i, 1, &gpu, &off);
+        }
+        if (m_desc.immutable_mesh->has_index) {
+            const VkIndexType index_type = m_desc.immutable_mesh->index_element_bytes == 4
+                                               ? VK_INDEX_TYPE_UINT32
+                                               : VK_INDEX_TYPE_UINT16;
+            cmd.BindIndexBuffer(m_desc.immutable_mesh->index.handle(), 0, index_type);
+            if (m_extension == nullptr) {
+                cmd.DrawIndexed(m_desc.draw_count, 1, 0, 0, 0);
+            } else {
+                m_extension->recordIndexed(ShaderDrawRecordContext {
+                    .data                     = m_desc,
+                    .device                   = device,
+                    .resources                = rr,
+                    .push_visible_descriptors = push_visible_descriptors,
+                });
+            }
         } else {
-            m_extension->recordIndexed(ShaderDrawRecordContext {
-                .data                     = m_desc,
-                .device                   = device,
-                .resources                = rr,
-                .push_visible_descriptors = push_visible_descriptors,
-            });
+            cmd.Draw(m_desc.draw_count, 1, 0, 0);
         }
     } else {
-        cmd.Draw(m_desc.draw_count, 1, 0, 0);
+        auto gpu_buf = m_desc.dyn_vertex ? rr.dyn_buf->gpuBuf() : rr.vertex_buf->gpuBuf();
+
+        for (usize i = 0; i < m_desc.vertex_bufs.size(); i++) {
+            auto& buf = m_desc.vertex_bufs[i];
+            cmd.BindVertexBuffers((u32)i, 1, &gpu_buf, &buf.offset);
+        }
+        if (m_desc.index_buf) {
+            const VkIndexType index_type = m_desc.index_element_bytes == 4
+                                               ? VK_INDEX_TYPE_UINT32
+                                               : VK_INDEX_TYPE_UINT16;
+            cmd.BindIndexBuffer(gpu_buf, m_desc.index_buf.offset, index_type);
+            if (m_extension == nullptr) {
+                cmd.DrawIndexed(m_desc.draw_count, 1, 0, 0, 0);
+            } else {
+                m_extension->recordIndexed(ShaderDrawRecordContext {
+                    .data                     = m_desc,
+                    .device                   = device,
+                    .resources                = rr,
+                    .push_visible_descriptors = push_visible_descriptors,
+                });
+            }
+        } else {
+            cmd.Draw(m_desc.draw_count, 1, 0, 0);
+        }
     }
 
     cmd.EndRenderPass();
@@ -2075,16 +2076,14 @@ void ShaderDrawCore::destroy(RenderingResources& rr) {
     m_desc.vk_tex_binding.clear();
     m_desc.vk_output              = {};
     m_desc.depth_stencil_image_ref = nullptr;
-    {
-        auto& buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
-        for (auto& bufref : m_desc.vertex_bufs) {
-            buf->unallocateSubRef(bufref);
-        }
-        m_desc.vertex_bufs.clear();
+    m_desc.immutable_mesh.reset();
+    auto* mesh_buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
+    for (auto& bufref : m_desc.vertex_bufs) {
+        if (mesh_buf) mesh_buf->unallocateSubRef(bufref);
     }
-    if (m_desc.index_buf) {
-        auto& buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
-        buf->unallocateSubRef(m_desc.index_buf);
+    m_desc.vertex_bufs.clear();
+    if (m_desc.index_buf && mesh_buf) {
+        mesh_buf->unallocateSubRef(m_desc.index_buf);
         m_desc.index_buf = {};
     }
     rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);

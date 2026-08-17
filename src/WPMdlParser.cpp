@@ -10,6 +10,7 @@
 #include "WPShaderParser.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -163,47 +164,110 @@ uint32_t StaticAttributeFloatCount(uint32_t mdl_flag) {
     }
 }
 
+constexpr std::array<uint32_t, 26> kOfficialVertexMasks {{
+    0x00000001, 0x00010000, 0x02000000, 0x00000002, 0x00000004, 0x00800000,
+    0x01000000, 0x00000008, 0x00000010, 0x00000020, 0x00000040, 0x00000080,
+    0x00000100, 0x00000200, 0x00000400, 0x00000800, 0x00001000, 0x00002000,
+    0x00004000, 0x00020000, 0x00040000, 0x00080000, 0x00100000, 0x00200000,
+    0x00400000, 0x00008000,
+}};
+constexpr std::array<uint32_t, 26> kOfficialVertexSizes {{
+    12, 16, 12, 12, 16, 16, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 16,
+}};
+
 uint32_t OfficialVertexStride(uint32_t mdl_flag) {
     // Attribute bits are independent; stride is the sum of each set bit's payload size
     // in table order. Known scene flags (9, 11, 15, 39, and the skinned 0x0180000F
     // variant) match the older exact-flag float counts used to unpack vertices.
-    constexpr std::array<uint32_t, 26> kMasks {{
-        0x00000001, 0x00010000, 0x02000000, 0x00000002, 0x00000004, 0x00800000,
-        0x01000000, 0x00000008, 0x00000010, 0x00000020, 0x00000040, 0x00000080,
-        0x00000100, 0x00000200, 0x00000400, 0x00000800, 0x00001000, 0x00002000,
-        0x00004000, 0x00020000, 0x00040000, 0x00080000, 0x00100000, 0x00200000,
-        0x00400000, 0x00008000,
-    }};
-    constexpr std::array<uint32_t, 26> kSizes {{
-        12, 16, 12, 12, 16, 16, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 8, 12, 16, 16,
-    }};
     uint32_t stride = 0;
-    for (size_t i = 0; i < kMasks.size(); i++) {
-        if ((mdl_flag & kMasks[i]) != 0) stride += kSizes[i];
+    for (size_t i = 0; i < kOfficialVertexMasks.size(); i++) {
+        if ((mdl_flag & kOfficialVertexMasks[i]) != 0) stride += kOfficialVertexSizes[i];
     }
     return stride;
+}
+
+const char* OfficialVertexAttrName(uint32_t mask) {
+    switch (mask) {
+    case 0x00000001: return WE_IN_POSITION.data();
+    case 0x00000002: return WE_IN_NORMAL.data();
+    case 0x00000004: return WE_IN_TANGENT4.data();
+    case 0x00800000: return WE_IN_BLENDINDICES.data();
+    case 0x01000000: return WE_IN_BLENDWEIGHTS.data();
+    case 0x00000008: return WE_IN_TEXCOORD.data();
+    case 0x00000020: return WE_IN_TEXCOORDVEC4.data();
+    default: return nullptr;
+    }
+}
+
+VertexType OfficialVertexAttrType(uint32_t mask, uint32_t size) {
+    if (mask == 0x00800000) return VertexType::UINT4;
+    switch (size) {
+    case 8: return VertexType::FLOAT2;
+    case 12: return VertexType::FLOAT3;
+    default: return VertexType::FLOAT4;
+    }
+}
+
+std::vector<SceneVertexArray::SceneVertexAttribute>
+BuildOfficialStaticVertexAttributes(uint32_t mdl_flag) {
+    std::vector<SceneVertexArray::SceneVertexAttribute> attrs;
+    usize offset            = 0;
+    usize texcoord_vec4_off = 0;
+    bool  has_texcoord      = false;
+    bool  has_texcoord_c2   = false;
+    bool  has_texcoord_vec4 = false;
+
+    for (size_t i = 0; i < kOfficialVertexMasks.size(); i++) {
+        const uint32_t mask = kOfficialVertexMasks[i];
+        if ((mdl_flag & mask) == 0) continue;
+        const uint32_t size = kOfficialVertexSizes[i];
+        SceneVertexArray::SceneVertexAttribute attr;
+        attr.padding = false;
+        attr.type    = OfficialVertexAttrType(mask, size);
+        if (const char* name = OfficialVertexAttrName(mask); name != nullptr) {
+            attr.name = name;
+        } else {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "_mdl_0x%08x", mask);
+            attr.name = buf;
+        }
+        if (attr.name == WE_IN_TEXCOORD) {
+            has_texcoord = true;
+        } else if (attr.name == WE_IN_TEXCOORDC2) {
+            has_texcoord_c2 = true;
+        } else if (attr.name == WE_IN_TEXCOORDVEC4) {
+            has_texcoord_vec4 = true;
+            texcoord_vec4_off = offset;
+        }
+        attrs.push_back(std::move(attr));
+        offset += size;
+    }
+
+    auto add_alias = [&](std::string_view name, VertexType type, usize byte_offset) {
+        SceneVertexArray::SceneVertexAttribute alias;
+        alias.name              = std::string(name);
+        alias.type              = type;
+        alias.padding           = false;
+        alias.alias             = true;
+        alias.alias_byte_offset = byte_offset;
+        attrs.push_back(std::move(alias));
+    };
+    // Flag 39 stores a_TexCoordVec4 instead of a_TexCoord. generic4 still declares
+    // a_TexCoord; LIGHTMAP generic declares a_TexCoordVec4. Aliases share the file slot
+    // and do not add stride. Flag 15 has only the 8-byte a_TexCoord at the end of 48 B.
+    if (has_texcoord_vec4) {
+        if (! has_texcoord)
+            add_alias(WE_IN_TEXCOORD, VertexType::FLOAT2, texcoord_vec4_off);
+        if (! has_texcoord_c2)
+            add_alias(WE_IN_TEXCOORDC2, VertexType::FLOAT2, texcoord_vec4_off + 8);
+    }
+    return attrs;
 }
 
 uint32_t StaticVertexFloatCount(uint32_t mdl_flag) {
     const uint32_t attribute_floats = StaticAttributeFloatCount(mdl_flag);
     if (attribute_floats == 0) return 0;
     return attribute_floats + (StaticVertexHasSkinAttributes(mdl_flag) ? kStaticSkinFloats : 0);
-}
-
-bool StaticVertexHasNormal(uint32_t mdl_flag) {
-    const uint32_t attribute_flag = StaticAttributeFlag(mdl_flag);
-    return attribute_flag == kStaticNormalFlag || attribute_flag == kStaticTangentSpaceFlag ||
-           attribute_flag == kStaticTangentSpaceSecondUvFlag;
-}
-
-bool StaticVertexHasTangentSpace(uint32_t mdl_flag) {
-    const uint32_t attribute_flag = StaticAttributeFlag(mdl_flag);
-    return attribute_flag == kStaticTangentSpaceFlag ||
-           attribute_flag == kStaticTangentSpaceSecondUvFlag;
-}
-
-bool StaticVertexHasSecondUv(uint32_t mdl_flag) {
-    return StaticAttributeFlag(mdl_flag) == kStaticTangentSpaceSecondUvFlag;
 }
 
 const StaticMdlFormat* FindStaticMdlFormat(int32_t mdl_version) {
@@ -294,49 +358,20 @@ std::string ReadStaticChunkMaterialPath(fs::IBinaryStream& f,
     return prefixed_material_paths[chunk_index];
 }
 
-bool ReadStaticVertexAttributes(fs::IBinaryStream& f, uint32_t mdl_flag,
-                                WPMdl::StaticVertex& vertex) {
-    for (auto& v : vertex.position) v = f.ReadFloat();
-
-    if (StaticVertexHasNormal(mdl_flag)) {
-        // Formats 11, 15, and 39 store authored normals. The canonical runtime vertex still
-        // exposes a deterministic normal fallback for older position/UV-only files, keeping
-        // model shader attributes valid without weakening the stricter static MDL parser.
-        for (auto& v : vertex.normal) v = f.ReadFloat();
-    }
-
-    if (StaticVertexHasTangentSpace(mdl_flag)) {
-        for (auto& v : vertex.tangent4) v = f.ReadFloat();
-    }
-
-    if (StaticVertexHasSkinAttributes(mdl_flag)) {
-        // Skinned static chunks store four blend indices and four weights after the tangent
-        // basis and before the texture coordinates. Scene model objects upload bind-pose
-        // positions, so the influences are consumed for stride alignment only.
-        for (int influence = 0; influence < 4; influence++) f.ReadUint32();
-        for (int influence = 0; influence < 4; influence++) f.ReadFloat();
-    }
-
-    for (auto& v : vertex.texcoord) v = f.ReadFloat();
-
-    if (StaticVertexHasSecondUv(mdl_flag)) {
-        // Arsenal's official static MDL uses flag 39, whose 14-float stride appends a second
-        // UV channel after the base texture UV. Its materials enable lightmap sampling, so this
-        // channel must be preserved as a real vertex attribute instead of being skipped.
-        for (auto& v : vertex.texcoord2) v = f.ReadFloat();
-    }
-    return true;
-}
-
 void UpdateStaticBounds(WPMdl::StaticChunk& chunk) {
-    if (chunk.vertexs.empty()) return;
+    const uint32_t stride = chunk.vertex_stride;
+    if (stride < 12 || chunk.vertex_blob.size() < stride) return;
 
-    chunk.bounds_min = chunk.vertexs.front().position;
-    chunk.bounds_max = chunk.vertexs.front().position;
-    for (const auto& vertex : chunk.vertexs) {
-        for (uint i = 0; i < 3; i++) {
-            chunk.bounds_min[i] = std::min(chunk.bounds_min[i], vertex.position[i]);
-            chunk.bounds_max[i] = std::max(chunk.bounds_max[i], vertex.position[i]);
+    const size_t count = chunk.vertex_blob.size() / stride;
+    const float* first = reinterpret_cast<const float*>(chunk.vertex_blob.data());
+    chunk.bounds_min   = { first[0], first[1], first[2] };
+    chunk.bounds_max   = chunk.bounds_min;
+    for (size_t i = 0; i < count; ++i) {
+        const float* vertex =
+            reinterpret_cast<const float*>(chunk.vertex_blob.data() + i * stride);
+        for (uint j = 0; j < 3; j++) {
+            chunk.bounds_min[j] = std::min(chunk.bounds_min[j], vertex[j]);
+            chunk.bounds_max[j] = std::max(chunk.bounds_max[j], vertex[j]);
         }
     }
 }
@@ -366,9 +401,13 @@ bool ReadStaticChunk(fs::IBinaryStream& f,
     }
 
     chunk.material_json_file = std::move(material_json_file);
-    chunk.vertexs.resize(vertex_size / vertex_stride);
-    for (auto& vertex : chunk.vertexs) {
-        if (! ReadStaticVertexAttributes(f, mdl_flag, vertex)) return false;
+    chunk.vertex_flag        = mdl_flag;
+    chunk.vertex_stride      = vertex_stride;
+    chunk.vertex_blob.resize(vertex_size);
+    if (f.Read(chunk.vertex_blob.data(), vertex_size) != vertex_size) {
+        LOG_ERROR("static mdl material '%s' vertex blob is truncated",
+                  chunk.material_json_file.c_str());
+        return false;
     }
 
     const uint32_t indices_size = f.ReadUint32();
@@ -591,9 +630,16 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
     }
 
     chunk.material_json_file = std::move(material_json_file);
-    chunk.vertexs.resize(vertex_size / vertex_stride);
-    for (auto& vertex : chunk.vertexs) {
-        if (! ReadStaticVertexAttributes(f, vertex_flag, vertex)) return false;
+    chunk.vertex_flag        = vertex_flag;
+    chunk.vertex_stride      = vertex_stride;
+    chunk.vertex_blob.resize(vertex_size);
+    if (f.Read(chunk.vertex_blob.data(), vertex_size) != vertex_size) {
+        LOG_ERROR("static mdl v23 chunk %u vertex blob is truncated: path='%.*s' material='%s'",
+                  chunk_index,
+                  static_cast<int>(path.size()),
+                  path.data(),
+                  chunk.material_json_file.c_str());
+        return false;
     }
 
     if (! CanReadBytes(f, sizeof(uint32_t))) {
@@ -605,21 +651,26 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
         return false;
     }
 
+    const uint32_t vertex_count =
+        chunk.vertex_stride > 0
+            ? static_cast<uint32_t>(chunk.vertex_blob.size() / chunk.vertex_stride)
+            : 0;
     const uint32_t indices_size     = f.ReadUint32();
     const bool     wide_indices     = (chunk_info & kStaticWideIndexFlag) != 0;
     const uint32_t index_value_bytes = wide_indices ? sizeof(uint32_t) : sizeof(uint16_t);
     const uint32_t triangle_bytes    = index_value_bytes * 3;
+    chunk.index_element_bytes        = index_value_bytes;
     if (indices_size == 0 || indices_size % triangle_bytes != 0 ||
         ! CanReadBytes(f, indices_size)) {
         LOG_ERROR("static mdl v23 chunk %u has unsupported index byte size %u (width=%u): "
-                  "path='%.*s' material='%s' verts=%zu info=%u",
+                  "path='%.*s' material='%s' verts=%u info=%u",
                   chunk_index,
                   indices_size,
                   index_value_bytes,
                   static_cast<int>(path.size()),
                   path.data(),
                   chunk.material_json_file.c_str(),
-                  chunk.vertexs.size(),
+                  vertex_count,
                   chunk_info);
         return false;
     }
@@ -632,12 +683,12 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
             max_index = std::max(max_index, v);
         }
     }
-    if (max_index >= chunk.vertexs.size()) {
-        LOG_ERROR("static mdl v23 chunk %u index %u is outside vertex count %zu: path='%.*s' "
+    if (max_index >= vertex_count) {
+        LOG_ERROR("static mdl v23 chunk %u index %u is outside vertex count %u: path='%.*s' "
                   "material='%s' stride=%u width=%u",
                   chunk_index,
                   max_index,
-                  chunk.vertexs.size(),
+                  vertex_count,
                   static_cast<int>(path.size()),
                   path.data(),
                   chunk.material_json_file.c_str(),
@@ -646,8 +697,7 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
         return false;
     }
 
-    if (! SkipStaticV23ChunkTail(f, chunk_index, path, chunk.material_json_file,
-                                 chunk.vertexs.size())) {
+    if (! SkipStaticV23ChunkTail(f, chunk_index, path, chunk.material_json_file, vertex_count)) {
         return false;
     }
     return true;
@@ -1838,50 +1888,32 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
     }
     mesh.SetMaskedDraw(std::move(masked_draw));
     mesh.SetSkinning({ .boneCount = bone_count });
+    mesh.SetFileImmutable(true);
+    if (mdl.asset_bounds.IsFiniteAndOrdered()) {
+        mesh.SetBounds(mdl.asset_bounds.min, mdl.asset_bounds.max);
+    }
 }
 
 void WPMdlParser::GenStaticMesh(SceneMesh& mesh, const WPMdl::StaticChunk& chunk) {
-    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 },
-                              { WE_IN_NORMAL.data(), VertexType::FLOAT3 },
-                              { WE_IN_TANGENT4.data(), VertexType::FLOAT4 },
-                              { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 },
-                              { WE_IN_TEXCOORDC2.data(), VertexType::FLOAT2 },
-                              { WE_IN_TEXCOORDVEC4.data(), VertexType::FLOAT4 } },
-                            chunk.vertexs.size());
-
-    // The static model vertex upload intentionally uses the padded SceneVertexArray contract:
-    // FLOAT3 attributes reserve four floats, FLOAT4 reserves four, and FLOAT2 reserves four. The
-    // filler values stay zero, giving Vulkan a stable 24-float stride while preserving the actual
-    // shader-facing attribute sizes reflected from the model shader. Static model shaders are not
-    // consistent about UV naming: older variants read a_TexCoord, some tools expose the secondary
-    // channel as a_TexCoordC2, and Arsenal's lightmapped generic shader reads both channels packed
-    // as a_TexCoordVec4.xyzw. Duplicating the two UV channels keeps all three contracts valid and
-    // prevents missing attributes from being silently rebound to offset zero.
-    std::array<float, 24> one_vert {};
-    for (uint i = 0; i < chunk.vertexs.size(); i++) {
-        const auto& v = chunk.vertexs[i];
-        one_vert.fill(0.0f);
-        memcpy(one_vert.data(), v.position.data(), sizeof(v.position));
-        memcpy(one_vert.data() + 4, v.normal.data(), sizeof(v.normal));
-        memcpy(one_vert.data() + 8, v.tangent4.data(), sizeof(v.tangent4));
-        memcpy(one_vert.data() + 12, v.texcoord.data(), sizeof(v.texcoord));
-        memcpy(one_vert.data() + 16, v.texcoord2.data(), sizeof(v.texcoord2));
-        memcpy(one_vert.data() + 20, v.texcoord.data(), sizeof(v.texcoord));
-        memcpy(one_vert.data() + 22, v.texcoord2.data(), sizeof(v.texcoord2));
-        vertex.SetVertexs(i, one_vert);
+    const uint32_t stride = chunk.vertex_stride != 0
+                                ? chunk.vertex_stride
+                                : OfficialVertexStride(chunk.vertex_flag);
+    const size_t vertex_count = stride > 0 ? chunk.vertex_blob.size() / stride : 0;
+    auto         attrs        = BuildOfficialStaticVertexAttributes(chunk.vertex_flag);
+    SceneVertexArray vertex(attrs, vertex_count);
+    if (vertex.OneSizeOf() != stride ||
+        ! vertex.SetPackedBytes(chunk.vertex_blob)) {
+        LOG_ERROR("static mesh packed layout mismatch: flag=0x%x blob=%zu stride=%u packed=%zu",
+                  chunk.vertex_flag,
+                  chunk.vertex_blob.size(),
+                  stride,
+                  vertex.OneSizeOf());
+        return;
     }
 
-    bool     need_uint32 = false;
-    uint32_t max_index   = 0;
-    for (const auto& triangle : chunk.indices) {
-        for (uint32_t index : triangle) {
-            max_index = std::max(max_index, index);
-            if (index > 0xffffu) need_uint32 = true;
-        }
-    }
-
-    std::vector<uint32_t> indices;
+    const bool need_uint32 = chunk.index_element_bytes == 4;
     if (need_uint32) {
+        std::vector<uint32_t> indices;
         indices.reserve(chunk.indices.size() * 3);
         for (const auto& triangle : chunk.indices) {
             indices.insert(indices.end(), triangle.begin(), triangle.end());
@@ -1897,13 +1929,16 @@ void WPMdlParser::GenStaticMesh(SceneMesh& mesh, const WPMdl::StaticChunk& chunk
             packed.push_back(static_cast<uint16_t>(triangle[1]));
             packed.push_back(static_cast<uint16_t>(triangle[2]));
         }
+        std::vector<uint32_t> indices;
         indices.resize(packed.size() / 2 + 1);
         memcpy(indices.data(), packed.data(), packed.size() * sizeof(uint16_t));
         mesh.AddVertexArray(std::move(vertex));
         mesh.AddIndexArray(SceneIndexArray(indices));
         mesh.SetIndexElementBytes(2);
     }
-    (void)max_index;
+    mesh.SetFileImmutable(true);
+    mesh.SetBounds(Eigen::Vector3f(chunk.bounds_min[0], chunk.bounds_min[1], chunk.bounds_min[2]),
+                   Eigen::Vector3f(chunk.bounds_max[0], chunk.bounds_max[1], chunk.bounds_max[2]));
 }
 
 void WPMdlParser::AddPuppetShaderInfo(WPShaderInfo& info, const WPMdl& mdl) {

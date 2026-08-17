@@ -38,26 +38,17 @@ struct WPMdl {
 
     std::string source_path;
     std::string mat_json_file;
-    struct StaticVertex {
-        // Static Wallpaper Engine model chunks use one canonical runtime layout here:
-        // position.xyz, normal.xyz, tangent.xyzw, texcoord.xy, and optional texcoord2.xy. Chunks
-        // that omit authored normals, tangents, or the secondary UV channel still keep the same
-        // struct with safe defaults so Vulkan attributes and shaders never disagree about offsets
-        // inside a model-only mesh.
-        std::array<float, 3> position { 0.0f, 0.0f, 0.0f };
-        std::array<float, 3> normal { 0.0f, 1.0f, 0.0f };
-        std::array<float, 4> tangent4 { 1.0f, 0.0f, 0.0f, 1.0f };
-        std::array<float, 2> texcoord { 0.0f, 0.0f };
-        std::array<float, 2> texcoord2 { 0.0f, 0.0f };
-    };
     struct StaticChunk {
         std::string                         material_json_file;
         // Older static model formats can store a prefixed material table before the geometry bytes.
         // Scene model objects select one of those entries through their `skin` index, so the parser
         // keeps the full table here while material_json_file remains the default/fallback material.
         std::vector<std::string>            material_json_variants;
-        std::vector<StaticVertex>           vertexs;
+        uint32_t                            vertex_flag { 0 };
+        uint32_t                            vertex_stride { 0 };
+        std::vector<uint8_t>                vertex_blob;
         std::vector<std::array<uint32_t, 3>> indices;
+        uint32_t                            index_element_bytes { 2 };
         std::array<float, 3>                bounds_min { 0.0f, 0.0f, 0.0f };
         std::array<float, 3>                bounds_max { 0.0f, 0.0f, 0.0f };
     };

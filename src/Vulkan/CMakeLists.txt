@@ -22,6 +22,7 @@ StagingBuffer.cpp
 Swapchain.cpp
 TextureCache.cpp
 VideoTextureCache.cpp
+ImmutableMeshStore.cpp
 Parameters.cpp
 Vma.cpp
 vulkan_wrapper.cpp

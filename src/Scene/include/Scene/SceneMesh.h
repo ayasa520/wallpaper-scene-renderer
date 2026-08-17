@@ -103,6 +103,31 @@ public:
 	void SetPrimitive(MeshPrimitive v) {  m_primitive = v; }
 	void SetPointSize(uint32_t v) { m_pointSize = v; }
 
+	// File mdl chunks own exact-size GPU VB/IB pairs. Generated image cards stay on the
+	// shared small static pool because they are authored at runtime and can be resized.
+	bool FileImmutable() const { return m_data->file_immutable; }
+	void SetFileImmutable(bool v) { m_data->file_immutable = v; }
+	const void* GpuStorageKey() const { return m_data.get(); }
+
+	bool HasBounds() const { return m_data->bounds_valid; }
+	const Eigen::Vector3f& BoundsMin() const { return m_data->bounds_min; }
+	const Eigen::Vector3f& BoundsMax() const { return m_data->bounds_max; }
+	void SetBounds(const Eigen::Vector3f& min, const Eigen::Vector3f& max) {
+		m_data->bounds_min   = min;
+		m_data->bounds_max   = max;
+		m_data->bounds_valid = min.allFinite() && max.allFinite() &&
+		                       (min.array() <= max.array()).all();
+	}
+
+	bool HasCpuPayload() const {
+		return VertexCount() > 0 && GetVertexArray(0).Data() != nullptr;
+	}
+	std::size_t ReleaseCpuPayload() {
+		std::size_t bytes = 0;
+		for (auto& vertex : m_data->vertexArrays) bytes += vertex.ReleaseCpuPayload();
+		for (auto& index : m_data->indexArrays) bytes += index.ReleaseCpuPayload();
+		return bytes;
+	}
 
 	SceneMaterial* Material() { return m_material.get(); }
 
@@ -117,7 +142,11 @@ private:
 		MaskedDrawPlan maskedDraw;
 		SkinningInfo skinning;
 		Eigen::Affine3f geometry_transform { Eigen::Affine3f::Identity() };
+		Eigen::Vector3f bounds_min { Eigen::Vector3f::Zero() };
+		Eigen::Vector3f bounds_max { Eigen::Vector3f::Zero() };
 		uint32_t index_element_bytes { 2 };
+		bool file_immutable { false };
+		bool bounds_valid { false };
 	};
 
 	uint32_t m_id { std::numeric_limits<uint32_t>::max() };
