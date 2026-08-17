@@ -76,6 +76,19 @@ public:
 	void AddIndexArray(SceneIndexArray&& array) {
 		m_data->indexArrays.emplace_back(std::move(array));
 	}
+	uint32_t IndexElementBytes() const { return m_data->index_element_bytes; }
+	void SetIndexElementBytes(uint32_t bytes) {
+		m_data->index_element_bytes = (bytes == 4) ? 4u : 2u;
+	}
+	uint32_t LogicalIndexCount() const {
+		if (m_data->indexArrays.empty()) return 0;
+		const auto& indice = m_data->indexArrays[0];
+		if (m_data->index_element_bytes == 4) {
+			return static_cast<uint32_t>(indice.DataCount());
+		}
+		const size_t packed = (indice.DataCount() * 2) / 3;
+		return static_cast<uint32_t>(packed * 3);
+	}
 	void AddVertexArray(SceneVertexArray&& array) {
 		m_data->vertexArrays.emplace_back(std::move(array));
 	}
@@ -104,6 +117,7 @@ private:
 		MaskedDrawPlan maskedDraw;
 		SkinningInfo skinning;
 		Eigen::Affine3f geometry_transform { Eigen::Affine3f::Identity() };
+		uint32_t index_element_bytes { 2 };
 	};
 
 	uint32_t m_id { std::numeric_limits<uint32_t>::max() };

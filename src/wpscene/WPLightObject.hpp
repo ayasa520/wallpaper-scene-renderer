@@ -36,6 +36,10 @@ public:
     bool                 usecookie { false };
     std::string          cookie;
     bool                 castshadows { false }; // scene.json key is `castshadow`
+    float                exponent { 1.0f };
+    float                cascadedistance0 { 25.0f };
+    float                cascadedistance1 { 50.0f };
+    float                cascadedistance2 { 200.0f };
     bool                 visible { true };
     VisibleBinding       visible_binding;
     int32_t              parent { 0 };

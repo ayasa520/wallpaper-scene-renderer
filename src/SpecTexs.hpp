@@ -64,6 +64,23 @@ constexpr std::string_view G_LCP { "g_LightsColorPremultiplied" };
 // First-party 3D model shaders read this separate color/radius payload instead of the older
 // premultiplied light vector used by existing 2D shaders, so the updater gates it to model nodes.
 constexpr std::string_view G_LCR { "g_LightsColorRadius" };
+constexpr std::string_view G_LPOINT_ORIGIN { "g_LPoint_Origin" };
+constexpr std::string_view G_LPOINT_COLOR { "g_LPoint_Color" };
+constexpr std::string_view G_LSPOT_ORIGIN { "g_LSpot_Origin" };
+constexpr std::string_view G_LSPOT_COLOR { "g_LSpot_Color" };
+constexpr std::string_view G_LSPOT_DIRECTION { "g_LSpot_Direction" };
+constexpr std::string_view G_LSPOT_EXPONENT { "g_LSpot_Exponent" };
+constexpr std::string_view G_LDIR_COLOR { "g_LDirectional_Color" };
+constexpr std::string_view G_LDIR_DIRECTION { "g_LDirectional_Direction" };
+constexpr std::string_view G_LTUBE_ORIGINA { "g_LTube_OriginA" };
+constexpr std::string_view G_LTUBE_ORIGINB { "g_LTube_OriginB" };
+constexpr std::string_view G_LTUBE_COLOR { "g_LTube_Color" };
+constexpr std::string_view G_LFEAT_SHADOW_POINT_PROJ { "g_LFeature_ShadowPointProjection" };
+constexpr std::string_view G_LFEAT_SHADOW_POINT_XFORM {
+    "g_LFeature_ShadowPointProjectionTransform"
+};
+constexpr std::string_view G_LFEAT_SHADOW_PROJ { "g_LFeature_ShadowProjection" };
+constexpr std::string_view G_LFEAT_SHADOW_PROJ_XFORM { "g_LFeature_ShadowProjectionTransform" };
 constexpr std::string_view G_EYE_POSITION { "g_EyePosition" };
 // These camera basis vectors are seeded and updated only for the model-only perspective camera;
 // keeping them named here avoids ad-hoc string literals without expanding the legacy 2D contract.

@@ -60,6 +60,7 @@ struct ShaderDrawState {
     VmaImageParameters* depth_stencil_image_ref { nullptr };
     PipelineParameters  pipeline;
     u32                 draw_count { 0 };
+    u32                 index_element_bytes { 2 };
 
     std::function<void()> update_dynamic_mesh_op;
     std::function<void()> update_op;

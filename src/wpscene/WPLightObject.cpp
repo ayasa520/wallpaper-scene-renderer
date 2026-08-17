@@ -56,5 +56,9 @@ bool WPLightObject::FromJson(const nlohmann::json& json,  fs::VFS&) {
     } else {
         GET_JSON_NAME_VALUE_NOWARN(json, "castshadows", castshadows);
     }
+    GET_JSON_NAME_VALUE_NOWARN(json, "exponent", exponent);
+    GET_JSON_NAME_VALUE_NOWARN(json, "cascadedistance0", cascadedistance0);
+    GET_JSON_NAME_VALUE_NOWARN(json, "cascadedistance1", cascadedistance1);
+    GET_JSON_NAME_VALUE_NOWARN(json, "cascadedistance2", cascadedistance2);
     return true;
 }

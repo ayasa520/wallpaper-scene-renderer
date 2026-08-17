@@ -64,6 +64,21 @@ struct WPUniformInfo {
     // previous uniform surface even if they happen to declare similarly named values.
     bool has_model_LCP { false };
     bool has_LCR { false };
+    bool has_LPOINT_ORIGIN { false };
+    bool has_LPOINT_COLOR { false };
+    bool has_LSPOT_ORIGIN { false };
+    bool has_LSPOT_COLOR { false };
+    bool has_LSPOT_DIRECTION { false };
+    bool has_LSPOT_EXPONENT { false };
+    bool has_LDIR_COLOR { false };
+    bool has_LDIR_DIRECTION { false };
+    bool has_LTUBE_ORIGINA { false };
+    bool has_LTUBE_ORIGINB { false };
+    bool has_LTUBE_COLOR { false };
+    bool has_LFEAT_SHADOW_POINT_PROJ { false };
+    bool has_LFEAT_SHADOW_POINT_XFORM { false };
+    bool has_LFEAT_SHADOW_PROJ { false };
+    bool has_LFEAT_SHADOW_PROJ_XFORM { false };
     bool has_EYE_POSITION { false };
     bool has_VIEWUP { false };
     bool has_VIEWRIGHT { false };

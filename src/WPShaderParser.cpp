@@ -36,7 +36,7 @@ static constexpr std::string_view kPreparedShaderPipelineKey {
     // Load(int2, mip) form is not a DXC SPIR-V overload, and the prepared-source cache key
     // hashes only authored WE text, so a prologue-only fix was reused from disk and
     // volumetricsfront.frag kept failing (Rainy Day SceneVolumetrics compile).
-    "prepared-shader-v23-texload-int3\n"
+    "prepared-shader-v24-lighting-v1\n"
 };
 
 using namespace wallpaper;

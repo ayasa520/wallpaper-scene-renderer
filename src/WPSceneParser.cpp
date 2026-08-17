@@ -11,6 +11,7 @@
 #include "Core/ArrayHelper.hpp"
 #include "SpecTexs.hpp"
 #include "Scene/ShadowAtlas.hpp"
+#include "Scene/LightingV1.hpp"
 #include "Scene/SceneTexture.h"
 
 #include "WPShaderParser.hpp"
@@ -522,6 +523,8 @@ struct WPModelObject {
     std::string          model;
     int32_t              skin { 0 };
     bool                 reflected { false };
+    // 3D models omit this key when they should cast. Non-casters write false.
+    bool                 castshadow { true };
 
     bool FromJson(const nlohmann::json& json, fs::VFS&) {
         GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
@@ -547,6 +550,7 @@ struct WPModelObject {
         GET_JSON_NAME_VALUE_NOWARN(json, "model", model);
         GET_JSON_NAME_VALUE_NOWARN(json, "skin", skin);
         GET_JSON_NAME_VALUE_NOWARN(json, "reflected", reflected);
+        GET_JSON_NAME_VALUE_NOWARN(json, "castshadow", castshadow);
         return ! model.empty();
     }
 };
@@ -640,6 +644,9 @@ void ApplyMissingImageParallaxFallbacks(ParseContext&                   context,
 
 namespace
 {
+bool           SceneHasShadowLights(const Scene& scene);
+LightingV1Desc LightingDescFromScene(const Scene& scene);
+
 constexpr std::string_view kSyntheticDirectDrawShapeTextureName {
     "__hanabi_shape_directdraw_transparent_source"
 };
@@ -1473,6 +1480,14 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
         ApplyKnownShaderSourceFixes(wpmat.shader, unit.stage, unit.src);
     }
 
+    bool lighting_v1 { false };
+    if (pScene != nullptr) {
+        const auto lighting_desc = LightingDescFromScene(*pScene);
+        for (auto& unit : sd_units) {
+            if (ExpandRequireLightingV1(unit.src, lighting_desc)) lighting_v1 = true;
+        }
+    }
+
     auto textures = wpmat.textures;
     if (wpmat.usertextures.size() > textures.size()) {
         textures.resize(wpmat.usertextures.size());
@@ -1545,6 +1560,14 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
 
     for (const auto& el : wpmat.combos) {
         pWPShaderInfo->combos[el.first] = std::to_string(el.second);
+    }
+
+    if (lighting_v1 && pScene != nullptr) {
+        if (pScene->shadows.quality != 0 && SceneHasShadowLights(*pScene)) {
+            pWPShaderInfo->combos["LIGHTS_SHADOW_MAPPING"]         = "1";
+            pWPShaderInfo->combos["LIGHTS_SHADOW_MAPPING_QUALITY"] =
+                std::to_string(pScene->shadows.quality);
+        }
     }
 
     if (pWPShaderInfo->defTexs.size() > 0) {
@@ -3602,6 +3625,33 @@ void main() {
     return true;
 }
 
+bool SceneHasShadowLights(const Scene& scene) {
+    for (char flag : scene.lighting.point_shadow) {
+        if (flag) return true;
+    }
+    for (char flag : scene.lighting.spot_shadow) {
+        if (flag) return true;
+    }
+    for (char flag : scene.lighting.directional_shadow) {
+        if (flag) return true;
+    }
+    return false;
+}
+
+LightingV1Desc LightingDescFromScene(const Scene& scene) {
+    LightingV1Desc desc;
+    desc.point               = scene.lighting.point;
+    desc.spot                = scene.lighting.spot;
+    desc.directional         = scene.lighting.directional;
+    desc.tube                = scene.lighting.tube;
+    desc.shadows             = scene.shadows.quality != 0;
+    desc.point_shadow        = scene.lighting.point_shadow;
+    desc.spot_shadow         = scene.lighting.spot_shadow;
+    desc.spot_cookie         = scene.lighting.spot_cookie;
+    desc.directional_shadow  = scene.lighting.directional_shadow;
+    return desc;
+}
+
 void ConfigureSceneShadows(Scene& scene) {
     for (auto& light : scene.lights) {
         if (light) light->clearShadowAtlasSlot();
@@ -3611,39 +3661,57 @@ void ConfigureSceneShadows(Scene& scene) {
     scene.shadows.atlas_active  = false;
     if (quality <= 0) {
         scene.renderTargets[std::string(SpecTex_ShadowAtlas)] = {
-            .width            = 2,
-            .height           = 2,
-            .mapWidth         = 2,
-            .mapHeight        = 2,
-            .allowReuse       = false,
-            .comparisonDepth  = true,
+            .width           = 2,
+            .height          = 2,
+            .mapWidth        = 2,
+            .mapHeight       = 2,
+            .allowReuse      = false,
+            .comparisonDepth = true,
         };
         return;
     }
 
     const int face = ShadowFaceSize(quality);
-    std::vector<SceneLight*> casters;
+    std::vector<SceneLight*> point_casters;
+    std::vector<SceneLight*> spot_casters;
+    std::vector<SceneLight*> dir_casters;
     for (auto& light : scene.lights) {
         if (! light || ! light->castsShadows()) continue;
-        if (light->type() != SceneLightType::Point && light->type() != SceneLightType::Spot) {
-            continue;
-        }
-        casters.push_back(light.get());
+        if (light->type() == SceneLightType::Point) point_casters.push_back(light.get());
+        else if (light->type() == SceneLightType::Spot) spot_casters.push_back(light.get());
+        else if (light->type() == SceneLightType::Directional) dir_casters.push_back(light.get());
     }
-    const int n = std::max(1, static_cast<int>(casters.size()));
-    const int w = std::max(2, n * face);
-    const int h = std::max(2, face);
-    for (int i = 0; i < static_cast<int>(casters.size()); ++i) {
+    const int point_n    = static_cast<int>(point_casters.size());
+    const int spot_n     = static_cast<int>(spot_casters.size());
+    const int dir_n      = static_cast<int>(dir_casters.size());
+    const int cascade_n  = dir_n * 3;
+    const int slots      = point_n + spot_n + cascade_n;
+    const int n          = std::max(1, slots);
+    const int w          = std::max(2, n * face);
+    const int h          = std::max(2, face);
+    int       cursor     = 0;
+    auto pack = [&](SceneLight& light, bool point, bool directional, int cascade_index) {
         SceneLight::ShadowAtlasSlot slot;
-        slot.packed  = true;
-        slot.point   = casters[static_cast<size_t>(i)]->type() == SceneLightType::Point;
-        slot.quality = quality;
-        slot.x       = i * face;
-        slot.y       = 0;
-        slot.size    = face;
-        slot.atlas_w = w;
-        slot.atlas_h = h;
-        casters[static_cast<size_t>(i)]->setShadowAtlasSlot(slot);
+        slot.packed         = true;
+        slot.point          = point;
+        slot.directional    = directional;
+        slot.cascade_index  = cascade_index;
+        slot.quality        = quality;
+        slot.x              = cursor * face;
+        slot.y              = 0;
+        slot.size           = face;
+        slot.atlas_w        = w;
+        slot.atlas_h        = h;
+        if (directional) light.setCascadeAtlasSlot(cascade_index, slot);
+        else light.setShadowAtlasSlot(slot);
+        cursor++;
+    };
+    for (SceneLight* light : point_casters) pack(*light, true, false, 0);
+    for (SceneLight* light : spot_casters) pack(*light, false, false, 0);
+    for (SceneLight* light : dir_casters) {
+        for (int cascade = 0; cascade < 3; ++cascade) {
+            pack(*light, false, true, cascade);
+        }
     }
     scene.renderTargets[std::string(SpecTex_ShadowAtlas)] = {
         .width           = w,
@@ -4542,6 +4610,7 @@ public:
 
         const auto order = ModelChunkOrder::Build(mdl, material_loader_, model_obj_);
         AppendChunks(mdl, order);
+        ApplyCastsShadows(root_.get(), model_obj_.castshadow);
 
         context_.scene->ApplyLayerVisibility(model_obj_.id);
     }
@@ -4671,6 +4740,15 @@ private:
         context_.scene->nodeOwners[node.get()] = model_obj_.id;
         context_.scene->objectRuntimeNodes[model_obj_.id].push_back(node.get());
         return node;
+    }
+
+    void ApplyCastsShadows(SceneNode* node, bool value) {
+        if (node == nullptr) return;
+        if (node->Name().find("__hanabi_model_reflection") != std::string::npos) return;
+        node->SetCastsShadows(value);
+        for (auto& child : node->GetChildren()) {
+            ApplyCastsShadows(child.get(), value);
+        }
     }
 
     SceneModelColorLoadMode NextModelOutputColorLoadMode(std::string_view output) {
@@ -6483,6 +6561,9 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     light.setInnerCone(light_obj.innercone);
     light.setOuterCone(light_obj.outercone);
     light.setCastsShadows(light_obj.castshadows);
+    light.setExponent(light_obj.exponent);
+    light.setCascadeDistances(light_obj.cascadedistance0, light_obj.cascadedistance1,
+                              light_obj.cascadedistance2);
     if (light_obj.usecookie && ! light_obj.cookie.empty()) {
         light.setCookie(light_obj.cookie);
     }
@@ -8742,6 +8823,27 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     // Scene Bloom owns a synthetic shader and its cache keys include the scene id, so it must be
     // built only after the parse context has reached the same identity state as authored shaders.
     ConfigureSceneBloomPass(context);
+
+    context.scene->lighting = {};
+    for (const auto& obj : wp_objs) {
+        const auto* light_obj = std::get_if<wpscene::WPLightObject>(&obj);
+        if (light_obj == nullptr) continue;
+        const auto& token = light_obj->light;
+        if (token == "lpoint" || token == "point") {
+            context.scene->lighting.point++;
+            context.scene->lighting.point_shadow.push_back(light_obj->castshadows ? 1 : 0);
+        } else if (token == "lspot" || token == "spot") {
+            context.scene->lighting.spot++;
+            context.scene->lighting.spot_shadow.push_back(light_obj->castshadows ? 1 : 0);
+            context.scene->lighting.spot_cookie.push_back(
+                (light_obj->usecookie && ! light_obj->cookie.empty()) ? 1 : 0);
+        } else if (token == "ldirectional" || token == "directional") {
+            context.scene->lighting.directional++;
+            context.scene->lighting.directional_shadow.push_back(light_obj->castshadows ? 1 : 0);
+        } else if (token == "ltube" || token == "tube") {
+            context.scene->lighting.tube++;
+        }
+    }
 
     for (WPObjectVar& obj : wp_objs) {
         std::visit(visitor::overload {

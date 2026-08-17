@@ -364,6 +364,21 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_LP               = existsOp(G_LP);
     info.has_model_LCP        = IsModelRenderNode(pNode) && existsOp(G_LCP);
     info.has_LCR              = IsModelRenderNode(pNode) && existsOp(G_LCR);
+    info.has_LPOINT_ORIGIN    = existsOp(G_LPOINT_ORIGIN);
+    info.has_LPOINT_COLOR     = existsOp(G_LPOINT_COLOR);
+    info.has_LSPOT_ORIGIN     = existsOp(G_LSPOT_ORIGIN);
+    info.has_LSPOT_COLOR      = existsOp(G_LSPOT_COLOR);
+    info.has_LSPOT_DIRECTION  = existsOp(G_LSPOT_DIRECTION);
+    info.has_LSPOT_EXPONENT   = existsOp(G_LSPOT_EXPONENT);
+    info.has_LDIR_COLOR       = existsOp(G_LDIR_COLOR);
+    info.has_LDIR_DIRECTION   = existsOp(G_LDIR_DIRECTION);
+    info.has_LTUBE_ORIGINA    = existsOp(G_LTUBE_ORIGINA);
+    info.has_LTUBE_ORIGINB    = existsOp(G_LTUBE_ORIGINB);
+    info.has_LTUBE_COLOR      = existsOp(G_LTUBE_COLOR);
+    info.has_LFEAT_SHADOW_POINT_PROJ  = existsOp(G_LFEAT_SHADOW_POINT_PROJ);
+    info.has_LFEAT_SHADOW_POINT_XFORM = existsOp(G_LFEAT_SHADOW_POINT_XFORM);
+    info.has_LFEAT_SHADOW_PROJ        = existsOp(G_LFEAT_SHADOW_PROJ);
+    info.has_LFEAT_SHADOW_PROJ_XFORM  = existsOp(G_LFEAT_SHADOW_PROJ_XFORM);
     info.has_EYE_POSITION     = IsModelRenderNode(pNode) && existsOp(G_EYE_POSITION);
     info.has_VIEWUP           = IsModelRenderNode(pNode) && existsOp(G_VIEWUP);
     info.has_VIEWRIGHT        = IsModelRenderNode(pNode) && existsOp(G_VIEWRIGHT);
@@ -840,6 +855,123 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         if (info.has_LP) updateOp(G_LP, lights);
         if (info.has_LP || info.has_model_LCP) updateOp(G_LCP, lights_color);
         if (info.has_LCR) updateOp(G_LCR, lights_color_radius);
+    }
+
+    const bool has_lighting_v1 =
+        info.has_LPOINT_ORIGIN || info.has_LPOINT_COLOR || info.has_LSPOT_ORIGIN ||
+        info.has_LSPOT_COLOR || info.has_LSPOT_DIRECTION || info.has_LSPOT_EXPONENT ||
+        info.has_LDIR_COLOR || info.has_LDIR_DIRECTION || info.has_LTUBE_ORIGINA ||
+        info.has_LTUBE_ORIGINB || info.has_LTUBE_COLOR || info.has_LFEAT_SHADOW_POINT_PROJ ||
+        info.has_LFEAT_SHADOW_POINT_XFORM || info.has_LFEAT_SHADOW_PROJ ||
+        info.has_LFEAT_SHADOW_PROJ_XFORM;
+    if (has_lighting_v1) {
+        const bool shadows_on = m_scene->shadows.quality != 0;
+        const Vector3f cascade_center = m_scene->ShadowCascadeCenter();
+        std::vector<float> point_origin;
+        std::vector<float> point_color;
+        std::vector<float> point_proj;
+        std::vector<float> point_xform;
+        std::vector<float> spot_origin;
+        std::vector<float> spot_color;
+        std::vector<float> spot_direction;
+        std::vector<float> spot_exponent;
+        std::vector<float> dir_color;
+        std::vector<float> dir_direction;
+        std::vector<float> tube_a;
+        std::vector<float> tube_b;
+        std::vector<float> tube_color;
+        std::vector<float> feat_proj;
+        std::vector<float> feat_xform;
+
+        auto append_vec4 = [](std::vector<float>& dst, float x, float y, float z, float w) {
+            dst.insert(dst.end(), { x, y, z, w });
+        };
+        auto append_mat4 = [](std::vector<float>& dst, const Matrix4f& mat) {
+            dst.insert(dst.end(), mat.data(), mat.data() + 16);
+        };
+
+        for (auto& light_ptr : m_scene->lights) {
+            if (! light_ptr) continue;
+            SceneLight& light = *light_ptr;
+            const Vector3f origin  = light.WorldOrigin();
+            const Vector3f forward = light.WorldForward();
+            const Vector3f color   = light.colorIntensity();
+            if (light.type() == SceneLightType::Point) {
+                append_vec4(point_origin, origin.x(), origin.y(), origin.z(), light.radius());
+                append_vec4(point_color, color.x(), color.y(), color.z(), light.intensity());
+                if (shadows_on && light.castsShadows()) {
+                    const auto proj = light.ShadowProjectionInfo();
+                    const auto uv   = light.ShadowAtlasUv();
+                    append_vec4(point_proj, proj.x(), proj.y(), proj.z(), proj.w());
+                    append_vec4(point_xform, uv.x(), uv.y(), uv.z(), uv.w());
+                } else if (shadows_on) {
+                    append_vec4(point_proj, 0, 0, 0, 0);
+                    append_vec4(point_xform, 0, 0, 0, 0);
+                }
+            } else if (light.type() == SceneLightType::Spot) {
+                append_vec4(spot_origin, origin.x(), origin.y(), origin.z(),
+                            std::cos(light.outerCone() * SceneLight::Deg2Rad()));
+                append_vec4(spot_color, color.x(), color.y(), color.z(), light.intensity());
+                append_vec4(spot_direction, forward.x(), forward.y(), forward.z(),
+                            std::cos(light.innerCone() * SceneLight::Deg2Rad()));
+                append_vec4(spot_exponent, light.exponent(), 0, 0, 0);
+                if (shadows_on && (light.castsShadows() || light.hasCookie())) {
+                    append_mat4(feat_proj, light.WorldToLightClip());
+                    const auto uv = light.ShadowAtlasUv();
+                    append_vec4(feat_xform, uv.x(), uv.y(), uv.z(), uv.w());
+                }
+            } else if (light.type() == SceneLightType::Directional) {
+                append_vec4(dir_color, color.x(), color.y(), color.z(), light.intensity());
+                append_vec4(dir_direction, forward.x(), forward.y(), forward.z(), 0);
+                if (shadows_on && light.castsShadows()) {
+                    for (int cascade = 0; cascade < 3; ++cascade) {
+                        append_mat4(feat_proj,
+                                    light.ShadowCascadeWorldToLightClip(
+                                        cascade, cascade_center, false));
+                        const auto uv = light.cascadeAtlasSlot(cascade).packed
+                                            ? Eigen::Vector4f(
+                                                  static_cast<float>(light.cascadeAtlasSlot(cascade).x) /
+                                                      static_cast<float>(std::max(
+                                                          light.cascadeAtlasSlot(cascade).atlas_w, 1)),
+                                                  static_cast<float>(light.cascadeAtlasSlot(cascade).y) /
+                                                      static_cast<float>(std::max(
+                                                          light.cascadeAtlasSlot(cascade).atlas_h, 1)),
+                                                  static_cast<float>(light.cascadeAtlasSlot(cascade).size) /
+                                                      static_cast<float>(std::max(
+                                                          light.cascadeAtlasSlot(cascade).atlas_w, 1)),
+                                                  static_cast<float>(light.cascadeAtlasSlot(cascade).size) /
+                                                      static_cast<float>(std::max(
+                                                          light.cascadeAtlasSlot(cascade).atlas_h, 1)))
+                                            : Eigen::Vector4f::Zero();
+                        append_vec4(feat_xform, uv.x(), uv.y(), uv.z(), uv.w());
+                    }
+                }
+            } else if (light.type() == SceneLightType::Tube) {
+                append_vec4(tube_a, origin.x(), origin.y(), origin.z(), light.radius());
+                append_vec4(tube_b, origin.x(), origin.y(), origin.z(), 0);
+                append_vec4(tube_color, color.x(), color.y(), color.z(), light.intensity());
+            }
+        }
+
+        auto push_if = [&](bool enabled, std::string_view name, const std::vector<float>& values) {
+            if (! enabled || values.empty()) return;
+            updateOp(name, std::span<const float> { values.data(), values.size() });
+        };
+        push_if(info.has_LPOINT_ORIGIN, G_LPOINT_ORIGIN, point_origin);
+        push_if(info.has_LPOINT_COLOR, G_LPOINT_COLOR, point_color);
+        push_if(info.has_LSPOT_ORIGIN, G_LSPOT_ORIGIN, spot_origin);
+        push_if(info.has_LSPOT_COLOR, G_LSPOT_COLOR, spot_color);
+        push_if(info.has_LSPOT_DIRECTION, G_LSPOT_DIRECTION, spot_direction);
+        push_if(info.has_LSPOT_EXPONENT, G_LSPOT_EXPONENT, spot_exponent);
+        push_if(info.has_LDIR_COLOR, G_LDIR_COLOR, dir_color);
+        push_if(info.has_LDIR_DIRECTION, G_LDIR_DIRECTION, dir_direction);
+        push_if(info.has_LTUBE_ORIGINA, G_LTUBE_ORIGINA, tube_a);
+        push_if(info.has_LTUBE_ORIGINB, G_LTUBE_ORIGINB, tube_b);
+        push_if(info.has_LTUBE_COLOR, G_LTUBE_COLOR, tube_color);
+        push_if(info.has_LFEAT_SHADOW_POINT_PROJ, G_LFEAT_SHADOW_POINT_PROJ, point_proj);
+        push_if(info.has_LFEAT_SHADOW_POINT_XFORM, G_LFEAT_SHADOW_POINT_XFORM, point_xform);
+        push_if(info.has_LFEAT_SHADOW_PROJ, G_LFEAT_SHADOW_PROJ, feat_proj);
+        push_if(info.has_LFEAT_SHADOW_PROJ_XFORM, G_LFEAT_SHADOW_PROJ_XFORM, feat_xform);
     }
 }
 
