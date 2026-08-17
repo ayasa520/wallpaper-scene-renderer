@@ -132,6 +132,16 @@ public:
     void ApplyAllLayerVisibility();
     void UpdateModelCameraPath();
     void UpdateCameraShake();
+    Eigen::Vector3f ShadowCascadeCenter() const {
+        if (! modelPerspectiveCameraName.empty()) {
+            auto it = cameras.find(modelPerspectiveCameraName);
+            if (it != cameras.end() && it->second) {
+                return it->second->GetPosition().cast<float>();
+            }
+        }
+        if (activeCamera != nullptr) return activeCamera->GetPosition().cast<float>();
+        return Eigen::Vector3f::Zero();
+    }
     Eigen::Vector3f ResolveCameraLayerNodeTranslation(
         const std::array<float, 3>& authored_origin) const;
     void UpdateActiveCameraLayer();
@@ -323,6 +333,18 @@ public:
         bool atlas_active { false };
     };
     ShadowSettings       shadows;
+
+    struct LightingInventory {
+        int point { 0 };
+        int spot { 0 };
+        int directional { 0 };
+        int tube { 0 };
+        std::vector<char> point_shadow;
+        std::vector<char> spot_shadow;
+        std::vector<char> spot_cookie;
+        std::vector<char> directional_shadow;
+    };
+    LightingInventory    lighting;
     bool                 cameraParallax { false };
     float                cameraParallaxAmount { 0.0f };
     float                cameraParallaxDelay { 0.0f };

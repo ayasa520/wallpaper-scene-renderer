@@ -57,7 +57,7 @@ struct WPMdl {
         // keeps the full table here while material_json_file remains the default/fallback material.
         std::vector<std::string>            material_json_variants;
         std::vector<StaticVertex>           vertexs;
-        std::vector<std::array<uint16_t, 3>> indices;
+        std::vector<std::array<uint32_t, 3>> indices;
         std::array<float, 3>                bounds_min { 0.0f, 0.0f, 0.0f };
         std::array<float, 3>                bounds_max { 0.0f, 0.0f, 0.0f };
     };

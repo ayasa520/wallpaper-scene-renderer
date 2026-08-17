@@ -92,11 +92,28 @@ public:
     bool castsShadows() const { return m_casts_shadows; }
     void setCastsShadows(bool enabled) { m_casts_shadows = enabled; }
 
+    float exponent() const { return m_exponent; }
+    void  setExponent(float exponent) { m_exponent = exponent; }
+
+    float cascadeDistance(int index) const {
+        if (index <= 0) return m_cascade0;
+        if (index == 1) return m_cascade1;
+        return m_cascade2;
+    }
+    void setCascadeDistances(float d0, float d1, float d2) {
+        m_cascade0 = d0;
+        m_cascade1 = d1;
+        m_cascade2 = d2;
+    }
+
     // One square `_rt_shadowAtlas` slot. Point lights pack six faces in a 2×3
-    // grid; spots occupy the full square.
+    // grid; spots occupy the full square. Directional lights use three cascade
+    // slots instead of this single slot.
     struct ShadowAtlasSlot {
         bool packed { false };
         bool point { true };
+        bool directional { false };
+        int  cascade_index { 0 };
         int  quality { 2 };
         int  x { 0 };
         int  y { 0 };
@@ -106,8 +123,22 @@ public:
     };
 
     void                   setShadowAtlasSlot(ShadowAtlasSlot slot) { m_shadow_slot = slot; }
-    void                   clearShadowAtlasSlot() { m_shadow_slot = {}; }
+    void                   clearShadowAtlasSlot() {
+        m_shadow_slot = {};
+        m_cascade_slots[0] = {};
+        m_cascade_slots[1] = {};
+        m_cascade_slots[2] = {};
+    }
     const ShadowAtlasSlot& shadowAtlasSlot() const { return m_shadow_slot; }
+    void setCascadeAtlasSlot(int index, ShadowAtlasSlot slot) {
+        if (index < 0 || index > 2) return;
+        m_cascade_slots[index] = slot;
+    }
+    const ShadowAtlasSlot& cascadeAtlasSlot(int index) const {
+        if (index <= 0) return m_cascade_slots[0];
+        if (index == 1) return m_cascade_slots[1];
+        return m_cascade_slots[2];
+    }
 
     Eigen::Vector4f ShadowAtlasUv() const {
         if (! m_shadow_slot.packed || m_shadow_slot.atlas_w <= 0 || m_shadow_slot.atlas_h <= 0) {
@@ -226,6 +257,37 @@ public:
         return clip;
     }
 
+    // Directional cascade VP. Authored cascadedistanceN is the ortho half-extent
+    // of cascade N. The eye sits cascadeDistance along -forward from `center`
+    // so the frustum covers that box. Sampling uses render_bias=false.
+    Eigen::Matrix4f ShadowCascadeWorldToLightClip(int cascade, const Eigen::Vector3f& center,
+                                                  bool render_bias) const {
+        const float               half = std::max(cascadeDistance(cascade), 0.01f);
+        const Eigen::Vector3f     fwd  = WorldForward();
+        const Eigen::Vector3f     eye  = center - fwd * half;
+        const Eigen::Matrix4f     axes = LightAxes();
+        Eigen::Matrix4f           world_to_light = Eigen::Matrix4f::Identity();
+        world_to_light.block<3, 3>(0, 0)         = axes.block<3, 3>(0, 0).transpose();
+        const Eigen::Vector3f t = -world_to_light.block<3, 3>(0, 0) * eye;
+        world_to_light(0, 3)    = t.x();
+        world_to_light(1, 3)    = t.y();
+        world_to_light(2, 3)    = t.z();
+
+        const float n = ShadowNearPlane();
+        const float f = std::max(half * 2.0f, n + 0.01f);
+        Eigen::Matrix4f proj = Eigen::Matrix4f::Zero();
+        proj(0, 0)           = 1.0f / half;
+        proj(1, 1)           = 1.0f / half;
+        // D3D / Vulkan clip z is [0, 1]. Official cascade sampling feeds this z
+        // straight to texSample2DCompare and treats abs(ndc) > 0.99 as out of tile.
+        proj(2, 2)           = 1.0f / (f - n);
+        float b              = -n / (f - n);
+        if (render_bias) b += 0.0005f;
+        proj(2, 3) = b;
+        proj(3, 3) = 1.0f;
+        return proj * world_to_light;
+    }
+
     Eigen::Matrix4f AltViewProjection() const {
         if (m_type == SceneLightType::Point) return PointAltViewProjection();
         if (m_has_cookie) {
@@ -283,6 +345,11 @@ private:
     bool           m_has_cookie { false };
     std::string    m_cookie;
     bool           m_casts_shadows { false };
+    float          m_exponent { 1.0f };
+    float          m_cascade0 { 25.0f };
+    float          m_cascade1 { 50.0f };
+    float          m_cascade2 { 200.0f };
     ShadowAtlasSlot m_shadow_slot {};
+    ShadowAtlasSlot m_cascade_slots[3] {};
 };
 } // namespace wallpaper

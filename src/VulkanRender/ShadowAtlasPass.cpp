@@ -126,7 +126,7 @@ void WalkCasters(wallpaper::SceneNode* node,
     if (auto* mesh = node->Mesh(); mesh != nullptr) {
         auto* material = mesh->Material();
         if (material != nullptr && material->modelRenderState.has_value() &&
-            mesh->Skinning().boneCount == 0 && mesh->VertexCount() > 0) {
+            node->CastsShadows() && mesh->VertexCount() > 0) {
             fn(*node, *mesh);
         }
     }
@@ -283,9 +283,9 @@ void ShadowAtlasPass::collectCasters(Scene& scene, const Device&, RenderingResou
                                           { reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(
                                                 indice.Data())),
                                             bytes })) {
-                const size_t count  = (indice.DataCount() * 2) / 3;
-                caster.index_count  = static_cast<uint32_t>(count * 3);
-                caster.indexed      = caster.index_count > 0;
+                caster.index_element_bytes = mesh.IndexElementBytes();
+                caster.index_count         = mesh.LogicalIndexCount();
+                caster.indexed             = caster.index_count > 0;
             }
         }
         m_casters.push_back(std::move(caster));
@@ -298,29 +298,46 @@ void ShadowAtlasPass::rebuildDrawList() {
     if (scene == nullptr) return;
 
     uint32_t slot = 0;
+    const Eigen::Vector3f cascade_center = scene->ShadowCascadeCenter();
+
     for (auto& light_ptr : scene->lights) {
         if (! light_ptr) continue;
         SceneLight& light = *light_ptr;
-        const auto& atlas = light.shadowAtlasSlot();
-        if (! atlas.packed) continue;
-
         const Eigen::Vector3f origin = light.WorldOrigin();
 
-        for (uint32_t ci = 0; ci < m_casters.size(); ++ci) {
-            auto* node = m_casters[ci].node;
-            if (node == nullptr || ! node->Visible()) continue;
-            node->UpdateTrans();
-            Eigen::Matrix4f model = node->ModelTrans().cast<float>();
-            if (auto* mesh = node->Mesh(); mesh != nullptr) {
-                model = model * mesh->GeometryTransform().matrix();
-            }
-
-            if (atlas.point) {
-                const Eigen::Matrix4f proj = ShadowPointProjection(
-                    light.ShadowNearPlane(), light.ShadowFarPlane(),
-                    ShadowPointFovDegrees(atlas.quality), true);
-                for (int face = 0; face < 6; ++face) {
-                    const auto vp = ShadowPointFaceViewport(atlas.x, atlas.y, atlas.size, face);
+        auto emit_tile = [&](const SceneLight::ShadowAtlasSlot& atlas, const Eigen::Matrix4f& mvp_light,
+                             bool point_faces) {
+            if (! atlas.packed) return;
+            for (uint32_t ci = 0; ci < m_casters.size(); ++ci) {
+                auto* node = m_casters[ci].node;
+                if (node == nullptr || ! node->Visible()) continue;
+                node->UpdateTrans();
+                Eigen::Matrix4f model = node->ModelTrans().cast<float>();
+                if (auto* mesh = node->Mesh(); mesh != nullptr) {
+                    model = model * mesh->GeometryTransform().matrix();
+                }
+                if (point_faces) {
+                    const Eigen::Matrix4f proj = ShadowPointProjection(
+                        light.ShadowNearPlane(), light.ShadowFarPlane(),
+                        ShadowPointFovDegrees(atlas.quality), true);
+                    for (int face = 0; face < 6; ++face) {
+                        const auto vp = ShadowPointFaceViewport(atlas.x, atlas.y, atlas.size, face);
+                        DrawItem item;
+                        item.caster_index = ci;
+                        item.ubo_slot     = slot++;
+                        item.vp_x         = vp.x;
+                        item.vp_y         = vp.y;
+                        item.vp_w         = vp.width;
+                        item.vp_h         = vp.height;
+                        item.scissor_x    = vp.scissor_x;
+                        item.scissor_y    = vp.scissor_y;
+                        item.scissor_w    = vp.scissor_w;
+                        item.scissor_h    = vp.scissor_h;
+                        item.mvp          = proj * ShadowPointView(face, origin) * model;
+                        m_draws.push_back(item);
+                    }
+                } else {
+                    const auto vp = ShadowSpotViewport(atlas.x, atlas.y, atlas.size);
                     DrawItem item;
                     item.caster_index = ci;
                     item.ubo_slot     = slot++;
@@ -332,25 +349,28 @@ void ShadowAtlasPass::rebuildDrawList() {
                     item.scissor_y    = vp.scissor_y;
                     item.scissor_w    = vp.scissor_w;
                     item.scissor_h    = vp.scissor_h;
-                    item.mvp = proj * ShadowPointView(face, origin) * model;
+                    item.mvp          = mvp_light * model;
                     m_draws.push_back(item);
                 }
-            } else {
-                const auto vp = ShadowSpotViewport(atlas.x, atlas.y, atlas.size);
-                DrawItem item;
-                item.caster_index = ci;
-                item.ubo_slot     = slot++;
-                item.vp_x         = vp.x;
-                item.vp_y         = vp.y;
-                item.vp_w         = vp.width;
-                item.vp_h         = vp.height;
-                item.scissor_x    = vp.scissor_x;
-                item.scissor_y    = vp.scissor_y;
-                item.scissor_w    = vp.scissor_w;
-                item.scissor_h    = vp.scissor_h;
-                item.mvp          = light.ShadowWorldToLightClip() * model;
-                m_draws.push_back(item);
             }
+        };
+
+        if (light.type() == SceneLightType::Directional) {
+            for (int cascade = 0; cascade < 3; ++cascade) {
+                const auto& atlas = light.cascadeAtlasSlot(cascade);
+                emit_tile(atlas,
+                          light.ShadowCascadeWorldToLightClip(cascade, cascade_center, true),
+                          false);
+            }
+            continue;
+        }
+
+        const auto& atlas = light.shadowAtlasSlot();
+        if (! atlas.packed) continue;
+        if (atlas.point) {
+            emit_tile(atlas, Eigen::Matrix4f::Identity(), true);
+        } else {
+            emit_tile(atlas, light.ShadowWorldToLightClip(), false);
         }
     }
 }
@@ -485,7 +505,10 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
 
         rr.command.BindVertexBuffers(0, 1, &gpu, &caster.vertex.offset);
         if (caster.indexed && caster.index) {
-            rr.command.BindIndexBuffer(gpu, caster.index.offset, VK_INDEX_TYPE_UINT16);
+            const VkIndexType index_type = caster.index_element_bytes == 4
+                                               ? VK_INDEX_TYPE_UINT32
+                                               : VK_INDEX_TYPE_UINT16;
+            rr.command.BindIndexBuffer(gpu, caster.index.offset, index_type);
             rr.command.DrawIndexed(caster.index_count, 1, 0, 0, 0);
         } else {
             rr.command.Draw(caster.vertex_count, 1, 0, 0);

@@ -109,6 +109,8 @@ public:
     void SetVisible(bool value) noexcept { SetLocalVisible(value); }
     void SetLocalVisible(bool value) noexcept { m_localVisible = value; }
     void SetLayerVisible(bool value) noexcept { m_layerVisible = value; }
+    bool CastsShadows() const noexcept { return m_castsShadows; }
+    void SetCastsShadows(bool value) noexcept { m_castsShadows = value; }
 
     // update self modle trans (will update parent before)
     void            UpdateTrans();
@@ -159,6 +161,7 @@ private:
     std::shared_ptr<SceneTextPrimitive> m_text;
     bool m_localVisible { true };
     bool m_layerVisible { true };
+    bool m_castsShadows { false };
 
     // specific a camera not active, used for image effect
     std::string m_cameraName;

@@ -1014,7 +1014,8 @@ std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
                                        VK_FORMAT_D32_SFLOAT,
                                        sam_info,
                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                                           VK_IMAGE_USAGE_SAMPLED_BIT,
+                                           VK_IMAGE_USAGE_SAMPLED_BIT |
+                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                        VMA_MEMORY_USAGE_GPU_ONLY,
                                        VK_IMAGE_ASPECT_DEPTH_BIT);
                 opt.has_value()) {

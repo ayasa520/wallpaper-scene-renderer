@@ -47,6 +47,7 @@ private:
         StagingBufferRef index;
         uint32_t         index_count { 0 };
         uint32_t         vertex_count { 0 };
+        uint32_t         index_element_bytes { 2 };
         bool             indexed { false };
     };
 
