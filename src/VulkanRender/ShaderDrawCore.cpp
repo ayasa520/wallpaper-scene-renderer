@@ -166,7 +166,7 @@ std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
 
 static int IntendedShaderDrawSampleCount(const ShaderDrawData& desc) {
     if (desc.scene != nullptr && ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.node)) {
-        return std::max(1, desc.scene->msaa.SampleCount());
+        return std::max(1, desc.scene->MsaaSampleCount());
     }
     return 1;
 }
@@ -1613,7 +1613,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
     }
     if (ShaderDrawCanUseMsaa(scene, m_desc.output, m_desc.node)) {
         m_desc.sample_count = static_cast<VkSampleCountFlagBits>(
-            std::max(1, scene.msaa.SampleCount()));
+            std::max(1, scene.MsaaSampleCount()));
         m_desc.resolve_msaa = false;
         if (mesh.Material() != nullptr) {
             m_desc.alpha_to_coverage = mesh.Material()->alpha_to_coverage;

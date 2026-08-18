@@ -593,14 +593,18 @@ private:
         int32_t quality { 1 };
         if (! msg->findInt32("value", &quality) || ! m_scene) return;
         quality = std::clamp(quality, 0, 3);
-        if (m_scene->msaa.quality == quality && m_scene->msaa.built_quality == quality) return;
+        const int effective = m_scene->has3dModels ? quality : 0;
+        if (m_scene->msaa.quality == quality && m_scene->msaa.built_quality == effective) return;
         m_scene->msaa.quality        = quality;
         m_scene->msaa.device_samples = 0;
         ConfigureSceneMsaa(*m_scene);
         m_scene->MarkRenderGraphResourcesDirty();
-        LOG_INFO("SceneWallpaper: antialiasing quality=%d samples=%d (refresh resources)",
+        LOG_INFO("SceneWallpaper: antialiasing requested=%d effective=%d samples=%d has3d=%s "
+                 "(refresh resources)",
                  quality,
-                 m_scene->msaa.SampleCount());
+                 m_scene->EffectiveMsaaQuality(),
+                 m_scene->MsaaSampleCount(),
+                 m_scene->has3dModels ? "true" : "false");
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
@@ -1088,6 +1092,11 @@ void MainHandler::loadScene() {
         scene->bloom.quality       = m_postprocessing_quality;
         scene->msaa.quality        = m_antialiasing_quality;
         ConfigureSceneMsaa(*scene);
+        LOG_INFO("SceneWallpaper: antialiasing requested=%d effective=%d samples=%d has3d=%s",
+                 m_antialiasing_quality,
+                 scene->EffectiveMsaaQuality(),
+                 scene->MsaaSampleCount(),
+                 scene->has3dModels ? "true" : "false");
         scene->vfs.swap(pVfs);
         if (scene->vfs && (scene->volumetrics.built_quality != m_volumetrics_quality ||
                            scene->shadows.built_quality != m_shadows_quality)) {

@@ -12,9 +12,9 @@ namespace wallpaper
 {
 
 inline void ConfigureSceneMsaa(Scene& scene) {
-    const int         samples = scene.msaa.SampleCount();
+    const int         samples = scene.MsaaSampleCount();
     const std::string ms_name(SpecTex_DefaultMS);
-    scene.msaa.built_quality = scene.msaa.quality;
+    scene.msaa.built_quality = scene.EffectiveMsaaQuality();
     if (samples <= 1) {
         if (scene.renderTargets.erase(ms_name) > 0) {
             scene.pendingRenderTargetReleaseKeys.insert(ms_name);
@@ -53,7 +53,7 @@ inline VkSampleCountFlagBits MsaaSupportedSampleCount(const Device& device, int 
 }
 
 inline bool ComposeOutputUsesMsaa(const Scene& scene, std::string_view output) {
-    return scene.msaa.SampleCount() > 1 && output == SpecTex_Default;
+    return scene.MsaaSampleCount() > 1 && output == SpecTex_Default;
 }
 
 // Bloom/HDR combine sample `_rt_default` and replace it. Those posts stay 1x on
@@ -88,7 +88,8 @@ void NoteComposeMsaaDraw(RenderingResources& rr, VkSampleCountFlagBits samples);
 bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingResources& rr);
 
 inline void SyncSceneMsaa(Scene& scene, const Device& device) {
-    const int requested = Scene::MsaaSettings::RequestedSampleCount(scene.msaa.quality);
+    const int requested =
+        Scene::MsaaSettings::RequestedSampleCount(scene.EffectiveMsaaQuality());
     scene.msaa.device_samples = static_cast<int>(MsaaSupportedSampleCount(device, requested));
     ConfigureSceneMsaa(scene);
 }

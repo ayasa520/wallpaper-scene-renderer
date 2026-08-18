@@ -148,6 +148,11 @@ public:
         const std::array<float, 3>& authored_origin) const;
     void UpdateActiveCameraLayer();
 
+    // Official 2.3 MSAA: user `msaa.quality` is remembered, but sample count / MS RT
+    // creation use 0 unless scene.json objects[] contains a non-null "model" key.
+    int EffectiveMsaaQuality() const { return has3dModels ? msaa.quality : 0; }
+    int MsaaSampleCount() const { return msaa.SampleCount(has3dModels); }
+
     SceneImageEffect*       FindImageEffect(int32_t owner_layer_id, uint32_t effect_index);
     const SceneImageEffect* FindImageEffect(int32_t owner_layer_id, uint32_t effect_index) const;
     SceneImageEffect*       FindImageEffectById(int32_t owner_layer_id, int32_t effect_id);
@@ -338,6 +343,7 @@ public:
 
     struct MsaaSettings {
         // Official msaa strings: none=0, x2=1, x4=2, x8=3. Sample count is 1 << quality.
+        // `quality` is the user-requested value; pass has3dModels into SampleCount().
         int quality { 1 };
         int built_quality { -1 };
         // Device-clamped sample count written by the Vulkan backend. 0 means not yet queried.
@@ -349,13 +355,17 @@ public:
             return 1 << quality;
         }
 
-        int SampleCount() const {
-            if (quality <= 0) return 1;
+        int SampleCount(bool has_3d_models) const {
+            const int q = has_3d_models ? quality : 0;
+            if (q <= 0) return 1;
             if (device_samples > 1) return device_samples;
-            return RequestedSampleCount(quality);
+            return RequestedSampleCount(q);
         }
     };
     MsaaSettings         msaa;
+    // Official 2.3 MSAA gate. True when any objects[] entry has a non-null "model"
+    // field. `"image": "models/foo.json"` is not a model.
+    bool                 has3dModels { false };
 
     struct LightingInventory {
         int point { 0 };

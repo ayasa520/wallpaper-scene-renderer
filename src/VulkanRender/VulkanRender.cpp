@@ -1244,7 +1244,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     if (m_device_faulted) return;
     if (! m_inited) return;
     SyncSceneMsaa(scene, *m_device);
-    const int msaa_samples = scene.msaa.SampleCount();
+    const int msaa_samples = scene.MsaaSampleCount();
     if (msaa_samples != m_compiled_msaa_samples) {
         dropCompiledPassFramebuffers();
         m_rendering_resources.model_depth_images.clear();

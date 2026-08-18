@@ -16,7 +16,7 @@ void NoteComposeMsaaDraw(RenderingResources& rr, VkSampleCountFlagBits samples) 
 
 bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingResources& rr) {
     if (! rr.msaa_compose_dirty) return false;
-    if (scene.msaa.SampleCount() <= 1) {
+    if (scene.MsaaSampleCount() <= 1) {
         rr.msaa_compose_dirty = false;
         return false;
     }
