@@ -998,6 +998,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
 
     if (width == 0 || height == 0) return;
     scene.physicalOutputExtent = { width, height };
+    scene.ApplyTextureResolutionForCurrentOutput();
     double sw = scene.ortho[0], sh = scene.ortho[1];
     double fboAspect = width / (double)height, sAspect = sw / sh;
     auto&  gCam    = *scene.cameras.at("global");

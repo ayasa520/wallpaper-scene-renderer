@@ -715,8 +715,9 @@ void EnsureSystemTextureRegistered(Scene& scene, std::string_view texture_key) {
         .isSprite  = false,
         .width     = 1,
         .height    = 1,
-        .mapWidth  = 1,
-        .mapHeight = 1,
+        .mapWidth     = 1,
+        .mapHeight    = 1,
+        .mipmapCount  = 1,
     };
     scene.dirtyImportedTextureKeys.insert(key);
 }
@@ -1399,6 +1400,8 @@ void RegisterSceneTextureFromHeader(Scene& scene, const std::string& name,
     texture.height    = header.height;
     texture.mapWidth  = header.mapWidth;
     texture.mapHeight = header.mapHeight;
+    texture.mipmapCount   = header.mipmapCount;
+    texture.mipmap_larger = header.mipmap_larger;
     if (header.isSprite) {
         texture.isSprite   = true;
         texture.spriteAnim = header.spriteAnim;
@@ -1630,6 +1633,10 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
             } else {
                 resolution = { texh.mapWidth, texh.mapHeight, texh.mapWidth, texh.mapHeight };
             }
+            // Parse-time values use the authored header. After GPU upload the
+            // shader updater overwrites g_TextureNResolution from
+            // EffectiveImportedTextureResolution() so half/auto follow the
+            // official bind-path GPU extent.
 
             RegisterSceneTextureFromHeader(*pScene, name, texh);
             if ((pScene->textures.at(name)).isSprite) {

@@ -4880,8 +4880,9 @@ void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key,
         .isSprite  = false,
         .width     = image->header.width,
         .height    = image->header.height,
-        .mapWidth  = image->header.mapWidth,
-        .mapHeight = image->header.mapHeight,
+        .mapWidth    = image->header.mapWidth,
+        .mapHeight   = image->header.mapHeight,
+        .mipmapCount = 1,
     };
     opaque->scene->dirtyImportedTextureKeys.insert(std::string(key));
 }

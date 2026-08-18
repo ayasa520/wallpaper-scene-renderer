@@ -33,6 +33,11 @@ struct SceneTexture {
     i32             height { 0 };
     i32             mapWidth { 0 };
     i32             mapHeight { 0 };
+    i32             mipmapCount { 0 };
+    bool            mipmap_larger { false };
+    // Actual uploaded GPU extent after optional mip0 drop. 0 means not uploaded yet.
+    i32             gpuWidth { 0 };
+    i32             gpuHeight { 0 };
     SpriteAnimation spriteAnim;
 };
 } // namespace wallpaper

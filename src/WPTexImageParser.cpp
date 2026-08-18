@@ -179,7 +179,7 @@ bool ReadString(fs::IBinaryStream& file, std::string& value) {
 std::string GetTextureHeaderCachePath(std::string_view cache_namespace, std::string_view name) {
     std::string key;
     key.reserve(cache_namespace.size() + name.size() + 16);
-    key.append("tex-header-v2\n");
+    key.append("tex-header-v3\n");
     key.append(cache_namespace);
     key.push_back('\n');
     key.append(name);
@@ -254,7 +254,7 @@ void SaveSpriteAnimation(const SpriteAnimation& animation, fs::IBinaryStreamW& f
 }
 
 bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinaryStream& file) {
-    if (ReadVersion("WTHD", file) != 2) return false;
+    if (ReadVersion("WTHD", file) != 3) return false;
     if (! ReadPod(file, file_size)) return false;
 
     if (! ReadPod(file, header.width)) return false;
@@ -275,6 +275,7 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
     if (! ReadPod(file, type)) return false;
     if (! ReadPod(file, format)) return false;
     if (! ReadPod(file, header.count)) return false;
+    if (! ReadPod(file, header.mipmapCount)) return false;
     if (! ReadPod(file, header.isSprite)) return false;
     if (! ReadPod(file, wrap_s)) return false;
     if (! ReadPod(file, wrap_t)) return false;
@@ -298,7 +299,7 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
 }
 
 void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IBinaryStreamW& file) {
-    WriteVersion("WTHD", file, 2);
+    WriteVersion("WTHD", file, 3);
     WritePod(file, file_size);
 
     WritePod(file, header.width);
@@ -319,6 +320,7 @@ void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IB
     WritePod(file, type);
     WritePod(file, format);
     WritePod(file, header.count);
+    WritePod(file, header.mipmapCount);
     WritePod(file, header.isSprite);
     WritePod(file, wrap_s);
     WritePod(file, wrap_t);
@@ -340,6 +342,7 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
         std::vector<std::vector<float>> imageDatas(image_count);
         for (usize i_image = 0; i_image < image_count; i_image++) {
             int mipmap_count = file.ReadInt32();
+            if (i_image == 0) header.mipmapCount = mipmap_count;
             for (int32_t i_mipmap = 0; i_mipmap < mipmap_count; i_mipmap++) {
                 int32_t width  = file.ReadInt32();
                 int32_t height = file.ReadInt32();
@@ -406,6 +409,7 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
         }
     } else {
         i32 mipmap_count = file.ReadInt32();
+        header.mipmapCount = mipmap_count;
         for (i32 i_mipmap = 0; i_mipmap < mipmap_count; i_mipmap++) {
             i32 width  = file.ReadInt32();
             i32 height = file.ReadInt32();
@@ -462,6 +466,7 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
         auto& mipmaps  = img_slot.mipmaps;
 
         usize mipmap_count = (usize)std::max<i32>(file.ReadInt32(), 0);
+        if (i_image == 0) img.header.mipmapCount = (i32)mipmap_count;
         mipmaps.resize(mipmap_count);
         // load image
         for (usize i_mipmap = 0; i_mipmap < mipmap_count; i_mipmap++) {

@@ -20,6 +20,7 @@ constexpr std::string_view PROPERTY_VOLUMETRICS          = "volumetrics";
 constexpr std::string_view PROPERTY_SHADOWS              = "shadows";
 constexpr std::string_view PROPERTY_POSTPROCESSING       = "postprocessing";
 constexpr std::string_view PROPERTY_ANTIALIASING         = "antialiasing";
+constexpr std::string_view PROPERTY_TEXTURE_RESOLUTION   = "texture-resolution";
 constexpr std::string_view PROPERTY_FILLMODE             = "fillmode";
 constexpr std::string_view PROPERTY_SPEED                = "speed";
 constexpr std::string_view PROPERTY_GRAPHIVZ             = "graphivz";
