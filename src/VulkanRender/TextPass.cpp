@@ -45,7 +45,7 @@ int IntendedTextSampleCount(const wallpaper::Scene* scene, std::string_view outp
     // ping-pong / text-bridge targets stay 1x: official effect shaders sample
     // them as Texture2D, and the exe has no multisampled ping-pong RT name.
     if (scene != nullptr && wallpaper::vulkan::ComposeOutputUsesMsaa(*scene, output)) {
-        return std::max(1, scene->msaa.SampleCount());
+        return std::max(1, scene->MsaaSampleCount());
     }
     return 1;
 }

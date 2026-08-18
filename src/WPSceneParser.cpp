@@ -8985,11 +8985,18 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         }
     }
 
+    bool has_3d_models = false;
     for (auto& obj : json.at("objects")) {
         int32_t     object_id = 0;
         std::string object_name;
         GET_JSON_NAME_VALUE_NOWARN(obj, "id", object_id);
         GET_JSON_NAME_VALUE_NOWARN(obj, "name", object_name);
+
+        // Official 2.3 MSAA gate: any non-null objects[].model counts, including
+        // hidden/pruned layers. An image path of models/foo.json does not.
+        if (obj.contains("model") && ! obj.at("model").is_null()) {
+            has_3d_models = true;
+        }
 
         const bool is_image_layer = obj.contains("image") && ! obj.at("image").is_null();
         const bool script_referenced_hidden_image =
@@ -9165,6 +9172,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
 
     InitContext(context, vfs, sc, scene_id);
+    context.scene->has3dModels         = has_3d_models;
     context.layer_visibility_contracts = std::move(layer_visibility_contracts);
     context.scene->soundManager        = &sm;
     // Text atlases and effect ping-pong stay in the authored letter box. Desktop density is
