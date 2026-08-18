@@ -245,6 +245,7 @@ private:
     int32_t                                  m_shadows_quality { 2 };
     int32_t                                  m_postprocessing_quality { 1 };
     int32_t                                  m_antialiasing_quality { 1 };
+    int32_t                                  m_texture_resolution_quality { 0 };
 
     WPSceneParser                        m_scene_parser;
     std::unique_ptr<audio::SoundManager> m_sound_manager;
@@ -276,6 +277,7 @@ public:
         CMD_SET_SHADOWS,
         CMD_SET_POSTPROCESSING,
         CMD_SET_ANTIALIASING,
+        CMD_SET_TEXTURE_RESOLUTION,
         CMD_SET_SPEED,
         CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
         CMD_RECONFIGURE_OFFSCREEN_EXPORT,
@@ -316,6 +318,7 @@ public:
                 CASE_CMD(SET_SHADOWS);
                 CASE_CMD(SET_POSTPROCESSING);
                 CASE_CMD(SET_ANTIALIASING);
+                CASE_CMD(SET_TEXTURE_RESOLUTION);
                 CASE_CMD(SET_SCENE);
                 CASE_CMD(APPLY_USER_PROPERTIES);
                 CASE_CMD(APPLY_MEDIA_STATE);
@@ -605,6 +608,14 @@ private:
                  m_scene->EffectiveMsaaQuality(),
                  m_scene->MsaaSampleCount(),
                  m_scene->has3dModels ? "true" : "false");
+    }
+    MHANDLER_CMD(SET_TEXTURE_RESOLUTION) {
+        int32_t quality { 0 };
+        if (! msg->findInt32("value", &quality) || ! m_scene) return;
+        quality = std::clamp(quality, 0, 2);
+        if (m_scene->textureResolution.quality == quality) return;
+        m_scene->textureResolution.quality = quality;
+        m_scene->ApplyTextureResolutionForCurrentOutput();
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
@@ -911,6 +922,15 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                 nmsg->setInt32("value", m_antialiasing_quality);
                 nmsg->post();
             }
+        } else if (property == PROPERTY_TEXTURE_RESOLUTION) {
+            int32_t quality { 0 };
+            if (msg->findInt32("value", &quality)) {
+                m_texture_resolution_quality = std::clamp(quality, 0, 2);
+                auto nmsg = CreateMsgWithCmd(m_render_handler,
+                                             RenderHandler::CMD::CMD_SET_TEXTURE_RESOLUTION);
+                nmsg->setInt32("value", m_texture_resolution_quality);
+                nmsg->post();
+            }
         } else if (property == PROPERTY_FILLMODE) {
             int32_t value;
             if (msg->findInt32("value", &value)) {
@@ -1091,6 +1111,7 @@ void MainHandler::loadScene() {
         scene->shadows.quality     = m_shadows_quality;
         scene->bloom.quality       = m_postprocessing_quality;
         scene->msaa.quality        = m_antialiasing_quality;
+        scene->textureResolution.quality = m_texture_resolution_quality;
         ConfigureSceneMsaa(*scene);
         LOG_INFO("SceneWallpaper: antialiasing requested=%d effective=%d samples=%d has3d=%s",
                  m_antialiasing_quality,

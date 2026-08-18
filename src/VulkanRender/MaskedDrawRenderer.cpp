@@ -126,6 +126,8 @@ bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
                 m_textures[i] = *cached;
                 continue;
             }
+        } else {
+            scene.DropParsedImageCache(texture_name);
         }
 
         const auto texture_it = scene.textures.find(texture_name);
@@ -139,10 +141,7 @@ bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
 
         auto image = scene.GetParsedImageIfReady(texture_name);
         if (image == nullptr) {
-            image = scene.dirtyImportedTextureKeys.count(texture_name) == 0
-                        ? scene.ParseImageBlockingCached(texture_name)
-                        : (scene.imageParser != nullptr ? scene.imageParser->Parse(texture_name)
-                                                        : nullptr);
+            image = scene.ParseImageBlockingCached(texture_name);
         }
         if (image == nullptr) {
             LOG_ERROR("MaskedDrawTexture: parse failed node='%s' group=%zu texture='%s'",

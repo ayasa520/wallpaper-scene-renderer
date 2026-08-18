@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <future>
 #include <string_view>
 #include <unordered_set>
@@ -186,6 +187,41 @@ std::pair<int32_t, Scene::CameraLayerRuntimeState*> FindActiveCameraLayer(Scene&
     return { 0, nullptr };
 }
 
+constexpr uint64_t kOfficialTextureResolutionAutoArea = 1969920ull;
+
+const char* TextureResolutionRequestedName(int quality) {
+    switch (quality) {
+    case 1:
+        return "half";
+    case 2:
+        return "auto";
+    default:
+        return "full";
+    }
+}
+
+bool TextureResolutionShouldDropMip0(int quality, uint32_t width, uint32_t height) {
+    if (quality == 1) return true;
+    if (quality != 2) return false;
+    // Official Wallpaper Engine 2.8.42 auto: one global bool for the whole
+    // wallpaper, not a per-texture 1920x1080 test. Compare output pixel area
+    // (floatA * floatB) against 1969920 (1920 * 1080 * 0.95). Below → half.
+    const uint64_t area =
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    return area < kOfficialTextureResolutionAutoArea;
+}
+
+void DropImageMip0(Image& image) {
+    for (auto& slot : image.slots) {
+        if (slot.mipmaps.size() <= 1) continue;
+        slot.mipmaps.erase(slot.mipmaps.begin());
+        if (!slot.mipmaps.empty()) {
+            slot.width  = slot.mipmaps.front().width;
+            slot.height = slot.mipmaps.front().height;
+        }
+    }
+}
+
 double SanitizeCameraZoom(double zoom, int32_t layer_id) {
     if (std::isfinite(zoom) && zoom > 0.0001) return zoom;
 
@@ -230,6 +266,7 @@ std::shared_ptr<Image> Scene::CacheParsedImageResultLocked(
                                 std::chrono::steady_clock::now() - started_at)
                                 .count();
     if (image != nullptr) {
+        PrepareParsedImageForGpu(*image);
         m_parsed_image_cache[texture_key] = image;
         LOG_INFO("%s: key='%s' bytes=%zu duration=%.2fms",
                  success_event,
@@ -399,6 +436,104 @@ void Scene::ClearParsedImageCache() {
             if (future.valid()) future.wait();
         }
     }
+}
+
+void Scene::ApplyTextureResolution(int quality, uint32_t output_width, uint32_t output_height) {
+    quality = std::clamp(quality, 0, 2);
+    const bool next_drop = TextureResolutionShouldDropMip0(quality, output_width, output_height);
+    const bool quality_changed = textureResolution.quality != quality;
+    const bool drop_changed    = textureResolution.drop_mip0 != next_drop;
+    const bool first_apply     = textureResolution.output_width == 0 && output_width != 0;
+
+    textureResolution.quality       = quality;
+    textureResolution.drop_mip0     = next_drop;
+    textureResolution.output_width  = output_width;
+    textureResolution.output_height = output_height;
+
+    if (quality_changed || drop_changed || first_apply) {
+        const uint64_t area =
+            static_cast<uint64_t>(output_width) * static_cast<uint64_t>(output_height);
+        LOG_INFO("texture-resolution requested=%s drop-mip0=%s output=%ux%u area=%llu",
+                 TextureResolutionRequestedName(quality),
+                 next_drop ? "true" : "false",
+                 output_width,
+                 output_height,
+                 static_cast<unsigned long long>(area));
+    }
+
+    if (!drop_changed) return;
+
+    textureResolution.epoch++;
+    for (auto& [key, texture] : textures) {
+        texture.gpuWidth  = 0;
+        texture.gpuHeight = 0;
+        if (texture.isVideo || key.empty()) continue;
+        // 1-mip / video / synthetic images cannot drop mip0. Unknown mip
+        // counts are refreshed so a later parse can apply the new policy.
+        if (texture.mipmapCount == 1) continue;
+        dirtyImportedTextureKeys.insert(key);
+    }
+    ClearParsedImageCache();
+    MarkRenderGraphResourcesDirty();
+}
+
+void Scene::ApplyTextureResolutionForCurrentOutput() {
+    if (physicalOutputExtent[0] == 0 || physicalOutputExtent[1] == 0) return;
+    ApplyTextureResolution(textureResolution.quality,
+                           physicalOutputExtent[0],
+                           physicalOutputExtent[1]);
+}
+
+void Scene::PrepareParsedImageForGpu(Image& image) {
+    image.revision = textureResolution.epoch;
+    const auto texture_it = textures.find(image.key);
+    const bool video =
+        image.header.isVideoTexture ||
+        (texture_it != textures.end() && texture_it->second.isVideo);
+    if (!video && textureResolution.drop_mip0) {
+        DropImageMip0(image);
+    }
+    if (texture_it == textures.end() || image.slots.empty()) return;
+    texture_it->second.gpuWidth  = image.slots[0].width;
+    texture_it->second.gpuHeight = image.slots[0].height;
+}
+
+std::array<i32, 4>
+Scene::EffectiveImportedTextureResolution(const SceneTexture& texture) const {
+    const bool drop = textureResolution.drop_mip0 && !texture.isVideo &&
+                      texture.mipmapCount > 1;
+    if (texture.gpuWidth > 0 && texture.gpuHeight > 0) {
+        // Official bind path: g_TextureNResolution follows the uploaded GPU
+        // extent, not the authored .tex header, once mip0 has been dropped.
+        if (!drop) {
+            if (texture.mipmap_larger) {
+                return { texture.width, texture.height, texture.mapWidth, texture.mapHeight };
+            }
+            return { texture.mapWidth, texture.mapHeight, texture.mapWidth, texture.mapHeight };
+        }
+        if (texture.mipmap_larger) {
+            return { texture.gpuWidth,
+                     texture.gpuHeight,
+                     std::max<i32>(1, texture.mapWidth / 2),
+                     std::max<i32>(1, texture.mapHeight / 2) };
+        }
+        return { texture.gpuWidth, texture.gpuHeight, texture.gpuWidth, texture.gpuHeight };
+    }
+    if (!drop) {
+        if (texture.mipmap_larger) {
+            return { texture.width, texture.height, texture.mapWidth, texture.mapHeight };
+        }
+        return { texture.mapWidth, texture.mapHeight, texture.mapWidth, texture.mapHeight };
+    }
+    if (texture.mipmap_larger) {
+        return { std::max<i32>(1, texture.width / 2),
+                 std::max<i32>(1, texture.height / 2),
+                 std::max<i32>(1, texture.mapWidth / 2),
+                 std::max<i32>(1, texture.mapHeight / 2) };
+    }
+    const i32 half_w = std::max<i32>(1, texture.mapWidth / 2);
+    const i32 half_h = std::max<i32>(1, texture.mapHeight / 2);
+    return { half_w, half_h, half_w, half_h };
 }
 
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {

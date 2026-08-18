@@ -581,6 +581,20 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         }
     }
 
+    if (material != nullptr) {
+        const auto tex_count = std::min(material->textures.size(), info.texs.size());
+        for (size_t i = 0; i < tex_count; i++) {
+            if (! info.texs[i].has_resolution) continue;
+            const auto& name = material->textures[i];
+            if (name.empty() || m_scene->renderTargets.count(name) != 0) continue;
+            const auto texture_it = m_scene->textures.find(name);
+            if (texture_it == m_scene->textures.end()) continue;
+            updateOp(WE_GLTEX_RESOLUTION_NAMES[i],
+                     ShaderValue(array_cast<float>(
+                         m_scene->EffectiveImportedTextureResolution(texture_it->second))));
+        }
+    }
+
     bool reqMI    = info.has_MI;
     bool reqM     = info.has_M;
     bool reqAM    = info.has_AM;

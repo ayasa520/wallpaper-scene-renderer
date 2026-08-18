@@ -44,6 +44,9 @@ struct ImageHeader {
     ImageType     type { ImageType::UNKNOWN };
     TextureFormat format { TextureFormat::RGBA8 };
     i32           count { 0 };
+    // Authored mip chain length of the first slot. Official texture-resolution
+    // only drops mip0 when this is greater than 1.
+    i32           mipmapCount { 0 };
 
     bool          isSprite { false };
     TextureSample sample;

@@ -363,6 +363,23 @@ public:
         }
     };
     MsaaSettings         msaa;
+
+    struct TextureResolutionSettings {
+        // Official Wallpaper Engine 2.8.42 `generalSettings.resolution`.
+        // 0=full (High Quality), 1=half (High Performance), 2=auto.
+        // Independent of Low/Medium/High/Ultra quality presets.
+        int      quality { 0 };
+        bool     drop_mip0 { false };
+        uint32_t output_width { 0 };
+        uint32_t output_height { 0 };
+        uint64_t epoch { 1 };
+    };
+    TextureResolutionSettings textureResolution;
+
+    void ApplyTextureResolution(int quality, uint32_t output_width, uint32_t output_height);
+    void ApplyTextureResolutionForCurrentOutput();
+    void PrepareParsedImageForGpu(Image& image);
+    std::array<i32, 4> EffectiveImportedTextureResolution(const SceneTexture& texture) const;
     // Official 2.3 MSAA gate. True when any objects[] entry has a non-null "model"
     // field. `"image": "models/foo.json"` is not a model.
     bool                 has3dModels { false };

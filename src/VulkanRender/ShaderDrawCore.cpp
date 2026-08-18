@@ -770,6 +770,8 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                     desc.vk_textures[i] = *cached_slots;
                     continue;
                 }
+            } else {
+                scene.DropParsedImageCache(tex_name);
             }
 
             const auto texture_it = scene.textures.find(tex_name);
@@ -777,7 +779,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                 texture_it != scene.textures.end() && ! texture_it->second.isVideo;
             auto image = static_scene_texture ? scene.GetParsedImageIfReady(tex_name) : nullptr;
             if (image == nullptr) {
-                image = static_scene_texture && scene.dirtyImportedTextureKeys.count(tex_name) == 0
+                image = static_scene_texture
                             ? scene.ParseImageBlockingCached(tex_name)
                             : (scene.imageParser != nullptr ? scene.imageParser->Parse(tex_name)
                                                             : nullptr);
