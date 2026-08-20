@@ -72,7 +72,6 @@ std::vector<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surf
     std::vector<VkDeviceQueueCreateInfo> queues;
 
     auto props = m_gpu.GetQueueFamilyProperties();
-    const auto gpu_props = m_gpu.GetProperties();
 
     std::vector<uint32_t> graphic_indexs, present_indexs;
     uint32_t              index = 0;
@@ -80,11 +79,6 @@ std::vector<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surf
         if (prop.queueFlags & VK_QUEUE_GRAPHICS_BIT) graphic_indexs.push_back(index);
         index++;
     };
-    LOG_INFO("VulkanDevice: choose queues gpu='%s' surface=%s queueFamilies=%zu graphicsCandidates=%zu",
-             gpu_props.deviceName,
-             surface != VK_NULL_HANDLE ? "true" : "false",
-             props.size(),
-             graphic_indexs.size());
     m_graphics_queue.family_index           = graphic_indexs.front();
     const static float defaultQueuePriority = 0.0f;
     {
@@ -105,10 +99,6 @@ std::vector<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surf
             if (ok) present_indexs.push_back(index);
             index++;
         };
-        LOG_INFO("VulkanDevice: present queue candidates gpu='%s' count=%zu firstGraphics=%u",
-                 gpu_props.deviceName,
-                 present_indexs.size(),
-                 graphic_indexs.front());
         if (present_indexs.empty()) {
             LOG_ERROR("not find present queue");
         } else if (graphic_indexs.front() != present_indexs.front()) {
@@ -122,11 +112,6 @@ std::vector<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surf
             queues.push_back(info);
         }
     }
-    LOG_INFO("VulkanDevice: selected queues gpu='%s' graphicsFamily=%u presentFamily=%u queueCreateInfos=%zu",
-             gpu_props.deviceName,
-             m_graphics_queue.family_index,
-             m_present_queue.family_index,
-             queues.size());
     return queues;
 }
 
@@ -160,13 +145,6 @@ bool Device::Create(Instance& inst,
         });
     bool rq_surface = ! inst.offscreen();
     const auto gpu_props = inst.gpu().GetProperties();
-    LOG_INFO("VulkanDevice: create begin gpu='%s' offscreen=%s extent=%ux%u requestedExts=%zu enabledExts=%zu",
-             gpu_props.deviceName,
-             inst.offscreen() ? "true" : "false",
-             extent.width,
-             extent.height,
-             exts.size(),
-             tested_exts_c.size());
     const auto supported_features = inst.gpu().GetFeatures();
     if (! supported_features.geometryShader) {
         LOG_ERROR("cannot create vulkan device '%s': required geometryShader feature is unavailable",
@@ -182,11 +160,6 @@ bool Device::Create(Instance& inst,
                                           &enabled_features,
                                           nullptr,
                                           device.dld));
-    LOG_INFO("VulkanDevice: create device success gpu='%s' graphicsFamily=%u presentFamily=%u deviceHandle=%p",
-             gpu_props.deviceName,
-             device.m_graphics_queue.family_index,
-             device.m_present_queue.family_index,
-             static_cast<void*>(*device.m_device));
 
     // VK_CHECK_RESULT_BOOL_RE(CreateDevice(inst, device.ChooseDeviceQueue(inst.surface()),
     // tested_exts_c, &device.m_device));
@@ -205,15 +178,7 @@ bool Device::Create(Instance& inst,
                                        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
                                                 VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                        .queueFamilyIndex = device.m_graphics_queue.family_index };
-        LOG_INFO("VulkanDevice: create command pool gpu='%s' deviceHandle=%p queueFamilyIndex=%u flags=0x%x",
-                 gpu_props.deviceName,
-                 static_cast<void*>(*device.m_device),
-                 info.queueFamilyIndex,
-                 info.flags);
         VVK_CHECK_BOOL_RE(device.m_device.CreateCommandPool(info, device.m_command_pool));
-        LOG_INFO("VulkanDevice: create command pool success gpu='%s' poolHandle=%p",
-                 gpu_props.deviceName,
-                 reinterpret_cast<void*>(*device.m_command_pool));
     }
     {
         VmaAllocatorCreateInfo allocatorInfo = {};

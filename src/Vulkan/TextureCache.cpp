@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <optional>
 
 using namespace wallpaper;
@@ -452,12 +453,30 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, 
                 break;
             }
 
+            /*
+             * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT exposes memory-plane
+             * layouts, not the color-aspect layout used by linear images.
+             * Querying COLOR here returns an unusable zero row pitch on Mesa,
+             * which later makes an otherwise valid exported pool fail the
+             * renderer protocol's stride validation.
+             */
             const VkImageSubresource subresource {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .aspectMask = use_modifier_tiling
+                    ? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT
+                    : VK_IMAGE_ASPECT_COLOR_BIT,
                 .mipLevel = 0,
                 .arrayLayer = 0,
             };
             const auto layout = image.handle.GetSubresourceLayout(subresource);
+            if (layout.rowPitch == 0 ||
+                layout.rowPitch > std::numeric_limits<uint32_t>::max() ||
+                layout.offset > std::numeric_limits<uint32_t>::max()) {
+                LOG_ERROR("invalid dma-buf plane layout rowPitch=%llu offset=%llu modifier-tiling=%s",
+                          static_cast<unsigned long long>(layout.rowPitch),
+                          static_cast<unsigned long long>(layout.offset),
+                          use_modifier_tiling ? "true" : "false");
+                break;
+            }
 
             image.drm_fourcc = drm_fourcc;
             if (use_modifier_tiling) {
