@@ -19,6 +19,7 @@ public:
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void prepareDeferred(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
+    void refreshImportedTextureBindings(Scene&, const Device&) override;
     void dropOutputFramebuffers() override;
     void updateBeforeUpload() override;
     DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) override;
@@ -29,6 +30,7 @@ public:
     bool canReuseForResidency(const VulkanPass& next_pass) const override;
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
+    bool referencesImportedTexture(std::string_view) const override;
 
 private:
     ShaderDrawCore m_core;

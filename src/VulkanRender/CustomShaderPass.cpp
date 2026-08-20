@@ -40,6 +40,10 @@ void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
     if (! m_core.refreshResources(scene, device, resources)) setPrepared(false);
 }
 
+void CustomShaderPass::refreshImportedTextureBindings(Scene& scene, const Device& device) {
+    if (!m_core.refreshImportedTextureBindings(scene, device)) setPrepared(false);
+}
+
 void CustomShaderPass::dropOutputFramebuffers() { m_core.dropOutputFramebuffers(); }
 
 void CustomShaderPass::updateBeforeUpload() { m_core.updateBeforeUpload(); }
@@ -80,6 +84,10 @@ void CustomShaderPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
 
 bool CustomShaderPass::referencesRenderTarget(std::string_view target) const {
     return m_core.referencesRenderTarget(target);
+}
+
+bool CustomShaderPass::referencesImportedTexture(std::string_view texture_key) const {
+    return m_core.referencesImportedTexture(texture_key);
 }
 
 void CustomShaderPass::setDescTex(u32 index, std::string_view tex_key) {

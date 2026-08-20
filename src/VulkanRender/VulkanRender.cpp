@@ -1260,12 +1260,14 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         setRenderTargetSize(scene, rg);
 
         const auto dirty_render_targets = scene.dirtyRenderTargetKeys;
+        const auto dirty_imported_textures = scene.dirtyImportedTextureResourceKeys;
         const auto dirty_text_layers = scene.dirtyTextLayerIds;
-        // A resource refresh can now be targeted either by render-target key or by text layer id.
-        // Treating an empty render-target set as "refresh everything" was correct before direct
-        // text had its own dirty set, but it would turn every Clock tick back into a full pass walk.
+        // Resource refreshes can be targeted by output dependency, imported descriptor input, or
+        // direct text-layer ownership. Treating one empty set as "refresh everything" would turn
+        // every media or clock update back into a full pass walk.
         const bool has_targeted_dirty_resources =
-            !dirty_render_targets.empty() || !dirty_text_layers.empty();
+            !dirty_render_targets.empty() || !dirty_imported_textures.empty() ||
+            !dirty_text_layers.empty();
         const bool refresh_all =
             scene.renderGraphAllResourcesDirty || !has_targeted_dirty_resources;
         std::size_t refreshed_passes = 0;
@@ -1275,16 +1277,26 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
             auto* p = m_passes[pass_index];
             if (p == nullptr) continue;
 
-            const bool affected =
+            const bool broader_resource_refresh =
                 refresh_all || p->referencesAnyRenderTarget(dirty_render_targets) ||
                 p->referencesAnyTextLayer(dirty_text_layers);
+            const bool imported_binding_refresh =
+                p->referencesAnyImportedTexture(dirty_imported_textures);
+            const bool affected = broader_resource_refresh || imported_binding_refresh;
             if (!affected) continue;
 
             if (p->prepared()) {
-                // Text bridge updates are now target-scoped like particle resources: refresh only
-                // passes that touch the resized render targets so a one-pixel glyph-width change
-                // cannot force every static shader pass in the wallpaper to rebind resources.
-                p->refreshResources(scene, *m_device, m_rendering_resources);
+                if (broader_resource_refresh) {
+                    // Text bridge updates are now target-scoped like particle resources: refresh
+                    // only passes that touch resized targets. The broad hook may recreate output
+                    // resources, so it is reserved for changes that actually affect those outputs.
+                    p->refreshResources(scene, *m_device, m_rendering_resources);
+                } else {
+                    // Imported media replacement changes sampled image descriptors only. Rebinding
+                    // through the broad hook also re-queries effect ping-pong outputs, which can
+                    // disturb an otherwise resident transition chain and make its overlay vanish.
+                    p->refreshImportedTextureBindings(scene, *m_device);
+                }
                 refreshed_passes++;
             }
             if (!p->prepared()) {

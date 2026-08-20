@@ -37,13 +37,16 @@ public:
     // GPU resources can stay prepared and skip all extra work on minute-level text updates.
     virtual void refreshResources(Scene&, const Device&, RenderingResources&) {}
     virtual void dropOutputFramebuffers() {}
-    // Dynamic passes write their current CPU-side vertex/index bytes into the shared staging
-    // buffer. VulkanRender calls this before recording the frame's staging-buffer upload, so
-    // particle systems that grow into newly allocated dynamic subranges after a reused-scene source
-    // switch cannot draw from previous-frame or uninitialized GPU bytes. Uniform and sprite updates
-    // intentionally stay on execute() because text/effect composites depend on the original pass
-    // ordering for their transform and texture-projection state.
+    // Passes write their current CPU-side uniforms and dynamic vertex/index bytes into the shared
+    // staging buffer here. VulkanRender calls this hook in render-graph order before recording the
+    // frame's staging-buffer upload, so every draw in the submit observes the state produced for the
+    // same frame instead of a previous-frame value or an uninitialized dynamic subrange.
     virtual void updateBeforeUpload() {}
+    // Imported image replacement is an input-descriptor operation. It must not reuse the broader
+    // resource refresh hook, because that hook is also allowed to rotate render-target images and
+    // recreate output framebuffers. Media thumbnails can change every track while an effect's
+    // ping-pong outputs remain unchanged, so keep the two resource lifecycles independent.
+    virtual void refreshImportedTextureBindings(Scene&, const Device&) {}
     // Deferred runtime preparation is split into an asset-streaming phase and a Vulkan residency
     // phase. A pass returns Waiting after it has queued background CPU work, allowing the renderer
     // to keep drawing prepared content instead of blocking the render thread on asset decoding.
@@ -68,6 +71,7 @@ public:
     virtual bool canReuseForResidency(const VulkanPass& next_pass) const;
     virtual void absorbResidencyGraphState(const VulkanPass&) {}
     virtual bool referencesRenderTarget(std::string_view) const { return false; }
+    virtual bool referencesImportedTexture(std::string_view) const { return false; }
     virtual bool referencesTextLayer(int32_t) const { return false; }
 
     bool referencesAnyRenderTarget(const std::unordered_set<std::string>& render_targets) const {
@@ -76,6 +80,17 @@ public:
         // its prepared framebuffer, descriptors, and mesh uploads remain valid for this frame.
         for (const auto& render_target : render_targets) {
             if (referencesRenderTarget(render_target)) return true;
+        }
+        return false;
+    }
+
+    bool referencesAnyImportedTexture(
+        const std::unordered_set<std::string>& imported_textures) const {
+        // Imported textures are descriptor inputs rather than render targets. Keep this dependency
+        // class explicit so runtime image replacement refreshes only passes whose copied Vulkan
+        // handles can become stale.
+        for (const auto& imported_texture : imported_textures) {
+            if (referencesImportedTexture(imported_texture)) return true;
         }
         return false;
     }
