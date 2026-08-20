@@ -485,7 +485,7 @@ void Scene::ApplyTextureResolutionForCurrentOutput() {
 }
 
 void Scene::PrepareParsedImageForGpu(Image& image) {
-    image.revision = textureResolution.epoch;
+    image.textureResolutionEpoch = textureResolution.epoch;
     const auto texture_it = textures.find(image.key);
     const bool video =
         image.header.isVideoTexture ||

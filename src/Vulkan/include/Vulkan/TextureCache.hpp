@@ -114,9 +114,18 @@ private:
     vvk::CommandBuffers               m_tex_cmds;
     vvk::CommandBuffer                m_tex_cmd;
 
-    const Device&                m_device;
-    Map<std::string, ImageSlots> m_tex_map;
-    Map<std::string, uint64_t>   m_tex_revision_map;
+    struct ImageCacheRevision {
+        uint64_t content { 0 };
+        uint64_t texture_resolution_epoch { 0 };
+
+        bool operator==(const ImageCacheRevision&) const = default;
+    };
+
+    static ImageCacheRevision CacheRevisionFor(const Image& image);
+
+    const Device&                         m_device;
+    Map<std::string, ImageSlots>          m_tex_map;
+    Map<std::string, ImageCacheRevision>  m_tex_revision_map;
 
     struct StreamingTexUpload {
         std::shared_ptr<Image> image;
