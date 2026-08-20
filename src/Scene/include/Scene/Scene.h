@@ -220,6 +220,10 @@ public:
     UserPropertyMap                      userProperties;
     std::set<std::string>                dirtyImportedTextureKeys;
     std::unordered_set<std::string>      dirtyRenderTargetKeys;
+    // Runtime imported images can replace their TextureCache allocation when dimensions or slot
+    // layout change. Prepared passes keep copied Vulkan image/view handles, so they must rebind any
+    // imported key whose CPU image changed before the next draw records uploads and executes.
+    std::unordered_set<std::string>      dirtyImportedTextureResourceKeys;
     // Runtime visibility changes now use explicit resource residency instead of relying on a broad
     // texture-cache clear during every render-graph topology rebuild. Script/property code records
     // the concrete cache keys owned only by a hidden layer branch here, and the Vulkan render thread
@@ -423,6 +427,7 @@ public:
         renderGraphResourcesDirty = true;
         renderGraphAllResourcesDirty = true;
         dirtyRenderTargetKeys.clear();
+        dirtyImportedTextureResourceKeys.clear();
         dirtyTextLayerIds.clear();
     }
 
@@ -435,6 +440,17 @@ public:
         renderGraphResourcesDirty = true;
         if (!renderGraphAllResourcesDirty && !render_target_key.empty()) {
             dirtyRenderTargetKeys.insert(std::move(render_target_key));
+        }
+    }
+
+    void MarkImportedTextureResourcesDirty(std::string imported_texture_key) {
+        // Keep imported-image rebinding selective. Media thumbnails affect only the passes that
+        // sample their system texture keys; refreshing every prepared pass would turn a cover
+        // change into a scene-wide resource rebuild.
+        renderGraphDirty = true;
+        renderGraphResourcesDirty = true;
+        if (!renderGraphAllResourcesDirty && !imported_texture_key.empty()) {
+            dirtyImportedTextureResourceKeys.insert(std::move(imported_texture_key));
         }
     }
 
@@ -464,6 +480,7 @@ public:
         renderGraphTopologyDirty = false;
         renderGraphAllResourcesDirty = false;
         dirtyRenderTargetKeys.clear();
+        dirtyImportedTextureResourceKeys.clear();
         dirtyTextLayerIds.clear();
     }
 

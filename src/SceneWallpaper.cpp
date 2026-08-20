@@ -499,8 +499,15 @@ private:
             // instead of letting the animation path snap the shared global camera back to the
             // project's native aspect until a later resize/fill-mode event repairs it.
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
-            RefreshRenderGraphIfNeeded();
+            // Imported images must finish their TextureCache allocation decision before prepared
+            // passes copy the resulting Vulkan image/view handles. A media transition can change
+            // either thumbnail's dimensions, which replaces that key's allocation. Refreshing the
+            // pass first makes correctness depend on whichever pass happens to parse the dirty key
+            // first and leaves the explicit imported-texture phase capable of replacing it again.
+            // Keeping allocation, rebinding, upload recording, and execution in this order gives
+            // every consumer one coherent resource generation in the submitted frame.
             m_render->refreshImportedTextures(*m_scene);
+            RefreshRenderGraphIfNeeded();
 
             // LOG_INFO("frame info, fps: %.1f, frametime: %.1f", 1.0f, 1000.0f*m_scene->frameTime);
             m_scene->shaderValueUpdater->FrameBegin();

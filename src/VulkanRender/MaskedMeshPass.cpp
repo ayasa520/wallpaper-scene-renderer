@@ -22,6 +22,10 @@ void MaskedMeshPass::refreshResources(Scene& scene, const Device& device,
     if (! m_visible_draw.refreshResources(scene, device, resources)) setPrepared(false);
 }
 
+void MaskedMeshPass::refreshImportedTextureBindings(Scene& scene, const Device& device) {
+    if (!m_visible_draw.refreshImportedTextureBindings(scene, device)) setPrepared(false);
+}
+
 void MaskedMeshPass::dropOutputFramebuffers() { m_visible_draw.dropOutputFramebuffers(); }
 
 void MaskedMeshPass::updateBeforeUpload() { m_visible_draw.updateBeforeUpload(); }
@@ -73,6 +77,10 @@ void MaskedMeshPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
 
 bool MaskedMeshPass::referencesRenderTarget(std::string_view render_target) const {
     return m_visible_draw.referencesRenderTarget(render_target);
+}
+
+bool MaskedMeshPass::referencesImportedTexture(std::string_view texture_key) const {
+    return m_visible_draw.referencesImportedTexture(texture_key);
 }
 
 void MaskedMeshPass::setDescTex(u32 index, std::string_view texture_key) {

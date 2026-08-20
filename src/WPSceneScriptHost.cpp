@@ -4871,9 +4871,10 @@ void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key,
     const auto image = BuildMediaThumbnailImage(key, width, height, rgba);
     if (image == nullptr) return;
 
-    synthetic_parser->RegisterImage(std::string(key), image);
-    opaque->scene->textures[std::string(key)] = SceneTexture {
-        .url       = std::string(key),
+    const std::string texture_key(key);
+    synthetic_parser->RegisterImage(texture_key, image);
+    opaque->scene->textures[texture_key] = SceneTexture {
+        .url       = texture_key,
         .sample    = image->header.sample,
         .format    = image->header.format,
         .isVideo   = false,
@@ -4884,7 +4885,8 @@ void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key,
         .mapHeight   = image->header.mapHeight,
         .mipmapCount = 1,
     };
-    opaque->scene->dirtyImportedTextureKeys.insert(std::string(key));
+    opaque->scene->dirtyImportedTextureKeys.insert(texture_key);
+    opaque->scene->MarkImportedTextureResourcesDirty(texture_key);
 }
 
 void UpdateMediaThumbnailTexture(WPSceneScriptHost::Opaque*     opaque,
@@ -9423,8 +9425,20 @@ void WPSceneScriptHost::ApplyMediaState(const WPSceneScriptMediaState& media_sta
                                         bool                           initial_dispatch) {
     if (! Ready()) return;
 
+    const bool texture_pixels_changed =
+        m_impl->media_state.thumbnail_width != media_state.thumbnail_width ||
+        m_impl->media_state.thumbnail_height != media_state.thumbnail_height ||
+        m_impl->media_state.thumbnail_rgba != media_state.thumbnail_rgba ||
+        m_impl->media_state.previous_thumbnail_width != media_state.previous_thumbnail_width ||
+        m_impl->media_state.previous_thumbnail_height != media_state.previous_thumbnail_height ||
+        m_impl->media_state.previous_thumbnail_rgba != media_state.previous_thumbnail_rgba;
     m_impl->media_state = media_state;
-    UpdateMediaThumbnailTexture(m_impl, media_state);
+    if (texture_pixels_changed) {
+        // Register current and previous images as one logical media update. Each key also marks the
+        // prepared passes that sample it for a resource-only refresh, so a dimension change cannot
+        // leave those passes holding a VkImageView destroyed by TextureCache::CreateTex().
+        UpdateMediaThumbnailTexture(m_impl, media_state);
+    }
 
     JSContext* context = m_impl->runtime.context;
     const bool thumbnail_changed =

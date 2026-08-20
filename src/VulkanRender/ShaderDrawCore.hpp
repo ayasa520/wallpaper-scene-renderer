@@ -151,6 +151,7 @@ public:
     bool prepare(Scene&, const Device&, RenderingResources&);
     bool prepareDeferred(Scene&, const Device&, RenderingResources&);
     bool refreshResources(Scene&, const Device&, RenderingResources&);
+    bool refreshImportedTextureBindings(Scene&, const Device&);
     void dropOutputFramebuffers();
     void updateBeforeUpload();
     DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&);
@@ -162,6 +163,7 @@ public:
     bool canReuseForResidency(const ShaderDrawCore&) const;
     void absorbResidencyGraphState(const ShaderDrawCore&);
     bool referencesRenderTarget(std::string_view) const;
+    bool referencesImportedTexture(std::string_view) const;
     void setTexture(u32 index, std::string_view texture_key);
 
     const ShaderDrawData& data() const { return m_desc; }

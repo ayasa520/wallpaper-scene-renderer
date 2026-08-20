@@ -230,12 +230,16 @@ bool ShaderDrawCore::referencesRenderTarget(std::string_view render_target) cons
     // one of their descriptor inputs samples it. This lets a resized text bridge update the exact
     // effect chain that consumes it instead of refreshing every other shader in the wallpaper.
     if (m_desc.output == render_target) return true;
+    return referencesImportedTexture(render_target);
+}
+
+bool ShaderDrawCore::referencesImportedTexture(std::string_view texture_key) const {
     for (const auto& texture : m_desc.textures) {
-        if (texture == render_target) return true;
+        if (texture == texture_key) return true;
     }
     if (m_extension != nullptr && m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
         for (const auto texture : m_extension->resourceTextures(*m_desc.node->Mesh())) {
-            if (texture == render_target) return true;
+            if (texture == texture_key) return true;
         }
     }
     return false;
@@ -1412,10 +1416,10 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         // authored uniforms directly and should not rediscover the material through the scene node.
         auto* material = mesh.Material();
 
-        // Keep Star-River-style dynamic mesh uploads separate from general pass updates. Only the
-        // vertex/index bytes need to move before m_dyn_buf->recordUpload(); uniform and sprite
-        // updates stay in execute() so Date/Clock effect composites keep their original layout
-        // timing and do not shift when the upload fix is active.
+        // Keep dynamic mesh uploads separate from general pass updates because both operations own
+        // independent subranges of the shared staging buffer. They are nevertheless dispatched by
+        // updateBeforeUpload(): every CPU write that feeds the current draw must happen before
+        // VulkanRender records and flushes m_dyn_buf->recordUpload().
         m_desc.update_dynamic_mesh_op = update_dyn_buf_op;
         m_desc.update_op =
             [shader_updater, block, buf, bufref, extension,
@@ -1742,11 +1746,50 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     return true;
 }
 
+bool ShaderDrawCore::refreshImportedTextureBindings(Scene& scene, const Device& device) {
+    m_desc.scene = &scene;
+
+    for (usize texture_index = 0; texture_index < m_desc.textures.size(); ++texture_index) {
+        const auto& texture_key = m_desc.textures[texture_index];
+        if (scene.dirtyImportedTextureResourceKeys.count(texture_key) == 0) continue;
+
+        const auto cached_slots = device.tex_cache().FindTex(texture_key);
+        if (!cached_slots.has_value() || cached_slots->slots.empty()) {
+            LOG_ERROR("ImportedTexturePassRebind: cached texture missing layer=%d node='%s' "
+                      "output='%s' slot=%zu key='%s'",
+                      m_desc.layer_id,
+                      m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+                      m_desc.output.c_str(),
+                      static_cast<size_t>(texture_index),
+                      texture_key.c_str());
+            return false;
+        }
+
+        if (m_desc.vk_textures.size() < m_desc.textures.size()) {
+            m_desc.vk_textures.resize(m_desc.textures.size());
+        }
+        m_desc.vk_textures[texture_index] = *cached_slots;
+    }
+
+    bool extension_affected = false;
+    if (m_extension != nullptr && m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
+        for (const auto texture_key : m_extension->resourceTextures(*m_desc.node->Mesh())) {
+            if (scene.dirtyImportedTextureResourceKeys.count(std::string(texture_key)) == 0) {
+                continue;
+            }
+            extension_affected = true;
+            break;
+        }
+        if (extension_affected && !m_extension->refreshTextures(scene, device, m_desc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ShaderDrawCore::dropOutputFramebuffers() { m_desc.fb.reset(); }
 
 void ShaderDrawCore::updateBeforeUpload() {
-    if (! m_desc.update_dynamic_mesh_op) return;
-
     if (m_desc.should_execute && ! m_desc.should_execute()) {
         return;
     }
@@ -1760,11 +1803,14 @@ void ShaderDrawCore::updateBeforeUpload() {
         return;
     }
 
-    // VulkanRender records the shared dynamic-buffer upload before pass execution. Updating only
-    // dynamic vertex/index bytes here preserves the original execute-time uniform ordering for
-    // text/effect composites while still preventing reused-source particle fields, such as
-    // 3308867900's Star River layer, from drawing from stale or never-uploaded subranges.
-    m_desc.update_dynamic_mesh_op();
+    // recordUpload() flushes the mapped staging allocation, records the staging-to-GPU copies, and
+    // clears its dirty ranges before any pass executes. Writing uniforms from execute() therefore
+    // made every animated material value arrive one submitted frame late: on a media switch the new
+    // current texture was visible while the blend pass still read the previous animation endpoint.
+    // Update both the pass UBO and dynamic geometry here, in render-graph order, so the buffer copy
+    // and the draw recorded for this submit describe one coherent frame.
+    if (m_desc.update_op) m_desc.update_op();
+    if (m_desc.update_dynamic_mesh_op) m_desc.update_dynamic_mesh_op();
 }
 
 void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
@@ -1791,8 +1837,6 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // prevents temporary render targets from staying pinned only because no draw was recorded.
         return;
     }
-
-    if (m_desc.update_op) m_desc.update_op();
 
     if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;
         scene != nullptr && ShaderDrawSamplesResolvedDefault(m_desc.textures)) {
