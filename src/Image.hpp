@@ -69,7 +69,12 @@ struct Image : NoCopy, NoMove {
     ImageHeader       header;
     std::vector<Slot> slots;
     std::string       key;
-    uint64_t          revision { 0 };
+    // Content producers advance this revision whenever the pixels associated with a stable key
+    // change. GPU preparation policy has an independent lifetime and must never overwrite it.
+    uint64_t revision { 0 };
+    // Identifies the texture-resolution policy used to prepare the current mip chain. Texture
+    // caches compare this independently from content revision so either dimension can invalidate.
+    uint64_t textureResolutionEpoch { 0 };
 };
 
 } // namespace wallpaper

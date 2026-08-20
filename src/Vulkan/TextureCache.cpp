@@ -27,6 +27,10 @@ namespace wallpaper
 {
 namespace vulkan
 {
+TextureCache::ImageCacheRevision TextureCache::CacheRevisionFor(const Image& image) {
+    return { image.revision, image.textureResolutionEpoch };
+}
+
 VkFormat ToVkType(TextureFormat tf) {
     switch (tf) {
     case TextureFormat::BC1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
@@ -806,11 +810,12 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
 
 ImageSlotsRef TextureCache::CreateTex(Image& image) {
     m_streaming_tex_uploads.erase(image.key);
+    const auto image_revision = CacheRevisionFor(image);
     if (exists(m_tex_map, image.key)) {
         auto& cached = m_tex_map.at(image.key);
-        const auto cached_revision =
-            exists(m_tex_revision_map, image.key) ? m_tex_revision_map.at(image.key) : 0;
-        if (cached_revision == image.revision) {
+        const auto cached_revision_it = m_tex_revision_map.find(image.key);
+        if (cached_revision_it != m_tex_revision_map.end() &&
+            cached_revision_it->second == image_revision) {
             return cached;
         }
 
@@ -822,7 +827,7 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
                                   cached,
                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                   m_pending_image_uploads)) {
-            m_tex_revision_map[image.key] = image.revision;
+            m_tex_revision_map[image.key] = image_revision;
             LOG_INFO("TextureCacheUploadQueued: key='%s' slots=%zu revision=%zu reuse=true",
                      image.key.c_str(),
                      image.slots.size(),
@@ -842,7 +847,7 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
         return {};
     }
     m_tex_map[image.key] = std::move(img_slots);
-    m_tex_revision_map[image.key] = image.revision;
+    m_tex_revision_map[image.key] = image_revision;
     LOG_INFO("TextureCacheUploadQueued: key='%s' slots=%zu revision=%zu reuse=false",
              image.key.c_str(),
              image.slots.size(),
@@ -948,16 +953,19 @@ TextureCache::StageTexUploads(std::shared_ptr<Image> image,
                               std::size_t byte_budget) {
     if (image == nullptr || image->key.empty()) return TextureCacheStreamingState::Failed;
     const std::string key = image->key;
+    const auto image_revision = CacheRevisionFor(*image);
 
     auto cached_it = m_tex_map.find(key);
     if (cached_it != m_tex_map.end()) {
-        const auto cached_revision =
-            exists(m_tex_revision_map, key) ? m_tex_revision_map.at(key) : 0;
-        if (cached_revision == image->revision && m_streaming_tex_uploads.count(key) == 0) {
+        const auto cached_revision_it = m_tex_revision_map.find(key);
+        if (cached_revision_it != m_tex_revision_map.end() &&
+            cached_revision_it->second == image_revision &&
+            m_streaming_tex_uploads.count(key) == 0) {
             return TextureCacheStreamingState::Ready;
         }
 
-        if (cached_revision != image->revision) {
+        if (cached_revision_it == m_tex_revision_map.end() ||
+            !(cached_revision_it->second == image_revision)) {
             purgeQueuedWorkForKey(key);
             if (CanReuseTextureSlots(cached_it->second, *image)) {
                 StreamingTexUpload streaming;
@@ -966,7 +974,7 @@ TextureCache::StageTexUploads(std::shared_ptr<Image> image,
                 for (usize i = 0; i < cached_it->second.slots.size(); i++) {
                     streaming.remaining_slots.push_back(i);
                 }
-                m_tex_revision_map[key] = streaming.image->revision;
+                m_tex_revision_map[key] = image_revision;
                 m_streaming_tex_uploads[key] = std::move(streaming);
             } else {
                 m_tex_map.erase(key);
@@ -990,7 +998,7 @@ TextureCache::StageTexUploads(std::shared_ptr<Image> image,
             streaming.remaining_slots.push_back(i);
         }
         m_tex_map[key] = std::move(img_slots);
-        m_tex_revision_map[key] = image->revision;
+        m_tex_revision_map[key] = image_revision;
         m_streaming_tex_uploads[key] = std::move(streaming);
         const auto priority_label =
             priority_slot.has_value() ? std::to_string(*priority_slot) : std::string("none");
