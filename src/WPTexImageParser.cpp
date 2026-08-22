@@ -37,6 +37,9 @@ using WPTexFlags = BitFlags<WPTexFlagEnum>;
 namespace
 {
 constexpr std::string_view TEX_HEADER_DIR { "tex-headers01" };
+// Bump when cached sprite-frame UVs or other header fields would be interpreted
+// differently. A version mismatch is a miss; do not rewrite stale records in place.
+constexpr int kTextureHeaderCacheVersion = 5;
 
 char* Lz4Decompress(const char* src, int size, int decompressed_size) {
     char* dst       = new char[(usize)decompressed_size];
@@ -179,7 +182,7 @@ bool ReadString(fs::IBinaryStream& file, std::string& value) {
 std::string GetTextureHeaderCachePath(std::string_view cache_namespace, std::string_view name) {
     std::string key;
     key.reserve(cache_namespace.size() + name.size() + 16);
-    key.append("tex-header-v4\n");
+    key.append("tex-header-v5\n");
     key.append(cache_namespace);
     key.push_back('\n');
     key.append(name);
@@ -254,7 +257,7 @@ void SaveSpriteAnimation(const SpriteAnimation& animation, fs::IBinaryStreamW& f
 }
 
 bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinaryStream& file) {
-    if (ReadVersion("WTHD", file) != 4) return false;
+    if (ReadVersion("WTHD", file) != kTextureHeaderCacheVersion) return false;
     if (! ReadPod(file, file_size)) return false;
 
     if (! ReadPod(file, header.width)) return false;
@@ -295,7 +298,7 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
 }
 
 void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IBinaryStreamW& file) {
-    WriteVersion("WTHD", file, 4);
+    WriteVersion("WTHD", file, kTextureHeaderCacheVersion);
     WritePod(file, file_size);
 
     WritePod(file, header.width);
@@ -400,11 +403,14 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
                 sf.yAxis[0] = file.ReadFloat();
                 sf.yAxis[1] = file.ReadFloat();
             }
+            // Keep pixel-space axis lengths for autosize and particle cell padding before
+            // converting the same vectors into UV. Each axis is a 2D pixel vector: x
+            // components / mip0 width, y components / mip0 height.
             sf.width  = (float)std::sqrt(std::pow(sf.xAxis[0], 2) + std::pow(sf.xAxis[1], 2));
             sf.height = (float)std::sqrt(std::pow(sf.yAxis[0], 2) + std::pow(sf.yAxis[1], 2));
             sf.xAxis[0] /= spriteWidth;
-            sf.xAxis[1] /= spriteWidth;
-            sf.yAxis[0] /= spriteHeight;
+            sf.xAxis[1] /= spriteHeight;
+            sf.yAxis[0] /= spriteWidth;
             sf.yAxis[1] /= spriteHeight;
             sf.rate = sf.height / sf.width;
             header.spriteAnim.AppendFrame(sf);

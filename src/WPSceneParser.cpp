@@ -1887,6 +1887,12 @@ TextureSample ResolvePrimaryMaterialSampler(const Scene& scene, const SceneMater
     return {};
 }
 
+bool PrimaryMaterialTextureIsSprite(const Scene& scene, const SceneMaterial& material) {
+    if (material.textures.empty() || material.textures.front().empty()) return false;
+    const auto texture_it = scene.textures.find(material.textures.front());
+    return texture_it != scene.textures.end() && texture_it->second.isSprite;
+}
+
 ImageEffectCameraClipRange ResolveImageEffectCameraClipRange(bool has_animated_puppet_mesh) {
     if (! has_animated_puppet_mesh) return {};
 
@@ -5342,12 +5348,41 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     auto&     mesh   = *spMesh;
 
     {
-        // deal with pow of 2
+        const bool primary_texture_is_sprite =
+            PrimaryMaterialTextureIsSprite(*context.scene, material);
         std::array<float, 2> mapRate { 1.0f, 1.0f };
         if (! wpimgobj.nopadding &&
             exists(material.customShader.constValues, WE_GLTEX_RESOLUTION_NAMES[0])) {
             const auto& r = material.customShader.constValues.at(WE_GLTEX_RESOLUTION_NAMES[0]);
-            mapRate       = { r[2] / r[0], r[3] / r[1] };
+            const std::array<float, 2> padded_map_rate { r[2] / r[0], r[3] / r[1] };
+
+            /*
+             * Ordinary padded images sample the card UV directly, so their base coordinates must
+             * be cropped to the logical content extent. Sprite frames already encode rotation and
+             * translation normalized against the physical mip0 atlas. Cropping the card before
+             * that frame transform applies the same content-to-physical ratio twice and stretches
+             * a partial frame over the authored layer. Keep sprite cards in frame-local [0, 1]
+             * space while preserving the physical/content resolution contract for shader users.
+             */
+            if (primary_texture_is_sprite) {
+                if (padded_map_rate[0] != 1.0f || padded_map_rate[1] != 1.0f) {
+                    LOG_INFO("SceneImageCardUvContract: layer=%d name='%s' texture='%s' "
+                             "physical=[%.0f %.0f] content=[%.0f %.0f] "
+                             "skipped-card-uv=[%.4f %.4f] "
+                             "final-card-uv=[1.0000 1.0000] owner=sprite-frame",
+                             wpimgobj.id,
+                             wpimgobj.name.c_str(),
+                             primary_source_texture.c_str(),
+                             r[0],
+                             r[1],
+                             r[2],
+                             r[3],
+                             padded_map_rate[0],
+                             padded_map_rate[1]);
+                }
+            } else {
+                mapRate = padded_map_rate;
+            }
         }
 
         if (hasAnimatedPuppetMesh) {
