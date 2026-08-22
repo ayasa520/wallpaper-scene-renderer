@@ -291,10 +291,6 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
 
     if (! LoadExtraHeaderMap(header.extraHeader, file)) return false;
     if (! LoadSpriteAnimation(header.spriteAnim, file)) return false;
-    if (! header.isVideoTexture) {
-        const auto it = header.extraHeader.find("texb_is_video_mp4");
-        header.isVideoTexture = it != header.extraHeader.end() && it->second.val == 1;
-    }
     return true;
 }
 
