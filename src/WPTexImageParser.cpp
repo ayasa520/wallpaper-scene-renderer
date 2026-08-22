@@ -179,7 +179,7 @@ bool ReadString(fs::IBinaryStream& file, std::string& value) {
 std::string GetTextureHeaderCachePath(std::string_view cache_namespace, std::string_view name) {
     std::string key;
     key.reserve(cache_namespace.size() + name.size() + 16);
-    key.append("tex-header-v3\n");
+    key.append("tex-header-v4\n");
     key.append(cache_namespace);
     key.push_back('\n');
     key.append(name);
@@ -254,7 +254,7 @@ void SaveSpriteAnimation(const SpriteAnimation& animation, fs::IBinaryStreamW& f
 }
 
 bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinaryStream& file) {
-    if (ReadVersion("WTHD", file) != 3) return false;
+    if (ReadVersion("WTHD", file) != 4) return false;
     if (! ReadPod(file, file_size)) return false;
 
     if (! ReadPod(file, header.width)) return false;
@@ -299,7 +299,7 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
 }
 
 void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IBinaryStreamW& file) {
-    WriteVersion("WTHD", file, 3);
+    WriteVersion("WTHD", file, 4);
     WritePod(file, file_size);
 
     WritePod(file, header.width);
@@ -348,7 +348,13 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
                 int32_t height = file.ReadInt32();
                 if (i_mipmap == 0) {
                     imageDatas.at(i_image) = { (float)width, (float)height };
-                    header.mipmap_pow2     = algorism::IsPowOfTwo((u32)(width * height));
+                    if (i_image == 0) {
+                        // Sprite TEX headers store the logical atlas extent in mapWidth/mapHeight,
+                        // while the first image's mip0 records the physical GPU allocation. Derive
+                        // both power-of-two and padding metadata from that same authoritative mip so
+                        // runtime g_TextureNResolution updates preserve padded sprite-sheet UVs.
+                        SetHeaderPow2(header, width, height);
+                    }
                 }
                 if (header.extraHeader["texb"].val > 1) {
                     int32_t LZ4_compressed    = file.ReadInt32();
