@@ -60,16 +60,19 @@ public:
     std::vector<Particle>&         ParticlesVec();
     std::span<const ParticleTrail> Trails() const;
     std::vector<ParticleTrail>&    TrailsVec();
+    std::vector<ParticleEmitRuntime>& EmitRuntimes();
+    std::span<const ParticleEmitRuntime> EmitRuntimes() const;
 
     BoundedData& GetBoundedData();
     const BoundedData& GetBoundedData() const;
 
 private:
-    bool                       m_is_death { false };
-    bool                       m_no_live_particle { false };
-    std::vector<Particle>      m_particles;
-    std::vector<ParticleTrail> m_trails;
-    BoundedData                m_bounded_data;
+    bool                            m_is_death { false };
+    bool                            m_no_live_particle { false };
+    std::vector<Particle>           m_particles;
+    std::vector<ParticleTrail>      m_trails;
+    std::vector<ParticleEmitRuntime> m_emit_runtimes;
+    BoundedData                     m_bounded_data;
 };
 
 class ParticleSubSystem : NoCopy, NoMove {
@@ -101,7 +104,7 @@ public:
 
     ParticleInstance* QueryNewInstance();
 
-    void AddEmitter(ParticleEmittOp&&);
+    void AddEmitter(ParticleEmittOp&&, ParticleEmitterTiming);
     void AddInitializer(ParticleInitOp&&);
     void AddOperator(ParticleOperatorOp&&);
 
@@ -132,6 +135,7 @@ private:
     void SynchronizeTrailSlots(ParticleInstance& instance);
     void SampleTrailHistory(double frame_time);
     void MarkMeshesDirty();
+    void ResetInstanceEmitRuntimes(ParticleInstance&);
 
     struct ExtraRenderOutput {
         std::shared_ptr<SceneMesh> mesh;
@@ -143,7 +147,8 @@ private:
     std::shared_ptr<SceneMesh> m_mesh;
     std::vector<ExtraRenderOutput> m_extra_outputs;
     //	std::vector<std::unique_ptr<ParticleEmitter>> m_emiters;
-    std::vector<ParticleEmittOp> m_emiters;
+    std::vector<ParticleEmittOp>         m_emiters;
+    std::vector<ParticleEmitterTiming>   m_emit_timings;
 
     // std::vector<Particle>           m_particles;
     std::vector<ParticleInitOp>     m_initializers;

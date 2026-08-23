@@ -81,6 +81,10 @@ std::span<const Particle> ParticleInstance::Particles() const { return m_particl
 std::vector<Particle>&    ParticleInstance::ParticlesVec() { return m_particles; };
 std::span<const ParticleTrail> ParticleInstance::Trails() const { return m_trails; };
 std::vector<ParticleTrail>&    ParticleInstance::TrailsVec() { return m_trails; };
+std::vector<ParticleEmitRuntime>& ParticleInstance::EmitRuntimes() { return m_emit_runtimes; }
+std::span<const ParticleEmitRuntime> ParticleInstance::EmitRuntimes() const {
+    return m_emit_runtimes;
+}
 
 ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() { return m_bounded_data; }
 const ParticleInstance::BoundedData& ParticleInstance::GetBoundedData() const {
@@ -112,7 +116,18 @@ ParticleSubSystem::ParticleSubSystem(ParticleSystem& p, std::shared_ptr<SceneMes
 
 ParticleSubSystem::~ParticleSubSystem() = default;
 
-void ParticleSubSystem::AddEmitter(ParticleEmittOp&& em) { m_emiters.emplace_back(em); }
+void ParticleSubSystem::AddEmitter(ParticleEmittOp&& em, ParticleEmitterTiming timing) {
+    m_emiters.emplace_back(std::move(em));
+    m_emit_timings.push_back(std::move(timing));
+}
+
+void ParticleSubSystem::ResetInstanceEmitRuntimes(ParticleInstance& instance) {
+    auto& runtimes = instance.EmitRuntimes();
+    runtimes.resize(m_emit_timings.size());
+    for (size_t i = 0; i < m_emit_timings.size(); ++i) {
+        runtimes[i] = MakeParticleEmitRuntime(m_emit_timings[i]);
+    }
+}
 
 void ParticleSubSystem::AddInitializer(ParticleInitOp&& ini) { m_initializers.emplace_back(ini); }
 
@@ -409,11 +424,13 @@ ParticleInstance* ParticleSubSystem::QueryNewInstance() {
         for (auto& inst : m_instances) {
             if (inst->IsDeath() && inst->IsNoLiveParticle()) {
                 inst->Refresh();
+                ResetInstanceEmitRuntimes(*inst);
                 return inst.get();
             }
         }
         if (m_instances.size() < m_maxcount_instance) {
             m_instances.emplace_back(std::make_unique<ParticleInstance>());
+            ResetInstanceEmitRuntimes(*m_instances.back());
             return m_instances.back().get();
         }
     }
@@ -475,7 +492,10 @@ void ParticleSubSystem::Emitt() {
 
     UpdateLinkedControlpoints();
     if (m_spawn_type == SpawnType::STATIC) {
-        if (m_instances.empty()) m_instances.emplace_back(std::make_unique<ParticleInstance>());
+        if (m_instances.empty()) {
+            m_instances.emplace_back(std::make_unique<ParticleInstance>());
+            ResetInstanceEmitRuntimes(*m_instances.back());
+        }
     }
 
     for (auto& inst : m_instances) {
@@ -491,9 +511,12 @@ void ParticleSubSystem::Emitt() {
             std::span particles = bounded_data.parent->Particles();
             if (bounded_data.particle_idx != -1 && bounded_data.particle_idx < particles.size()) {
                 auto& p          = particles[bounded_data.particle_idx];
-                bounded_data.pos = ResolveEventAnchorPosition(ParticleModify::GetPos(p));
+                const auto parent_pos = ParticleModify::GetPos(p);
+                bounded_data.pos = ResolveEventAnchorPosition(parent_pos);
                 // only update pos once when event_death
-                if (m_spawn_type == SpawnType::EVENT_DEATH) bounded_data.particle_idx = -1;
+                if (m_spawn_type == SpawnType::EVENT_DEATH) {
+                    bounded_data.particle_idx = -1;
+                }
 
                 // death if bounded particle death
                 if (! inst->IsDeath() && type_has_death) {
@@ -516,9 +539,19 @@ void ParticleSubSystem::Emitt() {
         }
 
         if (! inst->IsDeath()) {
-            for (auto& emittOp : m_emiters) {
-                emittOp(inst->ParticlesVec(), m_initializers, m_controlpoints, m_maxcount,
-                        particleTime, m_time, m_next_spawn_sequence);
+            auto& runtimes = inst->EmitRuntimes();
+            if (runtimes.size() != m_emiters.size()) {
+                ResetInstanceEmitRuntimes(*inst);
+            }
+            for (size_t i = 0; i < m_emiters.size(); ++i) {
+                m_emiters[i](inst->ParticlesVec(),
+                             m_initializers,
+                             m_controlpoints,
+                             m_maxcount,
+                             particleTime,
+                             m_time,
+                             m_next_spawn_sequence,
+                             runtimes[i]);
             }
         }
 

@@ -1271,7 +1271,9 @@ void LoadEmitter(ParticleSystem& system, ParticleSubSystem& pSys, const wpscene:
          */
         ParticleAudioResponseFactor audio_rate_factor =
             BindParticleAudioResponse(system, em.audio_response);
-        pSys.AddEmitter(WPParticleParser::genParticleEmittOp(newEm, std::move(audio_rate_factor)));
+        ParticleEmitterTiming timing;
+        auto op = WPParticleParser::genParticleEmittOp(newEm, std::move(audio_rate_factor), timing);
+        pSys.AddEmitter(std::move(op), std::move(timing));
     }
 }
 

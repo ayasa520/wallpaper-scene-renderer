@@ -8,6 +8,7 @@
 #include <array>
 #include <span>
 #include <cstdint>
+#include <functional>
 
 #include "Core/Literals.hpp"
 
@@ -41,11 +42,6 @@ using ParticleInitOp = std::function<void(Particle&, const ParticleInitInfo&)>;
 // particle index lifetime-percent passTime
 using ParticleOperatorOp = std::function<void(const ParticleInfo&)>;
 
-using ParticleEmittOp =
-    std::function<void(std::vector<Particle>&, std::vector<ParticleInitOp>&,
-                       std::span<const ParticleControlpoint>, uint32_t maxcount, double timepass,
-                       double time, uint64_t& next_spawn_sequence)>;
-
 struct ParticleEmitterTiming {
     float emit_speed { 0.0f };
     bool  one_per_frame { false };
@@ -60,6 +56,34 @@ struct ParticleEmitterTiming {
     float delay { 0.0f };
     ParticleAudioResponseFactor audio_rate_factor;
 };
+
+// Per particle-system instance. Recycle reloads instantaneous, delay, duration,
+// clears credit, and zeroes the periodic timer/count. Shared emitter lambdas must not
+// keep this state.
+struct ParticleEmitRuntime {
+    float credit { 0.0f };
+    u32   instantaneous { 0 };
+    float periodic_timer { 0.0f };
+    u32   emitted_this_period { 0 };
+    float delay_remaining { 0.0f };
+    float duration_remaining { 0.0f };
+    bool  duration_limited { false };
+    bool  inactive { false };
+};
+
+inline ParticleEmitRuntime MakeParticleEmitRuntime(const ParticleEmitterTiming& timing) {
+    ParticleEmitRuntime runtime;
+    runtime.instantaneous      = timing.instantaneous;
+    runtime.delay_remaining    = timing.delay;
+    runtime.duration_remaining = timing.duration;
+    runtime.duration_limited   = timing.duration > 0.0f;
+    return runtime;
+}
+
+using ParticleEmittOp =
+    std::function<void(std::vector<Particle>&, std::vector<ParticleInitOp>&,
+                       std::span<const ParticleControlpoint>, uint32_t maxcount, double timepass,
+                       double time, uint64_t& next_spawn_sequence, ParticleEmitRuntime& runtime)>;
 
 struct ParticleBoxEmitterArgs {
     std::array<float, 3> directions;
