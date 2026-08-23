@@ -23,22 +23,11 @@ inline std::tuple<u32, bool> FindDeadParticle(std::span<const Particle> particle
     return { 0, false };
 }
 
-struct EmitRuntime {
-    float  credit { 0.0f };
-    u32    instantaneous { 0 };
-    float  periodic_timer { 0.0f };
-    u32    emitted_this_period { 0 };
-    float  delay_remaining { 0.0f };
-    float  duration_remaining { 0.0f };
-    bool   duration_limited { false };
-    bool   inactive { false };
-};
-
 inline float SampleInclusiveRange(float min_value, float max_value) {
     return min_value + Random::get(0.0f, 1.0f) * (max_value - min_value);
 }
 
-inline u32 ResolveEmitNum(EmitRuntime& runtime, const ParticleEmitterTiming& timing,
+inline u32 ResolveEmitNum(ParticleEmitRuntime& runtime, const ParticleEmitterTiming& timing,
                           double time_pass) {
     if (runtime.inactive) return 0;
 
@@ -122,15 +111,6 @@ inline u32 ResolveEmitNum(EmitRuntime& runtime, const ParticleEmitterTiming& tim
     return count;
 }
 
-inline EmitRuntime MakeEmitRuntime(const ParticleEmitterTiming& timing) {
-    EmitRuntime runtime;
-    runtime.instantaneous      = timing.instantaneous;
-    runtime.delay_remaining    = timing.delay;
-    runtime.duration_remaining = timing.duration;
-    runtime.duration_limited   = timing.duration > 0.0f;
-    return runtime;
-}
-
 inline bool HasParticleCapacity(std::span<const Particle> particles, u32 maxcount) {
     if (particles.size() < maxcount) return true;
     return std::any_of(particles.begin(), particles.end(), [](const Particle& particle) {
@@ -186,15 +166,15 @@ inline void ApplySign(Eigen::Vector3d& p, int32_t x, int32_t y, int32_t z) noexc
 } // namespace
 
 ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
-    EmitRuntime runtime = MakeEmitRuntime(a.timing);
     uint64_t sequence { 0 };
-    return [a, runtime, sequence](std::vector<Particle>&       ps,
-                                std::vector<ParticleInitOp>& inis,
-                                std::span<const ParticleControlpoint> controlpoints,
-                                u32                          maxcount,
-                                double                       timepass,
-                                double                       time,
-                                uint64_t&                    next_spawn_sequence) mutable {
+    return [a, sequence](std::vector<Particle>&       ps,
+                         std::vector<ParticleInitOp>& inis,
+                         std::span<const ParticleControlpoint> controlpoints,
+                         u32                          maxcount,
+                         double                       timepass,
+                         double                       time,
+                         uint64_t&                    next_spawn_sequence,
+                         ParticleEmitRuntime&         runtime) mutable {
         auto GenBox = [&]() {
             Eigen::Vector3d pos;
             for (int32_t i = 0; i < 3; i++)
@@ -227,15 +207,15 @@ ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
 
 ParticleEmittOp ParticleSphereEmitterArgs::MakeEmittOp(ParticleSphereEmitterArgs a) {
     using namespace Eigen;
-    EmitRuntime runtime = MakeEmitRuntime(a.timing);
     uint64_t sequence { 0 };
-    return [a, runtime, sequence](std::vector<Particle>&       ps,
-                                std::vector<ParticleInitOp>& inis,
-                                std::span<const ParticleControlpoint> controlpoints,
-                                u32                          maxcount,
-                                double                       timepass,
-                                double                       time,
-                                uint64_t&                    next_spawn_sequence) mutable {
+    return [a, sequence](std::vector<Particle>&       ps,
+                         std::vector<ParticleInitOp>& inis,
+                         std::span<const ParticleControlpoint> controlpoints,
+                         u32                          maxcount,
+                         double                       timepass,
+                         double                       time,
+                         uint64_t&                    next_spawn_sequence,
+                         ParticleEmitRuntime&         runtime) mutable {
         auto GenSphere = [&]() {
             auto   p = Particle();
             double r = algorism::lerp(

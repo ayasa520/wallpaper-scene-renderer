@@ -12,7 +12,8 @@ public:
                                                     const wpscene::ParticleInstanceoverride&,
                                                     ParticleAudioResponseFactor audio_factor = {});
     static ParticleEmittOp genParticleEmittOp(const wpscene::Emitter&,
-                                              ParticleAudioResponseFactor audio_rate_factor = {});
+                                              ParticleAudioResponseFactor audio_rate_factor,
+                                              ParticleEmitterTiming& timing);
     static ParticleInitOp  genOverrideInitOp(const wpscene::ParticleInstanceoverride&);
 };
 } // namespace wallpaper
