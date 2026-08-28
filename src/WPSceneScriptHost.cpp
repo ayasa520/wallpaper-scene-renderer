@@ -3812,8 +3812,10 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         }
 
         opaque->scene->objectRuntimeNodes.erase(layer_id);
-        opaque->scene->ClearLayerParentBinding(layer_id);
-        opaque->scene->layerLocalVisibility.erase(layer_id);
+        // Deleting a layer removes its authored SceneObject entirely: parent binding, local
+        // visibility, identity, and image runtime state all live there now. Children keep their
+        // dangling parent id, exactly like the previous per-concern maps did.
+        opaque->scene->DestroySceneObject(layer_id);
         if (auto sound_it = opaque->scene->objectRuntimeSoundHandles.find(layer_id);
             sound_it != opaque->scene->objectRuntimeSoundHandles.end()) {
             if (opaque->scene->soundManager != nullptr) {
@@ -3878,7 +3880,6 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             // parser-backed authoritative text image left to unregister here.
             opaque->scene->textLayers.erase(text_it);
         }
-        opaque->scene->imageLayers.erase(layer_id);
         // Deferred runtime sets are lightweight ownership records for hidden placeholder layers.
         // Delete must clear every deferred kind together with the regular registries so a later
         // dynamic layer that reuses this authored id cannot inherit a stale materialization state.
@@ -3983,15 +3984,15 @@ SceneCamera* GetPerspectiveSceneCamera(WPSceneScriptHost::Opaque* opaque) {
 const Scene::ImageLayerRuntimeState* FindImageLayerById(const WPSceneScriptHost::Opaque* opaque,
                                                         int32_t                          layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->imageLayers.find(layer_id);
-    return it == opaque->scene->imageLayers.end() ? nullptr : std::addressof(it->second);
+    const auto* object = opaque->scene->FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->ImageRuntimeState();
 }
 
 Scene::ImageLayerRuntimeState* FindImageLayerById(WPSceneScriptHost::Opaque* opaque,
                                                   int32_t                    layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->imageLayers.find(layer_id);
-    return it == opaque->scene->imageLayers.end() ? nullptr : std::addressof(it->second);
+    auto* object = opaque->scene->FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->ImageRuntimeState();
 }
 
 const WPPuppetLayer::AnimationLayer*

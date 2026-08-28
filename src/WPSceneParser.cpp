@@ -1782,13 +1782,20 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
 }
 
 SceneImageEffectLayer::HiddenFinalCompositePolicy
-ResolveHiddenFinalCompositePolicy(const wpscene::WPImageObject& image) {
+ResolveHiddenFinalCompositePolicy(const Scene& scene, const wpscene::WPImageObject& image) {
     // This is a source-contract decision rather than a shader or layer-name decision. Normal image
     // layers have a meaningful pre-effect source, so disabling the final effect should reveal that
     // source. Passthrough compose helpers are source-less routing layers; when their final effect is
     // hidden they should publish nothing instead of preserving a helper render target that may only
     // contain previous framebuffer contents.
-    return image.config.passthrough
+    //
+    // The flag is an object-level identity property, so the registered SceneObject is the
+    // authoritative source; the authored config is only the bootstrap value for paths that
+    // materialize before identity registration.
+    const auto* scene_object = scene.FindSceneObject(image.id);
+    const bool  passthrough =
+        scene_object != nullptr ? scene_object->Passthrough() : image.config.passthrough;
+    return passthrough
         ? SceneImageEffectLayer::HiddenFinalCompositePolicy::SuppressOutput
         : SceneImageEffectLayer::HiddenFinalCompositePolicy::PreserveSource;
 }
@@ -2431,11 +2438,12 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
         AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
     }
 
-    context.object_nodes[wpimgobj.id]       = node;
-    context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
-        .size      = wpimgobj.size,
-        .alignment = wpimgobj.alignment,
-    };
+    context.object_nodes[wpimgobj.id] = node;
+    context.scene->EnsureSceneObject(wpimgobj.id)
+        .SetImageRuntimeState(Scene::ImageLayerRuntimeState {
+            .size      = wpimgobj.size,
+            .alignment = wpimgobj.alignment,
+        });
     context.scene->objectRuntimeNodes[wpimgobj.id].push_back(node.get());
     context.scene->nodeOwners[node.get()] = wpimgobj.id;
     context.shader_updater->SetNodeData(node.get(), node_data);
@@ -5563,7 +5571,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                          ImageEffectSourcePolicyName(source_policy).data());
             }
             imgEffectLayer->SetHiddenFinalCompositePolicy(
-                ResolveHiddenFinalCompositePolicy(wpimgobj));
+                ResolveHiddenFinalCompositePolicy(*context.scene, wpimgobj));
             imgEffectLayer->SourceMesh().ChangeMeshDataFrom(mesh);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
             imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
@@ -5997,11 +6005,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     } else {
         AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
     }
-    context.object_nodes[wpimgobj.id]       = spWorldNode;
-    context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
-        .size      = wpimgobj.size,
-        .alignment = wpimgobj.alignment,
-    };
+    context.object_nodes[wpimgobj.id] = spWorldNode;
+    context.scene->EnsureSceneObject(wpimgobj.id)
+        .SetImageRuntimeState(Scene::ImageLayerRuntimeState {
+            .size      = wpimgobj.size,
+            .alignment = wpimgobj.alignment,
+        });
     context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spWorldNode.get());
     context.scene->nodeOwners[spWorldNode.get()] = wpimgobj.id;
     if (hasAnimatedPuppetMesh) {
@@ -7457,6 +7466,51 @@ bool IsObjectVisible(const WPObjectVar& obj) {
         obj);
 }
 
+// Registers one scene.json object as the authored SceneObject identity: id, kind, name, authored
+// transform, effect count, and the passthrough flag. Behavior-facing fields (local visibility,
+// parent binding, image runtime state) are intentionally not written here; those keep flowing
+// through the existing registration points so runtime semantics stay exactly as before.
+template <typename ValueT>
+void FillSceneObjectIdentityFor(Scene& scene, const ValueT& value) {
+    if (value.id == 0) return;
+    auto& object = scene.EnsureSceneObject(value.id);
+    object.SetName(value.name);
+    if constexpr (std::is_same_v<ValueT, wpscene::WPSoundObject>) {
+        object.SetKind(SceneObjectKind::Sound);
+        return;
+    } else {
+        object.SetAuthoredTransform(value.origin, value.scale, value.angles);
+        if constexpr (std::is_same_v<ValueT, wpscene::WPImageObject>) {
+            object.SetKind(SceneObjectKind::Image);
+            object.SetEffectCount(static_cast<int32_t>(value.effects.size()));
+            object.SetPassthrough(value.config.passthrough);
+        } else if constexpr (std::is_same_v<ValueT, wpscene::WPParticleObject>) {
+            object.SetKind(SceneObjectKind::Particle);
+        } else if constexpr (std::is_same_v<ValueT, wpscene::WPTextObject>) {
+            object.SetKind(SceneObjectKind::Text);
+            object.SetEffectCount(static_cast<int32_t>(value.effects.size()));
+        } else if constexpr (std::is_same_v<ValueT, wpscene::WPLightObject>) {
+            object.SetKind(SceneObjectKind::Light);
+        } else if constexpr (std::is_same_v<ValueT, WPModelObject>) {
+            object.SetKind(SceneObjectKind::Model);
+        } else if constexpr (std::is_same_v<ValueT, WPShapeObject>) {
+            object.SetKind(SceneObjectKind::Shape);
+            object.SetEffectCount(static_cast<int32_t>(value.effects.size()));
+        } else if constexpr (std::is_same_v<ValueT, WPEmptyObject>) {
+            object.SetKind(value.is_camera_layer ? SceneObjectKind::Camera
+                                                 : SceneObjectKind::Empty);
+        }
+    }
+}
+
+void FillSceneObjectIdentity(Scene& scene, const WPObjectVar& obj) {
+    std::visit(
+        [&scene](const auto& value) {
+            FillSceneObjectIdentityFor(scene, value);
+        },
+        obj);
+}
+
 std::optional<WPDynamicValue> ParsePropertyBaseValue(const nlohmann::json& property_json,
                                                      WPDynamicValue::Type  hint) {
     if (! property_json.is_object() || ! property_json.contains("value")) return std::nullopt;
@@ -8603,6 +8657,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         resolve_visibility(object);
 
         const bool requested_visible = object.visible;
+        FillSceneObjectIdentityFor(*context.scene, object);
         ParseImageObj(context, object, true);
         context.scene->SetLayerLocalVisibility(object.id, requested_visible);
         context.scene->ApplyLayerVisibility(object.id);
@@ -8615,6 +8670,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         if (! object.FromJson(object_json, *context.vfs)) return false;
         register_visibility_contract(object.id, LazyMaterializeKind::Particle);
         resolve_visibility(object);
+        FillSceneObjectIdentityFor(*context.scene, object);
         ParseParticleObj(context, object);
         context.scene->SetLayerLocalVisibility(object.id, object.visible);
         context.scene->ApplyLayerVisibility(object.id);
@@ -8627,6 +8683,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         if (! object.FromJson(object_json, *context.vfs)) return false;
         register_visibility_contract(object.id, LazyMaterializeKind::None);
         resolve_visibility(object);
+        FillSceneObjectIdentityFor(*context.scene, object);
         ParseLightObj(context, object);
         context.scene->SetLayerLocalVisibility(object.id, object.visible);
         context.scene->ApplyLayerVisibility(object.id);
@@ -8642,6 +8699,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         const auto sound_handle =
             WPSoundParser::Parse(object, *context.vfs, *context.scene->soundManager);
         if (sound_handle == 0) return false;
+        FillSceneObjectIdentityFor(*context.scene, object);
         context.scene->objectRuntimeSoundHandles[object.id] = sound_handle;
         if (out_layer_id) *out_layer_id = object.id;
         return true;
@@ -8652,6 +8710,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         if (! object.FromJson(object_json, *context.vfs)) return false;
         register_visibility_contract(object.id, LazyMaterializeKind::Text);
         resolve_visibility(object);
+        FillSceneObjectIdentityFor(*context.scene, object);
         ParseTextObj(context, object);
         context.scene->SetLayerLocalVisibility(object.id, object.visible);
         context.scene->ApplyLayerVisibility(object.id);
@@ -8664,6 +8723,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         if (! object.FromJson(object_json, *context.vfs)) return false;
         register_visibility_contract(object.id, LazyMaterializeKind::None);
         resolve_visibility(object);
+        FillSceneObjectIdentityFor(*context.scene, object);
         ParseModelObj(context, object);
         context.scene->SetLayerLocalVisibility(object.id, object.visible);
         context.scene->ApplyLayerVisibility(object.id);
@@ -8675,6 +8735,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
     if (! object.FromJson(object_json, *context.vfs)) return false;
     register_visibility_contract(object.id, LazyMaterializeKind::None);
     resolve_visibility(object);
+    FillSceneObjectIdentityFor(*context.scene, object);
     ParseEmptyObj(context, object);
     context.scene->SetLayerLocalVisibility(object.id, object.visible);
     context.scene->ApplyLayerVisibility(object.id);
@@ -8742,7 +8803,9 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     };
 
     scene.objectRuntimeNodes.erase(layer_id);
-    scene.imageLayers.erase(layer_id);
+    if (auto* scene_object = scene.FindSceneObject(layer_id)) {
+        scene_object->ClearImageRuntimeState();
+    }
     scene.layerNodes[layer_id] = nullptr;
 
     if (object_json.contains("shape") && ! object_json.at("shape").is_null()) {
@@ -9216,6 +9279,12 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
 
     InitContext(context, vfs, sc, scene_id);
+    for (const auto& obj : wp_objs) {
+        // Every surviving authored object becomes exactly one SceneObject before per-type
+        // materialization runs. Materialization then only registers behavior-facing state
+        // (visibility, parent binding, image runtime state) on this same identity.
+        FillSceneObjectIdentity(*context.scene, obj);
+    }
     context.scene->has3dModels         = has_3d_models;
     context.layer_visibility_contracts = std::move(layer_visibility_contracts);
     context.scene->soundManager        = &sm;
