@@ -64,7 +64,14 @@
 using namespace wallpaper;
 using namespace Eigen;
 
-std::string getAddr(void* p) { return std::to_string(reinterpret_cast<intptr_t>(p)); }
+// Per-layer effect passes (private source camera, ping-pong targets, effect FBOs, puppet surface)
+// are pass descriptions of the authored object, so their names derive from the layer id instead of
+// runtime pointer addresses. This keeps a layer's pass resources stable across parses and across
+// deferred rematerializations of the same object.
+std::string EffectCameraName(int32_t layer_id) {
+    return "__hanabi_effect_camera_" + std::to_string(layer_id);
+}
+std::string EffectResourceSuffix(int32_t layer_id) { return "layer" + std::to_string(layer_id); }
 
 uint32_t HashParticleFrameU32(uint32_t seed, uint32_t bits) {
     seed ^= bits + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
@@ -5503,8 +5510,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         auto& scene = *context.scene;
         FinalOutputCapability final_shader_capability =
             wpimgobj.config.finalOutputCapability;
-        // currently use addr for unique
-        std::string nodeAddr = getAddr(spImgNode.get());
+        std::string effect_camera_name = EffectCameraName(wpimgobj.id);
         const auto  effect_camera_clip = ResolveImageEffectCameraClipRange(hasAnimatedPuppetMesh);
         // set camera to attatch effect
         if (isCompose) {
@@ -5512,18 +5518,18 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 std::max<int32_t>(1, static_cast<int32_t>(std::lround(effect_source_size[0])));
             const int32_t source_camera_height =
                 std::max<int32_t>(1, static_cast<int32_t>(std::lround(effect_source_size[1])));
-            scene.cameras[nodeAddr] = std::make_shared<SceneCamera>(
+            scene.cameras[effect_camera_name] = std::make_shared<SceneCamera>(
                 source_camera_width,
                 source_camera_height,
                 effect_camera_clip.near_clip,
                 effect_camera_clip.far_clip);
-            scene.cameras.at(nodeAddr)->AttatchNode(spWorldNode);
+            scene.cameras.at(effect_camera_name)->AttatchNode(spWorldNode);
             LOG_INFO("SceneCompositionLayerSourceCamera: layer=%d name='%s' camera='%s' "
                      "size=[%d, %d] source-target=[%.3f, %.3f] near=%.3f far=%.3f "
                      "animated-puppet=%s",
                      wpimgobj.id,
                      wpimgobj.name.c_str(),
-                     nodeAddr.c_str(),
+                     effect_camera_name.c_str(),
                      source_camera_width,
                      source_camera_height,
                      effect_source_size[0],
@@ -5536,25 +5542,25 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // resolution below may still be reduced independently.
             i32 w                   = (i32)wpimgobj.size[0];
             i32 h                   = (i32)wpimgobj.size[1];
-            scene.cameras[nodeAddr] = std::make_shared<SceneCamera>(
+            scene.cameras[effect_camera_name] = std::make_shared<SceneCamera>(
                 w, h, effect_camera_clip.near_clip, effect_camera_clip.far_clip);
-            scene.cameras.at(nodeAddr)->AttatchNode(context.effect_camera_node);
+            scene.cameras.at(effect_camera_name)->AttatchNode(context.effect_camera_node);
             LOG_INFO("SceneImageEffectSourceCamera: layer=%d name='%s' camera='%s' "
                      "size=[%d, %d] near=%.3f far=%.3f animated-puppet=%s",
                      wpimgobj.id,
                      wpimgobj.name.c_str(),
-                     nodeAddr.c_str(),
+                     effect_camera_name.c_str(),
                      w,
                      h,
                      effect_camera_clip.near_clip,
                      effect_camera_clip.far_clip,
                      hasAnimatedPuppetMesh ? "true" : "false");
         }
-        scene.objectRuntimeCameraNames[wpimgobj.id].push_back(nodeAddr);
-        spImgNode->SetCamera(nodeAddr);
+        scene.objectRuntimeCameraNames[wpimgobj.id].push_back(effect_camera_name);
+        spImgNode->SetCamera(effect_camera_name);
         std::string effect_ppong_a, effect_ppong_b;
-        effect_ppong_a = WE_EFFECT_PPONG_PREFIX_A.data() + nodeAddr;
-        effect_ppong_b = WE_EFFECT_PPONG_PREFIX_B.data() + nodeAddr;
+        effect_ppong_a = WE_EFFECT_PPONG_PREFIX_A.data() + effect_camera_name;
+        effect_ppong_b = WE_EFFECT_PPONG_PREFIX_B.data() + effect_camera_name;
         // set image effect
         // Compose layers keep their source node in the normal scene tree, but their final authored
         // effect pass is still a detached render-graph node. Give the effect layer a world node
@@ -5593,12 +5599,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             if (! use_detached_effect_world_node && ! isCompose) {
                 spImgNode->CopyTrans(SceneNode());
             }
-            scene.cameras.at(nodeAddr)->AttatchImgEffect(imgEffectLayer);
+            scene.cameras.at(effect_camera_name)->AttatchImgEffect(imgEffectLayer);
         }
         if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
-            const std::string puppet_surface_camera = nodeAddr + "__puppet_surface_camera";
+            const std::string puppet_surface_camera = effect_camera_name + "__puppet_surface_camera";
             const std::string puppet_surface_target =
-                "_rt_puppet_surface_" + nodeAddr;
+                "_rt_puppet_surface_" + effect_camera_name;
             imgEffectLayer->SetPuppetSurfaceProjection(BuildPuppetSurfaceProjection(
                 wpimgobj,
                 *puppet,
@@ -5718,7 +5724,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             const std::string inRT { effect_ppong_a };
 
             // fbo name map and effect command
-            std::string effaddr = getAddr(imgEffectLayer.get());
+            std::string effaddr = EffectResourceSuffix(wpimgobj.id);
             const auto  feedback_fbos = wpeffobj.FeedbackFboNames();
 
             std::unordered_map<std::string, std::string> fboMap;
@@ -6121,7 +6127,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
 
     if (has_effect) {
         auto&             scene       = *context.scene;
-        const std::string camera_name = getAddr(spTextNode.get());
+        const std::string camera_name = EffectCameraName(text_obj.id);
         primitive->bridge.camera_name = camera_name;
         primitive->bridge.pingpong_a  = WE_EFFECT_PPONG_PREFIX_A.data() + camera_name;
         primitive->bridge.pingpong_b  = WE_EFFECT_PPONG_PREFIX_B.data() + camera_name;
@@ -6231,7 +6237,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                       &finalCompositeTransformData);
 
         const std::string in_rt        = primitive->bridge.pingpong_a;
-        const std::string effect_addr  = getAddr(imgEffectLayer.get());
+        const std::string effect_addr  = EffectResourceSuffix(text_obj.id);
         int32_t           effect_index = -1;
         for (const auto& wp_effect : text_obj.effects) {
             effect_index++;
