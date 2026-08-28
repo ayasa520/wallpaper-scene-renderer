@@ -43,17 +43,12 @@ bool IsLayerVisibleImpl(const Scene& scene, int32_t layer_id, std::unordered_set
     if (layer_id == 0) return true;
     if (!visiting.insert(layer_id).second) return true;
 
-    const auto visible_it = scene.layerLocalVisibility.find(layer_id);
-    const bool local_visible =
-        visible_it == scene.layerLocalVisibility.end() ? true : visible_it->second;
-    if (!local_visible) return false;
+    const auto* object = scene.FindSceneObject(layer_id);
+    if (object == nullptr) return true;
+    if (!object->LocalVisible()) return false;
+    if (object->ParentId() == 0) return true;
 
-    const auto binding_it = scene.layerParentBindings.find(layer_id);
-    if (binding_it == scene.layerParentBindings.end() || binding_it->second.parent_id == 0) {
-        return true;
-    }
-
-    return IsLayerVisibleImpl(scene, binding_it->second.parent_id, visiting);
+    return IsLayerVisibleImpl(scene, object->ParentId(), visiting);
 }
 
 Eigen::Vector3d ToVector3d(const std::array<float, 3>& value) {
@@ -167,8 +162,8 @@ void ApplyLayerVisibilityRecursive(Scene& scene, int32_t layer_id, std::unordere
         }
     }
 
-    for (const auto& [child_id, binding] : scene.layerParentBindings) {
-        if (binding.parent_id == layer_id) {
+    for (const auto& [child_id, object] : scene.sceneObjects) {
+        if (object != nullptr && object->ParentId() == layer_id) {
             ApplyLayerVisibilityRecursive(scene, child_id, visited);
         }
     }
@@ -536,31 +531,53 @@ Scene::EffectiveImportedTextureResolution(const SceneTexture& texture) const {
     return { half_w, half_h, half_w, half_h };
 }
 
+SceneObject* Scene::FindSceneObject(int32_t layer_id) {
+    auto it = sceneObjects.find(layer_id);
+    return it == sceneObjects.end() ? nullptr : it->second.get();
+}
+
+const SceneObject* Scene::FindSceneObject(int32_t layer_id) const {
+    auto it = sceneObjects.find(layer_id);
+    return it == sceneObjects.end() ? nullptr : it->second.get();
+}
+
+SceneObject& Scene::EnsureSceneObject(int32_t layer_id) {
+    if (auto* existing = FindSceneObject(layer_id)) return *existing;
+    auto object = std::make_unique<SceneObject>(layer_id);
+    auto* raw   = object.get();
+    sceneObjects.emplace(layer_id, std::move(object));
+    return *raw;
+}
+
+void Scene::DestroySceneObject(int32_t layer_id) { sceneObjects.erase(layer_id); }
+
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {
-        layerParentBindings.erase(layer_id);
+        if (auto* object = FindSceneObject(layer_id)) object->ClearParentBinding();
         return;
     }
-    layerParentBindings[layer_id] = LayerParentBinding {
-        .parent_id = parent_id,
-        .attachment = std::move(attachment),
-    };
+    EnsureSceneObject(layer_id).SetParentBinding(parent_id, std::move(attachment));
 }
 
 Scene::LayerParentBinding Scene::GetLayerParentBinding(int32_t layer_id) const {
-    auto it = layerParentBindings.find(layer_id);
-    return it == layerParentBindings.end() ? LayerParentBinding {} : it->second;
+    const auto* object = FindSceneObject(layer_id);
+    if (object == nullptr) return LayerParentBinding {};
+    return LayerParentBinding {
+        .parent_id  = object->ParentId(),
+        .attachment = object->Attachment(),
+    };
 }
 
 void Scene::ClearLayerParentBinding(int32_t layer_id) {
-    layerParentBindings.erase(layer_id);
+    if (auto* object = FindSceneObject(layer_id)) object->ClearParentBinding();
 }
 
 std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
     std::vector<int32_t> children;
-    for (const auto& [child_id, binding] : layerParentBindings) {
-        if (binding.parent_id == layer_id) children.push_back(child_id);
+    if (layer_id == 0) return children;
+    for (const auto& [child_id, object] : sceneObjects) {
+        if (object != nullptr && object->ParentId() == layer_id) children.push_back(child_id);
     }
     return children;
 }
@@ -568,12 +585,12 @@ std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
 void Scene::SetLayerLocalVisibility(int32_t layer_id, bool visible) {
     if (layer_id == 0) return;
 
-    layerLocalVisibility[layer_id] = visible;
+    EnsureSceneObject(layer_id).SetLocalVisible(visible);
 }
 
 bool Scene::GetLayerLocalVisibility(int32_t layer_id) const {
-    auto it = layerLocalVisibility.find(layer_id);
-    return it == layerLocalVisibility.end() ? true : it->second;
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? true : object->LocalVisible();
 }
 
 bool Scene::IsLayerVisible(int32_t layer_id) const {

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -14,6 +15,7 @@
 #include "SceneTexture.h"
 #include "SceneRenderTarget.h"
 #include "SceneNode.h"
+#include "SceneObject.h"
 #include "SceneLight.hpp"
 #include "WPSceneScriptHost.hpp"
 #include "WPTextLayer.hpp"
@@ -56,10 +58,9 @@ public:
         std::vector<CameraPathKeyframe> keyframes;
     };
 
-    struct ImageLayerRuntimeState {
-        std::array<float, 2> size { 0.0f, 0.0f };
-        std::string          alignment { "center" };
-    };
+    // Image-layer runtime state now lives on the owning SceneObject; the alias keeps the
+    // established Scene-facing type name for accessors and script-host call sites.
+    using ImageLayerRuntimeState = SceneImageLayerRuntimeState;
 
     struct CameraLayerRuntimeState {
         // Wallpaper Engine camera layers are represented in scene.json as transform-only objects
@@ -120,6 +121,14 @@ public:
 
     Scene();
     ~Scene();
+
+    // SceneObject is the authored layer identity: one per scene.json objects[] entry. The layer
+    // parent/visibility/image-state accessors below are the behavior-facing API; they are backed
+    // by the owning SceneObject instead of separate per-concern maps.
+    SceneObject*       FindSceneObject(int32_t layer_id);
+    const SceneObject* FindSceneObject(int32_t layer_id) const;
+    SceneObject&       EnsureSceneObject(int32_t layer_id);
+    void               DestroySceneObject(int32_t layer_id);
 
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
@@ -185,8 +194,9 @@ public:
     std::vector<WPSceneScriptRegistration> propertyAnimationRegistrations;
     std::vector<int32_t>                 layerOrder;
     std::unordered_map<int32_t, SceneNode*> layerNodes;
-    std::unordered_map<int32_t, LayerParentBinding> layerParentBindings;
-    std::unordered_map<int32_t, bool>    layerLocalVisibility;
+    // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
+    // callers may hold pointers to an object's image runtime state across rehashes.
+    std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
     std::unordered_map<int32_t, std::vector<SceneNode*>> objectRuntimeNodes;
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeCameraNames;
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeRenderTargets;
@@ -196,7 +206,6 @@ public:
     std::unordered_set<int32_t>                          deferredRuntimeParticleLayerIds;
     std::unordered_set<int32_t>                          deferredRuntimeTextLayerIds;
     std::unordered_map<int32_t, uint32_t>                 objectRuntimeSoundHandles;
-    std::unordered_map<int32_t, ImageLayerRuntimeState>   imageLayers;
     std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
     std::vector<int32_t>                                  cameraLayerOrder;
