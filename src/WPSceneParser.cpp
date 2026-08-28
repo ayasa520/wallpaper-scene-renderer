@@ -569,16 +569,28 @@ void ApplyNodeOwnerParallaxFallback(ParseContext& context, int32_t owner_id,
                                     bool suppress_model_parallax = false) {
     if (context.scene == nullptr || context.shader_updater == nullptr) return;
 
-    for (const auto& [node, node_owner_id] : context.scene->nodeOwners) {
-        if (node == nullptr || node_owner_id != owner_id) continue;
-        if (! node->Camera().empty()) continue;
+    auto apply_to_node = [&context, &depth, anchor, suppress_model_parallax](SceneNode* node) {
+        if (node == nullptr) return;
+        if (! node->Camera().empty()) return;
         auto* node_data = context.shader_updater->GetNodeData(node);
-        if (node_data == nullptr) continue;
+        if (node_data == nullptr) return;
 
         // Only camera-facing/world-facing nodes should receive this repaired parallax contract.
         // Effect source nodes render inside private effect cameras, so moving them here would bake
         // the same mouse offset into the offscreen texture and then apply it again at composition.
         node_data->SetParallaxContract(depth, anchor, suppress_model_parallax);
+    };
+
+    for (const auto& [node, node_owner_id] : context.scene->nodeOwners) {
+        if (node_owner_id != owner_id) continue;
+        apply_to_node(node);
+    }
+
+    // The layer's final composite is a detached drawing phase rather than a registered node
+    // identity, so it is reached through the owning effect layer instead of nodeOwners.
+    if (auto* effect_layer = context.scene->FindImageEffectLayer(owner_id);
+        effect_layer != nullptr && effect_layer->HasFinalComposite()) {
+        apply_to_node(&effect_layer->FinalNode());
     }
 }
 
@@ -1776,7 +1788,9 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
     final_node.AddMesh(composite_mesh);
 
     context.shader_updater->SetNodeData(&final_node, composite_data);
-    context.scene->nodeOwners[&final_node] = owner_layer_id;
+    // The final composite is a drawing phase of the owning layer, not a second layer identity:
+    // it stays out of sceneGraph/nodeOwners. Its node id (set above) is the back-reference the
+    // render graph uses to resolve the owning layer for visibility and residency decisions.
     effect_layer.SetFinalCompositeSource(std::string(initial_source));
     return true;
 }

@@ -141,7 +141,9 @@ private:
     // matrices from the previous parent relationship.
     void MarkTransSubtreeDirty();
 
-    i32         m_id;
+    // 0 means "no authored layer": detached helper nodes keep the default so layer-id resolution
+    // deterministically treats them as unowned instead of reading uninitialized memory.
+    i32         m_id { 0 };
     std::string m_name;
 
     bool            m_dirty;

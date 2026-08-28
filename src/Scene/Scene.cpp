@@ -829,6 +829,21 @@ const SceneImageEffect* Scene::FindImageEffect(int32_t owner_layer_id,
     return const_cast<Scene*>(this)->FindImageEffect(owner_layer_id, effect_index);
 }
 
+SceneImageEffectLayer* Scene::FindImageEffectLayer(int32_t owner_layer_id) {
+    auto camera_names_it = objectRuntimeCameraNames.find(owner_layer_id);
+    if (camera_names_it == objectRuntimeCameraNames.end()) return nullptr;
+
+    for (const auto& camera_name : camera_names_it->second) {
+        auto camera_it = cameras.find(camera_name);
+        if (camera_it == cameras.end() || !camera_it->second->HasImgEffect()) continue;
+
+        auto* effect_layer = camera_it->second->GetImgEffect().get();
+        if (effect_layer != nullptr) return effect_layer;
+    }
+
+    return nullptr;
+}
+
 SceneImageEffect* Scene::FindImageEffectById(int32_t owner_layer_id, int32_t effect_id) {
     auto camera_names_it = objectRuntimeCameraNames.find(owner_layer_id);
     if (camera_names_it == objectRuntimeCameraNames.end()) return nullptr;
