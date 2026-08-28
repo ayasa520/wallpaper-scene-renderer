@@ -5319,7 +5319,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     LoadAlignment(*spWorldNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
     spWorldNode->ID() = wpimgobj.id;
     auto spImgNode = use_detached_effect_world_node ? std::make_shared<SceneNode>() : spWorldNode;
-    spImgNode->SetName(wpimgobj.name);
+    if (use_detached_effect_world_node) {
+        // The detached node is this layer's private-camera source phase, not a second layer
+        // identity. Name it like the other phase nodes so the authored name stays unique to the
+        // world node and graph logs distinguish the two.
+        spImgNode->SetName(wpimgobj.name + "::__hanabi_effect_source");
+    }
     spImgNode->ID() = wpimgobj.id;
 
     SceneMaterial     material;
@@ -6110,7 +6115,11 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                          text_obj.name);
     spWorldNode->ID()      = text_obj.id;
     auto spTextNode        = has_effect ? std::make_shared<SceneNode>() : spWorldNode;
-    spTextNode->SetName(text_obj.name);
+    if (has_effect) {
+        // Same phase-naming contract as image layers: the bridged text node is the layer's
+        // private-camera source phase, so the authored name stays unique to the world node.
+        spTextNode->SetName(text_obj.name + "::__hanabi_effect_source");
+    }
     spTextNode->ID() = text_obj.id;
     spTextNode->AddText(primitive);
 
