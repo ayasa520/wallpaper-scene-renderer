@@ -165,10 +165,20 @@ static void CheckAndSetSprite(Scene& scene, vulkan::ShaderDrawRequest& desc,
     }
 }
 
+static int32_t NodeLayerId(const Scene& scene, SceneNode* node) {
+    if (node == nullptr) return 0;
+    if (auto owner_it = scene.nodeOwners.find(node); owner_it != scene.nodeOwners.end()) {
+        return owner_it->second;
+    }
+    return node->ID();
+}
+
 static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::string_view output) {
-    const auto owner_it = scene.nodeOwners.find(node);
-    if (owner_it == scene.nodeOwners.end()) return false;
-    if (scene.offscreenDependencyLayerIds.count(owner_it->second) == 0) return false;
+    // Detached final-composite nodes carry their owner layer in the node id instead of a
+    // nodeOwners registration, so resolve the layer through the shared helper.
+    const int32_t layer_id = NodeLayerId(scene, node);
+    if (layer_id == 0) return false;
+    if (scene.offscreenDependencyLayerIds.count(layer_id) == 0) return false;
 
     // Hidden dependency layers are allowed to keep rendering only into private offscreen targets that
     // another effect samples. They must never use that exemption for `_rt_default`, because that
@@ -265,14 +275,6 @@ struct TraversalRoute {
 
 static bool HasRenderableMeshMaterial(SceneNode* node) {
     return node != nullptr && node->Mesh() != nullptr && node->Mesh()->Material() != nullptr;
-}
-
-static int32_t NodeLayerId(const Scene& scene, SceneNode* node) {
-    if (node == nullptr) return 0;
-    if (auto owner_it = scene.nodeOwners.find(node); owner_it != scene.nodeOwners.end()) {
-        return owner_it->second;
-    }
-    return node->ID();
 }
 
 static bool ShouldEmitLayerNodeForResidency(Scene& scene, SceneNode* node, const ExtraInfo& extra) {

@@ -166,6 +166,7 @@ public:
     const SceneImageEffect* FindImageEffect(int32_t owner_layer_id, uint32_t effect_index) const;
     SceneImageEffect*       FindImageEffectById(int32_t owner_layer_id, int32_t effect_id);
     const SceneImageEffect* FindImageEffectById(int32_t owner_layer_id, int32_t effect_id) const;
+    SceneImageEffectLayer*  FindImageEffectLayer(int32_t owner_layer_id);
     bool                    SetEffectLocalVisibility(int32_t owner_layer_id,
                                                      uint32_t effect_index, bool visible);
     bool                    SetEffectLocalVisibilityById(int32_t owner_layer_id,
