@@ -320,8 +320,7 @@ static bool EffectSourceUsesOwnerNode(SceneImageEffectLayer* imgeff) {
 
 static bool HasRenderOrderProxyChildren(SceneNode* node, const ExtraInfo& extra) {
     if (node == nullptr || extra.scene == nullptr) return false;
-    const auto proxy_it = extra.scene->renderOrderProxyChildren.find(node);
-    return proxy_it != extra.scene->renderOrderProxyChildren.end() && !proxy_it->second.empty();
+    return ! extra.scene->RenderOrderProxyChildrenOf(node).empty();
 }
 
 static bool ShouldSeedEmptyProxyComposeFromFramebuffer(SceneNode* node,
@@ -545,16 +544,13 @@ static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode
         });
     }
 
-    if (auto proxy_it = extra.scene->renderOrderProxyChildren.find(node);
-        proxy_it != extra.scene->renderOrderProxyChildren.end()) {
-        for (auto* proxy_child : proxy_it->second) {
-            if (proxy_child == nullptr || !seen.insert(proxy_child).second) continue;
-            children.push_back(OrderedRenderGraphChild {
-                .node = proxy_child,
-                .proxy = true,
-                .sequence = sequence++,
-            });
-        }
+    for (auto* proxy_child : extra.scene->RenderOrderProxyChildrenOf(node)) {
+        if (proxy_child == nullptr || !seen.insert(proxy_child).second) continue;
+        children.push_back(OrderedRenderGraphChild {
+            .node = proxy_child,
+            .proxy = true,
+            .sequence = sequence++,
+        });
     }
 
     // The scene tree still owns lifetime and transforms, but the render graph needs Wallpaper
@@ -804,7 +800,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         // them through the physical tree means the root traversal is at the wrong sibling
         // position, so skip this visit to avoid late duplicate composites. (Detached effect
         // sources need no such skip anymore: they are bridge-owned and never enter the tree.)
-        if (scene.renderOrderProxyNodes.count(node) != 0) {
+        if (scene.IsRenderOrderProxyNode(node)) {
             LOG_INFO("SceneRenderGraphNodeRouteSkip: layer=%d name='%s' reason='proxy'",
                      NodeLayerId(scene, node),
                      node->Name().c_str());
@@ -1248,11 +1244,8 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
     for (size_t index = 0; index < scene.layerOrder.size(); index++) {
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
-    LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu proxy-parent-count=%zu proxy-node-count=%zu "
-             "warmup-hidden=%s",
+    LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu warmup-hidden=%s",
              scene.layerOrder.size(),
-             scene.renderOrderProxyChildren.size(),
-             scene.renderOrderProxyNodes.size(),
              include_hidden_for_pipeline_warmup ? "true" : "false");
     if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
         // Keep the official empty-buffer contract when reflections are off: receivers still

@@ -203,6 +203,15 @@ public:
     void MarkLayerOffscreenDependencySource(int32_t layer_id);
     bool IsLayerOffscreenDependencySource(int32_t layer_id) const;
 
+    // Render-order proxy queries, derived from authored parent bindings instead of parse-time
+    // node tables. A layer's handle is a proxy node when it is root-owned for transform
+    // correctness while its authored binding routes it under a parent (parent_id != 0 with no
+    // attachment); the render graph then draws it at the parent's authored sibling position and
+    // skips its physical root visit. Deriving at query time keeps the answers correct across
+    // deferred placeholder swaps and script-driven reparenting without stale-table maintenance.
+    bool IsRenderOrderProxyNode(const SceneNode* node) const;
+    std::vector<SceneNode*> RenderOrderProxyChildrenOf(const SceneNode* parent_node) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -276,14 +285,6 @@ public:
     std::vector<int32_t> cameraLayerOrder;
     std::unordered_map<SceneNode*, int32_t> nodeOwners;
     std::unordered_map<std::string, int32_t> layerNameToId;
-    // Some runtime nodes must stay root-owned for transform correctness, effect-camera routing, or
-    // deferred materialization, but Wallpaper Engine still orders them as children of their
-    // authored parent layer. These maps keep physical ownership separate from authored render
-    // order so the render graph can emit passes at the correct sibling position without changing
-    // the node's transform/output ownership model. (Detached effect-source nodes no longer need
-    // this: they are bridge-owned drawing phases that never enter the tree.)
-    std::unordered_map<SceneNode*, std::vector<SceneNode*>> renderOrderProxyChildren;
-    std::unordered_set<SceneNode*>                          renderOrderProxyNodes;
     UserPropertyMap                      userProperties;
     std::set<std::string>                dirtyImportedTextureKeys;
     std::unordered_set<std::string>      dirtyRenderTargetKeys;
