@@ -589,8 +589,10 @@ void ApplyNodeOwnerParallaxFallback(ParseContext& context, int32_t owner_id,
         node_data->SetParallaxContract(depth, anchor, suppress_model_parallax);
     };
 
-    for (const auto& [node, node_owner_id] : context.scene->nodeOwners) {
-        if (node_owner_id != owner_id) continue;
+    // The layer's registered draw handles live on its identity object. The list also contains
+    // detached effect-source nodes, which the former nodeOwners scan never held; they own the
+    // private effect camera and stay excluded by apply_to_node's camera check either way.
+    for (auto* node : context.scene->GetLayerRuntimeNodes(owner_id)) {
         apply_to_node(node);
     }
 
@@ -2361,7 +2363,6 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
             .alignment = wpimgobj.alignment,
         });
     context.scene->AddLayerRuntimeNode(wpimgobj.id, node.get());
-    context.scene->nodeOwners[node.get()] = wpimgobj.id;
     context.shader_updater->SetNodeData(node.get(), node_data);
     RegisterLayerSceneState(
         context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
@@ -2420,7 +2421,6 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
 
     context.object_nodes[wppartobj.id] = node;
     context.scene->AddLayerRuntimeNode(wppartobj.id, node.get());
-    context.scene->nodeOwners[node.get()] = wppartobj.id;
     context.shader_updater->SetNodeData(node.get(), node_data);
     RegisterLayerSceneState(
         context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
@@ -2458,7 +2458,6 @@ void RegisterLogicalTextLayer(ParseContext& context,
 
     context.object_nodes[text_obj.id] = node;
     context.scene->AddLayerRuntimeNode(text_obj.id, node.get());
-    context.scene->nodeOwners[node.get()] = text_obj.id;
     context.shader_updater->SetNodeData(node.get(), node_data);
     context.scene->SetTextLayerState(text_obj.id,
                                      TextLayerRuntimeState {
@@ -2553,7 +2552,6 @@ void ReplaceDeferredPlaceholderNode(ParseContext& context, int32_t layer_id,
     if (context.scene->sceneGraph != nullptr) {
         (void)DetachNodeFromTree(context.scene->sceneGraph, placeholder_node.get());
     }
-    context.scene->nodeOwners.erase(placeholder_node.get());
     if (context.shader_updater != nullptr) {
         context.shader_updater->ReplaceNodeReferences(placeholder_node.get(), replacement_node.get());
     }
@@ -3410,7 +3408,6 @@ void main()
         auto node = std::make_shared<SceneNode>();
         node->SetName(name);
         node->AddMesh(mesh);
-        scene.nodeOwners[node.get()] = 0;
         context.shader_updater->SetNodeData(node.get(), WPShaderValueData {});
         return node;
     };
@@ -3868,7 +3865,6 @@ void main() {
         auto node = std::make_shared<SceneNode>();
         node->SetName(name);
         node->AddMesh(mesh);
-        scene.nodeOwners[node.get()] = 0;
         context.shader_updater->SetNodeData(node.get(), WPShaderValueData {});
         return node;
     };
@@ -4205,7 +4201,6 @@ bool LoadVolumetricUtilMaterial(fs::VFS& vfs, Scene& scene, WPShaderValueUpdater
     mesh->AddMaterial(std::move(material));
     node.AddMesh(mesh);
     updater->SetNodeData(&node, sv_data);
-    scene.nodeOwners[&node] = 0;
     return true;
 }
 
@@ -4956,7 +4951,6 @@ private:
 
         context_.object_nodes[model_obj_.id] = root_;
         context_.scene->AddLayerRuntimeNode(model_obj_.id, root_.get());
-        context_.scene->nodeOwners[root_.get()] = model_obj_.id;
         context_.shader_updater->SetNodeData(root_.get(), root_data);
         RegisterLayerSceneState(
             context_, model_obj_.id, model_obj_.parent, model_obj_.attachment, model_obj_.visible);
@@ -5051,7 +5045,6 @@ private:
         RegisterUserShaderValueBindings(
             context_, wp_material, shader_info, node.get(), model_obj_.id, model_obj_.name);
         context_.shader_updater->SetNodeData(node.get(), node_data);
-        context_.scene->nodeOwners[node.get()] = model_obj_.id;
         context_.scene->AddLayerRuntimeNode(model_obj_.id, node.get());
         return node;
     }
@@ -5935,7 +5928,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             .alignment = wpimgobj.alignment,
         });
     context.scene->AddLayerRuntimeNode(wpimgobj.id, spWorldNode.get());
-    context.scene->nodeOwners[spWorldNode.get()] = wpimgobj.id;
     if (hasAnimatedPuppetMesh) {
         context.object_puppets[wpimgobj.id] = puppet->puppet.get();
     }
@@ -6343,7 +6335,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
 
     context.object_nodes[text_obj.id] = spWorldNode;
     context.scene->AddLayerRuntimeNode(text_obj.id, spWorldNode.get());
-    context.scene->nodeOwners[spWorldNode.get()] = text_obj.id;
     context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
 
     if (spTextNode.get() != spWorldNode.get()) {
@@ -6522,7 +6513,6 @@ void AttachExtraParticleRenderer(ParseContext& context, wpscene::WPParticleObjec
     parent_node.AppendChild(extra_node);
     if (register_layer_nodes) {
         context.scene->AddLayerRuntimeNode(wppartobj.id, extra_node.get());
-        context.scene->nodeOwners[extra_node.get()] = wppartobj.id;
     }
     context.shader_updater->SetNodeData(extra_node.get(), svData);
 }
@@ -6894,7 +6884,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         }
         context.object_nodes[wppartobj.id] = spNode;
         context.scene->AddLayerRuntimeNode(wppartobj.id, spNode.get());
-        context.scene->nodeOwners[spNode.get()] = wppartobj.id;
         RegisterLayerSceneState(
             context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
         context.scene->ApplyLayerVisibility(wppartobj.id);
@@ -6911,6 +6900,7 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
                                             Vector3f(light_obj.scale.data()),
                                             Vector3f(light_obj.angles.data()),
                                             light_obj.name);
+    node->ID() = light_obj.id;
 
     context.scene->lights.emplace_back(std::make_unique<SceneLight>(
         Vector3f(light_obj.color.data()), light_obj.radius, light_obj.intensity));
@@ -6948,7 +6938,6 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     AttachNodeToScene(context, node, light_obj.parent, light_obj.name);
     context.object_nodes[light_obj.id] = node;
     context.scene->AddLayerRuntimeNode(light_obj.id, node.get());
-    context.scene->nodeOwners[node.get()] = light_obj.id;
     RegisterLayerSceneState(context, light_obj.id, light_obj.parent, {}, light_obj.visible);
     context.scene->ApplyLayerVisibility(light_obj.id);
 }
@@ -6983,7 +6972,6 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     }
     context.object_nodes[empty_obj.id] = node;
     context.scene->AddLayerRuntimeNode(empty_obj.id, node.get());
-    context.scene->nodeOwners[node.get()] = empty_obj.id;
     context.shader_updater->SetNodeData(node.get(), svData);
     RegisterLayerSceneState(
         context, empty_obj.id, empty_obj.parent, empty_obj.attachment, empty_obj.visible);

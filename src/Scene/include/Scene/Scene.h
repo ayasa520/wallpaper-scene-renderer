@@ -122,11 +122,10 @@ public:
     SceneObject&       EnsureSceneObject(int32_t layer_id);
     void               DestroySceneObject(int32_t layer_id);
 
-    // Resolve any draw handle to its owning authored layer id. A nodeOwners registration wins
-    // (only layer handles register; bloom helpers register an explicit 0), otherwise the node id
-    // is the back-reference: drawing-phase nodes (detached effect sources, effect passes, the
-    // final composite) carry their owner layer there, and helper nodes without an authored layer
-    // keep the default id 0, which callers treat as "no owner".
+    // Resolve any draw handle to its owning authored layer id. The node id is the single
+    // back-reference: layer handles carry their authored id from parse, drawing-phase nodes
+    // (detached effect sources, effect passes, the final composite) carry their owner's id, and
+    // helper nodes (bloom, volumetrics) keep the default id 0, which callers treat as "no owner".
     int32_t LayerIdForNode(const SceneNode* node) const;
 
     // Deferred-runtime bookkeeping, backed by SceneObject::DeferredRuntimeKind. Semantics match
@@ -283,7 +282,6 @@ public:
     // First-registration order of camera layers; the bottom-most visible one wins as the active
     // view. Entries are appended once per layer id and never removed at runtime.
     std::vector<int32_t> cameraLayerOrder;
-    std::unordered_map<SceneNode*, int32_t> nodeOwners;
     std::unordered_map<std::string, int32_t> layerNameToId;
     UserPropertyMap                      userProperties;
     std::set<std::string>                dirtyImportedTextureKeys;

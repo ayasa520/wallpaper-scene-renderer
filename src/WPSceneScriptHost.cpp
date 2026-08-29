@@ -3760,7 +3760,6 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
                 }
                 opaque->animation_layer_states.erase(animation_state_it);
             }
-            opaque->scene->nodeOwners.erase(node);
         }
 
         // The layer's nodes were just detached above and are freed when detached_roots goes out
