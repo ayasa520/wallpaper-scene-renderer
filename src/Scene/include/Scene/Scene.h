@@ -160,6 +160,17 @@ public:
     const std::string* GetLayerInitialConfigJson(int32_t layer_id) const;
     void               ClearAllLayerInitialConfigJson();
 
+    // Layer-handle bookkeeping, backed by SceneObject's tri-state layer-node slot. Same semantics
+    // as the former layerNodes map: HasLayerNodeSlot is the registration check (a slot may hold
+    // nullptr mid-rematerialization or for node-less sound layers), GetLayerNode returns nullptr
+    // both for an absent slot and for a registered null handle, and FindLayerIdByNode is the
+    // reverse lookup over live handles only.
+    void       SetLayerNode(int32_t layer_id, SceneNode* node);
+    SceneNode* GetLayerNode(int32_t layer_id) const;
+    bool       HasLayerNodeSlot(int32_t layer_id) const;
+    void       ClearAllLayerNodeSlots();
+    int32_t    FindLayerIdByNode(const SceneNode* node) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -224,7 +235,6 @@ public:
     std::vector<WPSceneScriptRegistration> scriptRegistrations;
     std::vector<WPSceneScriptRegistration> propertyAnimationRegistrations;
     std::vector<int32_t>                 layerOrder;
-    std::unordered_map<int32_t, SceneNode*> layerNodes;
     // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;

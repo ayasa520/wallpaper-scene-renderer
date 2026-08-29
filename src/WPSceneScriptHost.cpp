@@ -2537,8 +2537,7 @@ WPShaderValueData* GetNodeData(WPSceneScriptHost::Opaque* opaque, SceneNode* nod
 
 SceneNode* FindNodeById(WPSceneScriptHost::Opaque* opaque, int32_t node_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->layerNodes.find(node_id);
-    return it == opaque->scene->layerNodes.end() ? nullptr : it->second;
+    return opaque->scene->GetLayerNode(node_id);
 }
 
 void RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
@@ -3200,11 +3199,8 @@ bool ApplyTextLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t laye
 }
 
 int32_t FindNodeId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* node) {
-    if (opaque == nullptr || opaque->scene == nullptr || node == nullptr) return 0;
-    for (const auto& [id, candidate] : opaque->scene->layerNodes) {
-        if (candidate == node) return id;
-    }
-    return 0;
+    if (opaque == nullptr || opaque->scene == nullptr) return 0;
+    return opaque->scene->FindLayerIdByNode(node);
 }
 
 int32_t FindOwningLayerId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* node) {
@@ -3406,7 +3402,7 @@ std::optional<int32_t> ResolveLayerReference(JSContext* context, WPSceneScriptHo
 
     int32_t layer_id = 0;
     if (JS_ToInt32(context, &layer_id, value) == 0) {
-        if (opaque->scene->layerNodes.count(layer_id) != 0) return layer_id;
+        if (opaque->scene->HasLayerNodeSlot(layer_id)) return layer_id;
     }
 
     std::string layer_name;
@@ -3420,7 +3416,7 @@ std::optional<int32_t> ResolveLayerReference(JSContext* context, WPSceneScriptHo
         if (! JS_IsException(node_id_value)) {
             int32_t node_id = 0;
             if (JS_ToInt32(context, &node_id, node_id_value) == 0 &&
-                opaque->scene->layerNodes.count(node_id) != 0) {
+                opaque->scene->HasLayerNodeSlot(node_id)) {
                 JS_FreeValue(context, node_id_value);
                 return node_id;
             }
@@ -3881,10 +3877,9 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             // parser-backed authoritative text image left to unregister here.
             opaque->scene->textLayers.erase(text_it);
         }
-        // The deferred-runtime record lives on the SceneObject, so DestroySceneObject above
-        // already dropped it together with the rest of the identity; a later dynamic layer that
-        // reuses this authored id starts from a fresh object.
-        opaque->scene->layerNodes.erase(layer_id);
+        // The deferred-runtime record and the layer-node slot live on the SceneObject, so
+        // DestroySceneObject above already dropped them together with the rest of the identity;
+        // a later dynamic layer that reuses this authored id starts from a fresh object.
         opaque->scene->scriptRegistrations.erase(
             std::remove_if(opaque->scene->scriptRegistrations.begin(),
                            opaque->scene->scriptRegistrations.end(),
@@ -5282,9 +5277,9 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                 updated_mesh = UpdateQuadMeshSize(mesh_node->Mesh(), new_size) || updated_mesh;
             });
 
-            auto layer_node_it = opaque->scene->layerNodes.find(layer_id);
-            if (layer_node_it != opaque->scene->layerNodes.end()) {
-                RefreshAlignedLayerPivot(layer_node_it->second, image_layer->alignment, new_size);
+            if (opaque->scene->HasLayerNodeSlot(layer_id)) {
+                RefreshAlignedLayerPivot(
+                    opaque->scene->GetLayerNode(layer_id), image_layer->alignment, new_size);
             }
 
             if (auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
@@ -6774,7 +6769,7 @@ JSValue NativeCreateSceneLayer(JSContext* context, JSValueConst, int argc, JSVal
             }
         } else if (normalized_json.at("parent").is_number_integer()) {
             const int32_t parent_id = normalized_json.at("parent").get<int32_t>();
-            if (opaque->scene->layerNodes.count(parent_id) == 0) {
+            if (! opaque->scene->HasLayerNodeSlot(parent_id)) {
                 normalized_json["parent"] = 0;
             }
         }

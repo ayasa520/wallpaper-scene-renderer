@@ -11,6 +11,8 @@
 namespace wallpaper
 {
 
+class SceneNode;
+
 // Authored object kind straight from scene.json. One entry of objects[] maps to exactly one
 // SceneObject; render-time SceneNodes are draw handles owned by passes, not layer identities.
 enum class SceneObjectKind
@@ -115,6 +117,22 @@ public:
     void                    SetSoundHandle(uint32_t handle) { m_sound_handle = handle; }
     void                    ClearSoundHandle() { m_sound_handle.reset(); }
 
+    // The layer's script-visible handle node. The slot is tri-state to preserve the former
+    // Scene::layerNodes semantics: no slot means the layer is not registered, a slot holding
+    // nullptr means the layer is registered but its handle is temporarily absent
+    // (mid-rematerialization, or node-less sound layers), and otherwise the slot is the live
+    // handle. Registration checks must use HasLayerNodeSlot, not the node value.
+    bool       HasLayerNodeSlot() const { return m_has_layer_node_slot; }
+    SceneNode* LayerNode() const { return m_layer_node; }
+    void       SetLayerNode(SceneNode* node) {
+        m_layer_node          = node;
+        m_has_layer_node_slot = true;
+    }
+    void ClearLayerNodeSlot() {
+        m_layer_node          = nullptr;
+        m_has_layer_node_slot = false;
+    }
+
     // The authored scene.json record for this object, normalized to its parse-time id. Deferred
     // layers re-parse it on materialization and scripts read originalOrigin and the initial
     // config from it. nullptr means no record (sound-only and some helper layers).
@@ -162,6 +180,9 @@ private:
     SceneDeferredRuntimeKind   m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
     std::optional<uint32_t>    m_sound_handle;
     std::optional<std::string> m_initial_config_json;
+
+    bool       m_has_layer_node_slot { false };
+    SceneNode* m_layer_node { nullptr };
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;
