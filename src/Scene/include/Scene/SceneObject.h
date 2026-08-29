@@ -163,6 +163,15 @@ public:
         return m_runtime_particle_subsystems;
     }
 
+    // The layer's live draw handles: world/placeholder node, detached effect-source node, model
+    // material nodes, particle renderer nodes. Same append-only contract as the lists above.
+    // The list must be cleared at the exact point the nodes are freed (layer destroy and
+    // re-materialization), because readers walk these pointers for visibility, residency, and
+    // material updates.
+    void AddRuntimeNode(SceneNode* node) { m_runtime_nodes.push_back(node); }
+    const std::vector<SceneNode*>& RuntimeNodes() const { return m_runtime_nodes; }
+    void ClearRuntimeNodes() { m_runtime_nodes.clear(); }
+
     // The authored scene.json record for this object, normalized to its parse-time id. Deferred
     // layers re-parse it on materialization and scripts read originalOrigin and the initial
     // config from it. nullptr means no record (sound-only and some helper layers).
@@ -218,6 +227,7 @@ private:
 
     std::vector<SceneLight*>        m_runtime_lights;
     std::vector<ParticleSubSystem*> m_runtime_particle_subsystems;
+    std::vector<SceneNode*>         m_runtime_nodes;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;

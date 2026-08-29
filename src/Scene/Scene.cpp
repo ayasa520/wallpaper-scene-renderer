@@ -132,16 +132,13 @@ void ApplyLayerVisibilityRecursive(Scene& scene, int32_t layer_id, std::unordere
     std::unordered_set<int32_t> visiting;
     const bool effective_visible = IsLayerVisibleImpl(scene, layer_id, visiting);
 
-    if (auto runtime_nodes_it = scene.objectRuntimeNodes.find(layer_id);
-        runtime_nodes_it != scene.objectRuntimeNodes.end()) {
-        for (auto* node : runtime_nodes_it->second) {
-            if (node != nullptr) {
-                // Layer visibility propagation must not overwrite a node's own local visibility
-                // contract. Runtime-owned support nodes may intentionally stay hidden even while
-                // their authored layer is visible, so the scene system only updates the
-                // layer-level flag.
-                node->SetLayerVisible(effective_visible);
-            }
+    for (auto* node : scene.GetLayerRuntimeNodes(layer_id)) {
+        if (node != nullptr) {
+            // Layer visibility propagation must not overwrite a node's own local visibility
+            // contract. Runtime-owned support nodes may intentionally stay hidden even while
+            // their authored layer is visible, so the scene system only updates the
+            // layer-level flag.
+            node->SetLayerVisible(effective_visible);
         }
     }
 
@@ -669,6 +666,25 @@ const std::vector<ParticleSubSystem*>&
 Scene::GetLayerRuntimeParticleSubsystems(int32_t layer_id) const {
     const auto* object = FindSceneObject(layer_id);
     return object == nullptr ? kNoRuntimeParticleSubsystems : object->RuntimeParticleSubsystems();
+}
+
+void Scene::AddLayerRuntimeNode(int32_t layer_id, SceneNode* node) {
+    if (layer_id == 0 || node == nullptr) return;
+    EnsureSceneObject(layer_id).AddRuntimeNode(node);
+}
+
+namespace
+{
+const std::vector<SceneNode*> kNoRuntimeNodes;
+} // namespace
+
+const std::vector<SceneNode*>& Scene::GetLayerRuntimeNodes(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? kNoRuntimeNodes : object->RuntimeNodes();
+}
+
+void Scene::ClearLayerRuntimeNodes(int32_t layer_id) {
+    if (auto* object = FindSceneObject(layer_id)) object->ClearRuntimeNodes();
 }
 
 int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {
