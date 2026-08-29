@@ -560,6 +560,46 @@ int32_t Scene::LayerIdForNode(const SceneNode* node) const {
     return node->ID();
 }
 
+void Scene::MarkLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind) {
+    if (layer_id == 0 || kind == SceneDeferredRuntimeKind::None) return;
+    EnsureSceneObject(layer_id).SetDeferredRuntimeKind(kind);
+}
+
+void Scene::ClearLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind) {
+    auto* object = FindSceneObject(layer_id);
+    if (object == nullptr || object->DeferredRuntimeKind() != kind) return;
+    object->SetDeferredRuntimeKind(SceneDeferredRuntimeKind::None);
+}
+
+bool Scene::IsLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object != nullptr && object->DeferredRuntimeKind() == kind;
+}
+
+bool Scene::IsLayerDeferredRuntime(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object != nullptr && object->DeferredRuntimeKind() != SceneDeferredRuntimeKind::None;
+}
+
+std::vector<int32_t> Scene::DeferredRuntimeLayerIds(SceneDeferredRuntimeKind kind) const {
+    std::vector<int32_t> layer_ids;
+    for (const auto& [layer_id, object] : sceneObjects) {
+        if (object != nullptr && object->DeferredRuntimeKind() == kind) {
+            layer_ids.push_back(layer_id);
+        }
+    }
+    return layer_ids;
+}
+
+std::size_t Scene::DeferredRuntimeLayerCount(SceneDeferredRuntimeKind kind) const {
+    std::size_t count = 0;
+    for (const auto& [layer_id, object] : sceneObjects) {
+        (void)layer_id;
+        if (object != nullptr && object->DeferredRuntimeKind() == kind) count++;
+    }
+    return count;
+}
+
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {

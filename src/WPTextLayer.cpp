@@ -3491,7 +3491,7 @@ bool wallpaper::UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id) {
 void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
     for (auto& [layer_id, state] : scene.textLayers) {
         if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
-            scene.deferredRuntimeTextLayerIds.count(layer_id) != 0 ||
+            scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text) ||
             !TextLayerNeedsBridgeResidency(scene, layer_id)) {
             continue;
         }
@@ -3547,7 +3547,7 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
 
     std::vector<ScreenAnchoredTextPlacement> placements;
     for (auto& [layer_id, state] : scene.textLayers) {
-        if (scene.deferredRuntimeTextLayerIds.count(layer_id) != 0) continue;
+        if (scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) continue;
         if (! HasExplicitTextScreenAnchor(state.object)) continue;
 
         const auto binding = scene.GetLayerParentBinding(layer_id);
@@ -3640,7 +3640,7 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
 }
 
 bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
-    if (scene.deferredRuntimeTextLayerIds.count(layer_id) != 0) {
+    if (scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
         return true;
     }
 
