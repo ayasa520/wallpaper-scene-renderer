@@ -715,6 +715,37 @@ bool Scene::IsLayerOffscreenDependencySource(int32_t layer_id) const {
     return object != nullptr && object->IsOffscreenDependencySource();
 }
 
+bool Scene::IsRenderOrderProxyNode(const SceneNode* node) const {
+    if (node == nullptr || sceneGraph == nullptr || node->Parent() != sceneGraph.get()) {
+        return false;
+    }
+    const int32_t layer_id = LayerIdForNode(node);
+    if (layer_id == 0 || GetLayerNode(layer_id) != node) return false;
+    const auto* object = FindSceneObject(layer_id);
+    return object != nullptr && object->ParentId() != 0 && object->Attachment().empty();
+}
+
+std::vector<SceneNode*> Scene::RenderOrderProxyChildrenOf(const SceneNode* parent_node) const {
+    std::vector<SceneNode*> children;
+    if (parent_node == nullptr || sceneGraph == nullptr) return children;
+    const int32_t parent_layer_id = LayerIdForNode(parent_node);
+    if (parent_layer_id == 0 || GetLayerNode(parent_layer_id) != parent_node) return children;
+    // layerOrder is the authored z-order, which keeps the enumeration deterministic; the render
+    // graph re-sorts by the same order anyway.
+    for (const auto child_layer_id : layerOrder) {
+        if (child_layer_id == parent_layer_id) continue;
+        const auto* object = FindSceneObject(child_layer_id);
+        if (object == nullptr || object->ParentId() != parent_layer_id ||
+            ! object->Attachment().empty()) {
+            continue;
+        }
+        SceneNode* child_node = GetLayerNode(child_layer_id);
+        if (child_node == nullptr || child_node->Parent() != sceneGraph.get()) continue;
+        children.push_back(child_node);
+    }
+    return children;
+}
+
 Scene::CameraLayerRuntimeState* Scene::FindCameraLayerState(int32_t layer_id) {
     auto* object = FindSceneObject(layer_id);
     return object == nullptr ? nullptr : object->CameraRuntimeState();

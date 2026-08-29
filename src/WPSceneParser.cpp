@@ -1959,92 +1959,9 @@ std::shared_ptr<SceneNode> FindParentNode(ParseContext& context, int32_t parent_
     return it == context.object_nodes.end() ? nullptr : it->second;
 }
 
-void RegisterRenderOrderProxyChild(ParseContext& context, int32_t parent_id,
-                                   const std::shared_ptr<SceneNode>& child,
-                                   int32_t                           child_layer_id) {
-    if (context.scene == nullptr || parent_id == 0 || child == nullptr) return;
-
-    auto parent = FindParentNode(context, parent_id);
-    if (! parent) return;
-
-    // This edge is intentionally order-only. The child may remain root-owned for inherited
-    // transform, attachment, or effect-camera correctness, while render-graph traversal later emits
-    // it at the authored parent's visual sibling position.
-    auto& routed_children = context.scene->renderOrderProxyChildren[parent.get()];
-    if (std::find(routed_children.begin(), routed_children.end(), child.get()) ==
-        routed_children.end()) {
-        routed_children.push_back(child.get());
-    }
-    context.scene->renderOrderProxyNodes.insert(child.get());
-    LOG_INFO("SceneRenderOrderProxyRegister: parent-layer=%d proxy-layer=%d parent-name='%s' "
-             "proxy-name='%s'",
-             parent_id,
-             child_layer_id,
-             parent->Name().c_str(),
-             child->Name().c_str());
-}
-
-void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
-    if (node == nullptr) return;
-
-    // Deferred materialization replaces placeholder nodes with real particle/text nodes. Any
-    // order-routing references to the placeholder must be removed first so the new node becomes the
-    // only authored-order participant for that layer.
-    const auto erase_node_from_vector = [node](std::vector<SceneNode*>& nodes) {
-        nodes.erase(std::remove(nodes.begin(), nodes.end(), node), nodes.end());
-    };
-
-    scene.renderOrderProxyNodes.erase(node);
-    for (auto it = scene.renderOrderProxyChildren.begin();
-         it != scene.renderOrderProxyChildren.end();) {
-        if (it->first == node) {
-            it = scene.renderOrderProxyChildren.erase(it);
-            continue;
-        }
-        erase_node_from_vector(it->second);
-        if (it->second.empty()) {
-            it = scene.renderOrderProxyChildren.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    // Detached effect-source nodes are bridge-owned drawing phases now; replacing the layer's
-    // bridge on re-materialization drops the old source records together with the bridge itself.
-}
-
-void RestoreRenderOrderProxyChildrenForLayer(Scene& scene, int32_t parent_layer_id,
-                                             SceneNode* parent_node) {
-    if (parent_layer_id == 0 || parent_node == nullptr) return;
-
-    auto& routed_children = scene.renderOrderProxyChildren[parent_node];
-    for (const auto child_layer_id : scene.GetLayerChildren(parent_layer_id)) {
-        const auto binding = scene.GetLayerParentBinding(child_layer_id);
-        if (binding.parent_id != parent_layer_id || ! binding.attachment.empty()) continue;
-
-        SceneNode* child_node = scene.GetLayerNode(child_layer_id);
-        if (child_node == nullptr) continue;
-
-        // Deferred parent materialization replaces the placeholder node that owned the authored
-        // render-order proxy bucket. Existing children may be lightweight containers that are not
-        // materialized themselves, so rebuild the parent->child route from layer bindings instead
-        // of waiting for every child parser to run again.
-        if (std::find(routed_children.begin(), routed_children.end(), child_node) ==
-            routed_children.end()) {
-            routed_children.push_back(child_node);
-        }
-        scene.renderOrderProxyNodes.insert(child_node);
-        LOG_INFO("SceneRenderOrderProxyRestore: parent-layer=%d proxy-layer=%d parent-name='%s' "
-                 "proxy-name='%s'",
-                 parent_layer_id,
-                 child_layer_id,
-                 parent_node->Name().c_str(),
-                 child_node->Name().c_str());
-    }
-
-    if (routed_children.empty()) {
-        scene.renderOrderProxyChildren.erase(parent_node);
-    }
-}
+// Render-order proxy routing is derived from authored parent bindings at query time
+// (Scene::IsRenderOrderProxyNode / RenderOrderProxyChildrenOf), so there is no parse-time
+// node table to register, restore after deferred materialization, or scrub on placeholder swaps.
 
 struct AttachmentBinding {
     uint32_t        bone_index { 0xFFFFFFFFu };
@@ -2433,7 +2350,6 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
     if (LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment)) {
         ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
-        RegisterRenderOrderProxyChild(context, wpimgobj.parent, node, wpimgobj.id);
     } else {
         AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
     }
@@ -2498,7 +2414,6 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
     if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
         ConfigureInheritedParentBinding(context, wppartobj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
-        RegisterRenderOrderProxyChild(context, wppartobj.parent, node, wppartobj.id);
     } else {
         AttachNodeToScene(context, node, wppartobj.parent, wppartobj.name, &node_data);
     }
@@ -2537,7 +2452,6 @@ void RegisterLogicalTextLayer(ParseContext& context,
     if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
         ConfigureInheritedParentBinding(context, text_obj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
-        RegisterRenderOrderProxyChild(context, text_obj.parent, node, text_obj.id);
     } else {
         AttachNodeToScene(context, node, text_obj.parent, text_obj.name, &node_data);
     }
@@ -2636,7 +2550,6 @@ void ReplaceDeferredPlaceholderNode(ParseContext& context, int32_t layer_id,
     // aimed at freed memory; later allocations can reuse the same address and create recursive or
     // dangling transform chains during uniform updates.
     auto adopted_children = ExtractDirectChildren(placeholder_node.get());
-    RemoveRenderOrderNodeReferences(*context.scene, placeholder_node.get());
     if (context.scene->sceneGraph != nullptr) {
         (void)DetachNodeFromTree(context.scene->sceneGraph, placeholder_node.get());
     }
@@ -6012,7 +5925,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
         }
         context.scene->sceneGraph->AppendChild(spWorldNode);
-        RegisterRenderOrderProxyChild(context, wpimgobj.parent, spWorldNode, wpimgobj.id);
     } else {
         AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
     }
@@ -6425,7 +6337,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
         ConfigureInheritedParentBinding(context, text_obj.parent, worldNodeData);
         context.scene->sceneGraph->AppendChild(spWorldNode);
-        RegisterRenderOrderProxyChild(context, text_obj.parent, spWorldNode, text_obj.id);
     } else {
         AttachNodeToScene(context, spWorldNode, text_obj.parent, text_obj.name, &worldNodeData);
     }
@@ -6978,7 +6889,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
             ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
-            RegisterRenderOrderProxyChild(context, wppartobj.parent, spNode, wppartobj.id);
         } else {
             AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
         }
@@ -7068,7 +6978,6 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     if (LayerUsesRoutedParent(empty_obj.parent, empty_obj.attachment)) {
         ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
         context.scene->sceneGraph->AppendChild(node);
-        RegisterRenderOrderProxyChild(context, empty_obj.parent, node, empty_obj.id);
     } else {
         AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name, &svData);
     }
@@ -8869,7 +8778,8 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
 
     ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
     scene.SetLayerNode(layer_id, node_it->second.get());
-    RestoreRenderOrderProxyChildrenForLayer(scene, layer_id, node_it->second.get());
+    // Proxy routing derives from bindings and the updated layer-node slot, so the swapped-in node
+    // becomes the authored-order participant without a table restore.
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
         if (it->second == layer_id) {
             it = scene.layerNameToId.erase(it);
