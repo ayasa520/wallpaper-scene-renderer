@@ -239,7 +239,6 @@ public:
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
     std::unordered_map<int32_t, std::vector<SceneNode*>> objectRuntimeNodes;
-    std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeCameraNames;
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeRenderTargets;
     std::unordered_map<int32_t, std::vector<SceneLight*>> objectRuntimeLights;
     std::unordered_map<int32_t, std::vector<ParticleSubSystem*>> objectRuntimeParticleSubsystems;

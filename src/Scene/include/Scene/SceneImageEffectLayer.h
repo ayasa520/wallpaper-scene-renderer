@@ -184,6 +184,15 @@ public:
         m_layer_surface_camera = std::move(camera_name);
     }
     const std::string& LayerSurfaceCamera() const { return m_layer_surface_camera; }
+
+    // Names of the Scene::cameras entries this bridge materialized: the private source/bridge
+    // camera and, for animated puppets, the puppet surface camera. They are the bridge's runtime
+    // resources; geometry updates and layer destroy resolve them through the owning layer's
+    // bridge instead of a Scene-level per-layer registry.
+    void AddRuntimeCameraName(std::string camera_name) {
+        m_runtime_camera_names.push_back(std::move(camera_name));
+    }
+    const std::vector<std::string>& RuntimeCameraNames() const { return m_runtime_camera_names; }
     void SetPuppetSurfaceProjection(PuppetSurfaceProjection projection);
     const PuppetSurfaceProjection* GetPuppetSurfaceProjection() const {
         return m_puppet_surface_projection.has_value()
@@ -264,6 +273,7 @@ private:
         FinalOutputCapability::PrivateThenPublish
     };
     std::string m_layer_surface_camera;
+    std::vector<std::string> m_runtime_camera_names;
     std::optional<PuppetSurfaceProjection> m_puppet_surface_projection;
     bool m_copy_background { false };
     //    std::vector<float> m_size;

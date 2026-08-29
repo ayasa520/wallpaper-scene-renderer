@@ -5571,7 +5571,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                      effect_camera_clip.far_clip,
                      hasAnimatedPuppetMesh ? "true" : "false");
         }
-        scene.objectRuntimeCameraNames[wpimgobj.id].push_back(effect_camera_name);
         spImgNode->SetCamera(effect_camera_name);
         std::string effect_ppong_a, effect_ppong_b;
         effect_ppong_a = WE_EFFECT_PPONG_PREFIX_A.data() + effect_camera_name;
@@ -5616,8 +5615,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             }
             scene.cameras.at(effect_camera_name)->AttatchImgEffect(imgEffectLayer);
             // The owning layer resolves its effect bridge through the SceneObject; the camera
-            // keeps ownership, the object holds the weak back-reference.
+            // keeps ownership, the object holds the weak back-reference. The bridge records the
+            // camera it materialized so geometry updates and destroy reach it through the layer.
             scene.EnsureSceneObject(wpimgobj.id).SetImageEffectLayer(imgEffectLayer);
+            imgEffectLayer->AddRuntimeCameraName(effect_camera_name);
         }
         if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
             const std::string puppet_surface_camera = effect_camera_name + "__puppet_surface_camera";
@@ -5642,7 +5643,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     projection->surface_bounds.max.x(),
                     projection->surface_bounds.min.y(),
                     projection->surface_bounds.max.y());
-                scene.objectRuntimeCameraNames[wpimgobj.id].push_back(puppet_surface_camera);
+                imgEffectLayer->AddRuntimeCameraName(puppet_surface_camera);
 
                 scene.renderTargets[puppet_surface_target] = SceneRenderTarget {
                     .width = projection->target_extent[0],
@@ -6188,7 +6189,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         // fill the bridge camera exactly in local text space.
         WPShaderValueData text_source_node_data;
         context.shader_updater->SetNodeData(spTextNode.get(), text_source_node_data);
-        scene.objectRuntimeCameraNames[text_obj.id].push_back(camera_name);
         spTextNode->SetCamera(camera_name);
 
         auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(spWorldNode.get(),
@@ -6201,8 +6201,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
         imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
         scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
-        // Same contract as image layers: the object holds the weak back-reference to its bridge.
+        // Same contract as image layers: the object holds the weak back-reference to its bridge,
+        // and the bridge records the camera it materialized.
         scene.EnsureSceneObject(text_obj.id).SetImageEffectLayer(imgEffectLayer);
+        imgEffectLayer->AddRuntimeCameraName(camera_name);
 
         scene.renderTargets[primitive->bridge.pingpong_a] = SceneRenderTarget {
             .width = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),

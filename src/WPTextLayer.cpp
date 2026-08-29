@@ -3265,13 +3265,13 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
         }
     }
 
-    const auto  camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
-    const bool  has_runtime_cameras = camera_names_it != scene.objectRuntimeCameraNames.end();
-    if (has_runtime_cameras) {
+    const auto* text_object = scene.FindSceneObject(layer_id);
+    const auto  bridge_ref  = text_object != nullptr ? text_object->ImageEffectLayer() : nullptr;
+    if (bridge_ref != nullptr) {
         const auto camera_size = next_geometry.visible_display_size;
         const bool local_bridge_geometry_changed =
             visible_display_size_changed || visible_local_center_changed;
-        for (const auto& camera_name : camera_names_it->second) {
+        for (const auto& camera_name : bridge_ref->RuntimeCameraNames()) {
             auto camera_it = scene.cameras.find(camera_name);
             if (camera_it == scene.cameras.end()) continue;
 
