@@ -131,6 +131,7 @@ public:
     SceneNode*  Parent() const noexcept { return m_parent; }
 
     i32& ID() { return m_id; }
+    i32  ID() const { return m_id; }
 
 private:
     // mark self and all children

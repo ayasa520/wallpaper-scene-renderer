@@ -166,11 +166,7 @@ static void CheckAndSetSprite(Scene& scene, vulkan::ShaderDrawRequest& desc,
 }
 
 static int32_t NodeLayerId(const Scene& scene, SceneNode* node) {
-    if (node == nullptr) return 0;
-    if (auto owner_it = scene.nodeOwners.find(node); owner_it != scene.nodeOwners.end()) {
-        return owner_it->second;
-    }
-    return node->ID();
+    return scene.LayerIdForNode(node);
 }
 
 static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::string_view output) {

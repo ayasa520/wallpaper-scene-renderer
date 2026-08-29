@@ -551,6 +551,15 @@ SceneObject& Scene::EnsureSceneObject(int32_t layer_id) {
 
 void Scene::DestroySceneObject(int32_t layer_id) { sceneObjects.erase(layer_id); }
 
+int32_t Scene::LayerIdForNode(const SceneNode* node) const {
+    if (node == nullptr) return 0;
+    if (auto owner_it = nodeOwners.find(const_cast<SceneNode*>(node));
+        owner_it != nodeOwners.end()) {
+        return owner_it->second;
+    }
+    return node->ID();
+}
+
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {

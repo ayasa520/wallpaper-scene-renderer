@@ -2602,12 +2602,7 @@ std::vector<std::shared_ptr<SceneNode>> ExtractDirectChildren(SceneNode* node) {
 }
 
 int32_t ResolveLayerIdForRuntimeNode(const Scene& scene, SceneNode* node) {
-    if (node == nullptr) return 0;
-    if (auto owner_it = scene.nodeOwners.find(node);
-        owner_it != scene.nodeOwners.end()) {
-        return owner_it->second;
-    }
-    return node->ID();
+    return scene.LayerIdForNode(node);
 }
 
 void RebindAdoptedAttachmentChildren(ParseContext& context, int32_t parent_layer_id,
