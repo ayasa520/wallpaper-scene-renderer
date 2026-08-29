@@ -474,9 +474,13 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         if (localTransform.has_value()) {
             SceneImageEffectLayer* effectLayer { nullptr };
             if (!node_cam_name.empty()) {
-                auto camera_it = m_scene->cameras.find(std::string(node_cam_name));
-                if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
-                    effectLayer = camera_it->second->GetImgEffect().get();
+                // pNode renders through its layer's private bridge camera exactly when it is the
+                // effect-source route; resolve the bridge through the owning layer instead of a
+                // camera back-reference.
+                auto* candidate = m_scene->FindImageEffectLayer(m_scene->LayerIdForNode(pNode));
+                if (candidate != nullptr &&
+                    std::string_view(candidate->BridgeCameraName()) == node_cam_name) {
+                    effectLayer = candidate;
                 }
             }
 
@@ -495,9 +499,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     pNode->UpdateTrans();
 
     if (! node_cam_name.empty()) {
-        auto camera_it = m_scene->cameras.find(std::string(node_cam_name));
-        if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
-            auto* effectLayer = camera_it->second->GetImgEffect().get();
+        auto* effectLayer = m_scene->FindImageEffectLayer(m_scene->LayerIdForNode(pNode));
+        if (effectLayer != nullptr &&
+            std::string_view(effectLayer->BridgeCameraName()) == node_cam_name) {
             auto* worldNode   = effectLayer->WorldNode();
             if (worldNode != nullptr && exists(m_nodeDataMap, worldNode)) {
                 auto& worldNodeData = m_nodeDataMap.at(worldNode);

@@ -3792,10 +3792,10 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             sound_handle.has_value() && opaque->scene->soundManager != nullptr) {
             opaque->scene->soundManager->UnmountStream(*sound_handle);
         }
-        // The bridge's runtime cameras are also resolved through the SceneObject, so clean them
-        // up before the identity is destroyed. Hold a strong reference for the loop: erasing the
-        // bridge-owning camera from Scene::cameras releases the bridge itself, and the remaining
-        // names (puppet surface camera) must stay readable.
+        // The bridge's runtime cameras and render targets are resolved through the SceneObject,
+        // which owns the bridge, so clean them up before DestroySceneObject below releases that
+        // owning reference. The local strong reference keeps the name lists readable through the
+        // loop regardless of destruction order.
         if (const auto* destroyed_object = opaque->scene->FindSceneObject(layer_id)) {
             if (const auto effect_layer = destroyed_object->ImageEffectLayer()) {
                 for (const auto& render_target : effect_layer->RuntimeRenderTargetNames()) {
@@ -5255,15 +5255,15 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                             std::max(1.0, static_cast<double>(new_size[1])));
                         camera_it->second->Update();
                     }
-                    if (camera_it->second->HasImgEffect()) {
-                        auto& effect_layer = *camera_it->second->GetImgEffect();
+                    if (camera_name == effect_layer_ref->BridgeCameraName()) {
                         updated_mesh =
-                            UpdateQuadMeshSize(&effect_layer.FinalMesh(), new_size) || updated_mesh;
+                            UpdateQuadMeshSize(&effect_layer_ref->FinalMesh(), new_size) ||
+                            updated_mesh;
                         // Image-layer size edits also run through the resource-only rebuild path,
                         // which means the resolved effect output node keeps rendering until a full
                         // topology rebuild happens. Synchronizing the live output mesh here keeps
                         // runtime-resized effect quads visually consistent immediately.
-                        effect_layer.SyncResolvedOutputMesh();
+                        effect_layer_ref->SyncResolvedOutputMesh();
                     }
                 }
             }

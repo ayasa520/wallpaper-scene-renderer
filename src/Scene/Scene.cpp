@@ -2,6 +2,7 @@
 
 #include "Image.hpp"
 #include "SceneCamera.h"
+#include "SceneImageEffectLayer.h"
 
 #include "Fs/VFS.h"
 #include "Interface/IImageParser.h"
@@ -923,10 +924,9 @@ const SceneImageEffect* Scene::FindImageEffect(int32_t owner_layer_id,
 }
 
 SceneImageEffectLayer* Scene::FindImageEffectLayer(int32_t owner_layer_id) {
-    // The owning SceneObject resolves its effect layer directly. The weak reference expires with
-    // the owning effect camera, so a destroyed camera still resolves to "no effect layer" exactly
-    // like the former objectRuntimeCameraNames/cameras walk; the returned raw pointer is backed by
-    // the camera's owning reference, matching what the walk handed out.
+    // The owning SceneObject owns its effect bridge directly; the returned raw pointer is backed
+    // by that owning reference and stays valid until the layer identity is destroyed. A destroyed
+    // layer resolves to "no effect layer" because the object itself is gone.
     const auto* object = FindSceneObject(owner_layer_id);
     if (object == nullptr) return nullptr;
     return object->ImageEffectLayer().get();

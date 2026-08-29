@@ -135,14 +135,14 @@ public:
         m_has_layer_node_slot = false;
     }
 
-    // The layer's image-effect bridge. The effect camera keeps ownership for now (render routes
-    // still resolve the camera by name), so the object holds a weak reference: it expires
-    // together with the owning camera, which preserves the former camera-name walk's
-    // "camera gone => no effect layer" resolution result.
-    std::shared_ptr<SceneImageEffectLayer> ImageEffectLayer() const {
-        return m_image_effect_layer.lock();
+    // The layer's image-effect bridge. The SceneObject owns it: the bridge is a per-layer
+    // runtime resource exactly like the sound handle, and it lives as long as the authored
+    // identity. Cameras and render targets the bridge materialized stay plain named resources
+    // in the Scene pools; nothing else holds an owning reference.
+    const std::shared_ptr<SceneImageEffectLayer>& ImageEffectLayer() const {
+        return m_image_effect_layer;
     }
-    void SetImageEffectLayer(std::weak_ptr<SceneImageEffectLayer> effect_layer) {
+    void SetImageEffectLayer(std::shared_ptr<SceneImageEffectLayer> effect_layer) {
         m_image_effect_layer = std::move(effect_layer);
     }
 
@@ -197,7 +197,7 @@ private:
     bool       m_has_layer_node_slot { false };
     SceneNode* m_layer_node { nullptr };
 
-    std::weak_ptr<SceneImageEffectLayer> m_image_effect_layer;
+    std::shared_ptr<SceneImageEffectLayer> m_image_effect_layer;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;

@@ -13,6 +13,7 @@
 #include "VulkanRender/Msaa.hpp"
 #include "Scene/ShadowAtlas.hpp"
 #include "Scene/LightingV1.hpp"
+#include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SceneTexture.h"
 
 #include "WPShaderParser.hpp"
@@ -5613,11 +5614,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             if (! use_detached_effect_world_node && ! isCompose) {
                 spImgNode->CopyTrans(SceneNode());
             }
-            scene.cameras.at(effect_camera_name)->AttatchImgEffect(imgEffectLayer);
-            // The owning layer resolves its effect bridge through the SceneObject; the camera
-            // keeps ownership, the object holds the weak back-reference. The bridge records the
-            // camera it materialized so geometry updates and destroy reach it through the layer.
+            // The owning SceneObject owns the effect bridge; the private effect camera is a pure
+            // projection resource with no back-reference. The bridge records that camera's name so
+            // draw-time consumers can match SceneNode::Camera() against it and geometry updates
+            // and destroy reach the camera through the layer.
             scene.EnsureSceneObject(wpimgobj.id).SetImageEffectLayer(imgEffectLayer);
+            imgEffectLayer->SetBridgeCameraName(effect_camera_name);
             imgEffectLayer->AddRuntimeCameraName(effect_camera_name);
         }
         if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
@@ -6200,10 +6202,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             ResolveObjectFinalBlend(BlendMode::Translucent, text_obj.colorBlendMode));
         imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
         imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
-        scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
-        // Same contract as image layers: the object holds the weak back-reference to its bridge,
-        // and the bridge records the camera it materialized.
+        // Same contract as image layers: the object owns the bridge, and the bridge records the
+        // camera it materialized; the camera itself carries no back-reference.
         scene.EnsureSceneObject(text_obj.id).SetImageEffectLayer(imgEffectLayer);
+        imgEffectLayer->SetBridgeCameraName(camera_name);
         imgEffectLayer->AddRuntimeCameraName(camera_name);
 
         scene.renderTargets[primitive->bridge.pingpong_a] = SceneRenderTarget {
