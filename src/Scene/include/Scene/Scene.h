@@ -130,6 +130,13 @@ public:
     SceneObject&       EnsureSceneObject(int32_t layer_id);
     void               DestroySceneObject(int32_t layer_id);
 
+    // Resolve any draw handle to its owning authored layer id. A nodeOwners registration wins
+    // (only layer handles register; bloom helpers register an explicit 0), otherwise the node id
+    // is the back-reference: drawing-phase nodes (detached effect sources, effect passes, the
+    // final composite) carry their owner layer there, and helper nodes without an authored layer
+    // keep the default id 0, which callers treat as "no owner".
+    int32_t LayerIdForNode(const SceneNode* node) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;

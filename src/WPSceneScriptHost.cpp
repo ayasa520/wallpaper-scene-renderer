@@ -3204,9 +3204,8 @@ int32_t FindNodeId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* nod
 }
 
 int32_t FindOwningLayerId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* node) {
-    if (opaque == nullptr || opaque->scene == nullptr || node == nullptr) return 0;
-    auto it = opaque->scene->nodeOwners.find(const_cast<SceneNode*>(node));
-    return it == opaque->scene->nodeOwners.end() ? 0 : it->second;
+    if (opaque == nullptr || opaque->scene == nullptr) return 0;
+    return opaque->scene->LayerIdForNode(node);
 }
 
 bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
