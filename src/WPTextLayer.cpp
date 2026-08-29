@@ -2783,21 +2783,12 @@ void SyncTextEffectLayerResolvedTransform(Scene&                  scene,
 }
 
 void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id) {
+    auto* effect_layer = scene.FindImageEffectLayer(layer_id);
+    if (effect_layer == nullptr) return;
 
-    auto camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
-    if (camera_names_it == scene.objectRuntimeCameraNames.end()) return;
-
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = scene.cameras.find(camera_name);
-        if (camera_it == scene.cameras.end() || ! camera_it->second->HasImgEffect()) continue;
-
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr) continue;
-
-        // The offscreen source camera remains in local text space; only the final published node
-        // follows the authoritative world transform.
-        SyncTextEffectLayerResolvedTransform(scene, *effect_layer);
-    }
+    // The offscreen source camera remains in local text space; only the final published node
+    // follows the authoritative world transform.
+    SyncTextEffectLayerResolvedTransform(scene, *effect_layer);
 }
 
 } // namespace
