@@ -7125,8 +7125,9 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
         camera_layer.angles                  = empty_obj.angles;
         camera_layer.zoom                    = empty_obj.zoom;
         camera_layer.fov                     = empty_obj.fov;
-        const bool first_camera_registration = context.scene->cameraLayers.count(empty_obj.id) == 0;
-        context.scene->cameraLayers[empty_obj.id] = camera_layer;
+        const bool first_camera_registration =
+            context.scene->FindCameraLayerState(empty_obj.id) == nullptr;
+        context.scene->SetCameraLayerState(empty_obj.id, camera_layer);
         if (first_camera_registration) context.scene->cameraLayerOrder.push_back(empty_obj.id);
         context.scene->UpdateActiveCameraLayer();
 

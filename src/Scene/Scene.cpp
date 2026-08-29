@@ -172,10 +172,10 @@ std::pair<int32_t, Scene::CameraLayerRuntimeState*> FindActiveCameraLayer(Scene&
     // parsed in layer order, so walking the recorded camera layer order backwards gives later
     // camera layers precedence while still letting user/script visibility changes disable them.
     for (auto it = scene.cameraLayerOrder.rbegin(); it != scene.cameraLayerOrder.rend(); ++it) {
-        auto layer_it = scene.cameraLayers.find(*it);
-        if (layer_it == scene.cameraLayers.end() || !layer_it->second.node) continue;
+        auto* camera_state = scene.FindCameraLayerState(*it);
+        if (camera_state == nullptr || !camera_state->node) continue;
         if (!scene.IsLayerVisible(*it)) continue;
-        return { *it, &layer_it->second };
+        return { *it, camera_state };
     }
     return { 0, nullptr };
 }
@@ -700,6 +700,21 @@ void Scene::SetTextLayerState(int32_t layer_id, TextLayerRuntimeState state) {
     EnsureSceneObject(layer_id).SetTextRuntimeState(std::move(state));
 }
 
+void Scene::SetCameraLayerState(int32_t layer_id, CameraLayerRuntimeState state) {
+    if (layer_id == 0) return;
+    EnsureSceneObject(layer_id).SetCameraRuntimeState(std::move(state));
+}
+
+Scene::CameraLayerRuntimeState* Scene::FindCameraLayerState(int32_t layer_id) {
+    auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->CameraRuntimeState();
+}
+
+const Scene::CameraLayerRuntimeState* Scene::FindCameraLayerState(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->CameraRuntimeState();
+}
+
 TextLayerRuntimeState* Scene::FindTextLayerState(int32_t layer_id) {
     auto* object = FindSceneObject(layer_id);
     return object == nullptr ? nullptr : object->TextRuntimeState();
@@ -771,7 +786,7 @@ bool Scene::IsLayerVisible(int32_t layer_id) const {
 void Scene::ApplyLayerVisibility(int32_t layer_id) {
     std::unordered_set<int32_t> visited;
     ApplyLayerVisibilityRecursive(*this, layer_id, visited);
-    if (!cameraLayers.empty()) UpdateActiveCameraLayer();
+    if (HasCameraLayers()) UpdateActiveCameraLayer();
 }
 
 void Scene::ApplyAllLayerVisibility() {
@@ -784,7 +799,7 @@ void Scene::ApplyAllLayerVisibility() {
             ApplyLayerVisibilityRecursive(*this, layer_id, visited);
         }
     }
-    if (!cameraLayers.empty()) UpdateActiveCameraLayer();
+    if (HasCameraLayers()) UpdateActiveCameraLayer();
 }
 
 void Scene::UpdateModelCameraPath() {
