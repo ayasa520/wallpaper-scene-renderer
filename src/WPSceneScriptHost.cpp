@@ -3793,23 +3793,27 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             sound_handle.has_value() && opaque->scene->soundManager != nullptr) {
             opaque->scene->soundManager->UnmountStream(*sound_handle);
         }
+        // The bridge's runtime cameras are also resolved through the SceneObject, so clean them
+        // up before the identity is destroyed. Hold a strong reference for the loop: erasing the
+        // bridge-owning camera from Scene::cameras releases the bridge itself, and the remaining
+        // names (puppet surface camera) must stay readable.
+        if (const auto* destroyed_object = opaque->scene->FindSceneObject(layer_id)) {
+            if (const auto effect_layer = destroyed_object->ImageEffectLayer()) {
+                for (const auto& camera_name : effect_layer->RuntimeCameraNames()) {
+                    for (auto& [linked_name, linked_cameras] : opaque->scene->linkedCameras) {
+                        linked_cameras.erase(
+                            std::remove(linked_cameras.begin(), linked_cameras.end(), camera_name),
+                            linked_cameras.end());
+                    }
+                    opaque->scene->cameras.erase(camera_name);
+                }
+            }
+        }
         // Deleting a layer removes its authored SceneObject entirely: parent binding, local
         // visibility, identity, image runtime state, deferred kind, and sound handle all live
         // there now. Children keep their dangling parent id, exactly like the previous
         // per-concern maps did.
         opaque->scene->DestroySceneObject(layer_id);
-        if (auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
-            camera_names_it != opaque->scene->objectRuntimeCameraNames.end()) {
-            for (const auto& camera_name : camera_names_it->second) {
-                for (auto& [linked_name, linked_cameras] : opaque->scene->linkedCameras) {
-                    linked_cameras.erase(
-                        std::remove(linked_cameras.begin(), linked_cameras.end(), camera_name),
-                        linked_cameras.end());
-                }
-                opaque->scene->cameras.erase(camera_name);
-            }
-            opaque->scene->objectRuntimeCameraNames.erase(camera_names_it);
-        }
         if (auto render_targets_it = opaque->scene->objectRuntimeRenderTargets.find(layer_id);
             render_targets_it != opaque->scene->objectRuntimeRenderTargets.end()) {
             for (const auto& render_target : render_targets_it->second) {
@@ -5242,9 +5246,10 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                     opaque->scene->GetLayerNode(layer_id), image_layer->alignment, new_size);
             }
 
-            if (auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
-                camera_names_it != opaque->scene->objectRuntimeCameraNames.end()) {
-                for (const auto& camera_name : camera_names_it->second) {
+            if (const auto* resized_object = opaque->scene->FindSceneObject(layer_id);
+                const auto effect_layer_ref =
+                    resized_object != nullptr ? resized_object->ImageEffectLayer() : nullptr) {
+                for (const auto& camera_name : effect_layer_ref->RuntimeCameraNames()) {
                     auto camera_it = opaque->scene->cameras.find(camera_name);
                     if (camera_it == opaque->scene->cameras.end()) continue;
 
@@ -5302,7 +5307,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
             // a resource-only rebuild lets the renderer recreate effect targets/cameras without
             // discarding the static scene mesh uploads that are unrelated to the resize itself.
             opaque->scene->MarkRenderGraphResourcesDirty();
-            return updated_mesh || opaque->scene->objectRuntimeCameraNames.count(layer_id) != 0;
+            return updated_mesh || opaque->scene->FindImageEffectLayer(layer_id) != nullptr;
         }
     }
 
