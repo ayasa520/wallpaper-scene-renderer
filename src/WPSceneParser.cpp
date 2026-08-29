@@ -6901,6 +6901,12 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
                                             Vector3f(light_obj.angles.data()),
                                             light_obj.name);
     node->ID() = light_obj.id;
+    LOG_INFO("SceneLightParsed: layer=%d name='%s' type='%s' radius=%.3f intensity=%.3f",
+             light_obj.id,
+             light_obj.name.c_str(),
+             light_obj.light.c_str(),
+             light_obj.radius,
+             light_obj.intensity);
 
     context.scene->lights.emplace_back(std::make_unique<SceneLight>(
         Vector3f(light_obj.color.data()), light_obj.radius, light_obj.intensity));
