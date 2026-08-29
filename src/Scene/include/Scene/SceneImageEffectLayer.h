@@ -193,6 +193,18 @@ public:
     }
     const std::string& BridgeCameraName() const { return m_bridge_camera_name; }
 
+    // Effect-backed layers draw their source through a root-independent node so the private
+    // effect camera sees it in local space. The bridge owns that draw handle exactly like it owns
+    // the final composite node and the effect pass nodes: it is a drawing phase of the layer, not
+    // a scene-graph identity. It never enters Scene::sceneGraph; the render graph emits it when
+    // the owning layer's world node is visited at its authored order position.
+    void AddDetachedSourceNode(std::shared_ptr<SceneNode> source_node) {
+        m_detached_source_nodes.push_back(std::move(source_node));
+    }
+    const std::vector<std::shared_ptr<SceneNode>>& DetachedSourceNodes() const {
+        return m_detached_source_nodes;
+    }
+
     // Names of the Scene::cameras entries this bridge materialized: the private source/bridge
     // camera and, for animated puppets, the puppet surface camera. They are the bridge's runtime
     // resources; geometry updates and layer destroy resolve them through the owning layer's
@@ -291,6 +303,7 @@ private:
     };
     std::string m_layer_surface_camera;
     std::string m_bridge_camera_name;
+    std::vector<std::shared_ptr<SceneNode>> m_detached_source_nodes;
     std::vector<std::string> m_runtime_camera_names;
     std::vector<std::string> m_runtime_render_target_names;
     std::optional<PuppetSurfaceProjection> m_puppet_surface_projection;

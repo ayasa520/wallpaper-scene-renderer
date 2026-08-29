@@ -1984,29 +1984,6 @@ void RegisterRenderOrderProxyChild(ParseContext& context, int32_t parent_id,
              child->Name().c_str());
 }
 
-void RegisterDetachedRenderOrderSource(ParseContext&                     context,
-                                       const std::shared_ptr<SceneNode>& world_node,
-                                       const std::shared_ptr<SceneNode>& source_node,
-                                       int32_t                           layer_id) {
-    if (context.scene == nullptr || world_node == nullptr || source_node == nullptr ||
-        world_node.get() == source_node.get()) {
-        return;
-    }
-
-    // Effect-backed layers split into a visible world transform node and a root-owned source node.
-    // Recording the pair here lets render-graph construction draw the source exactly where the
-    // world node appears in authored layer order without duplicating it during root traversal.
-    auto& sources = context.scene->detachedEffectSourceNodesByWorldNode[world_node.get()];
-    if (std::find(sources.begin(), sources.end(), source_node.get()) == sources.end()) {
-        sources.push_back(source_node.get());
-    }
-    context.scene->detachedEffectSourceNodes.insert(source_node.get());
-    LOG_INFO("SceneRenderOrderDetachedSourceRegister: layer=%d world-name='%s' source-name='%s'",
-             layer_id,
-             world_node->Name().c_str(),
-             source_node->Name().c_str());
-}
-
 void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
     if (node == nullptr) return;
 
@@ -2018,7 +1995,6 @@ void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
     };
 
     scene.renderOrderProxyNodes.erase(node);
-    scene.detachedEffectSourceNodes.erase(node);
     for (auto it = scene.renderOrderProxyChildren.begin();
          it != scene.renderOrderProxyChildren.end();) {
         if (it->first == node) {
@@ -2032,19 +2008,8 @@ void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
             ++it;
         }
     }
-    for (auto it = scene.detachedEffectSourceNodesByWorldNode.begin();
-         it != scene.detachedEffectSourceNodesByWorldNode.end();) {
-        if (it->first == node) {
-            it = scene.detachedEffectSourceNodesByWorldNode.erase(it);
-            continue;
-        }
-        erase_node_from_vector(it->second);
-        if (it->second.empty()) {
-            it = scene.detachedEffectSourceNodesByWorldNode.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    // Detached effect-source nodes are bridge-owned drawing phases now; replacing the layer's
+    // bridge on re-materialization drops the old source records together with the bridge itself.
 }
 
 void RestoreRenderOrderProxyChildrenForLayer(Scene& scene, int32_t parent_layer_id,
@@ -6074,11 +6039,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         spImgNode.get() == spWorldNode.get() && hasEffect ? worldNodeData : svData);
     if (spImgNode.get() != spWorldNode.get()) {
         context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
-        context.scene->sceneGraph->AppendChild(spImgNode);
-        RegisterDetachedRenderOrderSource(context, spWorldNode, spImgNode, wpimgobj.id);
+        // The detached source node is a drawing phase owned by the effect bridge, not a second
+        // layer identity: it never enters sceneGraph, stays out of nodeOwners, and its node id
+        // (set above) is the back-reference layer resolvers use. The render graph emits its draw
+        // when the world node is visited at the authored order position.
+        if (auto* source_bridge = context.scene->FindImageEffectLayer(wpimgobj.id)) {
+            source_bridge->AddDetachedSourceNode(spImgNode);
+        }
         context.scene->AddLayerRuntimeNode(wpimgobj.id, spImgNode.get());
-        // The detached source node is a drawing phase, not a second layer identity: it stays out
-        // of nodeOwners and its node id (set above) is the back-reference layer resolvers use.
     }
     RegisterLayerSceneState(
         context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
@@ -6468,11 +6436,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
 
     if (spTextNode.get() != spWorldNode.get()) {
-        context.scene->sceneGraph->AppendChild(spTextNode);
-        RegisterDetachedRenderOrderSource(context, spWorldNode, spTextNode, text_obj.id);
+        // Same phase contract as the image source node: bridge-owned, never in sceneGraph, no
+        // nodeOwners registration, and the node id (set above) back-references the owning layer.
+        if (auto* source_bridge = context.scene->FindImageEffectLayer(text_obj.id)) {
+            source_bridge->AddDetachedSourceNode(spTextNode);
+        }
         context.scene->AddLayerRuntimeNode(text_obj.id, spTextNode.get());
-        // Same phase contract as the image source node: no nodeOwners registration, the node id
-        // (set above) back-references the owning layer.
     }
 
     context.scene->SetTextLayerState(text_obj.id,

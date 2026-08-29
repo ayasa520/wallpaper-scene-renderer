@@ -280,15 +280,10 @@ public:
     // deferred materialization, but Wallpaper Engine still orders them as children of their
     // authored parent layer. These maps keep physical ownership separate from authored render
     // order so the render graph can emit passes at the correct sibling position without changing
-    // the node's transform/output ownership model.
+    // the node's transform/output ownership model. (Detached effect-source nodes no longer need
+    // this: they are bridge-owned drawing phases that never enter the tree.)
     std::unordered_map<SceneNode*, std::vector<SceneNode*>> renderOrderProxyChildren;
     std::unordered_set<SceneNode*>                          renderOrderProxyNodes;
-    // Effect-backed image/text layers split into a visible world node plus a root-owned source
-    // node that draws through the effect camera. The source must render at the world node's
-    // authored position in sibling order, then be skipped when the physical root traversal reaches
-    // the root-owned source node later.
-    std::unordered_map<SceneNode*, std::vector<SceneNode*>> detachedEffectSourceNodesByWorldNode;
-    std::unordered_set<SceneNode*>                          detachedEffectSourceNodes;
     UserPropertyMap                      userProperties;
     std::set<std::string>                dirtyImportedTextureKeys;
     std::unordered_set<std::string>      dirtyRenderTargetKeys;
