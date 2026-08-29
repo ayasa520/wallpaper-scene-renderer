@@ -3,7 +3,7 @@
 #include <vector>
 #include <memory>
 #include <Eigen/Dense>
-#include "SceneImageEffectLayer.h"
+#include "Core/Literals.hpp"
 
 namespace wallpaper
 {
@@ -68,10 +68,6 @@ public:
         return { m_orthoLeft, m_orthoRight, m_orthoBottom, m_orthoTop };
     }
 
-    void  AttatchImgEffect(std::shared_ptr<SceneImageEffectLayer> eff) { m_imgEffect = eff; }
-    bool  HasImgEffect() const { return (bool)m_imgEffect; }
-    auto& GetImgEffect() { return m_imgEffect; }
-
     Eigen::Vector3d GetPosition() const;
     Eigen::Vector3d GetDirection() const;
     Eigen::Vector3d GetUp() const;
@@ -124,7 +120,6 @@ private:
     Eigen::Matrix4d m_viewMat { Eigen::Matrix4d::Identity() };
     Eigen::Matrix4d m_viewProjectionMat { Eigen::Matrix4d::Identity() };
 
-    std::shared_ptr<SceneNode>             m_node;
-    std::shared_ptr<SceneImageEffectLayer> m_imgEffect { nullptr };
+    std::shared_ptr<SceneNode> m_node;
 };
 } // namespace wallpaper

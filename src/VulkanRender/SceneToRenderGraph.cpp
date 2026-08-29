@@ -1,6 +1,7 @@
 #include "SceneToRenderGraph.hpp"
 
 #include "Scene/Scene.h"
+#include "Scene/SceneImageEffectLayer.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "SpecTexs.hpp"
 #include "Core/MapSet.hpp"
@@ -827,9 +828,12 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     SceneImageEffectLayer*   imgeff { nullptr };
     const auto resolved_route_model = ResolveRouteModel(node, route.model);
     if (node != nullptr && !node->Camera().empty()) {
-        auto camera_it = scene.cameras.find(node->Camera());
-        if (camera_it != scene.cameras.end() && camera_it->second->HasImgEffect()) {
-            imgeff = camera_it->second->GetImgEffect().get();
+        // A node drawing through its layer's private bridge camera feeds the effect chain, so
+        // its output is the chain's first ping-pong target. The bridge resolves through the
+        // owning layer; the camera name only tags which of the layer's nodes takes this route.
+        auto* candidate = scene.FindImageEffectLayer(NodeLayerId(scene, node));
+        if (candidate != nullptr && candidate->BridgeCameraName() == node->Camera()) {
+            imgeff = candidate;
             output = imgeff->FirstTarget();
         }
     }

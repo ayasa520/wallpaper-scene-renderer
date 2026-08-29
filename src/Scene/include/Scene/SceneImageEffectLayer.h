@@ -185,6 +185,14 @@ public:
     }
     const std::string& LayerSurfaceCamera() const { return m_layer_surface_camera; }
 
+    // Name of the private Scene::cameras entry the layer's source draw renders through. Draw-time
+    // consumers detect "this node feeds the effect chain" by matching SceneNode::Camera() against
+    // this name; the camera itself is a pure projection resource and holds no back-reference.
+    void SetBridgeCameraName(std::string camera_name) {
+        m_bridge_camera_name = std::move(camera_name);
+    }
+    const std::string& BridgeCameraName() const { return m_bridge_camera_name; }
+
     // Names of the Scene::cameras entries this bridge materialized: the private source/bridge
     // camera and, for animated puppets, the puppet surface camera. They are the bridge's runtime
     // resources; geometry updates and layer destroy resolve them through the owning layer's
@@ -282,6 +290,7 @@ private:
         FinalOutputCapability::PrivateThenPublish
     };
     std::string m_layer_surface_camera;
+    std::string m_bridge_camera_name;
     std::vector<std::string> m_runtime_camera_names;
     std::vector<std::string> m_runtime_render_target_names;
     std::optional<PuppetSurfaceProjection> m_puppet_surface_projection;

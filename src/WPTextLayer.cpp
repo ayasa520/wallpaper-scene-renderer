@@ -3281,18 +3281,17 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
                 camera_it->second->Update();
             }
 
-            if (!camera_it->second->HasImgEffect()) continue;
+            if (camera_name != bridge_ref->BridgeCameraName()) continue;
 
-            auto& effect_layer = *camera_it->second->GetImgEffect();
             if (local_bridge_geometry_changed) {
                 // Local text-box changes rebuild the final quad and bridge camera. Transform-only
                 // scripts keep that mesh intact and only republish the resolved world matrix.
-                RebuildTextMesh(&effect_layer.FinalMesh(),
+                RebuildTextMesh(&bridge_ref->FinalMesh(),
                                 camera_size,
                                 next_geometry.visible_local_center);
-                effect_layer.SyncResolvedOutputMesh();
+                bridge_ref->SyncResolvedOutputMesh();
             }
-            SyncTextEffectLayerResolvedTransform(scene, effect_layer);
+            SyncTextEffectLayerResolvedTransform(scene, *bridge_ref);
         }
     }
 
