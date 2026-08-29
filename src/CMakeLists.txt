@@ -62,6 +62,7 @@ add_library(
   WPSceneScriptHost.cpp
   WPSceneParserPostFx.cpp
   WPSceneParserModel.cpp
+  WPSceneParserBindings.cpp
   WPNodeTransformResolver.cpp
   WPShaderValueUpdater.cpp
   WPTexImageParser.cpp
