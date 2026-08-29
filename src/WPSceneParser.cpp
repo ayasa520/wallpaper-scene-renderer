@@ -593,11 +593,23 @@ void ApplyNodeOwnerParallaxFallback(ParseContext& context, int32_t owner_id,
         apply_to_node(node);
     }
 
-    // The layer's final composite is a detached drawing phase rather than a registered node
-    // identity, so it is reached through the owning effect layer instead of nodeOwners.
+    // The layer's effect passes and final composite are drawing phases rather than registered
+    // node identities, so they are reached through the owning effect layer instead of nodeOwners.
+    // Effect pass nodes carry no SceneNode camera (their camera is a pass override), so they keep
+    // receiving the repaired contract exactly like they did through the former registration;
+    // detached source nodes own the private effect camera and stay excluded by the camera check.
     if (auto* effect_layer = context.scene->FindImageEffectLayer(owner_id);
-        effect_layer != nullptr && effect_layer->HasFinalComposite()) {
-        apply_to_node(&effect_layer->FinalNode());
+        effect_layer != nullptr) {
+        for (std::size_t i = 0; i < effect_layer->EffectCount(); i++) {
+            const auto& effect = effect_layer->GetEffect(i);
+            if (! effect) continue;
+            for (const auto& effect_node : effect->nodes) {
+                apply_to_node(effect_node.sceneNode.get());
+            }
+        }
+        if (effect_layer->HasFinalComposite()) {
+            apply_to_node(&effect_layer->FinalNode());
+        }
     }
 }
 
@@ -5836,6 +5848,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     wpmat.textures[0] = inRT;
                 }
                 auto spEffNode = std::make_shared<SceneNode>();
+                // Effect passes are drawing phases of the authored layer, not second layer
+                // identities: they stay out of nodeOwners, the node id is the back-reference the
+                // layer resolvers use (NodeLayerId and friends), and the phase name keeps the
+                // authored name unique to the world node.
+                spEffNode->ID() = wpimgobj.id;
+                spEffNode->SetName(wpimgobj.name + "::__hanabi_effect_pass_" +
+                                   std::to_string(i_eff) + "_" + std::to_string(i_mat));
                 ShaderValueMap effectBaseConstSvs = baseConstSvs;
                 WPShaderInfo wpEffShaderInfo;
                 wpEffShaderInfo.baseConstSvs = std::move(effectBaseConstSvs);
@@ -5898,7 +5917,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                                     i_mat);
 
                 context.shader_updater->SetNodeData(spEffNode.get(), svData);
-                context.scene->nodeOwners[spEffNode.get()] = wpimgobj.id;
                 imgEffect->nodes.push_back({ .authored_output = matOutRT,
                                              .output = matOutRT,
                                              .authored_textures = authored_textures,
@@ -6051,7 +6069,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         context.scene->sceneGraph->AppendChild(spImgNode);
         RegisterDetachedRenderOrderSource(context, spWorldNode, spImgNode, wpimgobj.id);
         context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spImgNode.get());
-        context.scene->nodeOwners[spImgNode.get()] = wpimgobj.id;
+        // The detached source node is a drawing phase, not a second layer identity: it stays out
+        // of nodeOwners and its node id (set above) is the back-reference layer resolvers use.
     }
     RegisterLayerSceneState(
         context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
@@ -6346,7 +6365,13 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 if (material_source.textures.empty()) material_source.textures.resize(1);
                 if (material_source.textures[0].empty()) material_source.textures[0] = in_rt;
 
-                auto         spEffectNode = std::make_shared<SceneNode>();
+                auto spEffectNode = std::make_shared<SceneNode>();
+                // Same phase contract as image effect passes: no nodeOwners registration, the
+                // node id back-references the owning layer, and the name marks the pass.
+                spEffectNode->ID() = text_obj.id;
+                spEffectNode->SetName(text_obj.name + "::__hanabi_effect_pass_" +
+                                      std::to_string(effect_index) + "_" +
+                                      std::to_string(material_index));
                 WPShaderInfo effect_shader_info;
                 effect_shader_info.baseConstSvs = context.global_base_uniforms;
                 effect_shader_info.baseConstSvs["g_EffectTextureProjectionMatrix"] =
@@ -6405,7 +6430,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                     effect_index,
                                                     material_index);
                 context.shader_updater->SetNodeData(spEffectNode.get(), effect_node_data);
-                context.scene->nodeOwners[spEffectNode.get()] = text_obj.id;
                 img_effect->nodes.push_back({ .authored_output = material_output,
                                               .output = material_output,
                                               .authored_textures = authored_textures,
@@ -6436,7 +6460,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         context.scene->sceneGraph->AppendChild(spTextNode);
         RegisterDetachedRenderOrderSource(context, spWorldNode, spTextNode, text_obj.id);
         context.scene->objectRuntimeNodes[text_obj.id].push_back(spTextNode.get());
-        context.scene->nodeOwners[spTextNode.get()] = text_obj.id;
+        // Same phase contract as the image source node: no nodeOwners registration, the node id
+        // (set above) back-references the owning layer.
     }
 
     context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
