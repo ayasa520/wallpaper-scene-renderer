@@ -28,8 +28,10 @@
 #include "Scene/Scene.h"
 #include "WPShaderParser.hpp"
 #include "WPShaderValueUpdater.hpp"
+#include "Particle/Particle.h"
 #include "WPUserProperties.hpp"
 #include "wpscene/WPImageObject.h"
+#include "wpscene/WPParticleObject.h"
 
 // A hidden layer whose visibility can flip at runtime is registered as a lightweight logical
 // placeholder first; the kind records which materializer owns it.
@@ -171,3 +173,34 @@ bool IsCameraLayerRuntimeProperty(std::string_view property_name);
 void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::json& object_json);
 void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json);
 void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& object_json);
+
+// Defined in WPSceneParser.cpp; shared with the particle unit.
+bool ShouldDeferRuntimeLayerMaterialization(const ParseContext& context, int32_t layer_id,
+                                            bool local_initial_visible,
+                                            const VisibilityContract* contract,
+                                            bool force_runtime_materialization);
+const VisibilityContract* FindLayerVisibilityContract(const ParseContext& context,
+                                                      int32_t layer_id);
+bool  LayerUsesRoutedParent(int32_t parent_id, std::string_view attachment);
+float RandomParticleFrameLifetime(const wallpaper::Particle& p, float sprite_frame_count_value);
+void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
+                                     wallpaper::WPShaderValueData& node_data);
+void RegisterLogicalParticleLayer(ParseContext& context,
+                                  wallpaper::wpscene::WPParticleObject& wppartobj);
+
+// Parent linkage for recursive particle child parsing. Members are the parsing-time capacity
+// contract for child subsystems; see the field comments at the use sites in
+// WPSceneParserParticle.cpp.
+struct ParticleChildPtr {
+    wallpaper::wpscene::ParticleChild* child { nullptr };
+    wallpaper::SceneNode*              node_parent { nullptr };
+    wallpaper::ParticleSubSystem*      particle_parent { nullptr };
+    wallpaper::i32                     max_instancecount { 1 };
+    wallpaper::u32                     parent_live_particle_slots { 1 };
+};
+
+// Defined in WPSceneParserParticle.cpp; the core parser dispatches particle objects into it,
+// and LoadMaterial resolves authored blend strings through the same table particles use.
+void ParseParticleObj(ParseContext& context, wallpaper::wpscene::WPParticleObject& wppartobj,
+                      ParticleChildPtr child_ptr = {});
+wallpaper::BlendMode ParseBlendMode(std::string_view str);
