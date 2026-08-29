@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -107,6 +108,13 @@ public:
     SceneDeferredRuntimeKind DeferredRuntimeKind() const { return m_deferred_runtime_kind; }
     void SetDeferredRuntimeKind(SceneDeferredRuntimeKind kind) { m_deferred_runtime_kind = kind; }
 
+    // Sound layers mount a SoundManager stream; the handle is that layer's runtime resource.
+    // nullopt means no stream was mounted. A stored 0 is kept as a value on purpose: it is what a
+    // failed mount recorded in the former Scene map, and presence checks must keep matching it.
+    std::optional<uint32_t> SoundHandle() const { return m_sound_handle; }
+    void                    SetSoundHandle(uint32_t handle) { m_sound_handle = handle; }
+    void                    ClearSoundHandle() { m_sound_handle.reset(); }
+
     // Image runtime state exists only for materialized image layers (concrete or logical); other
     // kinds return nullptr, which is what tells scripts "this is not an image layer".
     SceneImageLayerRuntimeState*       ImageRuntimeState() {
@@ -141,6 +149,7 @@ private:
     bool    m_passthrough { false };
 
     SceneDeferredRuntimeKind m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
+    std::optional<uint32_t>  m_sound_handle;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;

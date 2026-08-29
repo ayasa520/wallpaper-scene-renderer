@@ -7750,7 +7750,7 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
     // property edits follow the same value path as the parse-time WPSoundParser::MountStream call.
     const bool sound_volume_binding =
         property_name == "volume" && context.scene != nullptr &&
-        context.scene->objectRuntimeSoundHandles.count(object_id) != 0;
+        context.scene->GetLayerSoundHandle(object_id).has_value();
     const bool camera_registration =
         IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
     const auto object_node_it = context.object_nodes.find(object_id);
@@ -8749,7 +8749,7 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
             WPSoundParser::Parse(object, *context.vfs, *context.scene->soundManager);
         if (sound_handle == 0) return false;
         FillSceneObjectIdentityFor(*context.scene, object);
-        context.scene->objectRuntimeSoundHandles[object.id] = sound_handle;
+        context.scene->SetLayerSoundHandle(object.id, sound_handle);
         if (out_layer_id) *out_layer_id = object.id;
         return true;
     }
@@ -9067,7 +9067,7 @@ bool wallpaper::CreateDynamicSceneLayer(
     auto       node_it = context.object_nodes.find(layer_id);
     SceneNode* layer_node =
         node_it != context.object_nodes.end() && node_it->second ? node_it->second.get() : nullptr;
-    const bool has_sound_runtime = scene.objectRuntimeSoundHandles.count(layer_id) != 0;
+    const bool has_sound_runtime = scene.GetLayerSoundHandle(layer_id).has_value();
     if (layer_node == nullptr && ! has_sound_runtime) return false;
 
     const auto binding_start            = scene.bindingRegistrations.size();
@@ -9429,8 +9429,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                            ParseParticleObj(context, obj);
                        },
                        [&context, &sm](wpscene::WPSoundObject& obj) {
-                           context.scene->objectRuntimeSoundHandles[obj.id] =
-                               WPSoundParser::Parse(obj, *context.vfs, sm);
+                           context.scene->SetLayerSoundHandle(
+                               obj.id, WPSoundParser::Parse(obj, *context.vfs, sm));
                        },
                        [&context](wpscene::WPLightObject& obj) {
                            ParseLightObj(context, obj);

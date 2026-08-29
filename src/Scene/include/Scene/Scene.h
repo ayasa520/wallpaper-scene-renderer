@@ -5,6 +5,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -148,6 +149,11 @@ public:
     std::vector<int32_t> DeferredRuntimeLayerIds(SceneDeferredRuntimeKind kind) const;
     std::size_t          DeferredRuntimeLayerCount(SceneDeferredRuntimeKind kind) const;
 
+    // Sound-stream bookkeeping, backed by SceneObject::SoundHandle. Same semantics as the former
+    // objectRuntimeSoundHandles map, including keeping a failed mount's 0 handle as "present".
+    void                    SetLayerSoundHandle(int32_t layer_id, uint32_t handle);
+    std::optional<uint32_t> GetLayerSoundHandle(int32_t layer_id) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -221,7 +227,6 @@ public:
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeRenderTargets;
     std::unordered_map<int32_t, std::vector<SceneLight*>> objectRuntimeLights;
     std::unordered_map<int32_t, std::vector<ParticleSubSystem*>> objectRuntimeParticleSubsystems;
-    std::unordered_map<int32_t, uint32_t>                 objectRuntimeSoundHandles;
     std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
     std::vector<int32_t>                                  cameraLayerOrder;
