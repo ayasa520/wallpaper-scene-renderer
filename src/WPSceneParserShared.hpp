@@ -22,6 +22,8 @@
 
 #include "Core/Literals.hpp"
 #include "Fs/VFS.h"
+#include "WPDynamicValue.hpp"
+#include "WPUserSetting.hpp"
 #include "Scene/LightingV1.hpp"
 #include "Scene/Scene.h"
 #include "WPShaderParser.hpp"
@@ -153,3 +155,19 @@ void LoadUserShaderValue(wallpaper::SceneMaterial& material,
 
 // Defined in WPSceneParserModel.cpp; the core parser dispatches model objects into it.
 void ParseModelObj(ParseContext& context, WPModelObject& model_obj);
+
+// Defined in WPSceneParser.cpp; shared with the bindings unit.
+bool IsTextLayerObjectJson(const nlohmann::json& object_json);
+void LogTextLayerRegistration(const char* event_name, int32_t object_id,
+                              const std::string& object_name, std::string_view property_name,
+                              wallpaper::WPDynamicValue::Type hint,
+                              const wallpaper::WPUserSetting& setting,
+                              const std::optional<wallpaper::WPDynamicValue>& base_value);
+bool IsCameraLayerObjectJson(const nlohmann::json& object_json);
+bool IsCameraLayerRuntimeProperty(std::string_view property_name);
+
+// Defined in WPSceneParserBindings.cpp; the core parser registers script/property/effect
+// visibility bindings through these after objects are materialized.
+void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::json& object_json);
+void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json);
+void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& object_json);
