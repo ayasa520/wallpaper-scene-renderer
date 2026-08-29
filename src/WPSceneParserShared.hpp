@@ -7,12 +7,18 @@
 // global scope; moving them into a named namespace would churn thousands of references for
 // no behavioral gain.
 
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+
+#include <Eigen/Geometry>
+#include <nlohmann/json_fwd.hpp>
 
 #include "Core/Literals.hpp"
 #include "Fs/VFS.h"
@@ -95,3 +101,55 @@ bool                      ConfigureSceneVolumetricsImpl(wallpaper::Scene& scene,
                                                         wallpaper::fs::VFS& vfs);
 bool                      SceneHasShadowLights(const wallpaper::Scene& scene);
 wallpaper::LightingV1Desc LightingDescFromScene(const wallpaper::Scene& scene);
+
+// The authored 3D model object. Parsed by the core parser's object dispatch, materialized by
+// WPSceneParserModel.cpp.
+struct WPModelObject {
+    int32_t              id { 0 };
+    std::string          name;
+    std::array<float, 3> origin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
+    std::array<float, 3> angles { 0.0f, 0.0f, 0.0f };
+    bool                 visible { true };
+    wallpaper::VisibleBinding visible_binding;
+    int32_t              parent { 0 };
+    std::string          attachment;
+    std::string          model;
+    int32_t              skin { 0 };
+    bool                 reflected { false };
+    // 3D models omit this key when they should cast. Non-casters write false.
+    bool                 castshadow { true };
+
+    bool FromJson(const nlohmann::json& json, wallpaper::fs::VFS&);
+};
+
+// The isolated model camera keeps authored 3D view transforms away from `global_perspective`;
+// the reflection target is registered lazily by model materialization but referenced by the
+// material loader's render-target contract.
+inline constexpr std::string_view kSceneModelPerspectiveCameraName { "__hanabi_model_perspective" };
+inline constexpr std::string_view kModelReflectionTargetName { "_rt_Reflection" };
+
+// Defined in WPSceneParser.cpp; shared with the model unit.
+std::string DescribeIndexVec(const std::vector<wallpaper::usize>& values);
+bool ConfigureBoneAttachment(ParseContext& context, int32_t parent_id, std::string_view attachment,
+                             const Eigen::Affine3f& local_transform, std::string_view object_kind,
+                             std::string_view object_name, wallpaper::WPShaderValueData& node_data);
+void AttachNodeToScene(ParseContext& context, const std::shared_ptr<wallpaper::SceneNode>& node,
+                       int32_t parent_id, const std::string& object_name,
+                       wallpaper::WPShaderValueData* node_data = nullptr);
+void RegisterLayerSceneState(ParseContext& context, int32_t layer_id, int32_t parent_id,
+                             std::string_view attachment, bool visible);
+void LoadConstvalue(wallpaper::SceneMaterial& material, const wallpaper::wpscene::WPMaterial& wpmat,
+                    const wallpaper::WPShaderInfo& info);
+void RegisterUserShaderValueBindings(ParseContext& context,
+                                     const wallpaper::wpscene::WPMaterial& wpmat,
+                                     const wallpaper::WPShaderInfo& info,
+                                     wallpaper::SceneNode* node, int32_t object_id,
+                                     std::string_view object_name);
+void LoadUserShaderValue(wallpaper::SceneMaterial& material,
+                         const wallpaper::wpscene::WPMaterial& wpmat,
+                         const wallpaper::WPShaderInfo& info,
+                         const wallpaper::UserPropertyMap* user_properties);
+
+// Defined in WPSceneParserModel.cpp; the core parser dispatches model objects into it.
+void ParseModelObj(ParseContext& context, WPModelObject& model_obj);
