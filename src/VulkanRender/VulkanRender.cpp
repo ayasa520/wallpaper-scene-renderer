@@ -133,6 +133,7 @@ struct VulkanRender::Impl {
     void drawFrame(Scene&);
     void setPaused(bool paused);
     void setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback);
+    void setOffscreenFrameReadyCallback(OffscreenFrameReadyCallback callback);
     bool reconfigureOffscreenExport(uint32_t width,
                                     uint32_t height,
                                     TexTiling tiling,
@@ -155,6 +156,7 @@ struct VulkanRender::Impl {
     bool initRes();
     void drawFrameSwapchain();
     void drawFrameOffscreen(Scene&);
+    bool drainOffscreenFrame();
     int  m_compiled_msaa_samples { -1 };
     void processDeferredGraphPreparation(Scene&);
     void dropCompiledPassFramebuffers();
@@ -183,12 +185,22 @@ struct VulkanRender::Impl {
     bool m_pass_loaded { false };
     bool m_device_faulted { false };
     bool m_device_fault_log_emitted { false };
+    /*
+     * Offscreen pipelining: the frame fence is waited at the start of the NEXT
+     * draw (or before any structural GPU change) instead of right after
+     * submit, so the render thread publishes the exported slot immediately.
+     * m_offscreen_acquire_export_ok gates the per-slot acquire SYNC_FD export;
+     * when it is false every frame keeps the historical synchronous wait.
+     */
+    bool m_offscreen_fence_pending { false };
+    bool m_offscreen_acquire_export_ok { false };
     std::deque<std::size_t> m_deferred_prepare_indices;
     std::unordered_set<std::size_t> m_deferred_waiting_indices_logged;
 
     std::unique_ptr<VulkanExSwapchain> m_ex_swapchain;
     RenderingResources                 m_rendering_resources;
     OffscreenFrameReleaseCallback      m_offscreen_frame_release_cb;
+    OffscreenFrameReadyCallback        m_offscreen_frame_ready_cb;
 
     std::vector<VulkanPass*> m_passes;
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
@@ -206,6 +218,9 @@ void VulkanRender::drawFrame(Scene& scene) { pImpl->drawFrame(scene); };
 void VulkanRender::setPaused(bool paused) { pImpl->setPaused(paused); };
 void VulkanRender::setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback) {
     pImpl->setOffscreenFrameReleaseCallback(std::move(callback));
+};
+void VulkanRender::setOffscreenFrameReadyCallback(OffscreenFrameReadyCallback callback) {
+    pImpl->setOffscreenFrameReadyCallback(std::move(callback));
 };
 bool VulkanRender::reconfigureOffscreenExport(
     uint32_t width,
@@ -443,6 +458,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     // are preferable to a SIGSEGV while switching away from the failed scene.
     m_rendering_resources.sem_swap_wait_image.abandon();
     m_rendering_resources.sem_swap_finish.abandon();
+    for (auto& semaphore : m_rendering_resources.sem_offscreen_acquire) semaphore.abandon();
     m_rendering_resources.fence_frame.abandon();
     m_rendering_resources.command.abandon();
     for (auto& [_, image] : m_rendering_resources.model_depth_images) {
@@ -521,6 +537,9 @@ void VulkanRender::Impl::destroy() {
     }
     m_rendering_resources.sem_swap_wait_image.reset();
     m_rendering_resources.sem_swap_finish.reset();
+    for (auto& semaphore : m_rendering_resources.sem_offscreen_acquire) semaphore.reset();
+    m_offscreen_fence_pending = false;
+    m_offscreen_acquire_export_ok = false;
     m_rendering_resources.fence_frame.reset();
     m_rendering_resources.vertex_buf = nullptr;
     m_rendering_resources.dyn_buf = nullptr;
@@ -554,6 +573,31 @@ bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
                                    .pNext = nullptr };
         VVK_CHECK_BOOL_RE(m_device->handle().CreateSemaphore(ci, rr.sem_swap_finish));
         VVK_CHECK_BOOL_RE(m_device->handle().CreateSemaphore(ci, rr.sem_swap_wait_image));
+    } else {
+        /*
+         * Best effort: drivers without SYNC_FD semaphore export simply keep
+         * the synchronous per-frame fence wait, so failures here only disable
+         * the pipelined publish, never the renderer.
+         */
+        VkExportSemaphoreCreateInfo export_ci {
+            .sType       = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+            .pNext       = nullptr,
+            .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        };
+        VkSemaphoreCreateInfo ci { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                                   .pNext = &export_ci };
+        m_offscreen_acquire_export_ok =
+            m_device->handle().Dispatch().vkGetSemaphoreFdKHR != nullptr;
+        for (auto& semaphore : rr.sem_offscreen_acquire) {
+            if (!m_offscreen_acquire_export_ok) break;
+            if (m_device->handle().CreateSemaphore(ci, semaphore) != VK_SUCCESS)
+                m_offscreen_acquire_export_ok = false;
+        }
+        if (!m_offscreen_acquire_export_ok) {
+            for (auto& semaphore : rr.sem_offscreen_acquire) semaphore.reset();
+            LOG_INFO("offscreen acquire SYNC_FD export unavailable; "
+                     "keeping synchronous frame fence waits");
+        }
     }
 
     rr.vertex_buf = m_vertex_buf.get();
@@ -615,6 +659,11 @@ void VulkanRender::Impl::setOffscreenFrameReleaseCallback(
     m_offscreen_frame_release_cb = std::move(callback);
 }
 
+void VulkanRender::Impl::setOffscreenFrameReadyCallback(
+    OffscreenFrameReadyCallback callback) {
+    m_offscreen_frame_ready_cb = std::move(callback);
+}
+
 bool VulkanRender::Impl::reconfigureOffscreenExport(
     uint32_t width,
     uint32_t height,
@@ -626,6 +675,9 @@ bool VulkanRender::Impl::reconfigureOffscreenExport(
     if (!m_inited || !m_device || !m_ex_swapchain || !m_instance.offscreen())
         return false;
 
+    // Retire deferred staging before Reconfigure() waits the device idle and
+    // replaces the exported ring the pending submission rendered into.
+    (void)drainOffscreenFrame();
     const bool ok = m_ex_swapchain->Reconfigure(*m_device,
                                                 width,
                                                 height,
@@ -652,6 +704,8 @@ bool VulkanRender::Impl::reconfigureOffscreenExport(
 
 void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {
     if (!m_device) return;
+    // CreateTex() can replace a texture the deferred submission still samples.
+    (void)drainOffscreenFrame();
 
     for (const auto& key : scene.dirtyImportedTextureKeys) {
         scene.DropParsedImageCache(key);
@@ -850,9 +904,32 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         return;
 }
 
+/*
+ * Deferred completion point of the previous offscreen submit. Runs at the
+ * start of the next frame and before any operation that destroys or rewrites
+ * GPU resources the in-flight submission may still reference. Staging
+ * retirement lives here because it frees the buffers the deferred submission
+ * reads; the pixel content of every published frame is unchanged.
+ */
+bool VulkanRender::Impl::drainOffscreenFrame() {
+    if (!m_offscreen_fence_pending) return true;
+    RenderingResources& rr = m_rendering_resources;
+    m_offscreen_fence_pending = false;
+    if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait deferred offscreen fence"))
+        return false;
+    m_device->tex_cache().RetireCompletedUploads();
+    rr.immutable_meshes.retireStaging();
+    if (!checkVkResult(rr.fence_frame.Reset(), "reset deferred offscreen fence"))
+        return false;
+    return true;
+}
+
 void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     RenderingResources& rr = m_rendering_resources;
     if (!m_ex_swapchain) {
+        return;
+    }
+    if (!drainOffscreenFrame()) {
         return;
     }
 
@@ -912,24 +989,69 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(rr.command.End(), "end offscreen frame command buffer"))
         return;
 
+    const bool pipelined = m_offscreen_acquire_export_ok &&
+                           slot_id < rr.sem_offscreen_acquire.size() &&
+                           rr.sem_offscreen_acquire[slot_id];
     VkSubmitInfo sub_info {
         .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext              = nullptr,
         .commandBufferCount = 1,
         .pCommandBuffers    = rr.command.address(),
     };
+    if (pipelined) {
+        sub_info.signalSemaphoreCount = 1;
+        sub_info.pSignalSemaphores    = rr.sem_offscreen_acquire[slot_id].address();
+    }
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
 
-    if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
-        return;
-    m_device->tex_cache().RetireCompletedUploads();
-    rr.immutable_meshes.retireStaging();
+    /*
+     * The immutable-mesh CPU payloads were memcpy'd into staging buffers at
+     * create() time, so dropping them only needs the recording above to have
+     * happened, not the fence.
+     */
     ReleaseUploadedFileMeshCpu(scene);
-    if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
-        return;
+
+    if (pipelined) {
+        /*
+         * Publish immediately: the exported SYNC_FD is the frame's explicit
+         * acquire fence, so the consumer waits for the GPU on its side while
+         * this thread already returns to the frame timer. SYNC_FD export has
+         * copy transference with wait semantics, leaving the binary semaphore
+         * unsignaled and reusable on this slot's next ring rotation. The
+         * fence wait moves to drainOffscreenFrame() at the start of the next
+         * frame (or before any structural GPU change).
+         */
+        int acquire_fd = -1;
+        const VkResult export_result =
+            rr.sem_offscreen_acquire[slot_id].GetSemaphoreFdKHR(
+                VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, &acquire_fd);
+        if (export_result == VK_SUCCESS && acquire_fd >= 0) {
+            m_ex_swapchain->storeAcquireFd(slot_id, acquire_fd);
+            m_offscreen_fence_pending = true;
+        } else {
+            checkVkResult(export_result, "export offscreen acquire SYNC_FD");
+            LOG_INFO("offscreen acquire SYNC_FD export failed; "
+                     "reverting to synchronous frame fence waits");
+            m_offscreen_acquire_export_ok = false;
+        }
+    }
+
+    if (!m_offscreen_fence_pending) {
+        if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
+            return;
+        m_device->tex_cache().RetireCompletedUploads();
+        rr.immutable_meshes.retireStaging();
+        if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
+            return;
+    }
     m_ex_swapchain->renderFrame();
+    if (m_offscreen_frame_ready_cb) {
+        // The slot just became eatFrame()-visible; wake the IPC relay so it
+        // publishes now instead of on its next fixed-rate poll tick.
+        m_offscreen_frame_ready_cb(slot_id);
+    }
 }
 
 void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) {
@@ -1127,6 +1249,8 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
         // instead of turning a recoverable backend replacement into a process crash.
         return;
     }
+    // Pass destruction below must not race the deferred offscreen submission.
+    (void)drainOffscreenFrame();
 
     // A topology rebuild invalidates the compiled pass list and the backing mesh buffers that were
     // uploaded for the previous graph. Reallocating those buffers keeps the full rebuild path
@@ -1245,6 +1369,9 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                                             bool refresh_resources_only) {
     if (m_device_faulted) return;
     if (! m_inited) return;
+    // Framebuffer drops, stale-pass destruction and residency releases below
+    // must not race the deferred offscreen submission.
+    (void)drainOffscreenFrame();
     SyncSceneMsaa(scene, *m_device);
     const int msaa_samples = scene.MsaaSampleCount();
     if (msaa_samples != m_compiled_msaa_samples) {
@@ -1496,6 +1623,8 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
 void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGraph& rg) {
     if (m_device_faulted) return;
     if (!m_inited || !m_device || !m_rendering_resources.pipeline_cache) return;
+    // setRenderTargetSize() can reallocate screen-bound render targets.
+    (void)drainOffscreenFrame();
 
     const auto started_at = std::chrono::steady_clock::now();
     auto       nodes      = rg.topologicalOrder();

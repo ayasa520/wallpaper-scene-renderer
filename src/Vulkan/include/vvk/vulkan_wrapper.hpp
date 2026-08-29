@@ -182,6 +182,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetPipelineExecutableStatisticsKHR  vkGetPipelineExecutableStatisticsKHR {};
     PFN_vkGetQueryPoolResults                 vkGetQueryPoolResults {};
     PFN_vkGetSemaphoreCounterValueKHR         vkGetSemaphoreCounterValueKHR {};
+    PFN_vkGetSemaphoreFdKHR                   vkGetSemaphoreFdKHR {};
     PFN_vkMapMemory                           vkMapMemory {};
     PFN_vkQueueSubmit                         vkQueueSubmit {};
     PFN_vkResetFences                         vkResetFences {};
@@ -499,6 +500,18 @@ public:
             .pValues        = &value,
         };
         return dld->vkWaitSemaphoresKHR(owner, &wait_info, timeout);
+    }
+
+    VkResult GetSemaphoreFdKHR(VkExternalSemaphoreHandleTypeFlagBits handle_type,
+                               int* fd) const {
+        if (dld->vkGetSemaphoreFdKHR == nullptr) return VK_ERROR_EXTENSION_NOT_PRESENT;
+        const VkSemaphoreGetFdInfoKHR get_fd_info {
+            .sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+            .pNext      = nullptr,
+            .semaphore  = handle,
+            .handleType = handle_type,
+        };
+        return dld->vkGetSemaphoreFdKHR(owner, &get_fd_info, fd);
     }
 };
 

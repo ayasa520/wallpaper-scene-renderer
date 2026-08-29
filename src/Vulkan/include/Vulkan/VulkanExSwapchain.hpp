@@ -115,6 +115,8 @@ public:
                                                 VkExtent2D { w, h });
         activateGeneration(*m_active);
         resetDirty();
+        /* Stashed acquire fences reference retired submissions. */
+        clearAcquireFds();
         return true;
     }
 

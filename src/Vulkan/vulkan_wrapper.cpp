@@ -163,6 +163,7 @@ bool Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetPipelineExecutablePropertiesKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
     X(vkGetSemaphoreCounterValueKHR);
+    X(vkGetSemaphoreFdKHR);
     X(vkMapMemory);
     X(vkQueueSubmit);
     X(vkResetFences);
