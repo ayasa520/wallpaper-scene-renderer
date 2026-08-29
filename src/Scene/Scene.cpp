@@ -550,12 +550,10 @@ SceneObject& Scene::EnsureSceneObject(int32_t layer_id) {
 void Scene::DestroySceneObject(int32_t layer_id) { sceneObjects.erase(layer_id); }
 
 int32_t Scene::LayerIdForNode(const SceneNode* node) const {
-    if (node == nullptr) return 0;
-    if (auto owner_it = nodeOwners.find(const_cast<SceneNode*>(node));
-        owner_it != nodeOwners.end()) {
-        return owner_it->second;
-    }
-    return node->ID();
+    // The node id is the single back-reference: layer handles carry their authored id from
+    // parse, drawing-phase nodes (detached sources, effect passes, the final composite) carry
+    // their owner's id, and helper nodes keep the default 0, which callers treat as "no owner".
+    return node == nullptr ? 0 : node->ID();
 }
 
 void Scene::MarkLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind) {
