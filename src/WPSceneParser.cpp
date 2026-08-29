@@ -8813,11 +8813,11 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
                                               const UserPropertyMap* user_properties) {
     if (! scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Image)) return false;
 
-    const auto config_it = scene.initialLayerConfigJson.find(layer_id);
-    if (config_it == scene.initialLayerConfigJson.end()) return false;
+    const auto* initial_config = scene.GetLayerInitialConfigJson(layer_id);
+    if (initial_config == nullptr) return false;
 
     nlohmann::json object_json;
-    if (! PARSE_JSON(config_it->second, object_json)) return false;
+    if (! PARSE_JSON(*initial_config, object_json)) return false;
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
@@ -8904,11 +8904,11 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
                                                  const UserPropertyMap* user_properties) {
     if (! scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Particle)) return false;
 
-    const auto config_it = scene.initialLayerConfigJson.find(layer_id);
-    if (config_it == scene.initialLayerConfigJson.end()) return false;
+    const auto* initial_config = scene.GetLayerInitialConfigJson(layer_id);
+    if (initial_config == nullptr) return false;
 
     nlohmann::json object_json;
-    if (! PARSE_JSON(config_it->second, object_json)) return false;
+    if (! PARSE_JSON(*initial_config, object_json)) return false;
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
@@ -8968,11 +8968,11 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
                                              const UserPropertyMap* user_properties) {
     if (! scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) return false;
 
-    const auto config_it = scene.initialLayerConfigJson.find(layer_id);
-    if (config_it == scene.initialLayerConfigJson.end()) return false;
+    const auto* initial_config = scene.GetLayerInitialConfigJson(layer_id);
+    if (initial_config == nullptr) return false;
 
     nlohmann::json object_json;
-    if (! PARSE_JSON(config_it->second, object_json)) return false;
+    if (! PARSE_JSON(*initial_config, object_json)) return false;
 
     ParseContext context {};
     if (! InitDynamicParseContext(context, scene, user_properties)) return false;
@@ -9076,8 +9076,8 @@ bool wallpaper::CreateDynamicSceneLayer(
     RegisterSceneScriptsForObject(context, normalized_object_json);
 
     scene.layerOrder.push_back(layer_id);
-    scene.layerNodes[layer_id]             = layer_node;
-    scene.initialLayerConfigJson[layer_id] = normalized_object_json.dump();
+    scene.layerNodes[layer_id] = layer_node;
+    scene.SetLayerInitialConfigJson(layer_id, normalized_object_json.dump());
     std::string layer_name = layer_node != nullptr
                                  ? layer_node->Name()
                                  : normalized_object_json.value("name", std::string {});
@@ -9099,7 +9099,8 @@ bool wallpaper::CreateDynamicSceneLayer(
                                          scene.scriptRegistrations.end());
     }
     if (out_initial_config_json != nullptr) {
-        *out_initial_config_json = scene.initialLayerConfigJson.at(layer_id);
+        // The record was stored just above, so the pointer is always valid here.
+        *out_initial_config_json = *scene.GetLayerInitialConfigJson(layer_id);
     }
     if (out_layer_id != nullptr) {
         *out_layer_id = layer_id;
@@ -9466,7 +9467,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     context.scene->layerOrder.clear();
     context.scene->layerNodes.clear();
-    context.scene->initialLayerConfigJson.clear();
+    context.scene->ClearAllLayerInitialConfigJson();
     context.scene->layerNameToId.clear();
     for (const auto& obj : wp_objs) {
         const auto object_id = GetObjectId(obj);
@@ -9479,7 +9480,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                                                                      : nullptr;
         if (auto config_it = initial_layer_config_json_by_id.find(*object_id);
             config_it != initial_layer_config_json_by_id.end()) {
-            context.scene->initialLayerConfigJson[*object_id] = config_it->second;
+            context.scene->SetLayerInitialConfigJson(*object_id, config_it->second);
         }
 
         const auto node_name = node_it != context.object_nodes.end() && node_it->second
