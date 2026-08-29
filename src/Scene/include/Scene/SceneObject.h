@@ -17,6 +17,7 @@ class SceneNode;
 class SceneImageEffectLayer;
 class SceneLight;
 class ParticleSubSystem;
+struct TextLayerRuntimeState;
 
 // Authored object kind straight from scene.json. One entry of objects[] maps to exactly one
 // SceneObject; render-time SceneNodes are draw handles owned by passes, not layer identities.
@@ -65,6 +66,9 @@ struct SceneImageLayerRuntimeState {
 class SceneObject : NoCopy, NoMove {
 public:
     explicit SceneObject(int32_t id) : m_id(id) {}
+    // Out-of-line (Scene.cpp): the text runtime state is held through a pointer to a parser-side
+    // type this header only forward-declares.
+    ~SceneObject();
 
     int32_t Id() const { return m_id; }
 
@@ -172,6 +176,14 @@ public:
     const std::vector<SceneNode*>& RuntimeNodes() const { return m_runtime_nodes; }
     void ClearRuntimeNodes() { m_runtime_nodes.clear(); }
 
+    // Text layers keep their runtime text record (authored object snapshot, live primitive,
+    // render contract, applied alignment) on the identity. nullptr means "not a registered text
+    // layer"; registration overwrites the record exactly like the former Scene::textLayers map
+    // entry. Held by pointer so this header does not include the parser-side type; the setter is
+    // defined out-of-line in Scene.cpp for the same reason.
+    TextLayerRuntimeState* TextRuntimeState() const { return m_text_runtime_state.get(); }
+    void                   SetTextRuntimeState(TextLayerRuntimeState state);
+
     // The authored scene.json record for this object, normalized to its parse-time id. Deferred
     // layers re-parse it on materialization and scripts read originalOrigin and the initial
     // config from it. nullptr means no record (sound-only and some helper layers).
@@ -228,6 +240,8 @@ private:
     std::vector<SceneLight*>        m_runtime_lights;
     std::vector<ParticleSubSystem*> m_runtime_particle_subsystems;
     std::vector<SceneNode*>         m_runtime_nodes;
+
+    std::unique_ptr<TextLayerRuntimeState> m_text_runtime_state;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;

@@ -3434,9 +3434,9 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
 }
 
 bool wallpaper::SyncTextLayerSceneMaterials(Scene& scene, int32_t layer_id) {
-    auto state_it = scene.textLayers.find(layer_id);
-    if (state_it == scene.textLayers.end()) return false;
-    auto& state = state_it->second;
+    auto* text_state = scene.FindTextLayerState(layer_id);
+    if (text_state == nullptr) return false;
+    auto& state = *text_state;
 
     if (state.primitive == nullptr) {
         return false;
@@ -3463,18 +3463,23 @@ bool wallpaper::RasterizeTextPrimitiveLayout(fs::VFS& vfs,
 }
 
 bool wallpaper::UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id) {
-    auto state_it = scene.textLayers.find(layer_id);
-    if (state_it == scene.textLayers.end()) {
+    auto* text_state = scene.FindTextLayerState(layer_id);
+    if (text_state == nullptr) {
         return false;
     }
 
-    auto&      state = state_it->second;
+    auto&      state = *text_state;
     const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
     return SyncTextLayerSceneGeometry(scene, layer_id, state, previous_geometry);
 }
 
 void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
-    for (auto& [layer_id, state] : scene.textLayers) {
+    // Text records live on the identity objects; skipping objects without one reproduces the
+    // former textLayers key set (registration always stores a full record).
+    for (auto& [layer_id, object] : scene.sceneObjects) {
+        auto* text_state = object != nullptr ? object->TextRuntimeState() : nullptr;
+        if (text_state == nullptr) continue;
+        auto& state = *text_state;
         if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
             scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text) ||
             !TextLayerNeedsBridgeResidency(scene, layer_id)) {
@@ -3514,10 +3519,10 @@ bool wallpaper::ApplyTextLayerTransformValue(Scene&               scene,
                                              SceneNode*           node,
                                              std::string_view     property_name,
                                              std::array<float, 3> value) {
-    auto state_it = scene.textLayers.find(layer_id);
-    if (state_it == scene.textLayers.end()) return false;
+    auto* text_state = scene.FindTextLayerState(layer_id);
+    if (text_state == nullptr) return false;
 
-    auto&      state = state_it->second;
+    auto&      state = *text_state;
     const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
     if (!ApplyTextLayerObjectTransform(state, node, property_name, value)) return false;
 
@@ -3531,7 +3536,10 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
     }
 
     std::vector<ScreenAnchoredTextPlacement> placements;
-    for (auto& [layer_id, state] : scene.textLayers) {
+    for (auto& [layer_id, object] : scene.sceneObjects) {
+        auto* text_state = object != nullptr ? object->TextRuntimeState() : nullptr;
+        if (text_state == nullptr) continue;
+        auto& state = *text_state;
         if (scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) continue;
         if (! HasExplicitTextScreenAnchor(state.object)) continue;
 
@@ -3592,12 +3600,12 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
 }
 
 bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_id) {
-    auto state_it = scene.textLayers.find(layer_id);
-    if (state_it == scene.textLayers.end()) {
+    auto* text_state = scene.FindTextLayerState(layer_id);
+    if (text_state == nullptr) {
         return false;
     }
 
-    auto& state = state_it->second;
+    auto& state = *text_state;
     if (state.primitive == nullptr) {
         return false;
     }
@@ -3627,12 +3635,12 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
         return true;
     }
 
-    auto state_it = scene.textLayers.find(layer_id);
-    if (state_it == scene.textLayers.end() || scene.vfs == nullptr) {
+    auto* text_state = scene.FindTextLayerState(layer_id);
+    if (text_state == nullptr || scene.vfs == nullptr) {
         return false;
     }
 
-    auto&      state                 = state_it->second;
+    auto&      state                 = *text_state;
     const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
     // Atlas revisions now live on the scene-owned primitive itself. Runtime layout rebuilds only
     // need the next monotonically increasing atlas version so the dedicated text pass refreshes

@@ -21,6 +21,14 @@
 namespace wallpaper 
 {
 
+// Defined here instead of the header: SceneObject.h only forward-declares the parser-side
+// TextLayerRuntimeState, and this translation unit sees the complete type through Scene.h.
+SceneObject::~SceneObject() = default;
+
+void SceneObject::SetTextRuntimeState(TextLayerRuntimeState state) {
+    m_text_runtime_state = std::make_unique<TextLayerRuntimeState>(std::move(state));
+}
+
 namespace
 {
 std::size_t EstimateParsedImageBytes(const std::shared_ptr<Image>& image) {
@@ -685,6 +693,21 @@ const std::vector<SceneNode*>& Scene::GetLayerRuntimeNodes(int32_t layer_id) con
 
 void Scene::ClearLayerRuntimeNodes(int32_t layer_id) {
     if (auto* object = FindSceneObject(layer_id)) object->ClearRuntimeNodes();
+}
+
+void Scene::SetTextLayerState(int32_t layer_id, TextLayerRuntimeState state) {
+    if (layer_id == 0) return;
+    EnsureSceneObject(layer_id).SetTextRuntimeState(std::move(state));
+}
+
+TextLayerRuntimeState* Scene::FindTextLayerState(int32_t layer_id) {
+    auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->TextRuntimeState();
+}
+
+const TextLayerRuntimeState* Scene::FindTextLayerState(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->TextRuntimeState();
 }
 
 int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {

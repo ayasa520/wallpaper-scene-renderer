@@ -2581,12 +2581,13 @@ void RegisterLogicalTextLayer(ParseContext& context,
     context.scene->AddLayerRuntimeNode(text_obj.id, node.get());
     context.scene->nodeOwners[node.get()] = text_obj.id;
     context.shader_updater->SetNodeData(node.get(), node_data);
-    context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
-        .object            = text_obj,
-        .primitive         = nullptr,
-        .render_contract   = render_contract,
-        .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
-    };
+    context.scene->SetTextLayerState(text_obj.id,
+                                     TextLayerRuntimeState {
+                                         .object            = text_obj,
+                                         .primitive         = nullptr,
+                                         .render_contract   = render_contract,
+                                         .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
+                                     });
     RegisterLayerSceneState(
         context, text_obj.id, text_obj.parent, text_obj.attachment, text_obj.visible);
     context.scene->ApplyLayerVisibility(text_obj.id);
@@ -6474,15 +6475,16 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         // (set above) back-references the owning layer.
     }
 
-    context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
-        .object            = text_obj,
-        .primitive         = primitive,
-        .render_contract   = render_contract,
-        .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
-    };
+    context.scene->SetTextLayerState(text_obj.id,
+                                     TextLayerRuntimeState {
+                                         .object            = text_obj,
+                                         .primitive         = primitive,
+                                         .render_contract   = render_contract,
+                                         .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
+                                     });
 
     ApplyTextLayerNodePlacement(spWorldNode.get(),
-                                context.scene->textLayers[text_obj.id],
+                                *context.scene->FindTextLayerState(text_obj.id),
                                 text_obj.origin);
 
     RegisterLayerSceneState(
@@ -8997,8 +8999,8 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     }
 
     wpscene::WPTextObject object;
-    if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
-        object = state_it->second.object;
+    if (const auto* text_state = scene.FindTextLayerState(layer_id); text_state != nullptr) {
+        object = text_state->object;
     } else {
         if (! object.FromJson(object_json, *context.vfs)) return false;
     }
@@ -9048,9 +9050,6 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
     scene.ClearLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text);
-    if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
-    } else {
-    }
     return true;
 }
 
