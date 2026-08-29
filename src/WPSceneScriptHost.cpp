@@ -2197,10 +2197,7 @@ std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost:
         return std::nullopt;
     }
 
-    const auto particle_it = opaque->scene->objectRuntimeParticleSubsystems.find(layer_id);
-    if (particle_it == opaque->scene->objectRuntimeParticleSubsystems.end()) return std::nullopt;
-
-    for (const auto* subsystem : particle_it->second) {
+    for (const auto* subsystem : opaque->scene->GetLayerRuntimeParticleSubsystems(layer_id)) {
         if (subsystem == nullptr) continue;
         if (IsParticleColorProperty(property_name)) {
             if (auto color = subsystem->RuntimeColorOverride(); color.has_value()) {
@@ -2234,8 +2231,8 @@ void LogInvalidParticlePropertyValue(const char* property_kind, int32_t layer_id
 
 template<typename Apply>
 bool ApplyParticleSubsystemValue(Scene& scene, int32_t layer_id, Apply&& apply) {
-    const auto particle_it = scene.objectRuntimeParticleSubsystems.find(layer_id);
-    if (particle_it == scene.objectRuntimeParticleSubsystems.end()) {
+    const auto& subsystems = scene.GetLayerRuntimeParticleSubsystems(layer_id);
+    if (subsystems.empty()) {
         // Deferred particle layers intentionally have no live subsystem. Their current property
         // snapshot is consumed when visibility materializes the layer, so accepting the write here
         // keeps the script-facing property contract identical before and after materialization.
@@ -2243,7 +2240,7 @@ bool ApplyParticleSubsystemValue(Scene& scene, int32_t layer_id, Apply&& apply) 
     }
 
     bool applied = false;
-    for (auto* subsystem : particle_it->second) {
+    for (auto* subsystem : subsystems) {
         if (subsystem == nullptr) continue;
         apply(*subsystem);
         applied = true;
@@ -2904,7 +2901,7 @@ LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32
         CollectResidencyNodeResources(scene, node, resources);
     }
 
-    if (auto* effect_layer = const_cast<Scene&>(scene).FindImageEffectLayer(layer_id)) {
+    if (const auto* effect_layer = scene.FindImageEffectLayer(layer_id)) {
         for (const auto& key : effect_layer->RuntimeRenderTargetNames()) {
             if (!key.empty() && key != SpecTex_Default) resources.render_targets.insert(key);
         }
@@ -3811,41 +3808,41 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
                 }
             }
         }
-        // Deleting a layer removes its authored SceneObject entirely: parent binding, local
-        // visibility, identity, image runtime state, deferred kind, and sound handle all live
-        // there now. Children keep their dangling parent id, exactly like the previous
-        // per-concern maps did.
-        opaque->scene->DestroySceneObject(layer_id);
-        if (auto lights_it = opaque->scene->objectRuntimeLights.find(layer_id);
-            lights_it != opaque->scene->objectRuntimeLights.end()) {
+        // The layer's mounted lights and particle subsystems are recorded on the SceneObject, so
+        // remove them from the Scene-level pools before the identity is destroyed below.
+        if (const auto& owned_lights = opaque->scene->GetLayerRuntimeLights(layer_id);
+            ! owned_lights.empty()) {
             auto& lights = opaque->scene->lights;
             lights.erase(std::remove_if(lights.begin(),
                                         lights.end(),
                                         [&](const std::unique_ptr<SceneLight>& light) {
                                             return light != nullptr &&
-                                                   std::find(lights_it->second.begin(),
-                                                             lights_it->second.end(),
-                                                             light.get()) !=
-                                                       lights_it->second.end();
+                                                   std::find(owned_lights.begin(),
+                                                             owned_lights.end(),
+                                                             light.get()) != owned_lights.end();
                                         }),
                          lights.end());
-            opaque->scene->objectRuntimeLights.erase(lights_it);
         }
-        if (auto particle_it = opaque->scene->objectRuntimeParticleSubsystems.find(layer_id);
-            particle_it != opaque->scene->objectRuntimeParticleSubsystems.end()) {
+        if (const auto& owned_subsystems =
+                opaque->scene->GetLayerRuntimeParticleSubsystems(layer_id);
+            ! owned_subsystems.empty()) {
             auto& subsystems = opaque->scene->paritileSys->subsystems;
             subsystems.erase(
                 std::remove_if(subsystems.begin(),
                                subsystems.end(),
                                [&](const std::unique_ptr<ParticleSubSystem>& subsystem) {
                                    return subsystem != nullptr &&
-                                          std::find(particle_it->second.begin(),
-                                                    particle_it->second.end(),
-                                                    subsystem.get()) != particle_it->second.end();
+                                          std::find(owned_subsystems.begin(),
+                                                    owned_subsystems.end(),
+                                                    subsystem.get()) != owned_subsystems.end();
                                }),
                 subsystems.end());
-            opaque->scene->objectRuntimeParticleSubsystems.erase(particle_it);
         }
+        // Deleting a layer removes its authored SceneObject entirely: parent binding, local
+        // visibility, identity, image runtime state, deferred kind, sound handle, and the
+        // light/particle records all live there now. Children keep their dangling parent id,
+        // exactly like the previous per-concern maps did.
+        opaque->scene->DestroySceneObject(layer_id);
         if (auto text_it = opaque->scene->textLayers.find(layer_id);
             text_it != opaque->scene->textLayers.end()) {
             // First-class text primitives own their atlas pages directly and the dedicated text
@@ -5072,14 +5069,13 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
             return WPDynamicValue(image_layer->size);
         }
         if (opaque->scene != nullptr && layer_id != 0) {
-            if (auto lights_it = opaque->scene->objectRuntimeLights.find(layer_id);
-                lights_it != opaque->scene->objectRuntimeLights.end() &&
-                ! lights_it->second.empty() && lights_it->second.front() != nullptr) {
+            if (const auto& layer_lights = opaque->scene->GetLayerRuntimeLights(layer_id);
+                ! layer_lights.empty() && layer_lights.front() != nullptr) {
                 if (property_name == "intensity") {
-                    return WPDynamicValue(lights_it->second.front()->intensity());
+                    return WPDynamicValue(layer_lights.front()->intensity());
                 }
                 if (property_name == "radius") {
-                    return WPDynamicValue(lights_it->second.front()->radius());
+                    return WPDynamicValue(layer_lights.front()->radius());
                 }
             }
         }
@@ -5420,23 +5416,26 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
     if (opaque != nullptr && opaque->scene != nullptr) {
         const auto layer_id = FindNodeId(opaque, node);
         if (layer_id != 0) {
-            if (auto lights_it = opaque->scene->objectRuntimeLights.find(layer_id);
-                lights_it != opaque->scene->objectRuntimeLights.end()) {
+            // An empty list means no lights are mounted for this layer (registration never stores
+            // an empty entry), so the write falls through to the generic handling below exactly
+            // like the former absent map entry did.
+            if (const auto& layer_lights = opaque->scene->GetLayerRuntimeLights(layer_id);
+                ! layer_lights.empty()) {
                 if (property_name == "intensity") {
                     float intensity = 0.0f;
                     if (! value.tryGet(&intensity)) return false;
-                    for (auto* light : lights_it->second) {
+                    for (auto* light : layer_lights) {
                         if (light != nullptr) light->setIntensity(intensity);
                     }
-                    return ! lights_it->second.empty();
+                    return true;
                 }
                 if (property_name == "radius") {
                     float radius = 0.0f;
                     if (! value.tryGet(&radius)) return false;
-                    for (auto* light : lights_it->second) {
+                    for (auto* light : layer_lights) {
                         if (light != nullptr) light->setRadius(radius);
                     }
-                    return ! lights_it->second.empty();
+                    return true;
                 }
             }
         }

@@ -6999,7 +6999,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         child_ptr.particle_parent->AddChild(std::move(particleSub));
     else {
         context.scene->paritileSys->subsystems.emplace_back(std::move(particleSub));
-        context.scene->objectRuntimeParticleSubsystems[wppartobj.id].push_back(particle_subsystem);
+        context.scene->AddLayerRuntimeParticleSubsystem(wppartobj.id, particle_subsystem);
     }
 
     if (is_child) {
@@ -7063,7 +7063,7 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     if (light_obj.usecookie && ! light_obj.cookie.empty()) {
         light.setCookie(light_obj.cookie);
     }
-    context.scene->objectRuntimeLights[light_obj.id].push_back(&light);
+    context.scene->AddLayerRuntimeLight(light_obj.id, &light);
     light.setNode(node);
 
     AttachNodeToScene(context, node, light_obj.parent, light_obj.name);

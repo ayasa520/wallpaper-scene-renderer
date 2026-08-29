@@ -642,6 +642,35 @@ void Scene::ClearAllLayerNodeSlots() {
     }
 }
 
+void Scene::AddLayerRuntimeLight(int32_t layer_id, SceneLight* light) {
+    if (layer_id == 0 || light == nullptr) return;
+    EnsureSceneObject(layer_id).AddRuntimeLight(light);
+}
+
+namespace
+{
+// Absent-object lookups return a shared empty list so callers keep the former map's
+// "no entry" iteration behavior without a per-call allocation.
+const std::vector<SceneLight*>        kNoRuntimeLights;
+const std::vector<ParticleSubSystem*> kNoRuntimeParticleSubsystems;
+} // namespace
+
+const std::vector<SceneLight*>& Scene::GetLayerRuntimeLights(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? kNoRuntimeLights : object->RuntimeLights();
+}
+
+void Scene::AddLayerRuntimeParticleSubsystem(int32_t layer_id, ParticleSubSystem* subsystem) {
+    if (layer_id == 0 || subsystem == nullptr) return;
+    EnsureSceneObject(layer_id).AddRuntimeParticleSubsystem(subsystem);
+}
+
+const std::vector<ParticleSubSystem*>&
+Scene::GetLayerRuntimeParticleSubsystems(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? kNoRuntimeParticleSubsystems : object->RuntimeParticleSubsystems();
+}
+
 int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {
     // A null query must not match registered-but-null slots.
     if (node == nullptr) return 0;
@@ -930,6 +959,10 @@ SceneImageEffectLayer* Scene::FindImageEffectLayer(int32_t owner_layer_id) {
     const auto* object = FindSceneObject(owner_layer_id);
     if (object == nullptr) return nullptr;
     return object->ImageEffectLayer().get();
+}
+
+const SceneImageEffectLayer* Scene::FindImageEffectLayer(int32_t owner_layer_id) const {
+    return const_cast<Scene*>(this)->FindImageEffectLayer(owner_layer_id);
 }
 
 SceneImageEffect* Scene::FindImageEffectById(int32_t owner_layer_id, int32_t effect_id) {
