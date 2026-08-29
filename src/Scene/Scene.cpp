@@ -106,29 +106,21 @@ bool ResolveCameraPathSample(const Scene::CameraPathSegment& segment,
 }
 
 void CollectLayerEffectNodes(const Scene& scene, int32_t layer_id, std::vector<SceneNode*>& nodes) {
-    auto camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
-    if (camera_names_it == scene.objectRuntimeCameraNames.end()) return;
+    auto* effect_layer = const_cast<Scene&>(scene).FindImageEffectLayer(layer_id);
+    if (effect_layer == nullptr) return;
 
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = scene.cameras.find(camera_name);
-        if (camera_it == scene.cameras.end() || !camera_it->second->HasImgEffect()) continue;
+    if (effect_layer->HasFinalComposite()) {
+        // Final composite nodes are owned by the image-effect bridge instead of the authored
+        // scene tree, so they will not be reached by normal parent/child propagation. Treat
+        // them as layer-owned runtime nodes here to keep layer visibility authoritative while
+        // preserving effect-local visibility on the internal shader nodes.
+        nodes.push_back(&effect_layer->FinalNode());
+    }
 
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr) continue;
-
-        if (effect_layer->HasFinalComposite()) {
-            // Final composite nodes are owned by the image-effect bridge instead of the authored
-            // scene tree, so they will not be reached by normal parent/child propagation. Treat
-            // them as layer-owned runtime nodes here to keep layer visibility authoritative while
-            // preserving effect-local visibility on the internal shader nodes.
-            nodes.push_back(&effect_layer->FinalNode());
-        }
-
-        for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
-            auto& effect = effect_layer->GetEffect(effect_index);
-            for (auto& effect_node : effect->nodes) {
-                if (effect_node.sceneNode) nodes.push_back(effect_node.sceneNode.get());
-            }
+    for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
+        auto& effect = effect_layer->GetEffect(effect_index);
+        for (auto& effect_node : effect->nodes) {
+            if (effect_node.sceneNode) nodes.push_back(effect_node.sceneNode.get());
         }
     }
 }
@@ -920,19 +912,9 @@ void Scene::UpdateActiveCameraLayer() {
 }
 
 SceneImageEffect* Scene::FindImageEffect(int32_t owner_layer_id, uint32_t effect_index) {
-    auto camera_names_it = objectRuntimeCameraNames.find(owner_layer_id);
-    if (camera_names_it == objectRuntimeCameraNames.end()) return nullptr;
-
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = cameras.find(camera_name);
-        if (camera_it == cameras.end() || !camera_it->second->HasImgEffect()) continue;
-
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr || effect_index >= effect_layer->EffectCount()) continue;
-        return effect_layer->GetEffect(effect_index).get();
-    }
-
-    return nullptr;
+    auto* effect_layer = FindImageEffectLayer(owner_layer_id);
+    if (effect_layer == nullptr || effect_index >= effect_layer->EffectCount()) return nullptr;
+    return effect_layer->GetEffect(effect_index).get();
 }
 
 const SceneImageEffect* Scene::FindImageEffect(int32_t owner_layer_id,
@@ -941,36 +923,23 @@ const SceneImageEffect* Scene::FindImageEffect(int32_t owner_layer_id,
 }
 
 SceneImageEffectLayer* Scene::FindImageEffectLayer(int32_t owner_layer_id) {
-    auto camera_names_it = objectRuntimeCameraNames.find(owner_layer_id);
-    if (camera_names_it == objectRuntimeCameraNames.end()) return nullptr;
-
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = cameras.find(camera_name);
-        if (camera_it == cameras.end() || !camera_it->second->HasImgEffect()) continue;
-
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer != nullptr) return effect_layer;
-    }
-
-    return nullptr;
+    // The owning SceneObject resolves its effect layer directly. The weak reference expires with
+    // the owning effect camera, so a destroyed camera still resolves to "no effect layer" exactly
+    // like the former objectRuntimeCameraNames/cameras walk; the returned raw pointer is backed by
+    // the camera's owning reference, matching what the walk handed out.
+    const auto* object = FindSceneObject(owner_layer_id);
+    if (object == nullptr) return nullptr;
+    return object->ImageEffectLayer().get();
 }
 
 SceneImageEffect* Scene::FindImageEffectById(int32_t owner_layer_id, int32_t effect_id) {
-    auto camera_names_it = objectRuntimeCameraNames.find(owner_layer_id);
-    if (camera_names_it == objectRuntimeCameraNames.end()) return nullptr;
+    auto* effect_layer = FindImageEffectLayer(owner_layer_id);
+    if (effect_layer == nullptr) return nullptr;
 
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = cameras.find(camera_name);
-        if (camera_it == cameras.end() || !camera_it->second->HasImgEffect()) continue;
-
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr) continue;
-
-        for (std::size_t effect_index = 0; effect_index < effect_layer->EffectCount();
-             effect_index++) {
-            auto& effect = effect_layer->GetEffect(effect_index);
-            if (effect != nullptr && effect->EffectId() == effect_id) return effect.get();
-        }
+    for (std::size_t effect_index = 0; effect_index < effect_layer->EffectCount();
+         effect_index++) {
+        auto& effect = effect_layer->GetEffect(effect_index);
+        if (effect != nullptr && effect->EffectId() == effect_id) return effect.get();
     }
 
     return nullptr;
