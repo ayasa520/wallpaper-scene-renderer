@@ -115,6 +115,17 @@ public:
     void                    SetSoundHandle(uint32_t handle) { m_sound_handle = handle; }
     void                    ClearSoundHandle() { m_sound_handle.reset(); }
 
+    // The authored scene.json record for this object, normalized to its parse-time id. Deferred
+    // layers re-parse it on materialization and scripts read originalOrigin and the initial
+    // config from it. nullptr means no record (sound-only and some helper layers).
+    const std::string* InitialConfigJson() const {
+        return m_initial_config_json.has_value() ? &*m_initial_config_json : nullptr;
+    }
+    void SetInitialConfigJson(std::string config_json) {
+        m_initial_config_json = std::move(config_json);
+    }
+    void ClearInitialConfigJson() { m_initial_config_json.reset(); }
+
     // Image runtime state exists only for materialized image layers (concrete or logical); other
     // kinds return nullptr, which is what tells scripts "this is not an image layer".
     SceneImageLayerRuntimeState*       ImageRuntimeState() {
@@ -148,8 +159,9 @@ private:
     int32_t m_effect_count { 0 };
     bool    m_passthrough { false };
 
-    SceneDeferredRuntimeKind m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
-    std::optional<uint32_t>  m_sound_handle;
+    SceneDeferredRuntimeKind   m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
+    std::optional<uint32_t>    m_sound_handle;
+    std::optional<std::string> m_initial_config_json;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;

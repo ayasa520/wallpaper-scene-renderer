@@ -154,6 +154,12 @@ public:
     void                    SetLayerSoundHandle(int32_t layer_id, uint32_t handle);
     std::optional<uint32_t> GetLayerSoundHandle(int32_t layer_id) const;
 
+    // Authored-config bookkeeping, backed by SceneObject::InitialConfigJson. Same semantics as
+    // the former initialLayerConfigJson map; nullptr means no record.
+    void               SetLayerInitialConfigJson(int32_t layer_id, std::string config_json);
+    const std::string* GetLayerInitialConfigJson(int32_t layer_id) const;
+    void               ClearAllLayerInitialConfigJson();
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -231,7 +237,6 @@ public:
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
     std::vector<int32_t>                                  cameraLayerOrder;
     std::unordered_map<SceneNode*, int32_t> nodeOwners;
-    std::unordered_map<int32_t, std::string> initialLayerConfigJson;
     std::unordered_map<std::string, int32_t> layerNameToId;
     std::unordered_set<int32_t>              offscreenDependencyLayerIds;
     // Some runtime nodes must stay root-owned for transform correctness, effect-camera routing, or

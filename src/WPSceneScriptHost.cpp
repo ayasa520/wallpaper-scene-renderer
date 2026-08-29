@@ -2159,12 +2159,12 @@ std::optional<WPDynamicValue> ReadOriginalLayerPropertyValue(
     if (property_name != "originalOrigin" || opaque == nullptr || opaque->scene == nullptr)
         return std::nullopt;
 
-    const auto initial_it = opaque->scene->initialLayerConfigJson.find(layer_id);
-    if (initial_it == opaque->scene->initialLayerConfigJson.end()) return std::nullopt;
+    const auto* initial_config = opaque->scene->GetLayerInitialConfigJson(layer_id);
+    if (initial_config == nullptr) return std::nullopt;
 
     nlohmann::json layer_config;
     try {
-        layer_config = nlohmann::json::parse(initial_it->second);
+        layer_config = nlohmann::json::parse(*initial_config);
     } catch (const std::exception& e) {
         LOG_ERROR("failed to parse initial layer configuration JSON for layer %d: %s",
                   layer_id,
@@ -3885,7 +3885,6 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // already dropped it together with the rest of the identity; a later dynamic layer that
         // reuses this authored id starts from a fresh object.
         opaque->scene->layerNodes.erase(layer_id);
-        opaque->scene->initialLayerConfigJson.erase(layer_id);
         opaque->scene->scriptRegistrations.erase(
             std::remove_if(opaque->scene->scriptRegistrations.begin(),
                            opaque->scene->scriptRegistrations.end(),
@@ -6535,7 +6534,7 @@ JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValue
         // allowing reset-position scripts to test for originalOrigin just like in Wallpaper Engine.
         return JS_NewBool(context,
                           opaque != nullptr && opaque->scene != nullptr &&
-                              opaque->scene->initialLayerConfigJson.contains(node_id));
+                              opaque->scene->GetLayerInitialConfigJson(node_id) != nullptr);
     }
     if (member_name == "size") {
         return JS_NewBool(context,
@@ -6727,9 +6726,9 @@ JSValue NativeGetInitialSceneLayerConfig(JSContext* context, JSValueConst, int a
     if (! resolved_layer.has_value()) return JS_UNDEFINED;
     const int32_t layer_id = *resolved_layer;
 
-    const auto it = opaque->scene->initialLayerConfigJson.find(layer_id);
-    if (it == opaque->scene->initialLayerConfigJson.end()) return JS_UNDEFINED;
-    return ParseJsonToJS(context, it->second);
+    const auto* initial_config = opaque->scene->GetLayerInitialConfigJson(layer_id);
+    if (initial_config == nullptr) return JS_UNDEFINED;
+    return ParseJsonToJS(context, *initial_config);
 }
 
 JSValue NativeDestroySceneLayer(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {

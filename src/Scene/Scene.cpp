@@ -610,6 +610,23 @@ std::optional<uint32_t> Scene::GetLayerSoundHandle(int32_t layer_id) const {
     return object == nullptr ? std::nullopt : object->SoundHandle();
 }
 
+void Scene::SetLayerInitialConfigJson(int32_t layer_id, std::string config_json) {
+    if (layer_id == 0) return;
+    EnsureSceneObject(layer_id).SetInitialConfigJson(std::move(config_json));
+}
+
+const std::string* Scene::GetLayerInitialConfigJson(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->InitialConfigJson();
+}
+
+void Scene::ClearAllLayerInitialConfigJson() {
+    for (auto& [layer_id, object] : sceneObjects) {
+        (void)layer_id;
+        if (object != nullptr) object->ClearInitialConfigJson();
+    }
+}
+
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {
