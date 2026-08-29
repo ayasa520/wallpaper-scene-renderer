@@ -5653,7 +5653,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                     .allowReuse = true,
                     .sample = source_sampler,
                 };
-                scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(puppet_surface_target);
+                imgEffectLayer->AddRuntimeRenderTargetName(puppet_surface_target);
             }
         }
         // set renderTarget for ping-pong operate
@@ -5679,8 +5679,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 .magFilter = TextureFilter::LINEAR,
                 .minFilter = TextureFilter::LINEAR,
             };
-            scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_a);
-            scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(effect_ppong_b);
+            imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_a);
+            imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_b);
             if (effect_source_screen_bound) {
                 LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
                          "pingpong-a='%s' pingpong-b='%s' authored-size=[%.3f, %.3f] "
@@ -5796,7 +5796,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                  wpfbo.fit,
                                  persistent_feedback_fbo ? "true" : "false");
                     }
-                    scene.objectRuntimeRenderTargets[wpimgobj.id].push_back(rtname);
+                    imgEffectLayer->AddRuntimeRenderTargetName(rtname);
                     fboMap[wpfbo.name] = rtname;
                 }
             }
@@ -6219,8 +6219,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         };
         scene.renderTargets[primitive->bridge.pingpong_b] =
             scene.renderTargets.at(primitive->bridge.pingpong_a);
-        scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_a);
-        scene.objectRuntimeRenderTargets[text_obj.id].push_back(primitive->bridge.pingpong_b);
+        imgEffectLayer->AddRuntimeRenderTargetName(primitive->bridge.pingpong_a);
+        imgEffectLayer->AddRuntimeRenderTargetName(primitive->bridge.pingpong_b);
         const auto source_size = primitive->VisibleSourceSize();
         const auto& bridge_camera = *scene.cameras.at(camera_name);
         const auto& bridge_target = scene.renderTargets.at(primitive->bridge.pingpong_a);
@@ -6328,7 +6328,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                              wp_fbo.fit,
                              persistent_feedback_fbo ? "true" : "false");
                 }
-                scene.objectRuntimeRenderTargets[text_obj.id].push_back(rt_name);
+                imgEffectLayer->AddRuntimeRenderTargetName(rt_name);
                 primitive->bridge.render_targets.push_back(TextBridgeRenderTarget {
                     .name = rt_name,
                     .scale = std::max<uint32_t>(1u, wp_fbo.scale),
