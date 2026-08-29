@@ -171,6 +171,16 @@ public:
     void       ClearAllLayerNodeSlots();
     int32_t    FindLayerIdByNode(const SceneNode* node) const;
 
+    // Runtime light / particle-subsystem bookkeeping, backed by the owning SceneObject. Same
+    // semantics as the former objectRuntime{Lights,ParticleSubsystems} maps: registration appends
+    // a live pointer, an empty list means nothing is mounted (registration never stores an empty
+    // entry), and the record dies with the SceneObject.
+    void AddLayerRuntimeLight(int32_t layer_id, SceneLight* light);
+    const std::vector<SceneLight*>& GetLayerRuntimeLights(int32_t layer_id) const;
+    void AddLayerRuntimeParticleSubsystem(int32_t layer_id, ParticleSubSystem* subsystem);
+    const std::vector<ParticleSubSystem*>&
+    GetLayerRuntimeParticleSubsystems(int32_t layer_id) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -207,7 +217,8 @@ public:
     const SceneImageEffect* FindImageEffect(int32_t owner_layer_id, uint32_t effect_index) const;
     SceneImageEffect*       FindImageEffectById(int32_t owner_layer_id, int32_t effect_id);
     const SceneImageEffect* FindImageEffectById(int32_t owner_layer_id, int32_t effect_id) const;
-    SceneImageEffectLayer*  FindImageEffectLayer(int32_t owner_layer_id);
+    SceneImageEffectLayer*       FindImageEffectLayer(int32_t owner_layer_id);
+    const SceneImageEffectLayer* FindImageEffectLayer(int32_t owner_layer_id) const;
     bool                    SetEffectLocalVisibility(int32_t owner_layer_id,
                                                      uint32_t effect_index, bool visible);
     bool                    SetEffectLocalVisibilityById(int32_t owner_layer_id,
@@ -239,8 +250,6 @@ public:
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
     std::unordered_map<int32_t, std::vector<SceneNode*>> objectRuntimeNodes;
-    std::unordered_map<int32_t, std::vector<SceneLight*>> objectRuntimeLights;
-    std::unordered_map<int32_t, std::vector<ParticleSubSystem*>> objectRuntimeParticleSubsystems;
     std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
     std::vector<int32_t>                                  cameraLayerOrder;
