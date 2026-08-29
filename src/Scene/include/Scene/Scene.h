@@ -189,6 +189,13 @@ public:
     const std::vector<SceneNode*>& GetLayerRuntimeNodes(int32_t layer_id) const;
     void ClearLayerRuntimeNodes(int32_t layer_id);
 
+    // Text-layer runtime-state bookkeeping, backed by SceneObject::TextRuntimeState. Same
+    // semantics as the former textLayers map: registration overwrites the record, nullptr means
+    // "not a registered text layer", and the record dies with the SceneObject.
+    void SetTextLayerState(int32_t layer_id, TextLayerRuntimeState state);
+    TextLayerRuntimeState*       FindTextLayerState(int32_t layer_id);
+    const TextLayerRuntimeState* FindTextLayerState(int32_t layer_id) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -257,7 +264,6 @@ public:
     // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
-    std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
     std::vector<int32_t>                                  cameraLayerOrder;
     std::unordered_map<SceneNode*, int32_t> nodeOwners;

@@ -3100,15 +3100,13 @@ bool ApplySoundPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id
 
 TextLayerRuntimeState* FindTextLayerById(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->textLayers.find(layer_id);
-    return it == opaque->scene->textLayers.end() ? nullptr : &it->second;
+    return opaque->scene->FindTextLayerState(layer_id);
 }
 
 const TextLayerRuntimeState* FindTextLayerById(const WPSceneScriptHost::Opaque* opaque,
                                                int32_t                          layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->textLayers.find(layer_id);
-    return it == opaque->scene->textLayers.end() ? nullptr : &it->second;
+    return static_cast<const Scene*>(opaque->scene)->FindTextLayerState(layer_id);
 }
 
 std::optional<WPDynamicValue> ReadTextLayerPropertyValue(const WPSceneScriptHost::Opaque* opaque,
@@ -3829,17 +3827,11 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // light/particle records all live there now. Children keep their dangling parent id,
         // exactly like the previous per-concern maps did.
         opaque->scene->DestroySceneObject(layer_id);
-        if (auto text_it = opaque->scene->textLayers.find(layer_id);
-            text_it != opaque->scene->textLayers.end()) {
-            // First-class text primitives own their atlas pages directly and the dedicated text
-            // pass uploads those images from the primitive itself. Deleting a text layer
-            // therefore only needs to drop the runtime registry entry; there is no synthetic
-            // parser-backed authoritative text image left to unregister here.
-            opaque->scene->textLayers.erase(text_it);
-        }
-        // The deferred-runtime record and the layer-node slot live on the SceneObject, so
-        // DestroySceneObject above already dropped them together with the rest of the identity;
-        // a later dynamic layer that reuses this authored id starts from a fresh object.
+        // The deferred-runtime record, the layer-node slot, and the text runtime state live on
+        // the SceneObject, so DestroySceneObject above already dropped them together with the
+        // rest of the identity; a later dynamic layer that reuses this authored id starts from a
+        // fresh object. First-class text primitives own their atlas pages directly, so dropping
+        // the text record needs no separate image unregistration.
         opaque->scene->scriptRegistrations.erase(
             std::remove_if(opaque->scene->scriptRegistrations.begin(),
                            opaque->scene->scriptRegistrations.end(),
