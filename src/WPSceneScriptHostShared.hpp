@@ -176,4 +176,40 @@ struct WPSceneScriptHost::Opaque {
     std::vector<SceneRegistrationRange> pending_scene_registration_ranges;
 };
 
+// The textures and render targets a layer tree currently holds resident on the GPU.
+struct LayerResidencyResources {
+    std::unordered_set<std::string> static_textures;
+    std::unordered_set<std::string> video_textures;
+    std::unordered_set<std::string> render_targets;
+};
+
+// Defined in WPSceneScriptHostResidency.cpp: residency bookkeeping and deferred-layer
+// materialization entry points the core script host dispatches into.
+bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
+bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
+bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
+bool MaterializeDeferredVisibleLayerTreeIfNeeded(WPSceneScriptHost::Opaque* opaque,
+                                                 int32_t                    root_layer_id);
+bool RetainsGpuResidencyWhileHidden(const Scene& scene, int32_t layer_id);
+LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32_t layer_id);
+LayerResidencyResources CollectRetainedResidencyResources(
+    const Scene& scene, const std::unordered_set<int32_t>& excluded_layers);
+void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
+                               const LayerResidencyResources& retained, const char* reason);
+void QueueHiddenLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque,
+                                         int32_t                    root_layer_id);
+void CancelLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque, int32_t root_layer_id);
+
+// Defined in WPSceneScriptHost.cpp: the registration and node-resolution helpers the
+// residency unit calls back into.
+SceneNode*             FindNodeById(WPSceneScriptHost::Opaque* opaque, int32_t node_id);
+void                   RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque,
+                                                int32_t layer_id, SceneNode* node);
+SceneRegistrationRange CaptureSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque);
+bool SceneRegistrationRangeHasNewEntries(WPSceneScriptHost::Opaque* opaque,
+                                         const SceneRegistrationRange& range);
+void RegisterSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque,
+                                    const SceneRegistrationRange& range);
+void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, SceneNode* node);
+
 } // namespace wallpaper
