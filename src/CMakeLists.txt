@@ -58,13 +58,13 @@ add_library(
   wpscene/WPLightObject.cpp
   WPParticleParser.cpp
   WPShaderParser.cpp
-  WPSceneParser.cpp
-  WPSceneScriptHost.cpp
-  WPSceneScriptHostResidency.cpp
-  WPSceneParserPostFx.cpp
-  WPSceneParserModel.cpp
-  WPSceneParserBindings.cpp
-  WPSceneParserParticle.cpp
+  SceneParser/WPSceneParser.cpp
+  ScriptHost/WPSceneScriptHost.cpp
+  ScriptHost/WPSceneScriptHostResidency.cpp
+  SceneParser/WPSceneParserPostFx.cpp
+  SceneParser/WPSceneParserModel.cpp
+  SceneParser/WPSceneParserBindings.cpp
+  SceneParser/WPSceneParserParticle.cpp
   WPNodeTransformResolver.cpp
   WPShaderValueUpdater.cpp
   WPTexImageParser.cpp
