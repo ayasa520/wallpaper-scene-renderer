@@ -2904,9 +2904,8 @@ LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32
         CollectResidencyNodeResources(scene, node, resources);
     }
 
-    if (auto render_targets_it = scene.objectRuntimeRenderTargets.find(layer_id);
-        render_targets_it != scene.objectRuntimeRenderTargets.end()) {
-        for (const auto& key : render_targets_it->second) {
+    if (auto* effect_layer = const_cast<Scene&>(scene).FindImageEffectLayer(layer_id)) {
+        for (const auto& key : effect_layer->RuntimeRenderTargetNames()) {
             if (!key.empty() && key != SpecTex_Default) resources.render_targets.insert(key);
         }
     }
@@ -3799,6 +3798,9 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // names (puppet surface camera) must stay readable.
         if (const auto* destroyed_object = opaque->scene->FindSceneObject(layer_id)) {
             if (const auto effect_layer = destroyed_object->ImageEffectLayer()) {
+                for (const auto& render_target : effect_layer->RuntimeRenderTargetNames()) {
+                    opaque->scene->renderTargets.erase(render_target);
+                }
                 for (const auto& camera_name : effect_layer->RuntimeCameraNames()) {
                     for (auto& [linked_name, linked_cameras] : opaque->scene->linkedCameras) {
                         linked_cameras.erase(
@@ -3814,13 +3816,6 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // there now. Children keep their dangling parent id, exactly like the previous
         // per-concern maps did.
         opaque->scene->DestroySceneObject(layer_id);
-        if (auto render_targets_it = opaque->scene->objectRuntimeRenderTargets.find(layer_id);
-            render_targets_it != opaque->scene->objectRuntimeRenderTargets.end()) {
-            for (const auto& render_target : render_targets_it->second) {
-                opaque->scene->renderTargets.erase(render_target);
-            }
-            opaque->scene->objectRuntimeRenderTargets.erase(render_targets_it);
-        }
         if (auto lights_it = opaque->scene->objectRuntimeLights.find(layer_id);
             lights_it != opaque->scene->objectRuntimeLights.end()) {
             auto& lights = opaque->scene->lights;
@@ -5273,14 +5268,14 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                 }
             }
 
-            if (auto render_targets_it = opaque->scene->objectRuntimeRenderTargets.find(layer_id);
-                render_targets_it != opaque->scene->objectRuntimeRenderTargets.end() &&
-                old_size[0] > 0.0f && old_size[1] > 0.0f) {
+            if (auto* resize_effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
+                resize_effect_layer != nullptr && old_size[0] > 0.0f && old_size[1] > 0.0f) {
                 const double scale_x =
                     static_cast<double>(new_size[0]) / static_cast<double>(old_size[0]);
                 const double scale_y =
                     static_cast<double>(new_size[1]) / static_cast<double>(old_size[1]);
-                for (const auto& render_target_name : render_targets_it->second) {
+                for (const auto& render_target_name :
+                     resize_effect_layer->RuntimeRenderTargetNames()) {
                     auto render_target_it = opaque->scene->renderTargets.find(render_target_name);
                     if (render_target_it == opaque->scene->renderTargets.end()) continue;
                     auto& render_target = render_target_it->second;

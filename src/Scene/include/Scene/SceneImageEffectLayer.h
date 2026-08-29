@@ -193,6 +193,15 @@ public:
         m_runtime_camera_names.push_back(std::move(camera_name));
     }
     const std::vector<std::string>& RuntimeCameraNames() const { return m_runtime_camera_names; }
+
+    // Names of the Scene::renderTargets entries this bridge materialized (ping-pong pair, effect
+    // FBOs, puppet surface target). Same ownership contract as the runtime camera names.
+    void AddRuntimeRenderTargetName(std::string render_target_name) {
+        m_runtime_render_target_names.push_back(std::move(render_target_name));
+    }
+    const std::vector<std::string>& RuntimeRenderTargetNames() const {
+        return m_runtime_render_target_names;
+    }
     void SetPuppetSurfaceProjection(PuppetSurfaceProjection projection);
     const PuppetSurfaceProjection* GetPuppetSurfaceProjection() const {
         return m_puppet_surface_projection.has_value()
@@ -274,6 +283,7 @@ private:
     };
     std::string m_layer_surface_camera;
     std::vector<std::string> m_runtime_camera_names;
+    std::vector<std::string> m_runtime_render_target_names;
     std::optional<PuppetSurfaceProjection> m_puppet_surface_projection;
     bool m_copy_background { false };
     //    std::vector<float> m_size;
