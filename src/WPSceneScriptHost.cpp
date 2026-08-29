@@ -2827,29 +2827,18 @@ void PushUniqueResidencyNode(SceneNode* node, std::vector<SceneNode*>& nodes,
 void CollectLayerEffectResidencyNodes(const Scene& scene, int32_t layer_id,
                                       std::vector<SceneNode*>& nodes,
                                       std::unordered_set<SceneNode*>& seen) {
-    auto camera_names_it = scene.objectRuntimeCameraNames.find(layer_id);
-    if (camera_names_it == scene.objectRuntimeCameraNames.end()) return;
+    auto* effect_layer = const_cast<Scene&>(scene).FindImageEffectLayer(layer_id);
+    if (effect_layer == nullptr) return;
 
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = scene.cameras.find(camera_name);
-        if (camera_it == scene.cameras.end() || !camera_it->second ||
-            !camera_it->second->HasImgEffect()) {
-            continue;
-        }
+    if (effect_layer->HasFinalComposite()) {
+        PushUniqueResidencyNode(&effect_layer->FinalNode(), nodes, seen);
+    }
 
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr) continue;
-
-        if (effect_layer->HasFinalComposite()) {
-            PushUniqueResidencyNode(&effect_layer->FinalNode(), nodes, seen);
-        }
-
-        for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
-            auto& effect = effect_layer->GetEffect(effect_index);
-            if (!effect) continue;
-            for (auto& effect_node : effect->nodes) {
-                PushUniqueResidencyNode(effect_node.sceneNode.get(), nodes, seen);
-            }
+    for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
+        auto& effect = effect_layer->GetEffect(effect_index);
+        if (!effect) continue;
+        for (auto& effect_node : effect->nodes) {
+            PushUniqueResidencyNode(effect_node.sceneNode.get(), nodes, seen);
         }
     }
 }
@@ -3370,25 +3359,14 @@ std::vector<SceneNode*> CollectPuppetLayerNodes(const WPSceneScriptHost::Opaque*
         }
     }
 
-    if (const auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
-        camera_names_it != opaque->scene->objectRuntimeCameraNames.end()) {
-        for (const auto& camera_name : camera_names_it->second) {
-            auto camera_it = opaque->scene->cameras.find(camera_name);
-            if (camera_it == opaque->scene->cameras.end() || ! camera_it->second ||
-                ! camera_it->second->HasImgEffect()) {
-                continue;
-            }
-
-            auto& effect_layer = camera_it->second->GetImgEffect();
-            if (! effect_layer) continue;
-
-            add_if_puppet(&effect_layer->FinalNode());
-            for (std::size_t effect_index = 0; effect_index < effect_layer->EffectCount();
-                 effect_index++) {
-                auto& effect = effect_layer->GetEffect(effect_index);
-                for (auto& effect_node : effect->nodes) {
-                    add_if_puppet(effect_node.sceneNode.get());
-                }
+    if (auto* effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
+        effect_layer != nullptr) {
+        add_if_puppet(&effect_layer->FinalNode());
+        for (std::size_t effect_index = 0; effect_index < effect_layer->EffectCount();
+             effect_index++) {
+            auto& effect = effect_layer->GetEffect(effect_index);
+            for (auto& effect_node : effect->nodes) {
+                add_if_puppet(effect_node.sceneNode.get());
             }
         }
     }
@@ -4225,26 +4203,17 @@ void ForEachEffectLayerMaterial(WPSceneScriptHost::Opaque* opaque, int32_t layer
                                 Visitor&& visitor) {
     if (opaque == nullptr || opaque->scene == nullptr) return;
 
-    auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
-    if (camera_names_it == opaque->scene->objectRuntimeCameraNames.end()) return;
+    auto* effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
+    if (effect_layer == nullptr) return;
 
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = opaque->scene->cameras.find(camera_name);
-        if (camera_it == opaque->scene->cameras.end() || ! camera_it->second->HasImgEffect())
-            continue;
-
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr) continue;
-
-        for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
-            auto& effect = effect_layer->GetEffect(effect_index);
-            for (auto& effect_node : effect->nodes) {
-                auto* node = effect_node.sceneNode.get();
-                if (node == nullptr || node->Mesh() == nullptr ||
-                    node->Mesh()->Material() == nullptr)
-                    continue;
-                visitor(*node->Mesh()->Material(), node, effect_node.output);
-            }
+    for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
+        auto& effect = effect_layer->GetEffect(effect_index);
+        for (auto& effect_node : effect->nodes) {
+            auto* node = effect_node.sceneNode.get();
+            if (node == nullptr || node->Mesh() == nullptr ||
+                node->Mesh()->Material() == nullptr)
+                continue;
+            visitor(*node->Mesh()->Material(), node, effect_node.output);
         }
     }
 }
@@ -4380,23 +4349,14 @@ void SyncEffectLayerTransforms(WPSceneScriptHost::Opaque* opaque, int32_t layer_
                                SceneNode* node) {
     if (opaque == nullptr || opaque->scene == nullptr || node == nullptr) return;
 
-    auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
-    if (camera_names_it == opaque->scene->objectRuntimeCameraNames.end()) return;
+    auto* effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
+    if (effect_layer == nullptr) return;
 
-    for (const auto& camera_name : camera_names_it->second) {
-        auto camera_it = opaque->scene->cameras.find(camera_name);
-        if (camera_it == opaque->scene->cameras.end() || ! camera_it->second->HasImgEffect())
-            continue;
-
-        auto* effect_layer = camera_it->second->GetImgEffect().get();
-        if (effect_layer == nullptr) continue;
-
-        if (effect_layer->WorldNode() != nullptr) {
-            effect_layer->SyncResolvedNodeToWorld();
-        } else {
-            effect_layer->SyncResolvedNodeToMatrix(
-                Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
-        }
+    if (effect_layer->WorldNode() != nullptr) {
+        effect_layer->SyncResolvedNodeToWorld();
+    } else {
+        effect_layer->SyncResolvedNodeToMatrix(
+            Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
     }
 }
 
