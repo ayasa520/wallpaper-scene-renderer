@@ -2294,8 +2294,8 @@ std::optional<std::array<uint32_t, 2>> ResolveTextBridgeProjection(
         return std::nullopt;
     }
 
-    const auto node_it = scene.layerNodes.find(layer_id);
-    if (node_it == scene.layerNodes.end() || node_it->second == nullptr) {
+    SceneNode* layer_node = scene.GetLayerNode(layer_id);
+    if (layer_node == nullptr) {
         return std::nullopt;
     }
 
@@ -2307,7 +2307,7 @@ std::optional<std::array<uint32_t, 2>> ResolveTextBridgeProjection(
 
     const Eigen::Matrix4d model =
         scene.shaderValueUpdater->ResolveModelTransformForProjection(
-            node_it->second, scene.activeCamera, true);
+            layer_node, scene.activeCamera, true);
     const Eigen::Matrix4d local_to_clip =
         scene.activeCamera->GetViewProjectionMatrix() * model;
 
@@ -3047,10 +3047,9 @@ std::vector<SceneNode*> FindTextPrimitiveRuntimeNodes(Scene& scene, int32_t laye
         }
     }
     if (nodes.empty()) {
-        if (auto layer_node_it = scene.layerNodes.find(layer_id);
-            layer_node_it != scene.layerNodes.end() && layer_node_it->second != nullptr &&
-            layer_node_it->second->Text() != nullptr) {
-            nodes.push_back(layer_node_it->second);
+        if (SceneNode* layer_node = scene.GetLayerNode(layer_id);
+            layer_node != nullptr && layer_node->Text() != nullptr) {
+            nodes.push_back(layer_node);
         }
     }
     return nodes;
@@ -3270,9 +3269,8 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
     const bool alignment_changed = previous_geometry.alignment != next_geometry.alignment;
 
     if (placement_display_size_changed || alignment_changed) {
-        if (auto layer_node_it = scene.layerNodes.find(layer_id);
-            layer_node_it != scene.layerNodes.end()) {
-            ApplyTextLayerNodeAlignmentOffset(layer_node_it->second, state);
+        if (scene.HasLayerNodeSlot(layer_id)) {
+            ApplyTextLayerNodeAlignmentOffset(scene.GetLayerNode(layer_id), state);
         }
     }
 
@@ -3555,12 +3553,10 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
             continue;
         }
 
-        auto layer_node_it = scene.layerNodes.find(layer_id);
-        if (layer_node_it == scene.layerNodes.end() || layer_node_it->second == nullptr) {
+        SceneNode* layer_node = scene.GetLayerNode(layer_id);
+        if (layer_node == nullptr) {
             continue;
         }
-
-        SceneNode* layer_node = layer_node_it->second;
         const auto anchored_origin = ResolveScreenAnchoredTextOrigin(*frame, state.object);
         const Eigen::Vector3f next_translation {
             anchored_origin[0],

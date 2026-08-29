@@ -957,7 +957,10 @@ int32_t AllocateDynamicLayerId(const Scene& scene) {
     for (const auto layer_id : scene.layerOrder) {
         max_id = std::max(max_id, layer_id);
     }
-    for (const auto& [layer_id, _] : scene.layerNodes) {
+    // Every registered layer-node slot lives on a SceneObject, so scanning the identity map covers
+    // the former layerNodes keys (and any identity-bearing id beyond them, which only makes the
+    // allocated id safer against reuse).
+    for (const auto& [layer_id, _] : scene.sceneObjects) {
         (void)_;
         max_id = std::max(max_id, layer_id);
     }
@@ -2054,24 +2057,24 @@ void RestoreRenderOrderProxyChildrenForLayer(Scene& scene, int32_t parent_layer_
         const auto binding = scene.GetLayerParentBinding(child_layer_id);
         if (binding.parent_id != parent_layer_id || ! binding.attachment.empty()) continue;
 
-        const auto child_node_it = scene.layerNodes.find(child_layer_id);
-        if (child_node_it == scene.layerNodes.end() || child_node_it->second == nullptr) continue;
+        SceneNode* child_node = scene.GetLayerNode(child_layer_id);
+        if (child_node == nullptr) continue;
 
         // Deferred parent materialization replaces the placeholder node that owned the authored
         // render-order proxy bucket. Existing children may be lightweight containers that are not
         // materialized themselves, so rebuild the parent->child route from layer bindings instead
         // of waiting for every child parser to run again.
-        if (std::find(routed_children.begin(), routed_children.end(), child_node_it->second) ==
+        if (std::find(routed_children.begin(), routed_children.end(), child_node) ==
             routed_children.end()) {
-            routed_children.push_back(child_node_it->second);
+            routed_children.push_back(child_node);
         }
-        scene.renderOrderProxyNodes.insert(child_node_it->second);
+        scene.renderOrderProxyNodes.insert(child_node);
         LOG_INFO("SceneRenderOrderProxyRestore: parent-layer=%d proxy-layer=%d parent-name='%s' "
                  "proxy-name='%s'",
                  parent_layer_id,
                  child_layer_id,
                  parent_node->Name().c_str(),
-                 child_node_it->second->Name().c_str());
+                 child_node->Name().c_str());
     }
 
     if (routed_children.empty()) {
@@ -2664,7 +2667,7 @@ void ReplaceDeferredPlaceholderNode(ParseContext& context, int32_t layer_id,
     // Hidden runtime layers are first represented by lightweight placeholder nodes so scripts and
     // user bindings have a stable layer identity. Some authored attachment children are real
     // SceneNode children of that placeholder. Destroying the placeholder without first adopting
-    // those children leaves scene.layerNodes, objectRuntimeNodes, and shader-data parent pointers
+    // those children leaves layer-node slots, objectRuntimeNodes, and shader-data parent pointers
     // aimed at freed memory; later allocations can reuse the same address and create recursive or
     // dangling transform chains during uniform updates.
     auto adopted_children = ExtractDirectChildren(placeholder_node.get());
@@ -8670,8 +8673,12 @@ bool InitDynamicParseContext(ParseContext& context, Scene& scene,
 
     std::unordered_map<SceneNode*, std::shared_ptr<SceneNode>> shared_nodes;
     CollectSceneNodeRefs(scene.sceneGraph, shared_nodes);
-    for (const auto& [layer_id, node] : scene.layerNodes) {
-        auto node_it = shared_nodes.find(node);
+    for (const auto& [layer_id, object] : scene.sceneObjects) {
+        if (object == nullptr || ! object->HasLayerNodeSlot()) continue;
+        // A registered slot may hold a null handle; downstream lookups tolerate that exactly like
+        // the former map's null entries did.
+        SceneNode* node    = object->LayerNode();
+        auto       node_it = shared_nodes.find(node);
         if (node_it != shared_nodes.end()) {
             context.object_nodes[layer_id] = node_it->second;
         }
@@ -8855,7 +8862,7 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     if (auto* scene_object = scene.FindSceneObject(layer_id)) {
         scene_object->ClearImageRuntimeState();
     }
-    scene.layerNodes[layer_id] = nullptr;
+    scene.SetLayerNode(layer_id, nullptr);
 
     if (object_json.contains("shape") && ! object_json.at("shape").is_null()) {
         WPShapeObject object;
@@ -8882,7 +8889,7 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     RegisterEffectVisibilityBindings(context, object_json);
 
     ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
-    scene.layerNodes[layer_id] = node_it->second.get();
+    scene.SetLayerNode(layer_id, node_it->second.get());
     RestoreRenderOrderProxyChildrenForLayer(scene, layer_id, node_it->second.get());
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
         if (it->second == layer_id) {
@@ -8940,14 +8947,14 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
     }
 
     scene.objectRuntimeNodes.erase(layer_id);
-    scene.layerNodes[layer_id] = nullptr;
+    scene.SetLayerNode(layer_id, nullptr);
 
     ParseParticleObj(context, object);
     auto node_it = context.object_nodes.find(layer_id);
     if (node_it == context.object_nodes.end() || ! node_it->second) return false;
 
     ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
-    scene.layerNodes[layer_id] = node_it->second.get();
+    scene.SetLayerNode(layer_id, node_it->second.get());
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
         if (it->second == layer_id) {
             it = scene.layerNameToId.erase(it);
@@ -9008,7 +9015,7 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     }
 
     scene.objectRuntimeNodes.erase(layer_id);
-    scene.layerNodes[layer_id] = nullptr;
+    scene.SetLayerNode(layer_id, nullptr);
 
     ParseTextObj(context, object);
     auto node_it = context.object_nodes.find(layer_id);
@@ -9020,7 +9027,7 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     RegisterEffectVisibilityBindings(context, object_json);
 
     ReplaceDeferredPlaceholderNode(context, layer_id, placeholder_node, node_it->second);
-    scene.layerNodes[layer_id] = node_it->second.get();
+    scene.SetLayerNode(layer_id, node_it->second.get());
     for (auto it = scene.layerNameToId.begin(); it != scene.layerNameToId.end();) {
         if (it->second == layer_id) {
             it = scene.layerNameToId.erase(it);
@@ -9054,7 +9061,7 @@ bool wallpaper::CreateDynamicSceneLayer(
     nlohmann::json normalized_object_json = object_json;
     int32_t        layer_id               = 0;
     GET_JSON_NAME_VALUE_NOWARN(normalized_object_json, "id", layer_id);
-    if (layer_id <= 0 || scene.layerNodes.count(layer_id) != 0 ||
+    if (layer_id <= 0 || scene.HasLayerNodeSlot(layer_id) ||
         scene.objectRuntimeNodes.count(layer_id) != 0) {
         layer_id                     = AllocateDynamicLayerId(scene);
         normalized_object_json["id"] = layer_id;
@@ -9076,7 +9083,7 @@ bool wallpaper::CreateDynamicSceneLayer(
     RegisterSceneScriptsForObject(context, normalized_object_json);
 
     scene.layerOrder.push_back(layer_id);
-    scene.layerNodes[layer_id] = layer_node;
+    scene.SetLayerNode(layer_id, layer_node);
     scene.SetLayerInitialConfigJson(layer_id, normalized_object_json.dump());
     std::string layer_name = layer_node != nullptr
                                  ? layer_node->Name()
@@ -9466,7 +9473,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     RegisterSceneScripts(context, json);
 
     context.scene->layerOrder.clear();
-    context.scene->layerNodes.clear();
+    context.scene->ClearAllLayerNodeSlots();
     context.scene->ClearAllLayerInitialConfigJson();
     context.scene->layerNameToId.clear();
     for (const auto& obj : wp_objs) {
@@ -9475,9 +9482,10 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
         auto node_it = context.object_nodes.find(*object_id);
         context.scene->layerOrder.push_back(*object_id);
-        context.scene->layerNodes[*object_id] =
-            node_it != context.object_nodes.end() && node_it->second ? node_it->second.get()
-                                                                     : nullptr;
+        context.scene->SetLayerNode(*object_id,
+                                    node_it != context.object_nodes.end() && node_it->second
+                                        ? node_it->second.get()
+                                        : nullptr);
         if (auto config_it = initial_layer_config_json_by_id.find(*object_id);
             config_it != initial_layer_config_json_by_id.end()) {
             context.scene->SetLayerInitialConfigJson(*object_id, config_it->second);

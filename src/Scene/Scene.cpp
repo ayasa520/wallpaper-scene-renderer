@@ -627,6 +627,39 @@ void Scene::ClearAllLayerInitialConfigJson() {
     }
 }
 
+void Scene::SetLayerNode(int32_t layer_id, SceneNode* node) {
+    if (layer_id == 0) return;
+    EnsureSceneObject(layer_id).SetLayerNode(node);
+}
+
+SceneNode* Scene::GetLayerNode(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? nullptr : object->LayerNode();
+}
+
+bool Scene::HasLayerNodeSlot(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object != nullptr && object->HasLayerNodeSlot();
+}
+
+void Scene::ClearAllLayerNodeSlots() {
+    for (auto& [layer_id, object] : sceneObjects) {
+        (void)layer_id;
+        if (object != nullptr) object->ClearLayerNodeSlot();
+    }
+}
+
+int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {
+    // A null query must not match registered-but-null slots.
+    if (node == nullptr) return 0;
+    for (const auto& [layer_id, object] : sceneObjects) {
+        if (object != nullptr && object->HasLayerNodeSlot() && object->LayerNode() == node) {
+            return layer_id;
+        }
+    }
+    return 0;
+}
+
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {
@@ -685,8 +718,10 @@ void Scene::ApplyAllLayerVisibility() {
     for (const auto layer_id : layerOrder) {
         ApplyLayerVisibilityRecursive(*this, layer_id, visited);
     }
-    for (const auto& [layer_id, _] : layerNodes) {
-        ApplyLayerVisibilityRecursive(*this, layer_id, visited);
+    for (const auto& [layer_id, object] : sceneObjects) {
+        if (object != nullptr && object->HasLayerNodeSlot()) {
+            ApplyLayerVisibilityRecursive(*this, layer_id, visited);
+        }
     }
     if (!cameraLayers.empty()) UpdateActiveCameraLayer();
 }
