@@ -3031,11 +3031,8 @@ std::string MakeTextLayerGlyphPageTextureKey(int32_t object_id, uint32_t page_in
 
 std::vector<SceneNode*> FindTextPrimitiveRuntimeNodes(Scene& scene, int32_t layer_id) {
     std::vector<SceneNode*> nodes;
-    if (const auto runtime_nodes_it = scene.objectRuntimeNodes.find(layer_id);
-        runtime_nodes_it != scene.objectRuntimeNodes.end()) {
-        for (auto* node : runtime_nodes_it->second) {
-            if (node != nullptr && node->Text() != nullptr) nodes.push_back(node);
-        }
+    for (auto* node : scene.GetLayerRuntimeNodes(layer_id)) {
+        if (node != nullptr && node->Text() != nullptr) nodes.push_back(node);
     }
     if (nodes.empty()) {
         if (SceneNode* layer_node = scene.GetLayerNode(layer_id);

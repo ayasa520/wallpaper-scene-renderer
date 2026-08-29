@@ -181,6 +181,14 @@ public:
     const std::vector<ParticleSubSystem*>&
     GetLayerRuntimeParticleSubsystems(int32_t layer_id) const;
 
+    // Runtime draw-handle bookkeeping, backed by SceneObject::RuntimeNodes. Same semantics as the
+    // former objectRuntimeNodes map: an empty list means the layer has no live draw handles (the
+    // former map never stored an empty entry), and ClearLayerRuntimeNodes replaces the former
+    // per-layer erase at the points where the nodes themselves are freed.
+    void AddLayerRuntimeNode(int32_t layer_id, SceneNode* node);
+    const std::vector<SceneNode*>& GetLayerRuntimeNodes(int32_t layer_id) const;
+    void ClearLayerRuntimeNodes(int32_t layer_id);
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -249,7 +257,6 @@ public:
     // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
-    std::unordered_map<int32_t, std::vector<SceneNode*>> objectRuntimeNodes;
     std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
     std::vector<int32_t>                                  cameraLayerOrder;

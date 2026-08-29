@@ -106,8 +106,9 @@ void ReleaseUploadedFileMeshCpu(wallpaper::Scene& scene) {
         if (mesh.FileImmutable() && mesh.HasCpuPayload()) mesh.ReleaseCpuPayload();
     };
     WalkSceneMeshes(scene.sceneGraph.get(), release);
-    for (auto& [_, nodes] : scene.objectRuntimeNodes) {
-        for (auto* node : nodes) WalkSceneMeshes(node, release);
+    for (auto& [_, object] : scene.sceneObjects) {
+        if (object == nullptr) continue;
+        for (auto* node : object->RuntimeNodes()) WalkSceneMeshes(node, release);
     }
 }
 

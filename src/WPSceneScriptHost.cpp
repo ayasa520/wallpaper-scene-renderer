@@ -2844,11 +2844,8 @@ std::vector<SceneNode*> CollectLayerResidencyNodes(const Scene& scene, int32_t l
     std::vector<SceneNode*> nodes;
     std::unordered_set<SceneNode*> seen;
 
-    if (auto runtime_nodes_it = scene.objectRuntimeNodes.find(layer_id);
-        runtime_nodes_it != scene.objectRuntimeNodes.end()) {
-        for (auto* node : runtime_nodes_it->second) {
-            PushUniqueResidencyNode(node, nodes, seen);
-        }
+    for (auto* node : scene.GetLayerRuntimeNodes(layer_id)) {
+        PushUniqueResidencyNode(node, nodes, seen);
     }
     CollectLayerEffectResidencyNodes(scene, layer_id, nodes, seen);
     return nodes;
@@ -2915,8 +2912,10 @@ LayerResidencyResources CollectRetainedResidencyResources(
     LayerResidencyResources resources;
     std::unordered_set<int32_t> visited_layers;
 
-    for (const auto& [layer_id, _] : scene.objectRuntimeNodes) {
-        (void)_;
+    // Iterate the identity map and skip layers without live draw handles: the former
+    // objectRuntimeNodes map only ever held non-empty entries, so this reproduces its key set.
+    for (const auto& [layer_id, object] : scene.sceneObjects) {
+        if (object == nullptr || object->RuntimeNodes().empty()) continue;
         if (!visited_layers.insert(layer_id).second) continue;
         if (excluded_layers.count(layer_id) != 0) continue;
         if (!RetainsGpuResidencyWhileHidden(scene, layer_id)) continue;
@@ -3242,10 +3241,7 @@ SceneNode* ResolveTextureAnimationNode(WPSceneScriptHost::Opaque* opaque, SceneN
     const int32_t layer_id = FindOwningLayerId(opaque, node);
     if (layer_id == 0 || opaque->scene == nullptr) return nullptr;
 
-    const auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
-    if (runtime_nodes_it == opaque->scene->objectRuntimeNodes.end()) return nullptr;
-
-    for (auto* runtime_node : runtime_nodes_it->second) {
+    for (auto* runtime_node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
         if (runtime_node == nullptr) continue;
         EnsureTextureAnimationStatesForNode(opaque, runtime_node);
         const auto state_it = opaque->texture_states.find(runtime_node);
@@ -3286,13 +3282,10 @@ std::vector<std::string> ResolveVideoTextureKeysForNode(WPSceneScriptHost::Opaqu
     if (layer_id == 0) layer_id = FindNodeId(opaque, node);
     if (layer_id == 0) return keys;
 
-    const auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
-    if (runtime_nodes_it == opaque->scene->objectRuntimeNodes.end()) return keys;
-
     // Video layers can render through runtime child/source nodes instead of the authored layer
     // proxy node. Walk the whole runtime-node set so getVideoTexture() controls the decoder that
     // actually feeds the prepared custom-shader pass.
-    for (auto* runtime_node : runtime_nodes_it->second) {
+    for (auto* runtime_node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
         CollectVideoTextureKeysForNode(opaque, runtime_node, &keys, &seen_keys);
     }
 
@@ -3310,10 +3303,7 @@ SceneNode* ResolvePuppetLayerNode(const WPSceneScriptHost::Opaque* opaque, Scene
     const int32_t layer_id = FindOwningLayerId(opaque, node);
     if (layer_id == 0 || opaque->scene == nullptr) return nullptr;
 
-    const auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
-    if (runtime_nodes_it == opaque->scene->objectRuntimeNodes.end()) return nullptr;
-
-    for (auto* runtime_node : runtime_nodes_it->second) {
+    for (auto* runtime_node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
         if (runtime_node == nullptr) continue;
         if (const auto* data = GetNodeData(opaque, runtime_node);
             data != nullptr && data->puppet_layer.hasPuppet()) {
@@ -3348,11 +3338,8 @@ std::vector<SceneNode*> CollectPuppetLayerNodes(const WPSceneScriptHost::Opaque*
     if (layer_id == 0) layer_id = FindNodeId(opaque, node);
     if (layer_id == 0) return result;
 
-    if (const auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
-        runtime_nodes_it != opaque->scene->objectRuntimeNodes.end()) {
-        for (auto* runtime_node : runtime_nodes_it->second) {
-            add_if_puppet(runtime_node);
-        }
+    for (auto* runtime_node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
+        add_if_puppet(runtime_node);
     }
 
     if (auto* effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
@@ -3716,18 +3703,14 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // retained layer.
         QueueLayerResourceRelease(*opaque->scene, layer_id, retained_resources, "destroy");
 
-        auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
-
         std::unordered_set<SceneNode*>          destroyed_nodes;
         std::vector<std::shared_ptr<SceneNode>> detached_roots;
-        if (runtime_nodes_it != opaque->scene->objectRuntimeNodes.end()) {
-            for (SceneNode* runtime_node : runtime_nodes_it->second) {
-                if (runtime_node == nullptr) continue;
-                CollectNodeSubtree(runtime_node, destroyed_nodes);
-                if (auto* parent = runtime_node->Parent()) {
-                    if (auto detached = ExtractChildNode(parent, runtime_node)) {
-                        detached_roots.push_back(std::move(detached));
-                    }
+        for (SceneNode* runtime_node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
+            if (runtime_node == nullptr) continue;
+            CollectNodeSubtree(runtime_node, destroyed_nodes);
+            if (auto* parent = runtime_node->Parent()) {
+                if (auto detached = ExtractChildNode(parent, runtime_node)) {
+                    detached_roots.push_back(std::move(detached));
                 }
             }
         }
@@ -3782,7 +3765,10 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             opaque->scene->nodeOwners.erase(node);
         }
 
-        opaque->scene->objectRuntimeNodes.erase(layer_id);
+        // The layer's nodes were just detached above and are freed when detached_roots goes out
+        // of scope, so drop the object's draw-handle records at the same point the former
+        // Scene-level map entry was erased.
+        opaque->scene->ClearLayerRuntimeNodes(layer_id);
         // The mounted sound stream must be stopped while the SceneObject that records its handle
         // still exists, so unmount before the identity is destroyed below.
         if (const auto sound_handle = opaque->scene->GetLayerSoundHandle(layer_id);
@@ -4184,10 +4170,7 @@ void ForEachBaseLayerMaterial(WPSceneScriptHost::Opaque* opaque, int32_t layer_i
                               Visitor&& visitor) {
     if (opaque == nullptr || opaque->scene == nullptr) return;
 
-    auto runtime_nodes_it = opaque->scene->objectRuntimeNodes.find(layer_id);
-    if (runtime_nodes_it == opaque->scene->objectRuntimeNodes.end()) return;
-
-    for (auto* node : runtime_nodes_it->second) {
+    for (auto* node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
         if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr)
             continue;
         visitor(*node->Mesh()->Material(), node);
