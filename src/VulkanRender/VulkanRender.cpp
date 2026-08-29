@@ -1021,9 +1021,9 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     bool  use_active_global_perspective_fov = false;
     float active_global_perspective_fov = 50.0f;
     if (scene.activeCameraLayerId != 0) {
-        auto active_layer_it = scene.cameraLayers.find(scene.activeCameraLayerId);
-        if (active_layer_it != scene.cameraLayers.end()) {
-            const auto& active_layer = active_layer_it->second;
+        if (const auto* active_layer_state =
+                scene.FindCameraLayerState(scene.activeCameraLayerId)) {
+            const auto& active_layer = *active_layer_state;
             if (active_layer.camera_name.empty() || active_layer.camera_name == "global") {
                 if (std::isfinite(active_layer.zoom) && active_layer.zoom > 0.0001) {
                     active_global_zoom = active_layer.zoom;

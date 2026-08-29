@@ -54,6 +54,20 @@ struct SceneImageLayerRuntimeState {
     std::string          alignment { "center" };
 };
 
+// Wallpaper Engine camera layers are represented in scene.json as transform-only objects with
+// camera-specific properties. Keep the authored values beside the render node so scripts and
+// keyframe animations can round-trip the WE-facing origin/zoom values while Hanabi stores the
+// attached SceneCamera node in renderer coordinates. Like the image runtime state, the record
+// lives on the owning SceneObject; the scene-wide camera-layer precedence order stays on Scene.
+struct SceneCameraLayerRuntimeState {
+    std::string                camera_name { "global" };
+    std::shared_ptr<SceneNode> node;
+    std::array<float, 3>       origin { 0.0f, 0.0f, 0.0f };
+    std::array<float, 3>       angles { 0.0f, 0.0f, 0.0f };
+    double                     zoom { 1.0 };
+    float                      fov { 50.0f };
+};
+
 // One scene.json object. This is the only authored layer identity: id, name, kind, authored
 // transform, local visibility, parent binding, and image-layer runtime state all live here.
 // Draw phases (source draw, effect passes, final composite) reference this object through its id
@@ -184,6 +198,19 @@ public:
     TextLayerRuntimeState* TextRuntimeState() const { return m_text_runtime_state.get(); }
     void                   SetTextRuntimeState(TextLayerRuntimeState state);
 
+    // Camera layers keep their runtime record here; nullptr means "not a camera layer".
+    // Registration overwrites the record exactly like the former Scene::cameraLayers map entry.
+    SceneCameraLayerRuntimeState* CameraRuntimeState() {
+        return m_has_camera_runtime_state ? &m_camera_runtime_state : nullptr;
+    }
+    const SceneCameraLayerRuntimeState* CameraRuntimeState() const {
+        return m_has_camera_runtime_state ? &m_camera_runtime_state : nullptr;
+    }
+    void SetCameraRuntimeState(SceneCameraLayerRuntimeState state) {
+        m_camera_runtime_state     = std::move(state);
+        m_has_camera_runtime_state = true;
+    }
+
     // The authored scene.json record for this object, normalized to its parse-time id. Deferred
     // layers re-parse it on materialization and scripts read originalOrigin and the initial
     // config from it. nullptr means no record (sound-only and some helper layers).
@@ -242,6 +269,9 @@ private:
     std::vector<SceneNode*>         m_runtime_nodes;
 
     std::unique_ptr<TextLayerRuntimeState> m_text_runtime_state;
+
+    bool                         m_has_camera_runtime_state { false };
+    SceneCameraLayerRuntimeState m_camera_runtime_state;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;

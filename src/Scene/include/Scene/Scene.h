@@ -63,18 +63,9 @@ public:
     // established Scene-facing type name for accessors and script-host call sites.
     using ImageLayerRuntimeState = SceneImageLayerRuntimeState;
 
-    struct CameraLayerRuntimeState {
-        // Wallpaper Engine camera layers are represented in scene.json as transform-only objects
-        // with camera-specific properties. Keep the authored values beside the render node so
-        // scripts and keyframe animations can round-trip the WE-facing origin/zoom values while
-        // Hanabi stores the attached SceneCamera node in renderer coordinates.
-        std::string                camera_name { "global" };
-        std::shared_ptr<SceneNode> node;
-        std::array<float, 3>       origin { 0.0f, 0.0f, 0.0f };
-        std::array<float, 3>       angles { 0.0f, 0.0f, 0.0f };
-        double                     zoom { 1.0 };
-        float                      fov { 50.0f };
-    };
+    // Camera-layer runtime state now lives on the owning SceneObject; the alias keeps the
+    // established Scene-facing type name for accessors and script-host call sites.
+    using CameraLayerRuntimeState = SceneCameraLayerRuntimeState;
 
     struct LayerParentBinding {
         int32_t     parent_id { 0 };
@@ -196,6 +187,15 @@ public:
     TextLayerRuntimeState*       FindTextLayerState(int32_t layer_id);
     const TextLayerRuntimeState* FindTextLayerState(int32_t layer_id) const;
 
+    // Camera-layer runtime-state bookkeeping, backed by SceneObject::CameraRuntimeState. Same
+    // semantics as the former cameraLayers map: registration overwrites the record, nullptr means
+    // "not a camera layer", and records are never erased at runtime. The scene-wide precedence
+    // order (cameraLayerOrder) stays on Scene because it is cross-layer state.
+    void SetCameraLayerState(int32_t layer_id, CameraLayerRuntimeState state);
+    CameraLayerRuntimeState*       FindCameraLayerState(int32_t layer_id);
+    const CameraLayerRuntimeState* FindCameraLayerState(int32_t layer_id) const;
+    bool HasCameraLayers() const { return ! cameraLayerOrder.empty(); }
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -264,8 +264,9 @@ public:
     // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
-    std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;
-    std::vector<int32_t>                                  cameraLayerOrder;
+    // First-registration order of camera layers; the bottom-most visible one wins as the active
+    // view. Entries are appended once per layer id and never removed at runtime.
+    std::vector<int32_t> cameraLayerOrder;
     std::unordered_map<SceneNode*, int32_t> nodeOwners;
     std::unordered_map<std::string, int32_t> layerNameToId;
     std::unordered_set<int32_t>              offscreenDependencyLayerIds;

@@ -5475,8 +5475,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
 const Scene::CameraLayerRuntimeState*
 FindCameraLayerState(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->cameraLayers.find(layer_id);
-    return it == opaque->scene->cameraLayers.end() ? nullptr : &it->second;
+    return static_cast<const Scene*>(opaque->scene)->FindCameraLayerState(layer_id);
 }
 
 Scene::CameraLayerRuntimeState*
