@@ -3892,13 +3892,23 @@ void UpdateSceneLightingUniforms(WPSceneScriptHost::Opaque* opaque) {
 
     const auto ambient  = opaque->scene->ambientColor;
     const auto skylight = opaque->scene->skylightColor;
-    TraverseSceneNodes(opaque->scene->sceneGraph.get(), [&](SceneNode* node) {
+    const auto apply_to_node = [&](SceneNode* node) {
         if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr)
             return;
         auto& const_values                   = node->Mesh()->Material()->customShader.constValues;
         const_values["g_LightAmbientColor"]  = ambient;
         const_values["g_LightSkylightColor"] = skylight;
-    });
+    };
+    TraverseSceneNodes(opaque->scene->sceneGraph.get(), apply_to_node);
+    // Detached effect-source nodes are bridge-owned and no longer live in the scene tree, but
+    // they carry the layer's actual image material and must keep receiving ambient updates. The
+    // per-layer runtime-node lists cover them; re-writing tree-owned nodes is an idempotent
+    // assignment.
+    for (const auto& [layer_id, object] : opaque->scene->sceneObjects) {
+        (void)layer_id;
+        if (object == nullptr) continue;
+        for (auto* node : object->RuntimeNodes()) apply_to_node(node);
+    }
 }
 
 void ApplySceneCameraParallax(WPSceneScriptHost::Opaque* opaque) {

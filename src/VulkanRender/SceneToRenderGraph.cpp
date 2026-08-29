@@ -800,16 +800,14 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     auto& scene = *extra.scene;
 
     if (node != nullptr && !route.routed_node) {
-        const bool proxy_node = scene.renderOrderProxyNodes.count(node) != 0;
-        const bool detached_source_node = scene.detachedEffectSourceNodes.count(node) != 0;
-        if (proxy_node || detached_source_node) {
-            // Root-owned proxy/source nodes are emitted through explicit authored-order routes.
-            // Reaching them through the physical tree means the root traversal is at the wrong
-            // sibling position, so skip this visit to avoid late duplicate composites.
-            LOG_INFO("SceneRenderGraphNodeRouteSkip: layer=%d name='%s' reason='%s'",
+        // Root-owned proxy nodes are emitted through explicit authored-order routes. Reaching
+        // them through the physical tree means the root traversal is at the wrong sibling
+        // position, so skip this visit to avoid late duplicate composites. (Detached effect
+        // sources need no such skip anymore: they are bridge-owned and never enter the tree.)
+        if (scene.renderOrderProxyNodes.count(node) != 0) {
+            LOG_INFO("SceneRenderGraphNodeRouteSkip: layer=%d name='%s' reason='proxy'",
                      NodeLayerId(scene, node),
-                     node->Name().c_str(),
-                     detached_source_node ? "detached-source" : "proxy");
+                     node->Name().c_str());
             return;
         }
     }
@@ -925,9 +923,12 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     }
 
     if (node != nullptr) {
-        if (auto detached_it = scene.detachedEffectSourceNodesByWorldNode.find(node);
-            detached_it != scene.detachedEffectSourceNodesByWorldNode.end()) {
-            for (auto* source_node : detached_it->second) {
+        // A world node's visit at its authored order position is where the owning layer's
+        // detached source draw is emitted; the bridge owns those source handles.
+        if (auto* world_bridge = scene.FindImageEffectLayer(NodeLayerId(scene, node));
+            world_bridge != nullptr && world_bridge->WorldNode() == node) {
+            for (const auto& source_node_ref : world_bridge->DetachedSourceNodes()) {
+                auto* source_node = source_node_ref.get();
                 if (source_node == nullptr) continue;
                 LOG_INFO("SceneRenderGraphDetachedSourceRoute: world-layer=%d source-layer=%d "
                          "world-name='%s' source-name='%s' output='%.*s'",
@@ -1248,12 +1249,10 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
     LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu proxy-parent-count=%zu proxy-node-count=%zu "
-             "detached-anchor-count=%zu detached-source-count=%zu warmup-hidden=%s",
+             "warmup-hidden=%s",
              scene.layerOrder.size(),
              scene.renderOrderProxyChildren.size(),
              scene.renderOrderProxyNodes.size(),
-             scene.detachedEffectSourceNodesByWorldNode.size(),
-             scene.detachedEffectSourceNodes.size(),
              include_hidden_for_pipeline_warmup ? "true" : "false");
     if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
         // Keep the official empty-buffer contract when reflections are off: receivers still
