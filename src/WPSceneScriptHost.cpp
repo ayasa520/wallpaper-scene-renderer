@@ -3073,9 +3073,7 @@ void CancelLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque,
 std::optional<uint32_t> FindSoundHandleByLayerId(const WPSceneScriptHost::Opaque* opaque,
                                                  int32_t                          layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return std::nullopt;
-    auto it = opaque->scene->objectRuntimeSoundHandles.find(layer_id);
-    if (it == opaque->scene->objectRuntimeSoundHandles.end()) return std::nullopt;
-    return it->second;
+    return opaque->scene->GetLayerSoundHandle(layer_id);
 }
 
 std::optional<WPDynamicValue> ReadSoundPropertyValue(const WPSceneScriptHost::Opaque* opaque,
@@ -3815,17 +3813,17 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         }
 
         opaque->scene->objectRuntimeNodes.erase(layer_id);
-        // Deleting a layer removes its authored SceneObject entirely: parent binding, local
-        // visibility, identity, and image runtime state all live there now. Children keep their
-        // dangling parent id, exactly like the previous per-concern maps did.
-        opaque->scene->DestroySceneObject(layer_id);
-        if (auto sound_it = opaque->scene->objectRuntimeSoundHandles.find(layer_id);
-            sound_it != opaque->scene->objectRuntimeSoundHandles.end()) {
-            if (opaque->scene->soundManager != nullptr) {
-                opaque->scene->soundManager->UnmountStream(sound_it->second);
-            }
-            opaque->scene->objectRuntimeSoundHandles.erase(sound_it);
+        // The mounted sound stream must be stopped while the SceneObject that records its handle
+        // still exists, so unmount before the identity is destroyed below.
+        if (const auto sound_handle = opaque->scene->GetLayerSoundHandle(layer_id);
+            sound_handle.has_value() && opaque->scene->soundManager != nullptr) {
+            opaque->scene->soundManager->UnmountStream(*sound_handle);
         }
+        // Deleting a layer removes its authored SceneObject entirely: parent binding, local
+        // visibility, identity, image runtime state, deferred kind, and sound handle all live
+        // there now. Children keep their dangling parent id, exactly like the previous
+        // per-concern maps did.
+        opaque->scene->DestroySceneObject(layer_id);
         if (auto camera_names_it = opaque->scene->objectRuntimeCameraNames.find(layer_id);
             camera_names_it != opaque->scene->objectRuntimeCameraNames.end()) {
             for (const auto& camera_name : camera_names_it->second) {

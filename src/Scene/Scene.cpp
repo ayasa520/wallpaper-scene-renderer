@@ -600,6 +600,16 @@ std::size_t Scene::DeferredRuntimeLayerCount(SceneDeferredRuntimeKind kind) cons
     return count;
 }
 
+void Scene::SetLayerSoundHandle(int32_t layer_id, uint32_t handle) {
+    if (layer_id == 0) return;
+    EnsureSceneObject(layer_id).SetSoundHandle(handle);
+}
+
+std::optional<uint32_t> Scene::GetLayerSoundHandle(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? std::nullopt : object->SoundHandle();
+}
+
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {
