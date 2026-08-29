@@ -280,6 +280,7 @@ public:
         CMD_SET_TEXTURE_RESOLUTION,
         CMD_SET_SPEED,
         CMD_SET_OFFSCREEN_RELEASE_CALLBACK,
+        CMD_SET_OFFSCREEN_READY_CALLBACK,
         CMD_RECONFIGURE_OFFSCREEN_EXPORT,
         CMD_STOP,
         CMD_DRAW,
@@ -325,6 +326,7 @@ public:
                 CASE_CMD(APPLY_AUDIO_SAMPLES);
                 CASE_CMD(SET_SPEED);
                 CASE_CMD(SET_OFFSCREEN_RELEASE_CALLBACK);
+                CASE_CMD(SET_OFFSCREEN_READY_CALLBACK);
                 CASE_CMD(RECONFIGURE_OFFSCREEN_EXPORT);
                 CASE_CMD(INIT_VULKAN);
             default: break;
@@ -688,6 +690,14 @@ private:
             m_render->setOffscreenFrameReleaseCallback({});
         }
     }
+    MHANDLER_CMD(SET_OFFSCREEN_READY_CALLBACK) {
+        std::shared_ptr<vulkan::OffscreenFrameReadyCallback> callback;
+        if (msg->findObject("value", &callback) && callback) {
+            m_render->setOffscreenFrameReadyCallback(*callback);
+        } else {
+            m_render->setOffscreenFrameReadyCallback({});
+        }
+    }
     MHANDLER_CMD(RECONFIGURE_OFFSCREEN_EXPORT) {
         std::shared_ptr<OffscreenExportReconfigureRequest> request;
         if (!msg->findObject("request", &request) || !request) return;
@@ -758,6 +768,16 @@ void SceneWallpaper::setOffscreenFrameReleaseCallback(
                                 RenderHandler::CMD::CMD_SET_OFFSCREEN_RELEASE_CALLBACK);
     msg->setObject("value",
                    std::make_shared<vulkan::OffscreenFrameReleaseCallback>(
+                       std::move(callback)));
+    msg->post();
+}
+
+void SceneWallpaper::setOffscreenFrameReadyCallback(
+    vulkan::OffscreenFrameReadyCallback callback) {
+    auto msg = CreateMsgWithCmd(m_main_handler->renderHandler(),
+                                RenderHandler::CMD::CMD_SET_OFFSCREEN_READY_CALLBACK);
+    msg->setObject("value",
+                   std::make_shared<vulkan::OffscreenFrameReadyCallback>(
                        std::move(callback)));
     msg->post();
 }

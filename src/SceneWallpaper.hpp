@@ -50,6 +50,8 @@ public:
     void initVulkan(const RenderInitInfo&);
     void setOffscreenFrameReleaseCallback(
         vulkan::OffscreenFrameReleaseCallback callback);
+    void setOffscreenFrameReadyCallback(
+        vulkan::OffscreenFrameReadyCallback callback);
     bool reconfigureOffscreenExport(uint32_t width,
                                     uint32_t height,
                                     TexTiling tiling,

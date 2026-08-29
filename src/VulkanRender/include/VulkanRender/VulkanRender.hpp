@@ -29,6 +29,7 @@ public:
     void drawFrame(Scene&);
     void setPaused(bool paused);
     void setOffscreenFrameReleaseCallback(OffscreenFrameReleaseCallback callback);
+    void setOffscreenFrameReadyCallback(OffscreenFrameReadyCallback callback);
     bool reconfigureOffscreenExport(uint32_t width,
                                     uint32_t height,
                                     TexTiling tiling,

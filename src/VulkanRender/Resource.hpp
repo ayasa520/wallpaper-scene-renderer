@@ -5,6 +5,7 @@
 #include "Vulkan/ImmutableMeshStore.hpp"
 #include "Vulkan/StagingBuffer.hpp"
 #include "vvk/vma_wrapper.hpp"
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -26,6 +27,13 @@ struct RenderingResources {
     vvk::Semaphore sem_swap_wait_image;
     vvk::Semaphore sem_swap_finish;
     vvk::Fence     fence_frame;
+    /*
+     * Offscreen export: one SYNC_FD-exportable binary semaphore per ring slot.
+     * The frame submit signals the in-progress slot's semaphore and its
+     * exported sync-file becomes the frame's explicit acquire fence, letting
+     * the producer publish without a CPU fence wait.
+     */
+    std::array<vvk::Semaphore, 3> sem_offscreen_acquire;
 
     StagingBuffer* vertex_buf;
     StagingBuffer* dyn_buf;
