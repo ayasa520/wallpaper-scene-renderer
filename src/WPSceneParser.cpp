@@ -2489,7 +2489,7 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
         // complete effect chains creates render targets, pipelines, and descriptors even though no
         // pass can execute while the layer is invisible. Keep only the transform/runtime contract
         // until the visibility property first turns true, then rebuild the graph with real passes.
-        context.scene->deferredRuntimeImageLayerIds.insert(wpimgobj.id);
+        context.scene->MarkLayerDeferredRuntime(wpimgobj.id, SceneDeferredRuntimeKind::Image);
     }
 
     LOG_INFO("SceneObjectMaterialize: mode=image-logical-only id=%d name='%s' image='%s' "
@@ -2543,7 +2543,7 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
     RegisterLayerSceneState(
         context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
     context.scene->ApplyLayerVisibility(wppartobj.id);
-    context.scene->deferredRuntimeParticleLayerIds.insert(wppartobj.id);
+    context.scene->MarkLayerDeferredRuntime(wppartobj.id, SceneDeferredRuntimeKind::Particle);
 }
 
 void RegisterLogicalTextLayer(ParseContext& context,
@@ -2588,7 +2588,7 @@ void RegisterLogicalTextLayer(ParseContext& context,
     RegisterLayerSceneState(
         context, text_obj.id, text_obj.parent, text_obj.attachment, text_obj.visible);
     context.scene->ApplyLayerVisibility(text_obj.id);
-    context.scene->deferredRuntimeTextLayerIds.insert(text_obj.id);
+    context.scene->MarkLayerDeferredRuntime(text_obj.id, SceneDeferredRuntimeKind::Text);
 }
 
 bool DetachNodeFromTree(const std::shared_ptr<SceneNode>& parent, SceneNode* target) {
@@ -6478,7 +6478,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     RegisterLayerSceneState(
         context, text_obj.id, text_obj.parent, text_obj.attachment, text_obj.visible);
     context.scene->ApplyLayerVisibility(text_obj.id);
-    context.scene->deferredRuntimeTextLayerIds.erase(text_obj.id);
+    context.scene->ClearLayerDeferredRuntime(text_obj.id, SceneDeferredRuntimeKind::Text);
 }
 
 struct ParticleChildPtr {
@@ -8811,7 +8811,7 @@ bool wallpaper::ConfigureSceneBloom(Scene& scene, fs::VFS& vfs) {
 
 bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
                                               const UserPropertyMap* user_properties) {
-    if (scene.deferredRuntimeImageLayerIds.count(layer_id) == 0) return false;
+    if (! scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Image)) return false;
 
     const auto config_it = scene.initialLayerConfigJson.find(layer_id);
     if (config_it == scene.initialLayerConfigJson.end()) return false;
@@ -8896,13 +8896,13 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     }
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
-    scene.deferredRuntimeImageLayerIds.erase(layer_id);
+    scene.ClearLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Image);
     return true;
 }
 
 bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
                                                  const UserPropertyMap* user_properties) {
-    if (scene.deferredRuntimeParticleLayerIds.count(layer_id) == 0) return false;
+    if (! scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Particle)) return false;
 
     const auto config_it = scene.initialLayerConfigJson.find(layer_id);
     if (config_it == scene.initialLayerConfigJson.end()) return false;
@@ -8960,13 +8960,13 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
     }
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
-    scene.deferredRuntimeParticleLayerIds.erase(layer_id);
+    scene.ClearLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Particle);
     return true;
 }
 
 bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
                                              const UserPropertyMap* user_properties) {
-    if (scene.deferredRuntimeTextLayerIds.count(layer_id) == 0) return false;
+    if (! scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) return false;
 
     const auto config_it = scene.initialLayerConfigJson.find(layer_id);
     if (config_it == scene.initialLayerConfigJson.end()) return false;
@@ -9033,7 +9033,7 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
     }
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
-    scene.deferredRuntimeTextLayerIds.erase(layer_id);
+    scene.ClearLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text);
     if (const auto state_it = scene.textLayers.find(layer_id); state_it != scene.textLayers.end()) {
     } else {
     }

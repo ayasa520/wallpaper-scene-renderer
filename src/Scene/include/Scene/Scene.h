@@ -137,6 +137,17 @@ public:
     // keep the default id 0, which callers treat as "no owner".
     int32_t LayerIdForNode(const SceneNode* node) const;
 
+    // Deferred-runtime bookkeeping, backed by SceneObject::DeferredRuntimeKind. Semantics match
+    // the former deferredRuntime{Image,Particle,Text}LayerIds sets: marking records the kind on
+    // the owning object, clearing is kind-checked so a stale clear for another kind is a no-op,
+    // and destroying the SceneObject drops the record together with the rest of the identity.
+    void MarkLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind);
+    void ClearLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind);
+    bool IsLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind) const;
+    bool IsLayerDeferredRuntime(int32_t layer_id) const;
+    std::vector<int32_t> DeferredRuntimeLayerIds(SceneDeferredRuntimeKind kind) const;
+    std::size_t          DeferredRuntimeLayerCount(SceneDeferredRuntimeKind kind) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -210,9 +221,6 @@ public:
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeRenderTargets;
     std::unordered_map<int32_t, std::vector<SceneLight*>> objectRuntimeLights;
     std::unordered_map<int32_t, std::vector<ParticleSubSystem*>> objectRuntimeParticleSubsystems;
-    std::unordered_set<int32_t>                          deferredRuntimeImageLayerIds;
-    std::unordered_set<int32_t>                          deferredRuntimeParticleLayerIds;
-    std::unordered_set<int32_t>                          deferredRuntimeTextLayerIds;
     std::unordered_map<int32_t, uint32_t>                 objectRuntimeSoundHandles;
     std::unordered_map<int32_t, TextLayerRuntimeState>    textLayers;
     std::unordered_map<int32_t, CameraLayerRuntimeState>  cameraLayers;

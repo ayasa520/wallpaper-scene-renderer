@@ -2239,7 +2239,7 @@ bool ApplyParticleSubsystemValue(Scene& scene, int32_t layer_id, Apply&& apply) 
         // Deferred particle layers intentionally have no live subsystem. Their current property
         // snapshot is consumed when visibility materializes the layer, so accepting the write here
         // keeps the script-facing property contract identical before and after materialization.
-        return scene.deferredRuntimeParticleLayerIds.count(layer_id) != 0;
+        return scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Particle);
     }
 
     bool applied = false;
@@ -2660,7 +2660,9 @@ void FlushPendingSceneRegistrationRanges(WPSceneScriptHost::Opaque* opaque) {
 
 bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
-    if (opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) == 0) return true;
+    if (! opaque->scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Particle)) {
+        return true;
+    }
 
     const auto registration_range = CaptureSceneRegistrationRange(opaque);
 
@@ -2689,7 +2691,9 @@ bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque,
 
 bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
-    if (opaque->scene->deferredRuntimeImageLayerIds.count(layer_id) == 0) return true;
+    if (! opaque->scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Image)) {
+        return true;
+    }
 
     const auto registration_range = CaptureSceneRegistrationRange(opaque);
 
@@ -2718,7 +2722,9 @@ bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, in
 
 bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
-    if (opaque->scene->deferredRuntimeTextLayerIds.count(layer_id) == 0) return true;
+    if (! opaque->scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
+        return true;
+    }
 
     const auto registration_range = CaptureSceneRegistrationRange(opaque);
 
@@ -3167,7 +3173,7 @@ bool ApplyTextLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t laye
         return true;
     }
 
-    if (opaque->scene->deferredRuntimeTextLayerIds.count(layer_id) != 0) {
+    if (opaque->scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
         return true;
     }
 
@@ -3214,9 +3220,7 @@ bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t lay
     // The script API is intentionally asked about the logical layer id instead of probing render
     // resources. Deferred image/text/particle placeholders all preserve their layer identity while
     // skipping heavy runtime nodes, which keeps this predicate independent from material layout.
-    return opaque->scene->deferredRuntimeImageLayerIds.count(layer_id) != 0 ||
-           opaque->scene->deferredRuntimeParticleLayerIds.count(layer_id) != 0 ||
-           opaque->scene->deferredRuntimeTextLayerIds.count(layer_id) != 0;
+    return opaque->scene->IsLayerDeferredRuntime(layer_id);
 }
 
 void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, SceneNode* node) {
@@ -3879,12 +3883,9 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             // parser-backed authoritative text image left to unregister here.
             opaque->scene->textLayers.erase(text_it);
         }
-        // Deferred runtime sets are lightweight ownership records for hidden placeholder layers.
-        // Delete must clear every deferred kind together with the regular registries so a later
-        // dynamic layer that reuses this authored id cannot inherit a stale materialization state.
-        opaque->scene->deferredRuntimeImageLayerIds.erase(layer_id);
-        opaque->scene->deferredRuntimeParticleLayerIds.erase(layer_id);
-        opaque->scene->deferredRuntimeTextLayerIds.erase(layer_id);
+        // The deferred-runtime record lives on the SceneObject, so DestroySceneObject above
+        // already dropped it together with the rest of the identity; a later dynamic layer that
+        // reuses this authored id starts from a fresh object.
         opaque->scene->layerNodes.erase(layer_id);
         opaque->scene->initialLayerConfigJson.erase(layer_id);
         opaque->scene->scriptRegistrations.erase(
@@ -7485,7 +7486,7 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
         command == "setCurrentTime" || command == "getCurrentTime" ||
         command == "duration" || command == "rate";
     if (command_requires_video_decoder &&
-        opaque->scene->deferredRuntimeImageLayerIds.count(node_id) != 0) {
+        opaque->scene->IsLayerDeferredRuntime(node_id, SceneDeferredRuntimeKind::Image)) {
         // Some Wallpaper Engine intro layers intentionally start hidden, then call
         // getVideoTexture().stop()/setCurrentTime() during init before their first visible=true
         // update tick. Visibility-driven materialization is too late for those scripts: the
@@ -9125,7 +9126,7 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
     std::unordered_set<int32_t> queued;
     auto append_if_deferred = [&](int32_t layer_id) {
         if (layer_id == 0 || !queued.insert(layer_id).second) return;
-        if (m_scene->deferredRuntimeTextLayerIds.count(layer_id) != 0) {
+        if (m_scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
             // Hidden text remains a logical placeholder until its parent chain first becomes
             // effectively visible. Materializing it during residency warm-up would retain Pango
             // shaping state, glyph bitmaps, atlas payloads, and effect bridge objects even though
@@ -9140,10 +9141,11 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
     for (const auto layer_id : m_scene->layerOrder) {
         append_if_deferred(layer_id);
     }
-    for (const auto layer_id : m_scene->deferredRuntimeImageLayerIds) {
+    for (const auto layer_id : m_scene->DeferredRuntimeLayerIds(SceneDeferredRuntimeKind::Image)) {
         append_if_deferred(layer_id);
     }
-    for (const auto layer_id : m_scene->deferredRuntimeParticleLayerIds) {
+    for (const auto layer_id :
+         m_scene->DeferredRuntimeLayerIds(SceneDeferredRuntimeKind::Particle)) {
         append_if_deferred(layer_id);
     }
     if (layer_ids.empty()) return;
@@ -9173,9 +9175,9 @@ void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
              layer_ids.size(),
              materialized_layers,
              elapsed_us / 1000.0,
-             m_scene->deferredRuntimeImageLayerIds.size(),
-             m_scene->deferredRuntimeParticleLayerIds.size(),
-             m_scene->deferredRuntimeTextLayerIds.size());
+             m_scene->DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Image),
+             m_scene->DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Particle),
+             m_scene->DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Text));
 }
 
 void WPSceneScriptHost::FrameBegin(double frame_time) {

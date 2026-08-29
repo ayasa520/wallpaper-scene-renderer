@@ -25,6 +25,18 @@ enum class SceneObjectKind
     Shape,
 };
 
+// A hidden authored layer may stay a lightweight logical placeholder until it is first needed.
+// The deferred kind records which materializer owns the layer; None means fully materialized.
+// A layer is deferred for at most one kind (its authored kind), so a single field carries the
+// same information as the former per-kind Scene sets.
+enum class SceneDeferredRuntimeKind
+{
+    None,
+    Image,
+    Particle,
+    Text,
+};
+
 // Image layers keep a small always-available runtime state (authored quad size plus alignment)
 // that scripts read and write independently from any render node. It lives on the SceneObject so
 // the object is the single source for layer-level state.
@@ -92,6 +104,9 @@ public:
     bool Passthrough() const { return m_passthrough; }
     void SetPassthrough(bool passthrough) { m_passthrough = passthrough; }
 
+    SceneDeferredRuntimeKind DeferredRuntimeKind() const { return m_deferred_runtime_kind; }
+    void SetDeferredRuntimeKind(SceneDeferredRuntimeKind kind) { m_deferred_runtime_kind = kind; }
+
     // Image runtime state exists only for materialized image layers (concrete or logical); other
     // kinds return nullptr, which is what tells scripts "this is not an image layer".
     SceneImageLayerRuntimeState*       ImageRuntimeState() {
@@ -124,6 +139,8 @@ private:
 
     int32_t m_effect_count { 0 };
     bool    m_passthrough { false };
+
+    SceneDeferredRuntimeKind m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;
