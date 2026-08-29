@@ -196,6 +196,13 @@ public:
     const CameraLayerRuntimeState* FindCameraLayerState(int32_t layer_id) const;
     bool HasCameraLayers() const { return ! cameraLayerOrder.empty(); }
 
+    // Offscreen-dependency bookkeeping, backed by SceneObject::IsOffscreenDependencySource.
+    // Marked once per layer from the parse-time dependency scan; unlike the former Scene-level
+    // id set, the record dies with the SceneObject, so a dynamic layer that reuses a destroyed
+    // dependency source's id starts clean instead of inheriting the stale exemption.
+    void MarkLayerOffscreenDependencySource(int32_t layer_id);
+    bool IsLayerOffscreenDependencySource(int32_t layer_id) const;
+
     void                SetLayerParentBinding(int32_t layer_id, int32_t parent_id,
                                               std::string attachment = {});
     LayerParentBinding  GetLayerParentBinding(int32_t layer_id) const;
@@ -269,7 +276,6 @@ public:
     std::vector<int32_t> cameraLayerOrder;
     std::unordered_map<SceneNode*, int32_t> nodeOwners;
     std::unordered_map<std::string, int32_t> layerNameToId;
-    std::unordered_set<int32_t>              offscreenDependencyLayerIds;
     // Some runtime nodes must stay root-owned for transform correctness, effect-camera routing, or
     // deferred materialization, but Wallpaper Engine still orders them as children of their
     // authored parent layer. These maps keep physical ownership separate from authored render

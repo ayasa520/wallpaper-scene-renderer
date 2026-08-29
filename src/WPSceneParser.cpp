@@ -2505,7 +2505,7 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
              wpimgobj.projectlayer ? "true" : "false",
              wpimgobj.effects.size(),
              context.scene != nullptr &&
-                     context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0
+                     context.scene->IsLayerOffscreenDependencySource(wpimgobj.id)
                  ? "true"
                  : "false",
              defer_runtime_materialization ? "true" : "false");
@@ -5252,7 +5252,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         wpimgobj.projectlayer || wpimgobj.image == "models/util/projectlayer.json";
     const bool is_offscreen_dependency_source =
         context.scene != nullptr &&
-        context.scene->offscreenDependencyLayerIds.count(wpimgobj.id) != 0;
+        context.scene->IsLayerOffscreenDependencySource(wpimgobj.id);
     const bool has_shader_color_blend = UsesShaderColorBlendMode(wpimgobj.colorBlendMode);
     // Wallpaper Engine `dependencies` expose a layer through `_rt_imageLayerComposite_<id>`
     // even when the source layer has no authored effects. Such layers still need a private source
@@ -9355,8 +9355,10 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     // Text atlases and effect ping-pong stay in the authored letter box. Desktop density is
     // applied when those results are composited, not by rebuilding glyphs at the output scale.
     (void)text_render_scale;
-    context.scene->textRenderScale             = 1.0;
-    context.scene->offscreenDependencyLayerIds = dependency_source_ids;
+    context.scene->textRenderScale = 1.0;
+    for (const auto dependency_source_id : dependency_source_ids) {
+        context.scene->MarkLayerOffscreenDependencySource(dependency_source_id);
+    }
     if (user_properties) {
         context.scene->userProperties = *user_properties;
     } else {

@@ -2787,7 +2787,7 @@ struct LayerResidencyResources {
 bool RetainsGpuResidencyWhileHidden(const Scene& scene, int32_t layer_id) {
     if (layer_id == 0) return true;
     if (scene.IsLayerVisible(layer_id)) return true;
-    return scene.offscreenDependencyLayerIds.count(layer_id) != 0;
+    return scene.IsLayerOffscreenDependencySource(layer_id);
 }
 
 void MergeResidencyResources(LayerResidencyResources& target,

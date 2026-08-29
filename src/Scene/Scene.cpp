@@ -705,6 +705,16 @@ void Scene::SetCameraLayerState(int32_t layer_id, CameraLayerRuntimeState state)
     EnsureSceneObject(layer_id).SetCameraRuntimeState(std::move(state));
 }
 
+void Scene::MarkLayerOffscreenDependencySource(int32_t layer_id) {
+    if (layer_id == 0) return;
+    EnsureSceneObject(layer_id).MarkOffscreenDependencySource();
+}
+
+bool Scene::IsLayerOffscreenDependencySource(int32_t layer_id) const {
+    const auto* object = FindSceneObject(layer_id);
+    return object != nullptr && object->IsOffscreenDependencySource();
+}
+
 Scene::CameraLayerRuntimeState* Scene::FindCameraLayerState(int32_t layer_id) {
     auto* object = FindSceneObject(layer_id);
     return object == nullptr ? nullptr : object->CameraRuntimeState();

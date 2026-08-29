@@ -175,7 +175,7 @@ static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::st
     // nodeOwners registration, so resolve the layer through the shared helper.
     const int32_t layer_id = NodeLayerId(scene, node);
     if (layer_id == 0) return false;
-    if (scene.offscreenDependencyLayerIds.count(layer_id) == 0) return false;
+    if (! scene.IsLayerOffscreenDependencySource(layer_id)) return false;
 
     // Hidden dependency layers are allowed to keep rendering only into private offscreen targets that
     // another effect samples. They must never use that exemption for `_rt_default`, because that
@@ -213,7 +213,7 @@ struct ExtraInfo {
 
 static bool IsOffscreenDependencyLayer(const ExtraInfo& extra, i32 imgId) {
     return extra.scene != nullptr && imgId != 0 &&
-        extra.scene->offscreenDependencyLayerIds.count(imgId) != 0;
+        extra.scene->IsLayerOffscreenDependencySource(imgId);
 }
 
 static bool ShouldPublishLayerLinkOutput(const ExtraInfo& extra, i32 imgId,
@@ -286,7 +286,7 @@ static bool ShouldEmitLayerNodeForResidency(Scene& scene, SceneNode* node, const
     // visible effects can sample their private offscreen outputs. Ordinary hidden layers are
     // pruned so their passes, framebuffers, descriptors, imported textures, and video decoders can
     // be released until the layer becomes visible again.
-    return scene.offscreenDependencyLayerIds.count(layer_id) != 0;
+    return scene.IsLayerOffscreenDependencySource(layer_id);
 }
 
 static size_t NodeLayerOrderIndex(SceneNode* node, const ExtraInfo& extra) {
@@ -301,7 +301,7 @@ static size_t NodeLayerOrderIndex(SceneNode* node, const ExtraInfo& extra) {
 static bool IsEffectLocalProxyDependency(SceneNode* node, const ExtraInfo& extra) {
     if (extra.scene == nullptr || node == nullptr) return false;
     const int32_t layer_id = NodeLayerId(*extra.scene, node);
-    return layer_id != 0 && extra.scene->offscreenDependencyLayerIds.count(layer_id) != 0;
+    return layer_id != 0 && extra.scene->IsLayerOffscreenDependencySource(layer_id);
 }
 
 static bool EffectSourceUsesProxyChildren(SceneImageEffectLayer* imgeff) {

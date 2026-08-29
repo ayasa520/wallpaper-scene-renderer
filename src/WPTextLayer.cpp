@@ -2283,7 +2283,7 @@ std::array<uint32_t, 2> StabilizeTextBridgeBackingExtent(
 
 bool TextLayerNeedsBridgeResidency(const Scene& scene, int32_t layer_id) {
     return scene.IsLayerVisible(layer_id) ||
-           scene.offscreenDependencyLayerIds.count(layer_id) != 0;
+           scene.IsLayerOffscreenDependencySource(layer_id);
 }
 
 std::optional<std::array<uint32_t, 2>> ResolveTextBridgeProjection(

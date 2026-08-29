@@ -130,6 +130,12 @@ public:
     bool Passthrough() const { return m_passthrough; }
     void SetPassthrough(bool passthrough) { m_passthrough = passthrough; }
 
+    // Set when another layer's authored effect samples this layer's private offscreen output
+    // (`_rt_imageLayerComposite_<id>`). Derived once at parse time from the scene-wide dependency
+    // scan; hidden dependency sources keep rendering into private targets and stay GPU-resident.
+    bool IsOffscreenDependencySource() const { return m_offscreen_dependency_source; }
+    void MarkOffscreenDependencySource() { m_offscreen_dependency_source = true; }
+
     SceneDeferredRuntimeKind DeferredRuntimeKind() const { return m_deferred_runtime_kind; }
     void SetDeferredRuntimeKind(SceneDeferredRuntimeKind kind) { m_deferred_runtime_kind = kind; }
 
@@ -254,6 +260,7 @@ private:
 
     int32_t m_effect_count { 0 };
     bool    m_passthrough { false };
+    bool    m_offscreen_dependency_source { false };
 
     SceneDeferredRuntimeKind   m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
     std::optional<uint32_t>    m_sound_handle;
