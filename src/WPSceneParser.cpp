@@ -5615,6 +5615,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 spImgNode->CopyTrans(SceneNode());
             }
             scene.cameras.at(effect_camera_name)->AttatchImgEffect(imgEffectLayer);
+            // The owning layer resolves its effect bridge through the SceneObject; the camera
+            // keeps ownership, the object holds the weak back-reference.
+            scene.EnsureSceneObject(wpimgobj.id).SetImageEffectLayer(imgEffectLayer);
         }
         if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
             const std::string puppet_surface_camera = effect_camera_name + "__puppet_surface_camera";
@@ -6198,6 +6201,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
         imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
         scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
+        // Same contract as image layers: the object holds the weak back-reference to its bridge.
+        scene.EnsureSceneObject(text_obj.id).SetImageEffectLayer(imgEffectLayer);
 
         scene.renderTargets[primitive->bridge.pingpong_a] = SceneRenderTarget {
             .width = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),

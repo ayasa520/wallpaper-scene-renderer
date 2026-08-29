@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -12,6 +13,7 @@ namespace wallpaper
 {
 
 class SceneNode;
+class SceneImageEffectLayer;
 
 // Authored object kind straight from scene.json. One entry of objects[] maps to exactly one
 // SceneObject; render-time SceneNodes are draw handles owned by passes, not layer identities.
@@ -133,6 +135,17 @@ public:
         m_has_layer_node_slot = false;
     }
 
+    // The layer's image-effect bridge. The effect camera keeps ownership for now (render routes
+    // still resolve the camera by name), so the object holds a weak reference: it expires
+    // together with the owning camera, which preserves the former camera-name walk's
+    // "camera gone => no effect layer" resolution result.
+    std::shared_ptr<SceneImageEffectLayer> ImageEffectLayer() const {
+        return m_image_effect_layer.lock();
+    }
+    void SetImageEffectLayer(std::weak_ptr<SceneImageEffectLayer> effect_layer) {
+        m_image_effect_layer = std::move(effect_layer);
+    }
+
     // The authored scene.json record for this object, normalized to its parse-time id. Deferred
     // layers re-parse it on materialization and scripts read originalOrigin and the initial
     // config from it. nullptr means no record (sound-only and some helper layers).
@@ -183,6 +196,8 @@ private:
 
     bool       m_has_layer_node_slot { false };
     SceneNode* m_layer_node { nullptr };
+
+    std::weak_ptr<SceneImageEffectLayer> m_image_effect_layer;
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;
