@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace wallpaper::vulkan;
 
@@ -1836,6 +1837,26 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // visibility turns the shader into a no-op for the frame. Releasing final-read keys here
         // prevents temporary render targets from staying pinned only because no draw was recorded.
         return;
+    }
+
+    // Temporary diagnostic: trace model-chunk draw submissions with their visibility flags so a
+    // frame capture can prove which pass painted an unexpected mesh. Enabled by VIVID_DRAW_TRACE.
+    {
+        static const bool draw_trace = std::getenv("VIVID_DRAW_TRACE") != nullptr;
+        static int        draw_trace_budget = 400;
+        if (draw_trace && draw_trace_budget > 0 && m_desc.node != nullptr &&
+            m_desc.node->Name().find("__hanabi_model_chunk") != std::string::npos) {
+            draw_trace_budget--;
+            LOG_INFO("DRAWTRACE model-chunk execute node=%p name='%s' vis=%d(l%d,L%d) "
+                     "when-hidden=%d output='%s'",
+                     (void*)m_desc.node,
+                     m_desc.node->Name().c_str(),
+                     (int)m_desc.node->Visible(),
+                     (int)m_desc.node->LocalVisible(),
+                     (int)m_desc.node->LayerVisible(),
+                     (int)m_desc.execute_when_hidden,
+                     m_desc.output.c_str());
+        }
     }
 
     if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;

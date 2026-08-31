@@ -547,7 +547,18 @@ SceneObject& Scene::EnsureSceneObject(int32_t layer_id) {
     return *raw;
 }
 
-void Scene::DestroySceneObject(int32_t layer_id) { sceneObjects.erase(layer_id); }
+void Scene::DestroySceneObject(int32_t layer_id) {
+    auto it = sceneObjects.find(layer_id);
+    if (it == sceneObjects.end()) return;
+    if (const auto* object = it->second.get();
+        object != nullptr && object->LayerNode() != nullptr) {
+        auto index_it = layerNodeIndex.find(object->LayerNode());
+        if (index_it != layerNodeIndex.end() && index_it->second == layer_id) {
+            layerNodeIndex.erase(index_it);
+        }
+    }
+    sceneObjects.erase(it);
+}
 
 int32_t Scene::LayerIdForNode(const SceneNode* node) const {
     // The node id is the single back-reference: layer handles carry their authored id from
@@ -625,7 +636,15 @@ void Scene::ClearAllLayerInitialConfigJson() {
 
 void Scene::SetLayerNode(int32_t layer_id, SceneNode* node) {
     if (layer_id == 0) return;
-    EnsureSceneObject(layer_id).SetLayerNode(node);
+    auto& object = EnsureSceneObject(layer_id);
+    if (SceneNode* previous = object.LayerNode(); previous != nullptr && previous != node) {
+        auto index_it = layerNodeIndex.find(previous);
+        if (index_it != layerNodeIndex.end() && index_it->second == layer_id) {
+            layerNodeIndex.erase(index_it);
+        }
+    }
+    object.SetLayerNode(node);
+    if (node != nullptr) layerNodeIndex[node] = layer_id;
 }
 
 SceneNode* Scene::GetLayerNode(int32_t layer_id) const {
@@ -643,6 +662,7 @@ void Scene::ClearAllLayerNodeSlots() {
         (void)layer_id;
         if (object != nullptr) object->ClearLayerNodeSlot();
     }
+    layerNodeIndex.clear();
 }
 
 void Scene::AddLayerRuntimeLight(int32_t layer_id, SceneLight* light) {
@@ -765,8 +785,9 @@ const TextLayerRuntimeState* Scene::FindTextLayerState(int32_t layer_id) const {
 }
 
 int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {
-    // A null query must not match registered-but-null slots.
+    // A null query must not match registered-but-null slots; the index never stores null keys.
     if (node == nullptr) return 0;
+    // Diagnostic build: bypass layerNodeIndex and use the historical slot scan.
     for (const auto& [layer_id, object] : sceneObjects) {
         if (object != nullptr && object->HasLayerNodeSlot() && object->LayerNode() == node) {
             return layer_id;
@@ -987,6 +1008,46 @@ Eigen::Vector3f Scene::ResolveCameraLayerNodeTranslation(
 
 void Scene::UpdateActiveCameraLayer() {
     auto [next_layer_id, camera_layer] = FindActiveCameraLayer(*this);
+
+    if (!cameraOrthographic) {
+        // Perspective scenes have a single shared view. A camera layer, when present, owns that
+        // view per frame: the layer node's world translation is the eye, the node's local -Z axis
+        // is the look direction, and its +Y axis is the up vector. Without a camera layer the
+        // authored scene camera (or camera-path playback) keeps the view.
+        if (modelPerspectiveCameraName.empty()) return;
+        auto camera_it = cameras.find(modelPerspectiveCameraName);
+        if (camera_it == cameras.end() || !camera_it->second) return;
+
+        if (camera_layer != nullptr && camera_layer->node) {
+            auto& node = *camera_layer->node;
+            node.UpdateTrans();
+            const Eigen::Matrix4d model = node.ModelTrans();
+            const Eigen::Vector3d eye   = model.block<3, 1>(0, 3);
+            Eigen::Vector3d       zaxis = model.block<3, 1>(0, 2);
+            Eigen::Vector3d       yaxis = model.block<3, 1>(0, 1);
+            if (zaxis.norm() > 1e-12 && yaxis.norm() > 1e-12) {
+                zaxis.normalize();
+                yaxis.normalize();
+                camera_it->second->SetExplicitView(eye, eye - zaxis, yaxis);
+                camera_it->second->Update();
+                UpdateLinkedCamera(modelPerspectiveCameraName);
+            }
+        }
+
+        activeCamera = camera_it->second.get();
+        if (activeCameraLayerId != next_layer_id) {
+            LOG_INFO("SceneCameraLayerActive: previous=%d active=%d camera='%s' perspective=true "
+                     "origin=[%.3f, %.3f, %.3f]",
+                     activeCameraLayerId,
+                     next_layer_id,
+                     modelPerspectiveCameraName.c_str(),
+                     camera_layer != nullptr ? camera_layer->origin[0] : 0.0f,
+                     camera_layer != nullptr ? camera_layer->origin[1] : 0.0f,
+                     camera_layer != nullptr ? camera_layer->origin[2] : 0.0f);
+            activeCameraLayerId = next_layer_id;
+        }
+        return;
+    }
 
     std::string camera_name = "global";
     std::shared_ptr<SceneNode> camera_node = defaultGlobalCameraNode;

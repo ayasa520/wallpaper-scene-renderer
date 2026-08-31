@@ -82,6 +82,7 @@ constexpr std::string_view G_LFEAT_SHADOW_POINT_XFORM {
 constexpr std::string_view G_LFEAT_SHADOW_PROJ { "g_LFeature_ShadowProjection" };
 constexpr std::string_view G_LFEAT_SHADOW_PROJ_XFORM { "g_LFeature_ShadowProjectionTransform" };
 constexpr std::string_view G_EYE_POSITION { "g_EyePosition" };
+constexpr std::string_view G_NORMAL_MODEL_MATRIX { "g_NormalModelMatrix" };
 // These camera basis vectors are seeded and updated only for the model-only perspective camera;
 // keeping them named here avoids ad-hoc string literals without expanding the legacy 2D contract.
 constexpr std::string_view G_VIEWUP { "g_ViewUp" };

@@ -463,12 +463,21 @@ std::optional<WPDynamicValue> WPDynamicValue::FromJsonLiteral(const nlohmann::js
 
     if (json.is_string()) {
         const auto& text = json.get_ref<const std::string&>();
-        std::array<float, 4> values {};
-        if (ParseJsonArray(json, values)) return WPDynamicValue(values);
-        std::array<float, 3> values3 {};
-        if (ParseJsonArray(json, values3)) return WPDynamicValue(values3);
-        std::array<float, 2> values2 {};
-        if (ParseJsonArray(json, values2)) return WPDynamicValue(values2);
+        // Authored vector strings are space-separated numbers ("0.63137 0.72549 1.00000").
+        // Anything else is free-form text: an option value such as "0.5, 1, 1" must reach
+        // scripts as the string they declared, because numeric parsing stops at the first
+        // comma and would otherwise silently repackage the text as a vector.
+        const bool vector_like =
+            ! text.empty() &&
+            text.find_first_not_of("0123456789.+-eE \t") == std::string::npos;
+        if (vector_like) {
+            std::array<float, 4> values {};
+            if (ParseJsonArray(json, values)) return WPDynamicValue(values);
+            std::array<float, 3> values3 {};
+            if (ParseJsonArray(json, values3)) return WPDynamicValue(values3);
+            std::array<float, 2> values2 {};
+            if (ParseJsonArray(json, values2)) return WPDynamicValue(values2);
+        }
         return WPDynamicValue(text);
     }
 

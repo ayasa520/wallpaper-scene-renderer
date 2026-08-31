@@ -150,6 +150,12 @@ void RegisterUserShaderValueBindings(ParseContext& context,
                                      const wallpaper::WPShaderInfo& info,
                                      wallpaper::SceneNode* node, int32_t object_id,
                                      std::string_view object_name);
+void RegisterConstantShaderValueBindings(ParseContext& context,
+                                         const wallpaper::wpscene::WPMaterial& wpmat,
+                                         const wallpaper::WPShaderInfo& info,
+                                         wallpaper::SceneNode* node, int32_t object_id,
+                                         std::string_view object_name, int32_t effect_id,
+                                         int32_t effect_index, wallpaper::usize material_index);
 void LoadUserShaderValue(wallpaper::SceneMaterial& material,
                          const wallpaper::wpscene::WPMaterial& wpmat,
                          const wallpaper::WPShaderInfo& info,

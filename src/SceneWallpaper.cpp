@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
+#include <functional>
 #include <malloc.h>
 #include <atomic>
 #include <future>
@@ -532,6 +534,74 @@ private:
             }
             m_scene->paritileSys->Emitt();
 
+            // Temporary diagnostic: dump the scene node tree once at the frame index given by
+            // VIVID_SCENE_TREE_DUMP so captures can report effective visibility and transforms.
+            {
+                static const int dump_frame = [] {
+                    const char* v = std::getenv("VIVID_SCENE_TREE_DUMP");
+                    return v != nullptr ? std::atoi(v) : -1;
+                }();
+                static int diag_frame_counter = 0;
+                if (dump_frame >= 0 && diag_frame_counter++ == dump_frame &&
+                    m_scene->sceneGraph) {
+                    std::function<void(SceneNode*, int)> walk = [&](SceneNode* n, int depth) {
+                        if (n == nullptr) return;
+                        n->UpdateTrans();
+                        const Eigen::Matrix4d m  = n->ModelTrans();
+                        const Eigen::Vector3d wp = m.block<3, 1>(0, 3);
+                        const auto&           t  = n->Translate();
+                        const auto&           s  = n->Scale();
+                        const auto&           r  = n->Rotation();
+                        LOG_INFO("TREEDUMP %*s id=%d name='%s' vis=%d(l%d,L%d) "
+                                 "t=[%.5g %.5g %.5g] s=[%.5g %.5g %.5g] r=[%.4g %.4g %.4g] "
+                                 "w=[%.5g %.5g %.5g] mesh=%d text=%d cam='%s'",
+                                 depth * 2, "", n->ID(), n->Name().c_str(), (int)n->Visible(),
+                                 (int)n->LocalVisible(), (int)n->LayerVisible(), t.x(), t.y(),
+                                 t.z(), s.x(), s.y(), s.z(), r.x(), r.y(), r.z(), wp.x(), wp.y(),
+                                 wp.z(), n->Mesh() != nullptr ? 1 : 0, n->HasText() ? 1 : 0,
+                                 n->Camera().c_str());
+                        if (n->Mesh() != nullptr && n->Mesh()->Material() != nullptr) {
+                            const auto& cv = n->Mesh()->Material()->customShader.constValues;
+                            std::string cv_text;
+                            for (const auto& [cv_name, cv_value] : cv) {
+                                cv_text += cv_name;
+                                cv_text += "=[";
+                                for (usize vi = 0; vi < cv_value.size(); vi++) {
+                                    if (vi) cv_text += " ";
+                                    cv_text += std::to_string(cv_value[vi]);
+                                }
+                                cv_text += "] ";
+                            }
+                            if (! cv_text.empty()) {
+                                LOG_INFO("TREEDUMP %*s   const: %s", depth * 2, "",
+                                         cv_text.c_str());
+                            }
+                        }
+                        for (auto& c : n->GetChildren()) walk(c.get(), depth + 1);
+                    };
+                    walk(m_scene->sceneGraph.get(), 0);
+                    for (auto& [name, cam] : m_scene->cameras) {
+                        if (! cam) continue;
+                        const auto pos = cam->GetPosition();
+                        LOG_INFO("TREEDUMP-CAM name='%s' pos=[%.5g %.5g %.5g] eye-set=%d",
+                                 name.c_str(), pos.x(), pos.y(), pos.z(),
+                                 m_scene->activeCamera == cam.get() ? 1 : 0);
+                    }
+                    for (auto& light : m_scene->lights) {
+                        if (! light) continue;
+                        const auto  origin = light->WorldOrigin();
+                        const auto* node   = light->node();
+                        LOG_INFO("TREEDUMP-LIGHT node='%s' id=%d origin=[%.5g %.5g %.5g] "
+                                 "radius=%.4g intensity=%.4g visible=%d",
+                                 node != nullptr ? node->Name().c_str() : "<null>",
+                                 node != nullptr ? node->ID() : 0,
+                                 origin.x(), origin.y(), origin.z(),
+                                 light->radius(), light->intensity(),
+                                 node != nullptr ? (int)node->Visible() : -1);
+                    }
+                }
+            }
+
             m_render->drawFrame(*m_scene);
 
             m_scene->shaderValueUpdater->FrameEnd();
@@ -656,6 +726,13 @@ private:
                 m_scene->scriptHost->ApplyAudioSamples(*audio_samples);
             }
             m_scene->scriptHost->MaterializeDeferredRuntimeLayersForResidency();
+            // Scene scripts distinguish the authored canvas (engine.canvasSize, scene ortho) from
+            // the physical wallpaper output (engine.screenResolution). UI layout scripts derive
+            // their resolution-adaptive scale from screenResolution, so publish the real output
+            // extent before the first script update runs; the host constructor only knows the
+            // canvas size.
+            m_scene->scriptHost->ResizeScreen(static_cast<int32_t>(m_output_width),
+                                              static_cast<int32_t>(m_output_height));
 
             if (m_rg) m_render->clearLastRenderGraph(true);
             {
@@ -714,12 +791,22 @@ private:
         } catch (...) {
             ok = false;
         }
+        if (ok) {
+            m_output_width  = request->width;
+            m_output_height = request->height;
+            if (m_scene && m_scene->scriptHost) {
+                m_scene->scriptHost->ResizeScreen(static_cast<int32_t>(m_output_width),
+                                                  static_cast<int32_t>(m_output_height));
+            }
+        }
         request->result.set_value(ok);
     }
     MHANDLER_CMD(INIT_VULKAN) {
         std::shared_ptr<RenderInitInfo> info;
         if (msg->findObject("info", &info)) {
-            m_render_scale = std::max(1.0, info->render_scale);
+            m_render_scale  = std::max(1.0, info->render_scale);
+            m_output_width  = info->width;
+            m_output_height = info->height;
             m_render->init(*info);
             if (m_render->inited())
                 main_handler.sendRenderReady();
@@ -735,6 +822,10 @@ private:
     std::shared_ptr<WPSceneScriptMediaState> m_applied_media_state;
     float                                    m_speed { 1.0f };
     double                                   m_render_scale { 1.0 };
+    // Physical wallpaper output extent, forwarded to scene scripts as engine.screenResolution.
+    // Distinct from the authored canvas (scene ortho / engine.canvasSize).
+    uint32_t                                 m_output_width { 1920 };
+    uint32_t                                 m_output_height { 1080 };
     std::atomic<bool>                        m_cursor_left_down { false };
 
     std::unique_ptr<vulkan::VulkanRender> m_render;

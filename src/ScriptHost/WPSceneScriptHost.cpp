@@ -57,6 +57,12 @@ struct CursorPositionState {
     double screen_y { 0.0 };
     double world_x { 0.0 };
     double world_y { 0.0 };
+    double world_z { 0.0 };
+    // Clip-space cursor position for perspective scenes: layer hit tests project quad corners
+    // through the shared view camera, so the cursor must be compared in the same space.
+    double ndc_x { 0.0 };
+    double ndc_y { 0.0 };
+    bool   perspective { false };
 };
 
 
@@ -3968,6 +3974,22 @@ bool ApplyMaterialUniformPropertyValue(WPSceneScriptHost::Opaque*       opaque,
     // Updating this map is therefore enough for live user-property colors to reach the next draw
     // without rebuilding the render graph or reloading the scene package.
     material->customShader.constValues[registration.property_name] = *shader_value;
+    // Temporary diagnostic: trace a few effect uniforms while bringing up script-driven chains.
+    {
+        static const bool trace = std::getenv("VIVID_DRAW_TRACE") != nullptr;
+        static int        budget = 200;
+        if (trace && budget > 0 &&
+            (registration.property_name == "u_lineOpacity" ||
+             registration.property_name == "u_globalScale" ||
+             registration.property_name == "u_trailEnable" ||
+             registration.property_name == "u_maxAB")) {
+            budget--;
+            LOG_INFO("UNIFTRACE layer=%d uniform='%s' value=%s",
+                     registration.object_id,
+                     registration.property_name.c_str(),
+                     value.describe().c_str());
+        }
+    }
     (void)opaque;
     return true;
 }
@@ -4041,15 +4063,20 @@ Eigen::Matrix4d ResolveCursorHitModelTransform(const WPSceneScriptHost::Opaque* 
 
     const auto*     node_data = GetNodeData(opaque, node);
     Eigen::Matrix4d resolved  = Eigen::Matrix4d::Identity();
+    SceneNode*      transform_parent =
+        node_data != nullptr ? node_data->TransformParent() : nullptr;
     if (node_data != nullptr && node_data->InheritsSceneParentTransform() &&
-        node_data->TransformParent() != nullptr) {
+        transform_parent != nullptr && GetNodeData(opaque, transform_parent) != nullptr) {
         // Effect-backed image layers often keep the script-facing authored node outside the real
         // SceneNode parent chain and express the render-time parent through WPShaderValueData.
         // Cursor hit bounds must use the same virtual parent transform as the renderer; otherwise
         // meshless authored layers are tested near their local origin while the visible composite
-        // is drawn under its parent group.
-        const Eigen::Matrix4d parent_model =
-            ResolveCursorHitModelTransform(opaque, node_data->TransformParent(), resolving);
+        // is drawn under its parent group. The renderer inherits the parent's authored pivot, not
+        // its alignment-adjusted mesh placement, so strip the parent's image-alignment translate
+        // exactly like the render-side transform resolver does.
+        const Eigen::Matrix4d parent_model = RemoveImageAlignmentOffsetFromModel(
+            ResolveCursorHitModelTransform(opaque, transform_parent, resolving),
+            transform_parent->AlignmentOffset());
         resolved = parent_model * node->GetLocalTrans();
     } else {
         node->UpdateTrans();
@@ -4067,19 +4094,21 @@ Eigen::Matrix4d ResolveCursorHitModelTransform(const WPSceneScriptHost::Opaque* 
 }
 
 std::optional<std::array<double, 4>> ComputeQuadBounds2D(const Eigen::Matrix4d&      model,
-                                                         const std::array<float, 2>& size) {
+                                                         const std::array<float, 2>& size,
+                                                         const Eigen::Matrix4d*      clip) {
     if (! std::isfinite(size[0]) || ! std::isfinite(size[1]) || size[0] <= 0.0f ||
         size[1] <= 0.0f) {
         return std::nullopt;
     }
 
-    const double                         half_width  = static_cast<double>(size[0]) * 0.5;
-    const double                         half_height = static_cast<double>(size[1]) * 0.5;
+    const double half_width  = static_cast<double>(size[0]) * 0.5;
+    const double half_height = static_cast<double>(size[1]) * 0.5;
+    // Winding order matters below: near-plane clipping walks the polygon edges.
     const std::array<Eigen::Vector4d, 4> corners {
         Eigen::Vector4d(-half_width, -half_height, 0.0, 1.0),
-        Eigen::Vector4d(-half_width, half_height, 0.0, 1.0),
         Eigen::Vector4d(half_width, -half_height, 0.0, 1.0),
         Eigen::Vector4d(half_width, half_height, 0.0, 1.0),
+        Eigen::Vector4d(-half_width, half_height, 0.0, 1.0),
     };
 
     double min_x = std::numeric_limits<double>::max();
@@ -4087,12 +4116,40 @@ std::optional<std::array<double, 4>> ComputeQuadBounds2D(const Eigen::Matrix4d& 
     double max_x = std::numeric_limits<double>::lowest();
     double max_y = std::numeric_limits<double>::lowest();
 
-    for (const auto& corner : corners) {
-        const Eigen::Vector4d world = model * corner;
-        min_x                       = std::min(min_x, world.x());
-        min_y                       = std::min(min_y, world.y());
-        max_x                       = std::max(max_x, world.x());
-        max_y                       = std::max(max_y, world.y());
+    const auto accumulate = [&](double x, double y) {
+        min_x = std::min(min_x, x);
+        min_y = std::min(min_y, y);
+        max_x = std::max(max_x, x);
+        max_y = std::max(max_y, y);
+    };
+
+    if (clip != nullptr) {
+        // Perspective scenes hit-test in clip space. A quad that crosses the eye plane must be
+        // clipped against w = epsilon before the perspective divide: simply dropping behind-eye
+        // corners leaves the surviving corner with a near-zero w whose division explodes the
+        // bounds across half the screen, turning distant labels into giant phantom hit targets.
+        constexpr double kMinW = 1e-4;
+        std::array<Eigen::Vector4d, 8> clipped;
+        size_t                         clipped_count = 0;
+        for (size_t i = 0; i < corners.size(); i++) {
+            const Eigen::Vector4d a = (*clip) * (model * corners[i]);
+            const Eigen::Vector4d b = (*clip) * (model * corners[(i + 1) % corners.size()]);
+            const bool            a_in = a.w() > kMinW;
+            const bool            b_in = b.w() > kMinW;
+            if (a_in) clipped[clipped_count++] = a;
+            if (a_in != b_in) {
+                const double t = (kMinW - a.w()) / (b.w() - a.w());
+                clipped[clipped_count++] = a + (b - a) * t;
+            }
+        }
+        for (size_t i = 0; i < clipped_count; i++) {
+            accumulate(clipped[i].x() / clipped[i].w(), clipped[i].y() / clipped[i].w());
+        }
+    } else {
+        for (const auto& corner : corners) {
+            const Eigen::Vector4d world = model * corner;
+            accumulate(world.x(), world.y());
+        }
     }
 
     if (min_x > max_x || min_y > max_y) return std::nullopt;
@@ -4101,7 +4158,7 @@ std::optional<std::array<double, 4>> ComputeQuadBounds2D(const Eigen::Matrix4d& 
 
 std::optional<std::array<double, 4>>
 ComputeLayerQuadBounds2D(const WPSceneScriptHost::Opaque* opaque, SceneNode* node,
-                         const std::array<float, 2>& size) {
+                         const std::array<float, 2>& size, const Eigen::Matrix4d* clip) {
     if (node == nullptr) return std::nullopt;
 
     // Meshless script targets still represent regular centered Wallpaper Engine quads. The key
@@ -4109,11 +4166,12 @@ ComputeLayerQuadBounds2D(const WPSceneScriptHost::Opaque* opaque, SceneNode* nod
     // effect composite nodes, so this fallback reconstructs only the cursor bounds and leaves the
     // render graph untouched.
     const Eigen::Matrix4d model = ResolveCursorHitModelTransform(opaque, node);
-    return ComputeQuadBounds2D(model, size);
+    return ComputeQuadBounds2D(model, size, clip);
 }
 
 std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost::Opaque* opaque,
-                                                         SceneNode*                       node) {
+                                                         SceneNode*                       node,
+                                                         const Eigen::Matrix4d*           clip) {
     if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->VertexCount() == 0)
         return std::nullopt;
 
@@ -4128,7 +4186,12 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
 
     const float* data         = vertex_array.Data();
     const usize  vertex_count = vertex_array.VertexCount();
-    const Eigen::Matrix4d model = ResolveCursorHitModelTransform(opaque, node);
+    // The renderer post-multiplies the mesh geometry transform into the model matrix before
+    // projecting vertices; cursor bounds must follow the same contract or hit regions drift away
+    // from the drawn quad for meshes with a non-identity geometry transform.
+    const Eigen::Matrix4d model =
+        ResolveCursorHitModelTransform(opaque, node) *
+        node->Mesh()->GeometryTransform().matrix().cast<double>();
 
     double min_x = std::numeric_limits<double>::max();
     double min_y = std::numeric_limits<double>::max();
@@ -4136,7 +4199,15 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
     double max_y = std::numeric_limits<double>::lowest();
 
     auto accumulate = [&](const Eigen::Vector4d& local) {
-        const Eigen::Vector4d world = model * local;
+        Eigen::Vector4d world = model * local;
+        if (clip != nullptr) {
+            // Vertex soups have no edge information for proper near-plane clipping, so drop
+            // near-eye vertices outright. The threshold matches the quad path's clip epsilon;
+            // anything smaller lets the perspective divide blow the bounds up.
+            const Eigen::Vector4d projected = (*clip) * world;
+            if (! (projected.w() > 1e-4)) return;
+            world = projected / projected.w();
+        }
         min_x = std::min(min_x, world.x());
         min_y = std::min(min_y, world.y());
         max_x = std::max(max_x, world.x());
@@ -4171,10 +4242,11 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
 
 std::optional<std::array<double, 4>>
 ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
-                            const WPSceneScriptRegistration& registration) {
+                            const WPSceneScriptRegistration& registration,
+                            const Eigen::Matrix4d*           clip) {
     if (registration.node == nullptr) return std::nullopt;
 
-    if (auto mesh_bounds = ComputeNodeBounds2D(opaque, registration.node);
+    if (auto mesh_bounds = ComputeNodeBounds2D(opaque, registration.node, clip);
         mesh_bounds.has_value()) {
         return mesh_bounds;
     }
@@ -4187,7 +4259,7 @@ ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
         // visible pixels are rendered by source/final composite nodes. The image registry retains
         // the authored quad size, so combining it with ResolveCursorHitModelTransform recreates
         // the event target without adding any dummy mesh that could be picked up by rendering.
-        return ComputeLayerQuadBounds2D(opaque, registration.node, image_layer->size);
+        return ComputeLayerQuadBounds2D(opaque, registration.node, image_layer->size, clip);
     }
 
     if (const auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
@@ -4197,7 +4269,7 @@ ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
         const std::array<float, 2> text_size = text_layer->primitive != nullptr
                                                    ? text_layer->primitive->VisibleDisplaySize()
                                                    : text_layer->object.size;
-        return ComputeLayerQuadBounds2D(opaque, registration.node, text_size);
+        return ComputeLayerQuadBounds2D(opaque, registration.node, text_size, clip);
     }
 
     return std::nullopt;
@@ -4215,10 +4287,23 @@ bool InstanceReceivesCursor(const WPSceneScriptHost::Opaque* opaque, const Scrip
         return false;
     }
 
-    const auto bounds = ComputeCursorTargetBounds2D(opaque, instance.registration);
+    // Perspective scenes share one view camera for every layer, so the cursor test happens in
+    // clip space: quad corners project through the view, the cursor arrives as its clip-space
+    // position. Orthographic scenes keep the historical world-plane comparison.
+    Eigen::Matrix4d        clip_matrix;
+    const Eigen::Matrix4d* clip = nullptr;
+    if (cursor.perspective && opaque != nullptr && opaque->scene != nullptr &&
+        opaque->scene->activeCamera != nullptr && opaque->scene->activeCamera->IsPerspective()) {
+        clip_matrix = opaque->scene->activeCamera->GetViewProjectionMatrix();
+        clip        = &clip_matrix;
+    }
+
+    const auto bounds = ComputeCursorTargetBounds2D(opaque, instance.registration, clip);
     if (! bounds.has_value()) return false;
-    return cursor.world_x >= (*bounds)[0] && cursor.world_x <= (*bounds)[2] &&
-           cursor.world_y >= (*bounds)[1] && cursor.world_y <= (*bounds)[3];
+    const double cursor_x = clip != nullptr ? cursor.ndc_x : cursor.world_x;
+    const double cursor_y = clip != nullptr ? cursor.ndc_y : cursor.world_y;
+    return cursor_x >= (*bounds)[0] && cursor_x <= (*bounds)[2] &&
+           cursor_y >= (*bounds)[1] && cursor_y <= (*bounds)[3];
 }
 
 JSValue MakeCursorEventObject(JSContext* context, const CursorPositionState& cursor,
@@ -4226,7 +4311,7 @@ JSValue MakeCursorEventObject(JSContext* context, const CursorPositionState& cur
     JSValue event  = JS_NewObject(context);
     // Cursor event positions must be real WE-style Vec instances rather than plain objects:
     // draggable scene scripts call event.worldPosition.add()/subtract() while computing offsets.
-    JSValue world  = NumericVectorToJS(context, { cursor.world_x, cursor.world_y, 0.0 });
+    JSValue world  = NumericVectorToJS(context, { cursor.world_x, cursor.world_y, cursor.world_z });
     JSValue screen = NumericVectorToJS(context, { cursor.screen_x, cursor.screen_y });
 
     JS_SetPropertyStr(context, event, "worldPosition", world);
@@ -4801,6 +4886,15 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
             if (property_name == "alpha") {
                 float alpha = 0.0f;
                 if (! value.tryGet(&alpha)) return false;
+
+                static const char* alpha_dump = std::getenv("VIVID_ALPHA_DUMP");
+                if (alpha_dump != nullptr && layer_id == std::atoi(alpha_dump)) {
+                    LOG_INFO("ALPHADUMP layer=%d alpha=%.4f writer={%s}",
+                             layer_id,
+                             alpha,
+                             DescribeScriptInstance(opaque, opaque->current_running_instance)
+                                 .c_str());
+                }
 
                 bool applied     = false;
                 auto apply_alpha = [&](SceneMaterial& material, bool update_user_alpha) {
@@ -7651,28 +7745,76 @@ CursorPositionState ComputeCursorPositionState(const WPSceneScriptHost::Opaque* 
 
     const float normalized_x = std::clamp(opaque->scene->mousePositionNormalized[0], 0.0f, 1.0f);
     const float normalized_y = std::clamp(opaque->scene->mousePositionNormalized[1], 0.0f, 1.0f);
-    const float screen_x     = normalized_x * static_cast<float>(opaque->scene->ortho[0]);
-    const float screen_y     = normalized_y * static_cast<float>(opaque->scene->ortho[1]);
+    // input.cursorScreenPosition shares its coordinate frame with engine.screenResolution:
+    // scripts divide one by the other to normalize the pointer. Use the published output size
+    // and only fall back to the authored canvas before the surface size is known.
+    const float screen_w = opaque->screen_size[0] > 0
+                               ? static_cast<float>(opaque->screen_size[0])
+                               : static_cast<float>(opaque->scene->ortho[0]);
+    const float screen_h = opaque->screen_size[1] > 0
+                               ? static_cast<float>(opaque->screen_size[1])
+                               : static_cast<float>(opaque->scene->ortho[1]);
+    const float screen_x = normalized_x * screen_w;
+    const float screen_y = normalized_y * screen_h;
 
-    double             world_x          = screen_x;
-    double             world_y          = static_cast<float>(opaque->scene->ortho[1]) - screen_y;
-    const SceneCamera* camera           = opaque->scene->activeCamera;
-    const auto         global_camera_it = opaque->scene->cameras.find("global");
-    if (global_camera_it != opaque->scene->cameras.end() && global_camera_it->second) {
-        camera = global_camera_it->second.get();
+    // World-space cursor defaults stay in canvas coordinates (scene ortho): orthographic layer
+    // origins live in that frame, independent of the physical output size above.
+    double             world_x          = normalized_x * static_cast<double>(opaque->scene->ortho[0]);
+    double             world_y          = (1.0 - normalized_y) * static_cast<double>(opaque->scene->ortho[1]);
+    double             world_z          = 0.0;
+    const SceneCamera* view_camera      = opaque->scene->activeCamera;
+    const bool         perspective_view = ! opaque->scene->cameraOrthographic &&
+                                  view_camera != nullptr && view_camera->IsPerspective();
+    if (perspective_view) {
+        // Perspective scenes give scripts a world-space cursor by intersecting the view ray
+        // with the far-clip plane: the full screen height then spans 2*tan(fov/2)*farz world
+        // units, which is the range wallpaper drag scripts calibrate against.
+        const double ndc_x   = normalized_x * 2.0 - 1.0;
+        const double ndc_y   = 1.0 - normalized_y * 2.0;
+        const double fov_rad = view_camera->Fov() * (EIGEN_PI / 180.0);
+        const double tan_v   = std::tan(fov_rad * 0.5);
+        const double far_z   = view_camera->FarClip();
+
+        const Eigen::Vector3d eye     = view_camera->GetPosition();
+        const Eigen::Vector3d forward = view_camera->GetDirection().normalized();
+        Eigen::Vector3d       up      = view_camera->GetUp();
+        Eigen::Vector3d       right   = forward.cross(up);
+        if (right.squaredNorm() > 1e-12) {
+            right.normalize();
+            up = right.cross(forward);
+
+            const Eigen::Vector3d world =
+                eye + forward * far_z + right * (ndc_x * tan_v * view_camera->Aspect() * far_z) +
+                up * (ndc_y * tan_v * far_z);
+            world_x           = world.x();
+            world_y           = world.y();
+            world_z           = world.z();
+            state.ndc_x       = ndc_x;
+            state.ndc_y       = ndc_y;
+            state.perspective = true;
+        }
     }
-    if (camera != nullptr) {
-        const Eigen::Vector3d camera_pos = camera->GetPosition();
-        const double          left       = camera_pos.x() - camera->Width() / 2.0;
-        const double          top        = camera_pos.y() + camera->Height() / 2.0;
-        world_x                          = left + normalized_x * camera->Width();
-        world_y                          = top - normalized_y * camera->Height();
+
+    if (! state.perspective) {
+        const SceneCamera* camera           = opaque->scene->activeCamera;
+        const auto         global_camera_it = opaque->scene->cameras.find("global");
+        if (global_camera_it != opaque->scene->cameras.end() && global_camera_it->second) {
+            camera = global_camera_it->second.get();
+        }
+        if (camera != nullptr) {
+            const Eigen::Vector3d camera_pos = camera->GetPosition();
+            const double          left       = camera_pos.x() - camera->Width() / 2.0;
+            const double          top        = camera_pos.y() + camera->Height() / 2.0;
+            world_x                          = left + normalized_x * camera->Width();
+            world_y                          = top - normalized_y * camera->Height();
+        }
     }
 
     state.screen_x = screen_x;
     state.screen_y = screen_y;
     state.world_x  = world_x;
     state.world_y  = world_y;
+    state.world_z  = world_z;
     return state;
 }
 
@@ -7697,7 +7839,7 @@ void UpdateInputState(WPSceneScriptHost::Opaque* opaque) {
 
     JSValue cursor_world  = JS_GetPropertyStr(context, opaque->input, "cursorWorldPosition");
     JSValue cursor_screen = JS_GetPropertyStr(context, opaque->input, "cursorScreenPosition");
-    set_vec3(cursor_world, cursor.world_x, cursor.world_y, 0.0);
+    set_vec3(cursor_world, cursor.world_x, cursor.world_y, cursor.world_z);
     set_vec2(cursor_screen, cursor.screen_x, cursor.screen_y);
     JS_SetPropertyStr(context,
                       opaque->input,
@@ -8646,6 +8788,8 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
         auto& instance = *instance_ptr;
         if (! instance.initialized || JS_IsUndefined(instance.update_fn)) continue;
 
+        m_impl->current_running_instance = instance.instance_id;
+
         if (const auto node_value = ReadRegistrationValue(m_impl, instance.registration);
             node_value.has_value()) {
             instance.current_value = *node_value;
@@ -8685,12 +8829,14 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
                     continue;
                 }
                 instance.current_value = runtime_value;
+
                 ApplyRegistrationValue(m_impl, instance.registration, runtime_value);
             }
         }
 
         JS_FreeValue(context, result);
     }
+    m_impl->current_running_instance = 0;
 }
 
 void WPSceneScriptHost::ApplyAudioSamples(const std::vector<float>& audio_samples) {
@@ -8920,6 +9066,27 @@ void WPSceneScriptHost::HandleCursorMove() {
     const auto cursor    = ComputeCursorPositionState(m_impl);
     const bool left_down = m_impl->scene->cursorLeftDown;
 
+    // While the left button is held on script layers the pointer is captured by the pressed set:
+    // drag handlers (panel bars, sliders) keep receiving cursorMove even when the cursor slides
+    // off the pressed layer's small bounds, and no enter/leave transitions fire mid-drag. WE
+    // panel scripts end a drag from cursorLeave, so a hover-based leave here would silently
+    // truncate every drag to a few pixels.
+    if (left_down && ! m_impl->pressed_instances.empty()) {
+        for (const auto& instance_ptr : m_impl->instances) {
+            auto& instance = *instance_ptr;
+            if (! instance.initialized ||
+                ! m_impl->pressed_instances.contains(instance.instance_id) ||
+                JS_IsUndefined(instance.cursor_move_fn)) {
+                continue;
+            }
+
+            JSValue event = MakeCursorEventObject(context, cursor, left_down);
+            CallScriptEvent(context, instance.cursor_move_fn, event, "cursorMove");
+            JS_FreeValue(context, event);
+        }
+        return;
+    }
+
     std::unordered_set<uint32_t> next_hovered;
     for (const auto& instance_ptr : m_impl->instances) {
         auto& instance = *instance_ptr;
@@ -8970,7 +9137,15 @@ void WPSceneScriptHost::HandleCursorButton(bool down) {
     const auto cursor  = ComputeCursorPositionState(m_impl);
 
     if (down) {
+        // Stale pressed entries (e.g. a missed button-up event) must not leave the pointer
+        // captured, or the hover refresh below would be skipped and the new press would latch
+        // onto an outdated hover set.
+        m_impl->pressed_instances.clear();
         HandleCursorMove();
+        // Every hovered layer shares the press, matching observed official behavior: dragging a
+        // panel also feeds the fullscreen camera-rotation surface below it, and celestial labels
+        // rely on their own drag thresholds to suppress clicks during a rotation drag. The press
+        // is not exclusive to the top-most layer.
         m_impl->pressed_instances = m_impl->hovered_instances;
         for (const auto& instance_ptr : m_impl->instances) {
             auto& instance = *instance_ptr;
@@ -9009,15 +9184,16 @@ void WPSceneScriptHost::HandleCursorButton(bool down) {
 void WPSceneScriptHost::ResizeScreen(int32_t width, int32_t height) {
     if (! Ready()) return;
 
+    // Only engine.screenResolution tracks the physical wallpaper output. engine.canvasSize is the
+    // authored scene canvas (scene ortho): widget layout scripts multiply configured percentages
+    // by canvasSize to produce origins in canvas coordinates, so resizing it to the display would
+    // re-layout every widget against the wrong frame (and pull authored-offscreen text on screen).
+    m_impl->screen_size = { width, height };
     JSContext* context = m_impl->runtime.context;
     JSValue    screen  = JS_GetPropertyStr(context, m_impl->engine_base, "screenResolution");
-    JSValue    canvas  = JS_GetPropertyStr(context, m_impl->engine_base, "canvasSize");
     JS_SetPropertyStr(context, screen, "x", JS_NewFloat64(context, width));
     JS_SetPropertyStr(context, screen, "y", JS_NewFloat64(context, height));
-    JS_SetPropertyStr(context, canvas, "x", JS_NewFloat64(context, width));
-    JS_SetPropertyStr(context, canvas, "y", JS_NewFloat64(context, height));
     JS_FreeValue(context, screen);
-    JS_FreeValue(context, canvas);
 
     for (const auto& instance_ptr : m_impl->instances) {
         auto& instance = *instance_ptr;

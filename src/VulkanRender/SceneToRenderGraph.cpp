@@ -457,8 +457,11 @@ static NodePassOptions BuildOwnerSourcePassOptions(
     std::string_view inherited_output,
     const TraversalRoute& route,
     const EffectSourceRoutingDecision& source_route) {
-    const bool clear_private_effect_source =
-        route.compose_source && imgeff != nullptr && output != inherited_output;
+    // Every private effect-source seed must start from a cleared target, not only composition
+    // sources. Render-graph memory aliasing can hand this pass a target whose bytes still hold
+    // another (now hidden) layer's last output, and a translucent owner draw with zero alpha
+    // writes nothing at all - compositing would then resurrect the stale content full-screen.
+    const bool clear_private_effect_source = imgeff != nullptr && output != inherited_output;
     const bool evaluate_framebuffer_source_with_active_camera =
         source_route.owner_node_samples_framebuffer &&
         !source_route.owner_node_uses_perspective_camera;

@@ -2199,7 +2199,7 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
 inline std::string GenPreShaderSha1(std::string_view expanded_src,
                                     std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "pre-shader-v3-authored-texture-combo-boundness\n";
+    out << "pre-shader-v4-mask-component-4\n";
     out << utils::genSha1(expanded_src) << '\n';
     for (const auto& texinfo : texinfos) {
         out << static_cast<int>(texinfo.enabled);
