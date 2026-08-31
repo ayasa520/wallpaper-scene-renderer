@@ -174,6 +174,11 @@ struct WPSceneScriptHost::Opaque {
     std::unordered_set<uint32_t> hovered_instances;
     std::unordered_set<uint32_t> pressed_instances;
     std::vector<SceneRegistrationRange> pending_scene_registration_ranges;
+    // Physical wallpaper output extent (engine.screenResolution). Zero until the wallpaper
+    // surface publishes its size; cursor screen coordinates then fall back to the scene canvas.
+    std::array<int32_t, 2> screen_size { 0, 0 };
+    // Diagnostic aid: instance id of the script update currently executing (0 outside updates).
+    uint32_t current_running_instance { 0 };
 };
 
 // The textures and render targets a layer tree currently holds resident on the GPU.

@@ -166,16 +166,29 @@ public:
         return Eigen::Vector4f(-f / denom, -n * f / denom, -1.0f, 0.0f);
     }
 
-    Eigen::Vector3f WorldOrigin() const {
-        if (m_node == nullptr) return Eigen::Vector3f::Zero();
+    // Parented lights compose the authored ancestor chain at draw time like every other routed
+    // layer. The shader-value updater publishes that composed transform once per frame; without
+    // it the physical scene-graph transform is the authoritative world placement.
+    void SetResolvedWorldTransform(const Eigen::Matrix4d& transform) {
+        m_resolvedWorld    = transform;
+        m_hasResolvedWorld = true;
+    }
+
+    Eigen::Matrix4d WorldTransform() const {
+        if (m_hasResolvedWorld) return m_resolvedWorld;
+        if (m_node == nullptr) return Eigen::Matrix4d::Identity();
         m_node->UpdateTrans();
-        return m_node->ModelTrans().block<3, 1>(0, 3).cast<float>();
+        return m_node->ModelTrans();
+    }
+
+    Eigen::Vector3f WorldOrigin() const {
+        if (m_node == nullptr && ! m_hasResolvedWorld) return Eigen::Vector3f::Zero();
+        return WorldTransform().block<3, 1>(0, 3).cast<float>();
     }
 
     Eigen::Vector3f WorldForward() const {
-        if (m_node == nullptr) return Eigen::Vector3f(0.0f, 0.0f, 1.0f);
-        m_node->UpdateTrans();
-        Eigen::Vector3f forward = m_node->ModelTrans().block<3, 1>(0, 2).cast<float>();
+        if (m_node == nullptr && ! m_hasResolvedWorld) return Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+        Eigen::Vector3f forward = WorldTransform().block<3, 1>(0, 2).cast<float>();
         if (forward.squaredNorm() > 1e-12f) return forward.normalized();
         return Eigen::Vector3f(0.0f, 0.0f, 1.0f);
     }
@@ -335,6 +348,8 @@ private:
 
     Eigen::Vector3f            m_premultiplied_color { Eigen::Vector3f::Zero() };
     std::shared_ptr<SceneNode> m_node { nullptr };
+    Eigen::Matrix4d            m_resolvedWorld { Eigen::Matrix4d::Identity() };
+    bool                       m_hasResolvedWorld { false };
 
     SceneLightType m_type { SceneLightType::Other };
     bool           m_cast_volumetrics { false };
@@ -345,7 +360,7 @@ private:
     bool           m_has_cookie { false };
     std::string    m_cookie;
     bool           m_casts_shadows { false };
-    float          m_exponent { 1.0f };
+    float          m_exponent { 2.0f };
     float          m_cascade0 { 25.0f };
     float          m_cascade1 { 50.0f };
     float          m_cascade2 { 200.0f };

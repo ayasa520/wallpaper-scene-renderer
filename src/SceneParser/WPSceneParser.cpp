@@ -1134,6 +1134,12 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
         pWPShaderInfo  = upWPShaderInfo.get();
     }
 
+    // Scene materials compile their HDR shader variant only when the wallpaper actually renders
+    // into an HDR swapchain (display HDR). Ultra post-processing on a standard-range output keeps
+    // the LDR material variant: the HDR variant's g_Brightness multiply and CombineLighting
+    // overbright term would wash out lit surfaces that the standard-range chain then blooms.
+    // Vivid currently always renders standard-range, so the combo stays off.
+
     SceneMaterialCustomShader materialShader;
 
     auto& shader = materialShader.shader;
@@ -1190,6 +1196,16 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
         for (auto& unit : sd_units) {
             if (ExpandRequireLightingV1(unit.src, lighting_desc)) lighting_v1 = true;
         }
+        if (lighting_v1) {
+            LOG_INFO("SceneLightingExpand: shader='%s' point=%d spot=%d directional=%d tube=%d "
+                     "shadows=%s",
+                     wpmat.shader.c_str(),
+                     lighting_desc.point,
+                     lighting_desc.spot,
+                     lighting_desc.directional,
+                     lighting_desc.tube,
+                     lighting_desc.shadows ? "true" : "false");
+        }
     }
 
     auto textures = wpmat.textures;
@@ -1232,11 +1248,16 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
                 texinfos.push_back({ false });
                 continue;
             }
+            const auto compo_flag = [&texh](const char* key) {
+                const auto it = texh.extraHeader.find(key);
+                return it != texh.extraHeader.end() && it->second.val != 0;
+            };
             texinfos.push_back({ true,
                                  {
-                                     (bool)texh.extraHeader.at("compo1").val,
-                                     (bool)texh.extraHeader.at("compo2").val,
-                                     (bool)texh.extraHeader.at("compo3").val,
+                                     compo_flag("compo1"),
+                                     compo_flag("compo2"),
+                                     compo_flag("compo3"),
+                                     compo_flag("compo4"),
                                  } });
         } else {
             // Runtime render targets should expose sampler metadata to the shader preprocessor just
@@ -1402,41 +1423,62 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
                                    std::string_view initial_source, int32_t owner_layer_id,
                                    std::string_view         owner_name,
                                    int32_t                  color_blend_mode,
-                                   const WPShaderValueData* final_transform_data = nullptr) {
+                                   const WPShaderValueData* final_transform_data = nullptr,
+                                   const wpscene::WPMaterial* direct_material    = nullptr,
+                                   int32_t                    direct_effect_id   = 0) {
     auto& vfs = *context.vfs;
 
     wpscene::WPMaterial composite_source;
-    nlohmann::json      composite_json;
-    if (! PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
-                     composite_json) ||
-        ! composite_source.FromJson(composite_json)) {
-        LOG_ERROR(
-            "SceneEffectFinalComposite: layer=%d name='%.*s' failed to load passthrough material",
-            owner_layer_id,
-            static_cast<int>(owner_name.size()),
-            owner_name.data());
-        return false;
+    if (direct_material != nullptr) {
+        // A single authored effect pass with no private buffers is the layer's on-screen
+        // writer: the pass material draws the final quad at output resolution while sampling
+        // the private source. Routing it through a second ping-pong target instead would cap
+        // procedural detail (orbit lines, atmosphere rims) at that target's resolution.
+        composite_source = *direct_material;
+    } else {
+        nlohmann::json composite_json;
+        if (! PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
+                         composite_json) ||
+            ! composite_source.FromJson(composite_json)) {
+            LOG_ERROR(
+                "SceneEffectFinalComposite: layer=%d name='%.*s' failed to load passthrough material",
+                owner_layer_id,
+                static_cast<int>(owner_name.size()),
+                owner_name.data());
+            return false;
+        }
     }
 
     if (composite_source.textures.empty()) composite_source.textures.resize(1);
-    composite_source.textures[0] = std::string(initial_source);
-    // Modes 1..30 are framebuffer-aware shader blend equations. Modes 0 and 31 use the neutral
-    // shader variant; mode 31 is expressed by the final fixed-function additive state instead.
-    composite_source.combos["BLENDMODE"] =
-        UsesShaderColorBlendMode(color_blend_mode) ? color_blend_mode : 0;
+    if (direct_material == nullptr || composite_source.textures[0].empty()) {
+        composite_source.textures[0] = std::string(initial_source);
+    }
+    if (direct_material == nullptr) {
+        // Modes 1..30 are framebuffer-aware shader blend equations. Modes 0 and 31 use the neutral
+        // shader variant; mode 31 is expressed by the final fixed-function additive state instead.
+        composite_source.combos["BLENDMODE"] =
+            UsesShaderColorBlendMode(color_blend_mode) ? color_blend_mode : 0;
+    }
 
     WPShaderInfo composite_shader_info;
     composite_shader_info.baseConstSvs = context.global_base_uniforms;
-    // The source object/effect chain has already baked authored color, alpha, brightness, and
-    // effect output into the ping-pong texture. The final composite must therefore be a neutral
-    // sampler: it applies the layer's final mesh and blend state, but it must not tint or fade the
-    // resolved texture a second time.
-    composite_shader_info.baseConstSvs["g_Color4"] =
-        std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
-    composite_shader_info.baseConstSvs["g_Color"]      = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
-    composite_shader_info.baseConstSvs["g_Alpha"]      = 1.0f;
-    composite_shader_info.baseConstSvs["g_UserAlpha"]  = 1.0f;
-    composite_shader_info.baseConstSvs["g_Brightness"] = 1.0f;
+    if (direct_material != nullptr) {
+        composite_shader_info.baseConstSvs["g_EffectTextureProjectionMatrix"] =
+            ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
+        composite_shader_info.baseConstSvs["g_EffectTextureProjectionMatrixInverse"] =
+            ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
+    } else {
+        // The source object/effect chain has already baked authored color, alpha, brightness, and
+        // effect output into the ping-pong texture. The final composite must therefore be a neutral
+        // sampler: it applies the layer's final mesh and blend state, but it must not tint or fade
+        // the resolved texture a second time.
+        composite_shader_info.baseConstSvs["g_Color4"] =
+            std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
+        composite_shader_info.baseConstSvs["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
+        composite_shader_info.baseConstSvs["g_Alpha"]      = 1.0f;
+        composite_shader_info.baseConstSvs["g_UserAlpha"]  = 1.0f;
+        composite_shader_info.baseConstSvs["g_Brightness"] = 1.0f;
+    }
 
     SceneMaterial     composite_material;
     WPShaderValueData composite_data;
@@ -1453,6 +1495,11 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
                   static_cast<int>(owner_name.size()),
                   owner_name.data());
         return false;
+    }
+    if (direct_material != nullptr) {
+        LoadConstvalue(composite_material, composite_source, composite_shader_info);
+        LoadUserShaderValue(
+            composite_material, composite_source, composite_shader_info, context.user_properties);
     }
     if (final_transform_data != nullptr) {
         // The fallback final composite is the screen-space writer used when the last authored
@@ -1475,6 +1522,32 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
     final_node.AddMesh(composite_mesh);
 
     context.shader_updater->SetNodeData(&final_node, composite_data);
+    if (direct_material != nullptr) {
+        RegisterUserShaderValueBindings(context,
+                                        composite_source,
+                                        composite_shader_info,
+                                        &final_node,
+                                        owner_layer_id,
+                                        owner_name);
+        RegisterConstantShaderValueBindings(context,
+                                            composite_source,
+                                            composite_shader_info,
+                                            &final_node,
+                                            owner_layer_id,
+                                            owner_name,
+                                            direct_effect_id,
+                                            0,
+                                            0);
+        LOG_INFO("SceneEffectDirectFinalDraw: layer=%d name='%.*s' effect-id=%d shader='%s' "
+                 "source='%.*s'",
+                 owner_layer_id,
+                 static_cast<int>(owner_name.size()),
+                 owner_name.data(),
+                 direct_effect_id,
+                 composite_source.shader.c_str(),
+                 static_cast<int>(initial_source.size()),
+                 initial_source.data());
+    }
     // The final composite is a drawing phase of the owning layer, not a second layer identity:
     // it stays out of sceneGraph/nodeOwners. Its node id (set above) is the back-reference the
     // render graph uses to resolve the owning layer for visibility and residency decisions.
@@ -2438,10 +2511,12 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
     // Apply exact authored material keys before display-name fallbacks. Some Wallpaper Engine
     // projects serialize both forms in one pass; the display-name value is the editor-visible
     // override and must be allowed to replace the internal default key deterministically.
+    std::unordered_set<std::string> exact_uniform_names;
     for (const auto& [name, value] : wpmat.constantshadervalues) {
         const auto resolution = ResolveMaterialValueUniform(info, name, false);
         if (! resolution.resolved()) continue;
         ApplyResolvedConstvalue(material, name, value, resolution);
+        exact_uniform_names.insert(resolution.uniform_name);
     }
 
     for (const auto& [name, value] : wpmat.constantshadervalues) {
@@ -2453,6 +2528,17 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
 
         const auto resolution = ResolveMaterialValueUniform(info, name, true);
         if (resolution.resolved()) {
+            // Model importer leftovers ("Alpha", "Color") normalize onto the same uniforms as the
+            // authored lowercase keys. An exact authored key is the value the editor exported, so
+            // a normalized fallback may fill gaps but never override it; planet atmosphere shells
+            // authored as {Alpha: 1, alpha: 0.25} must stay translucent.
+            if (exact_uniform_names.count(resolution.uniform_name) != 0) {
+                LOG_INFO("ShaderValueAliasSkip: material-value='%s' uniform='%s' "
+                         "reason=exact-key-owns-uniform",
+                         name.c_str(),
+                         resolution.uniform_name.c_str());
+                continue;
+            }
             ApplyResolvedConstvalue(material, name, value, resolution);
             continue;
         }
@@ -2590,9 +2676,9 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
     }
 }
 
-namespace
-{
-
+// Shared with WPSceneParserModel.cpp (declared in WPSceneParserShared.hpp): model chunk
+// materials carry the same authored constant bindings as effect pass materials, so their
+// script/user/animation constants register through this one dispatcher.
 void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::WPMaterial& wpmat,
                                          const WPShaderInfo& info, SceneNode* node,
                                          int32_t object_id, std::string_view object_name,
@@ -2675,9 +2761,6 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
                  DynamicValueTypeName(setting.value.type()));
     }
 }
-
-// Shared with WPSceneParserModel.cpp (declared in WPSceneParserShared.hpp).
-} // namespace
 
 void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                          const WPShaderInfo& info, const UserPropertyMap* user_properties) {
@@ -2855,6 +2938,26 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
     scene.modelPerspectiveCameraName = std::string(kSceneModelPerspectiveCameraName);
     scene.sceneGraph->AppendChild(model_camera_node);
     LoadModelCameraPaths(context, scene_config.camera);
+
+    if (! general.isOrtho) {
+        // A scene without an orthogonal projection renders every layer kind through the one
+        // authored perspective view: image quads, text, and models share the same eye and
+        // projection instead of splitting between a canvas-sized orthographic camera and a
+        // model-only camera. A camera layer, when present, re-targets this view per frame.
+        scene.activeCamera = scene.cameras.at(std::string(kSceneModelPerspectiveCameraName)).get();
+        LOG_INFO("ScenePerspectiveView: 3d scene routes all layers through camera='%s' "
+                 "fov=%.3f near=%.5f far=%.1f eye=[%.5f, %.5f, %.5f] center=[%.5f, %.5f, %.5f]",
+                 scene.modelPerspectiveCameraName.c_str(),
+                 general.fov,
+                 general.nearz,
+                 general.farz,
+                 eye.x(),
+                 eye.y(),
+                 eye.z(),
+                 center.x(),
+                 center.y(),
+                 center.z());
+    }
 }
 
 void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
@@ -2974,6 +3077,24 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
             ? wpimgobj.effectSourceSize
             : wpimgobj.size;
+    // Perspective scenes rasterize effect chains at canvas density. A unit-space layer's
+    // authored size would allocate a private target of a few texels, and procedural detail
+    // such as orbit lines or atmosphere rims cannot survive that sampling. The private target
+    // keeps the authored aspect ratio, because effect shaders derive their own aspect
+    // correction from the target resolution; only the pixel density rises toward the canvas.
+    const std::array<float, 2> effect_target_resolution = [&] {
+        if (context.scene == nullptr || context.scene->cameraOrthographic) {
+            return effect_source_size;
+        }
+        const float source_w = std::max(effect_source_size[0], 1.0f);
+        const float source_h = std::max(effect_source_size[1], 1.0f);
+        const float density  = std::max(
+            1.0f,
+            std::min(static_cast<float>(context.ortho_w) / source_w,
+                      static_cast<float>(context.ortho_h) / source_h));
+        return std::array<float, 2> { std::ceil(source_w * density),
+                                      std::ceil(source_h * density) };
+    }();
     // skip no effect fullscreen layer
     if (! hasEffect && wpimgobj.fullscreen) {
         register_logical_only_layer();
@@ -3356,10 +3477,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         // set renderTarget for ping-pong operate
         {
             scene.renderTargets[effect_ppong_a] = {
-                .width      = (uint16_t)effect_source_size[0],
-                .height     = (uint16_t)effect_source_size[1],
-                .mapWidth   = (uint16_t)effect_source_size[0],
-                .mapHeight  = (uint16_t)effect_source_size[1],
+                .width      = (uint16_t)effect_target_resolution[0],
+                .height     = (uint16_t)effect_target_resolution[1],
+                .mapWidth   = (uint16_t)effect_target_resolution[0],
+                .mapHeight  = (uint16_t)effect_target_resolution[1],
                 .allowReuse = true,
                 .sample     = source_sampler,
             };
@@ -3391,6 +3512,53 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                          wpimgobj.fullscreen ? "true" : "false");
             }
         }
+        // A single static-visible effect pass with no private buffers or commands is the layer's
+        // own on-screen writer: its material draws the final quad at output resolution while
+        // sampling the private source target. Multi-pass chains, dependency sources, puppets,
+        // compose helpers, and runtime-toggled effects keep the private ping-pong route.
+        const wpscene::WPImageEffect* direct_final_effect = nullptr;
+        wpscene::WPMaterial           direct_final_material;
+        if (hasAuthoredEffect && ! has_shader_color_blend && ! is_offscreen_dependency_source &&
+            ! isCompose && ! hasAnimatedPuppetMesh && wpimgobj.effects.size() == 1) {
+            const auto& candidate = wpimgobj.effects.front();
+            const auto  candidate_visibility =
+                BuildEffectVisibilityContract(candidate, context.user_properties);
+            bool eligible = ! candidate_visibility.can_prune_at_parse_time &&
+                            ! candidate_visibility.requires_runtime_contract &&
+                            candidate_visibility.initial_visible &&
+                            candidate.materials.size() == 1 && candidate.fbos.empty() &&
+                            candidate.commands.empty() && candidate.passes.size() <= 1;
+            if (eligible) {
+                direct_final_material = candidate.materials.front();
+                if (! candidate.passes.empty()) {
+                    const auto& direct_pass = candidate.passes.front();
+                    if (! direct_pass.target.empty()) {
+                        eligible = false;
+                    } else {
+                        for (const auto& bind : direct_pass.bind) {
+                            if (bind.name != "previous") {
+                                eligible = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (eligible) {
+                        direct_final_material.MergePass(direct_pass);
+                        for (const auto& bind : direct_pass.bind) {
+                            if (direct_final_material.textures.size() <=
+                                static_cast<usize>(bind.index)) {
+                                direct_final_material.textures.resize(
+                                    static_cast<usize>(bind.index) + 1);
+                            }
+                            direct_final_material.textures[static_cast<usize>(bind.index)] =
+                                effect_ppong_a;
+                        }
+                    }
+                }
+            }
+            if (eligible) direct_final_effect = &candidate;
+        }
+
         if (hasAuthoredEffect || has_shader_color_blend) {
             // Dependency-only sources intentionally stop at the first ping-pong target so
             // `_rt_imageLayerComposite_<id>` samples the raw source texture. Every real authored
@@ -3406,11 +3574,20 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                                           wpimgobj.id,
                                           wpimgobj.name,
                                           wpimgobj.colorBlendMode,
-                                          &finalCompositeTransformData);
+                                          &finalCompositeTransformData,
+                                          direct_final_effect != nullptr ? &direct_final_material
+                                                                         : nullptr,
+                                          direct_final_effect != nullptr ? direct_final_effect->id
+                                                                         : 0);
         }
         int32_t i_eff = -1;
         for (const auto& wpeffobj : wpimgobj.effects) {
             i_eff++;
+            if (&wpeffobj == direct_final_effect) {
+                // The single authored pass already draws as the layer's final on-screen writer;
+                // no private pass nodes exist for this effect.
+                continue;
+            }
             const auto effect_visibility =
                 BuildEffectVisibilityContract(wpeffobj, context.user_properties);
             if (effect_visibility.can_prune_at_parse_time) {
@@ -3449,7 +3626,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 for (usize i = 0; i < wpeffobj.fbos.size(); i++) {
                     const auto& wpfbo  = wpeffobj.fbos.at(i);
                     std::string rtname = wpfbo.name + "_" + effaddr;
-                    const auto  fbo_size = wpfbo.ResolveSize(effect_source_size);
+                    const auto  fbo_size = wpfbo.ResolveSize(effect_target_resolution);
                     const bool  persistent_feedback_fbo =
                         feedback_fbos.count(wpfbo.name) != 0;
                     if (effect_source_screen_bound && wpfbo.fit == 0) {
@@ -4235,7 +4412,18 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     context.scene->AddLayerRuntimeLight(light_obj.id, &light);
     light.setNode(node);
 
-    AttachNodeToScene(context, node, light_obj.parent, light_obj.name);
+    if (LayerUsesRoutedParent(light_obj.parent, {})) {
+        // A parented light composes the authored ancestor chain exactly like parented image and
+        // model layers; its shader-facing world transform is published per frame from the routed
+        // resolution. Physically nesting it would only apply the immediate parent's local
+        // transform because group ancestors are root-owned routed layers.
+        WPShaderValueData light_data;
+        ConfigureInheritedParentBinding(context, light_obj.parent, light_data);
+        context.scene->sceneGraph->AppendChild(node);
+        context.shader_updater->SetNodeData(node.get(), light_data);
+    } else {
+        AttachNodeToScene(context, node, light_obj.parent, light_obj.name);
+    }
     context.object_nodes[light_obj.id] = node;
     context.scene->AddLayerRuntimeNode(light_obj.id, node.get());
     RegisterLayerSceneState(context, light_obj.id, light_obj.parent, {}, light_obj.visible);
@@ -4243,8 +4431,11 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
 }
 
 void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
+    // 2D camera layers are authored around the centered canvas view, so their node gains the
+    // canvas half-size. Perspective scenes keep the authored origin verbatim: the camera layer's
+    // world translation is the eye position of the scene view.
     const auto node_origin =
-        empty_obj.is_camera_layer
+        empty_obj.is_camera_layer && context.scene->cameraOrthographic
             ? context.scene->ResolveCameraLayerNodeTranslation(empty_obj.origin)
             : Vector3f(empty_obj.origin.data());
     auto node  = std::make_shared<SceneNode>(node_origin,
@@ -4979,7 +5170,7 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
         }
     }
     if (! node_it->second->Name().empty()) {
-        scene.layerNameToId[node_it->second->Name()] = layer_id;
+        scene.layerNameToId.emplace(node_it->second->Name(), layer_id);
     }
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
@@ -5043,7 +5234,7 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
         }
     }
     if (! node_it->second->Name().empty()) {
-        scene.layerNameToId[node_it->second->Name()] = layer_id;
+        scene.layerNameToId.emplace(node_it->second->Name(), layer_id);
     }
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
@@ -5116,7 +5307,7 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
         }
     }
     if (! node_it->second->Name().empty()) {
-        scene.layerNameToId[node_it->second->Name()] = layer_id;
+        scene.layerNameToId.emplace(node_it->second->Name(), layer_id);
     }
     scene.SetLayerLocalVisibility(layer_id, local_visible);
     scene.ApplyLayerVisibility(layer_id);
@@ -5166,7 +5357,7 @@ bool wallpaper::CreateDynamicSceneLayer(
                                  ? layer_node->Name()
                                  : normalized_object_json.value("name", std::string {});
     if (! layer_name.empty()) {
-        scene.layerNameToId[layer_name] = layer_id;
+        scene.layerNameToId.emplace(layer_name, layer_id);
     }
 
     if (out_binding_registrations != nullptr) {
@@ -5574,7 +5765,11 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                                    ? node_it->second->Name()
                                    : GetObjectName(obj);
         if (! node_name.empty()) {
-            context.scene->layerNameToId[node_name] = *object_id;
+            // Scene scripts resolve getLayer(name) to one layer per name: the earliest authored
+            // object wins when several layers share a name. First-write registration keeps that
+            // contract; a last-write map would silently retarget script writes (planet radius,
+            // origins) onto later same-named HUD helper layers.
+            context.scene->layerNameToId.emplace(node_name, *object_id);
         }
     }
 

@@ -21,6 +21,7 @@ class Scene;
 class SceneNode;
 class SceneMesh;
 class SceneImageEffectLayer;
+class WPNodeTransformResolver;
 
 struct WPUniformInfo {
     bool has_MI { false };
@@ -80,6 +81,7 @@ struct WPUniformInfo {
     bool has_LFEAT_SHADOW_PROJ { false };
     bool has_LFEAT_SHADOW_PROJ_XFORM { false };
     bool has_EYE_POSITION { false };
+    bool has_NORMAL_MODEL_MATRIX { false };
     bool has_VIEWUP { false };
     bool has_VIEWRIGHT { false };
     bool has_VIEWFORWARD { false };

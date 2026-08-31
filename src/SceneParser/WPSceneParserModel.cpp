@@ -546,7 +546,17 @@ private:
                                 "model",
                                 model_obj_.name,
                                 root_data);
-        AttachNodeToScene(context_, root_, model_obj_.parent, model_obj_.name, &root_data);
+        if (LayerUsesRoutedParent(model_obj_.parent, model_obj_.attachment)) {
+            // A parented model composes the full authored ancestor chain at draw time, exactly
+            // like parented image/text/particle layers. Physically nesting the model root under
+            // its immediate parent node would only apply that parent's local transform, because
+            // group ancestors are themselves root-owned routed layers; scripted group scaling and
+            // rotation above the model would silently drop out of the model's world transform.
+            ConfigureInheritedParentBinding(context_, model_obj_.parent, root_data);
+            context_.scene->sceneGraph->AppendChild(root_);
+        } else {
+            AttachNodeToScene(context_, root_, model_obj_.parent, model_obj_.name, &root_data);
+        }
 
         context_.object_nodes[model_obj_.id] = root_;
         context_.scene->AddLayerRuntimeNode(model_obj_.id, root_.get());
@@ -643,6 +653,24 @@ private:
         node->AddMesh(mesh);
         RegisterUserShaderValueBindings(
             context_, wp_material, shader_info, node.get(), model_obj_.id, model_obj_.name);
+        // Model materials can author script/user/animation-driven constants (for example an
+        // alpha constant toggled from panel scripts through shared state). Register them so the
+        // script host drives the chunk material uniform each frame instead of leaving the
+        // parse-time fallback value on screen forever.
+        RegisterConstantShaderValueBindings(context_,
+                                            wp_material,
+                                            shader_info,
+                                            node.get(),
+                                            model_obj_.id,
+                                            model_obj_.name,
+                                            0,
+                                            0,
+                                            0);
+        // Chunk draws resolve their world transform through the model root's node data, so a
+        // routed model root's inherited ancestor transform reaches every chunk. A physically
+        // attached root resolves to its plain scene-graph transform through the same path, which
+        // keeps unparented and bone-attached models unchanged.
+        node_data.InheritParentTransform(root_.get(), false);
         context_.shader_updater->SetNodeData(node.get(), node_data);
         context_.scene->AddLayerRuntimeNode(model_obj_.id, node.get());
         return node;

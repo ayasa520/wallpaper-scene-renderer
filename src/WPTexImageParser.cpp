@@ -30,7 +30,8 @@ enum class WPTexFlagEnum : uint32_t
 
     compo1 = 20,
     compo2 = 21,
-    compo3 = 22
+    compo3 = 22,
+    compo4 = 23
 };
 using WPTexFlags = BitFlags<WPTexFlagEnum>;
 
@@ -116,6 +117,7 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
         header.extraHeader["compo1"].val = flags[WPTexFlagEnum::compo1];
         header.extraHeader["compo2"].val = flags[WPTexFlagEnum::compo2];
         header.extraHeader["compo3"].val = flags[WPTexFlagEnum::compo3];
+        header.extraHeader["compo4"].val = flags[WPTexFlagEnum::compo4];
     }
 
     /*
@@ -182,7 +184,7 @@ bool ReadString(fs::IBinaryStream& file, std::string& value) {
 std::string GetTextureHeaderCachePath(std::string_view cache_namespace, std::string_view name) {
     std::string key;
     key.reserve(cache_namespace.size() + name.size() + 16);
-    key.append("tex-header-v5\n");
+    key.append("tex-header-v6-compo4\n");
     key.append(cache_namespace);
     key.push_back('\n');
     key.append(name);

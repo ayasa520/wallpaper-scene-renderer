@@ -230,6 +230,30 @@ void WPShaderValueUpdater::PrepareFrame() {
     if (m_scene != nullptr) {
         m_scene->UpdateModelCameraPath();
     }
+
+    // Routed lights publish their ancestor-composed world transform once per frame so lighting,
+    // shadow, and volumetric consumers all read the same placement that the authored parent
+    // chain (including script-driven group transforms) produces.
+    if (m_scene != nullptr) {
+        WPNodeTransformResolver light_resolver(*m_scene,
+                                               m_parallax,
+                                               m_nodeDataMap,
+                                               m_modelTransformCache,
+                                               m_parallaxOffsetCache,
+                                               m_attachmentTransformCache,
+                                               nullptr,
+                                               m_mousePos,
+                                               m_puppet_frame_serial);
+        for (auto& light : m_scene->lights) {
+            if (! light || light->node() == nullptr) continue;
+            // Publish for every parented light, not only transform-binding inheritors: a light
+            // whose handle is routed (physical root parent, authored parent chain in the layer
+            // binding) has no useful physical-graph fallback, and skipping it freezes the light
+            // at its parse-time placement while scripts keep moving the authored parent.
+            light->SetResolvedWorldTransform(
+                light_resolver.ResolveRawModelTransform(light->node()));
+        }
+    }
     /*
         using namespace std::chrono;
         auto nowTime = system_clock::to_time_t(system_clock::now());
@@ -389,6 +413,7 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_LFEAT_SHADOW_PROJ        = existsOp(G_LFEAT_SHADOW_PROJ);
     info.has_LFEAT_SHADOW_PROJ_XFORM  = existsOp(G_LFEAT_SHADOW_PROJ_XFORM);
     info.has_EYE_POSITION     = IsModelRenderNode(pNode) && existsOp(G_EYE_POSITION);
+    info.has_NORMAL_MODEL_MATRIX = existsOp(G_NORMAL_MODEL_MATRIX);
     info.has_VIEWUP           = IsModelRenderNode(pNode) && existsOp(G_VIEWUP);
     info.has_VIEWRIGHT        = IsModelRenderNode(pNode) && existsOp(G_VIEWRIGHT);
     info.has_VIEWFORWARD      = IsModelRenderNode(pNode) && existsOp(G_VIEWFORWARD);
@@ -644,6 +669,27 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
         modelTrans = ApplyMeshGeometryTransform(modelTrans, pNode->Mesh());
 
+        if (info.has_NORMAL_MODEL_MATRIX) {
+            // World normals transform by the inverse transpose of the model linear part. Leaving
+            // this uniform at its zero-initialized cbuffer default makes every lit model normalize
+            // a zero vector, which turns lighting into NaN washout on the whole surface.
+            Eigen::Matrix3d linear = modelTrans.topLeftCorner<3, 3>();
+            if (std::abs(linear.determinant()) < 1e-18) {
+                linear = Eigen::Matrix3d::Identity();
+            } else {
+                linear = linear.inverse().transpose().eval();
+            }
+            const Eigen::Matrix3f normal_matrix = linear.cast<float>();
+            std::array<float, 12> packed {};
+            for (int column = 0; column < 3; ++column) {
+                packed[static_cast<size_t>(column) * 4 + 0] = normal_matrix(0, column);
+                packed[static_cast<size_t>(column) * 4 + 1] = normal_matrix(1, column);
+                packed[static_cast<size_t>(column) * 4 + 2] = normal_matrix(2, column);
+            }
+            updateOp(G_NORMAL_MODEL_MATRIX,
+                     std::span<const float> { packed.data(), packed.size() });
+        }
+
         if (reqM) updateOp(G_M, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqAM) updateOp(G_AM, ToDxcCBufferMatrixUniform(modelTrans));
         if (reqLMM) updateOp(G_LMM, ToDxcCBufferMatrixUniform(modelTrans));
@@ -859,8 +905,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         for (auto& l : m_scene->lights) {
             if (i == 4) break;
             assert(l->node() != nullptr);
-            l->node()->UpdateTrans();
-            const auto modelTrans = l->node()->ModelTrans();
+            const auto modelTrans = l->WorldTransform();
             lights[i * 4 + 0]     = (float)modelTrans(0, 3);
             lights[i * 4 + 1]     = (float)modelTrans(1, 3);
             lights[i * 4 + 2]     = (float)modelTrans(2, 3);
@@ -924,8 +969,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             const Vector3f forward = light.WorldForward();
             const Vector3f color   = light.colorIntensity();
             if (light.type() == SceneLightType::Point) {
-                append_vec4(point_origin, origin.x(), origin.y(), origin.z(), light.radius());
-                append_vec4(point_color, color.x(), color.y(), color.z(), light.intensity());
+                // LightingV1 array contract: the falloff radius rides the color vector's w and
+                // the origin vector's w carries the falloff exponent. Crossing these slots makes
+                // saturate(1 - distance/radius) collapse to zero for any scene whose lights sit
+                // farther than a few units, which blacks out every lit surface.
+                append_vec4(point_origin, origin.x(), origin.y(), origin.z(), light.exponent());
+                append_vec4(point_color, color.x(), color.y(), color.z(), light.radius());
                 if (shadows_on && light.castsShadows()) {
                     const auto proj = light.ShadowProjectionInfo();
                     const auto uv   = light.ShadowAtlasUv();
@@ -938,7 +987,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             } else if (light.type() == SceneLightType::Spot) {
                 append_vec4(spot_origin, origin.x(), origin.y(), origin.z(),
                             std::cos(light.outerCone() * SceneLight::Deg2Rad()));
-                append_vec4(spot_color, color.x(), color.y(), color.z(), light.intensity());
+                append_vec4(spot_color, color.x(), color.y(), color.z(), light.radius());
                 append_vec4(spot_direction, forward.x(), forward.y(), forward.z(),
                             std::cos(light.innerCone() * SceneLight::Deg2Rad()));
                 append_vec4(spot_exponent, light.exponent(), 0, 0, 0);
@@ -974,9 +1023,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                     }
                 }
             } else if (light.type() == SceneLightType::Tube) {
-                append_vec4(tube_a, origin.x(), origin.y(), origin.z(), light.radius());
+                append_vec4(tube_a, origin.x(), origin.y(), origin.z(), light.exponent());
                 append_vec4(tube_b, origin.x(), origin.y(), origin.z(), 0);
-                append_vec4(tube_color, color.x(), color.y(), color.z(), light.intensity());
+                append_vec4(tube_color, color.x(), color.y(), color.z(), light.radius());
             }
         }
 

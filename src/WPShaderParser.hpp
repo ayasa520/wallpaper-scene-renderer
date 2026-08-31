@@ -37,7 +37,9 @@ struct WPPreprocessorInfo {
 
 struct WPShaderTexInfo {
     bool                enabled { false };
-    std::array<bool, 3> composEnabled { false, false, false };
+    // One slot per authored mask component in shader declaration order:
+    // metallic, roughness, reflection, emissive.
+    std::array<bool, 4> composEnabled { false, false, false, false };
     // Some runtime render targets are meant to be sampled with screen-space UVs reconstructed by
     // the authored shader. The shader preparer adjusts only calls that sample the affected
     // g_TextureN slot, so ordinary textures and unrelated 2D effect targets keep their old UV path.

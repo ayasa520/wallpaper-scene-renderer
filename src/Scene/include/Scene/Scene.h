@@ -279,6 +279,11 @@ public:
     // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
+    // Reverse index over live layer-handle nodes for FindLayerIdByNode. Scene scripts resolve a
+    // handle node back to its layer id on every property write, so the reverse lookup must stay
+    // O(1); the index is maintained by SetLayerNode, ClearAllLayerNodeSlots, and
+    // DestroySceneObject, and only ever holds non-null registered handles.
+    std::unordered_map<const SceneNode*, int32_t> layerNodeIndex;
     // First-registration order of camera layers; the bottom-most visible one wins as the active
     // view. Entries are appended once per layer id and never removed at runtime.
     std::vector<int32_t> cameraLayerOrder;

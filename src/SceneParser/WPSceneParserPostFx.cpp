@@ -390,7 +390,10 @@ bool ConfigureSceneBloomPass(ParseContext& context) {
         LOG_INFO("ScenePostProcess: quality=0 path=none passes=0");
         return false;
     }
-    const bool use_hdr = scene.bloom.quality >= 2 && scene.bloom.hdr && scene.bloom.enabled;
+    // Only the display-HDR host mode runs the float-format mip chain whose combine writes
+    // linear values for an HDR surface. Ultra on a standard-range output keeps the LDR bloom
+    // chain; feeding the linearizing combine into a normalized output darkens the whole frame.
+    const bool use_hdr = scene.bloom.quality >= 3 && scene.bloom.hdr && scene.bloom.enabled;
     if (use_hdr) {
         return ConfigureSceneHdrBloomPass(context);
     }
@@ -684,11 +687,25 @@ void main() {
         return node;
     };
 
+    float ldr_strength  = scene.bloom.strength;
+    // The extraction threshold always follows the authored standard-range bloom key, even when
+    // ultra derives the strength from the HDR keys. Feeding the HDR threshold into the LDR chain
+    // makes every moderately bright surface bloom and washes out planet day sides.
+    const float ldr_threshold = scene.bloom.threshold;
+    if (scene.bloom.quality >= 2 && scene.bloom.hdr) {
+        // Ultra quality derives the LDR chain strength from the authored HDR bloom keys. The
+        // divisor is pow(scatter, iterations - 2) + 1 with the iteration count clamped to its
+        // floor of 2 when no HDR mip chain exists, so the standard-range chain receives
+        // hdrStrength / 2.
+        ldr_strength = scene.bloom.hdrStrength /
+                       (std::pow(std::max(1.0f, scene.bloom.hdrScatter), 0.0f) + 1.0f);
+    }
+
     ShaderValues downsample_values;
     downsample_values["g_TexelSize"]      = ShaderValue(scene_texel_size);
     downsample_values["u_enabled"]        = ShaderValue(scene.bloom.enabled ? 1.0f : 0.0f);
-    downsample_values["g_BloomStrength"]  = ShaderValue(scene.bloom.strength);
-    downsample_values["g_BloomThreshold"] = ShaderValue(scene.bloom.threshold);
+    downsample_values["g_BloomStrength"]  = ShaderValue(ldr_strength);
+    downsample_values["g_BloomThreshold"] = ShaderValue(ldr_threshold);
     downsample_values["g_BloomTint"]      = ShaderValue(scene.bloom.tint);
 
     ShaderValues blur_values;

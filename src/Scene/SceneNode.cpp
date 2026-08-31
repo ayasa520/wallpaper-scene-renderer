@@ -36,9 +36,13 @@ void SceneNode::SetLocalAffine(const Affine3f& affine) {
         if (scale[i] > 1e-6f) {
             linear.col(i) /= scale[i];
         } else {
+            // A degenerate column only borrows a unit basis vector so the Euler decomposition
+            // below stays finite. The zero scale itself is authored state and must survive the
+            // round-trip: scripts collapse panels with scale 0, and rewriting it to 1 would
+            // resurrect every proxy-routed effect publisher at full size.
             linear.col(i).setZero();
             linear(i, i) = 1.0f;
-            scale[i] = 1.0f;
+            scale[i] = 0.0f;
         }
     }
 
