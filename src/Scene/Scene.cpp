@@ -787,13 +787,10 @@ const TextLayerRuntimeState* Scene::FindTextLayerState(int32_t layer_id) const {
 int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {
     // A null query must not match registered-but-null slots; the index never stores null keys.
     if (node == nullptr) return 0;
-    // Diagnostic build: bypass layerNodeIndex and use the historical slot scan.
-    for (const auto& [layer_id, object] : sceneObjects) {
-        if (object != nullptr && object->HasLayerNodeSlot() && object->LayerNode() == node) {
-            return layer_id;
-        }
-    }
-    return 0;
+    // Scene scripts resolve a handle node back to its layer id on every property write, so this
+    // must stay O(1): a linear scan over sceneObjects dominates CPU frames on object-heavy scenes.
+    const auto it = layerNodeIndex.find(node);
+    return it == layerNodeIndex.end() ? 0 : it->second;
 }
 
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {

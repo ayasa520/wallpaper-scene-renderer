@@ -27,6 +27,7 @@ public:
     void destory(const Device&, RenderingResources&) override;
     bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;
     std::string residencyKey() const override;
+    std::string profileName() const override;
     bool canReuseForResidency(const VulkanPass&) const override;
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;

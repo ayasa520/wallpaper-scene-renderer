@@ -160,6 +160,7 @@ public:
     void destroy(RenderingResources&);
 
     std::string residencyKey(std::string_view pass_kind) const;
+    std::string profileName(std::string_view pass_kind) const;
     bool canReuseForResidency(const ShaderDrawCore&) const;
     void absorbResidencyGraphState(const ShaderDrawCore&);
     bool referencesRenderTarget(std::string_view) const;

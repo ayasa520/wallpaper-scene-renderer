@@ -33,6 +33,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -205,6 +206,24 @@ struct VulkanRender::Impl {
     std::vector<VulkanPass*> m_passes;
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
 
+    // Diagnostic (VIVID_GPU_PROFILE): GPU timestamps around every executed pass in the offscreen
+    // frame, aggregated by pass profile name and reported periodically. Off by default.
+    struct GpuPassProfiler {
+        bool                                    checked { false };
+        bool                                    enabled { false };
+        vvk::QueryPool                          pool;
+        uint32_t                                capacity { 0 };
+        uint32_t                                used { 0 };
+        bool                                    pending { false };
+        double                                  period_ns { 0.0 };
+        std::vector<std::string>                pending_names;
+        std::unordered_map<std::string, double> accum_ms;
+        double                                  total_ms { 0.0 };
+        uint32_t                                frames { 0 };
+    } m_gpu_profiler;
+    bool gpuProfilerActive();
+    void gpuProfilerCollect();
+    void gpuProfilerReport();
 };
 
 VulkanRender::VulkanRender(): pImpl(std::make_unique<Impl>()) {}
@@ -468,6 +487,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     }
     m_rendering_resources.model_depth_images.clear();
     m_rendering_resources.model_depth_resolved.clear();
+    m_rendering_resources.model_depth_dirty.clear();
     m_rendering_resources.masked_draw_attachments.abandon();
     if (m_rendering_resources.pipeline_cache) {
         m_rendering_resources.pipeline_cache->abandon();
@@ -524,6 +544,7 @@ void VulkanRender::Impl::destroy() {
         m_rendering_resources.pipeline_cache.reset();
         m_rendering_resources.model_depth_images.clear();
         m_rendering_resources.model_depth_resolved.clear();
+        m_rendering_resources.model_depth_dirty.clear();
         m_rendering_resources.masked_draw_attachments.clear();
         m_rendering_resources.immutable_meshes.clear();
         m_vertex_buf->destroy();
@@ -532,6 +553,10 @@ void VulkanRender::Impl::destroy() {
         m_rendering_resources.command.reset();
         m_render_cmd.reset();
         m_cmds.reset();
+
+        // The profiler query pool is device-owned; release it before the device goes away.
+        m_gpu_profiler.pool.reset();
+        m_gpu_profiler.pending = false;
 
         m_device->Destroy();
     }
@@ -924,6 +949,93 @@ bool VulkanRender::Impl::drainOffscreenFrame() {
     return true;
 }
 
+bool VulkanRender::Impl::gpuProfilerActive() {
+    auto& profiler = m_gpu_profiler;
+    if (! profiler.checked) {
+        profiler.checked = true;
+        profiler.enabled = std::getenv("VIVID_GPU_PROFILE") != nullptr && m_device != nullptr;
+        if (profiler.enabled) {
+            profiler.period_ns = m_device->limits().timestampPeriod;
+            profiler.capacity  = 4096;
+            const VkQueryPoolCreateInfo pool_ci {
+                .sType              = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext              = nullptr,
+                .flags              = 0,
+                .queryType          = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount         = profiler.capacity,
+                .pipelineStatistics = 0,
+            };
+            if (m_device->handle().CreateQueryPool(pool_ci, profiler.pool) != VK_SUCCESS ||
+                profiler.period_ns <= 0.0) {
+                LOG_INFO("GpuPassProfiler: query pool unavailable, profiling disabled");
+                profiler.enabled = false;
+            } else {
+                LOG_INFO("GpuPassProfiler: enabled timestamp-period=%.3fns capacity=%u",
+                         profiler.period_ns,
+                         profiler.capacity);
+            }
+        }
+    }
+    return profiler.enabled;
+}
+
+void VulkanRender::Impl::gpuProfilerCollect() {
+    auto& profiler = m_gpu_profiler;
+    if (! profiler.enabled || ! profiler.pending) return;
+    profiler.pending = false;
+
+    const uint32_t used = profiler.used;
+    if (used < 2) return;
+    std::vector<uint64_t> ticks(used, 0);
+    // The frame fence for the submission that wrote these queries was waited in
+    // drainOffscreenFrame(), so the results are available without further blocking.
+    const VkResult result = m_device->handle().GetQueryPoolResults(
+        *profiler.pool,
+        0,
+        used,
+        ticks.size() * sizeof(uint64_t),
+        ticks.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result != VK_SUCCESS) return;
+
+    for (uint32_t i = 1; i < used; i++) {
+        const double delta_ms = static_cast<double>(ticks[i] - ticks[i - 1]) *
+                                profiler.period_ns / 1e6;
+        profiler.accum_ms[profiler.pending_names[i - 1]] += delta_ms;
+    }
+    profiler.total_ms += static_cast<double>(ticks[used - 1] - ticks[0]) *
+                         profiler.period_ns / 1e6;
+    profiler.frames++;
+    if (profiler.frames >= 240) gpuProfilerReport();
+}
+
+void VulkanRender::Impl::gpuProfilerReport() {
+    auto& profiler = m_gpu_profiler;
+    if (profiler.frames == 0) return;
+
+    std::vector<std::pair<std::string, double>> entries(profiler.accum_ms.begin(),
+                                                        profiler.accum_ms.end());
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+
+    LOG_INFO("GpuPassProfiler: frames=%u gpu-total=%.2fms/frame passes=%zu",
+             profiler.frames,
+             profiler.total_ms / profiler.frames,
+             entries.size());
+    const std::size_t top_count = std::min<std::size_t>(entries.size(), 40);
+    for (std::size_t i = 0; i < top_count; i++) {
+        LOG_INFO("GpuPassProfiler: %6.3fms/frame %s",
+                 entries[i].second / profiler.frames,
+                 entries[i].first.c_str());
+    }
+
+    profiler.accum_ms.clear();
+    profiler.total_ms = 0.0;
+    profiler.frames   = 0;
+}
+
 void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     RenderingResources& rr = m_rendering_resources;
     if (!m_ex_swapchain) {
@@ -931,6 +1043,9 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     }
     if (!drainOffscreenFrame()) {
         return;
+    }
+    if (gpuProfilerActive()) {
+        gpuProfilerCollect();
     }
 
     auto render_lock = m_ex_swapchain->acquireRenderLock();
@@ -975,15 +1090,38 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
+    const bool gpu_profile_frame = gpuProfilerActive();
+    if (gpu_profile_frame) {
+        auto& profiler = m_gpu_profiler;
+        profiler.used  = 0;
+        profiler.pending_names.clear();
+        rr.command.ResetQueryPool(*profiler.pool, 0, profiler.capacity);
+        rr.command.WriteTimestamp(
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
+    }
+
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
     rr.immutable_meshes.recordUploads(rr.command);
     m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
 
+    if (gpu_profile_frame && m_gpu_profiler.used < m_gpu_profiler.capacity) {
+        auto& profiler = m_gpu_profiler;
+        rr.command.WriteTimestamp(
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
+        profiler.pending_names.emplace_back("__uploads");
+    }
+
     for (auto* p : m_passes) {
         if (! p->prepared()) continue;
         p->execute(*m_device, rr);
+        if (gpu_profile_frame && m_gpu_profiler.used < m_gpu_profiler.capacity) {
+            auto& profiler = m_gpu_profiler;
+            rr.command.WriteTimestamp(
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
+            profiler.pending_names.emplace_back(p->profileName());
+        }
     }
 
     if (!checkVkResult(rr.command.End(), "end offscreen frame command buffer"))
@@ -1005,6 +1143,9 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
+    if (gpu_profile_frame && m_gpu_profiler.used >= 2) {
+        m_gpu_profiler.pending = true;
+    }
 
     /*
      * The immutable-mesh CPU payloads were memcpy'd into staging buffers at
@@ -1279,6 +1420,7 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     // after scene topology or render-target ownership changes.
     m_rendering_resources.model_depth_images.clear();
     m_rendering_resources.model_depth_resolved.clear();
+    m_rendering_resources.model_depth_dirty.clear();
     m_rendering_resources.masked_draw_attachments.clear();
     if (clear_scene_caches) {
         // Scene switches drop GPU file meshes. Ordinary topology rebuilds keep them: the host
@@ -1378,6 +1520,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         dropCompiledPassFramebuffers();
         m_rendering_resources.model_depth_images.clear();
         m_rendering_resources.model_depth_resolved.clear();
+        m_rendering_resources.model_depth_dirty.clear();
         m_rendering_resources.masked_draw_attachments.clear();
         m_compiled_msaa_samples = msaa_samples;
     }
