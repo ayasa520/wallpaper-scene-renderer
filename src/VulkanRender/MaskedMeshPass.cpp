@@ -54,6 +54,10 @@ std::string MaskedMeshPass::residencyKey() const {
     return m_visible_draw.residencyKey("MaskedMeshPass");
 }
 
+std::string MaskedMeshPass::profileName() const {
+    return m_visible_draw.profileName("MaskedMeshPass");
+}
+
 bool MaskedMeshPass::canReuseForResidency(const VulkanPass& next_pass) const {
     const auto* next = dynamic_cast<const MaskedMeshPass*>(&next_pass);
     if (next == nullptr || ! m_visible_draw.canReuseForResidency(next->m_visible_draw)) {

@@ -1,6 +1,7 @@
 #include "VolumetricsSingleFillPass.hpp"
 
 #include "Core/ArrayHelper.hpp"
+#include "Msaa.hpp"
 #include "PassCommon.hpp"
 #include "Resource.hpp"
 #include "SpecTexs.hpp"
@@ -314,6 +315,10 @@ void VolumetricsSingleFillPass::clearFar(RenderingResources& rr) const {
 
 void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources& rr) {
     if (! m_desc.vk_dst.handle) return;
+
+    // Model chunk draws only mark the shared multisampled depth dirty; materialize the
+    // single-sample copy sampled below.
+    ResolveModelDepthIfNeeded(rr, m_desc.scene_output);
 
     VmaImageParameters* depth_image = nullptr;
     if (auto resolved = rr.model_depth_resolved.find(m_desc.scene_output);

@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace wallpaper
 {
@@ -46,6 +47,10 @@ struct RenderingResources {
     // the behavior opt-in for model passes and leaves all legacy 2D render targets color-only.
     std::unordered_map<std::string, VmaImageParameters> model_depth_images;
     std::unordered_map<std::string, VmaImageParameters> model_depth_resolved;
+    // Outputs whose multisampled model depth has been written since the last single-sample
+    // resolve. Model draws only mark this; the depth-sampling consumer resolves once on demand,
+    // so a frame with hundreds of model chunks does not pay one full-extent resolve per chunk.
+    std::unordered_set<std::string> model_depth_dirty;
 
     MaskedDrawAttachmentCache masked_draw_attachments;
 };

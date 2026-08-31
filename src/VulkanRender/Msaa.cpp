@@ -134,4 +134,98 @@ bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingRes
     return true;
 }
 
+bool ResolveModelDepthIfNeeded(RenderingResources& rr, std::string_view output) {
+    const auto dirty_it = rr.model_depth_dirty.find(std::string(output));
+    if (dirty_it == rr.model_depth_dirty.end()) return false;
+
+    const auto src_it = rr.model_depth_images.find(std::string(output));
+    const auto dst_it = rr.model_depth_resolved.find(std::string(output));
+    if (src_it == rr.model_depth_images.end() || dst_it == rr.model_depth_resolved.end() ||
+        ! src_it->second.handle || ! dst_it->second.handle || src_it->second.samples <= 1) {
+        rr.model_depth_dirty.erase(dirty_it);
+        return false;
+    }
+
+    auto& src = src_it->second;
+    auto& dst = dst_it->second;
+    auto& cmd = rr.command;
+
+    VkImageSubresourceRange range {
+        .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
+        .baseMipLevel   = 0,
+        .levelCount     = 1,
+        .baseArrayLayer = 0,
+        .layerCount     = 1,
+    };
+    VkImageMemoryBarrier to_transfer[2] {
+        {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image            = *src.handle,
+            .subresourceRange = range,
+        },
+        {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask    = 0,
+            .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+            // The resolve overwrites the full extent; prior contents are irrelevant.
+            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image            = *dst.handle,
+            .subresourceRange = range,
+        },
+    };
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_DEPENDENCY_BY_REGION_BIT,
+                        {},
+                        {},
+                        std::array { to_transfer[0], to_transfer[1] });
+    VkImageResolve region {
+        .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+        .extent         = src.extent,
+    };
+    std::array<VkImageResolve, 1> regions { region };
+    cmd.ResolveImage(*src.handle,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     *dst.handle,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     regions);
+    VkImageMemoryBarrier after[2] {
+        {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .image            = *src.handle,
+            .subresourceRange = range,
+        },
+        {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image            = *dst.handle,
+            .subresourceRange = range,
+        },
+    };
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_DEPENDENCY_BY_REGION_BIT,
+                        {},
+                        {},
+                        std::array { after[0], after[1] });
+
+    rr.model_depth_dirty.erase(std::string(output));
+    return true;
+}
+
 } // namespace wallpaper::vulkan

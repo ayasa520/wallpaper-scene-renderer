@@ -86,6 +86,9 @@ struct RenderingResources;
 
 void NoteComposeMsaaDraw(RenderingResources& rr, VkSampleCountFlagBits samples);
 bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingResources& rr);
+// Model draws mark the shared multisampled depth dirty; the depth-sampling consumer calls this
+// once to materialize the single-sample copy before reading it.
+bool ResolveModelDepthIfNeeded(RenderingResources& rr, std::string_view output);
 
 inline void SyncSceneMsaa(Scene& scene, const Device& device) {
     const int requested =

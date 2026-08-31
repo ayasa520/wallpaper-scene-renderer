@@ -72,6 +72,10 @@ std::string CustomShaderPass::residencyKey() const {
     return m_core.residencyKey("CustomShaderPass");
 }
 
+std::string CustomShaderPass::profileName() const {
+    return m_core.profileName("CustomShaderPass");
+}
+
 bool CustomShaderPass::canReuseForResidency(const VulkanPass& next_pass) const {
     const auto* next = dynamic_cast<const CustomShaderPass*>(&next_pass);
     return next != nullptr && m_core.canReuseForResidency(next->m_core);

@@ -68,6 +68,9 @@ public:
     // vkCreateGraphicsPipelines.
     virtual bool warmupPipeline(Scene&, const Device&, RenderingResources&) { return false; }
     virtual std::string residencyKey() const { return {}; }
+    // Human-readable identity for frame profiling. Defaults to the residency key; passes that
+    // know their scene node can add its authored name for readable reports.
+    virtual std::string profileName() const { return residencyKey(); }
     virtual bool canReuseForResidency(const VulkanPass& next_pass) const;
     virtual void absorbResidencyGraphState(const VulkanPass&) {}
     virtual bool referencesRenderTarget(std::string_view) const { return false; }

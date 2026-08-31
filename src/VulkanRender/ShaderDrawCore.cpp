@@ -165,6 +165,16 @@ std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
            "|output=" + m_desc.output;
 }
 
+std::string ShaderDrawCore::profileName(std::string_view pass_kind) const {
+    // Frame-profiling identity: the residency key plus the authored node name, so aggregated GPU
+    // timings can be attributed to scene content without cross-referencing node pointers.
+    std::string name = residencyKey(pass_kind);
+    if (m_desc.node != nullptr && ! m_desc.node->Name().empty()) {
+        name += "|name=" + m_desc.node->Name();
+    }
+    return name;
+}
+
 static int IntendedShaderDrawSampleCount(const ShaderDrawData& desc) {
     if (desc.scene != nullptr && ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.node)) {
         return std::max(1, desc.scene->MsaaSampleCount());
@@ -2046,83 +2056,11 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
 
     if (m_desc.model_pass && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
         m_desc.depth_stencil_image_ref != nullptr && m_desc.depth_stencil_image_ref->handle) {
-        auto resolved_it = rr.model_depth_resolved.find(m_desc.output);
-        if (resolved_it != rr.model_depth_resolved.end() && resolved_it->second.handle) {
-            auto& src = *m_desc.depth_stencil_image_ref;
-            auto& dst = resolved_it->second;
-            VkImageSubresourceRange range {
-                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
-                .baseMipLevel   = 0,
-                .levelCount     = 1,
-                .baseArrayLayer = 0,
-                .layerCount     = 1,
-            };
-            VkImageMemoryBarrier bars[2] {
-                {
-                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                    .dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
-                    .oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    .image            = *src.handle,
-                    .subresourceRange = range,
-                },
-                {
-                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask    = 0,
-                    .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-                    .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    .image            = *dst.handle,
-                    .subresourceRange = range,
-                },
-            };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                {},
-                                {},
-                                std::array { bars[0], bars[1] });
-            VkImageResolve region {
-                .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-                .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-                .extent         = src.extent,
-            };
-            std::array<VkImageResolve, 1> regions { region };
-            cmd.ResolveImage(*src.handle,
-                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             *dst.handle,
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             regions);
-            VkImageMemoryBarrier after[2] {
-                {
-                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
-                    .dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                    .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    .newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    .image            = *src.handle,
-                    .subresourceRange = range,
-                },
-                {
-                    .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-                    .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    .image            = *dst.handle,
-                    .subresourceRange = range,
-                },
-            };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                {},
-                                {},
-                                std::array { after[0], after[1] });
-        }
+        // Only mark the shared multisampled depth dirty. The depth-sampling consumer materializes
+        // the single-sample copy once on demand (ResolveModelDepthIfNeeded); resolving here would
+        // pay one full-extent depth resolve per model chunk pass, which dominates the frame on
+        // model-heavy scenes.
+        rr.model_depth_dirty.insert(m_desc.output);
     }
     // Temporary render targets may only be returned to TextureCache after the pass has actually
     // consumed them in the recorded frame. Releasing during prepare/resource-refresh is unsafe:
