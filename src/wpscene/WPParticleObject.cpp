@@ -79,6 +79,8 @@ bool ParticleRender::FromJson(const nlohmann::json& json) {
         GET_JSON_NAME_VALUE_NOWARN(json, "minlength", minlength);
         GET_JSON_NAME_VALUE_NOWARN(json, "segments", segments);
     }
+    GET_JSON_NAME_VALUE_NOWARN(json, "orientation", orientation);
+    GET_JSON_NAME_VALUE_NOWARN(json, "axis", axis);
     return true;
 }
 

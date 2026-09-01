@@ -191,6 +191,7 @@ public:
         i32    id { 0 };
         double rate { 1.0f };
         double blend { 1.0f };
+        bool   additive { false };
         bool   visible { true };
         double cur_time { 0.0f };
         bool   playing { true };
@@ -199,11 +200,10 @@ public:
         bool   pending_ended_callback { false };
     };
 
-    void prepared(std::span<AnimationLayer>);
+    void prepared(std::span<const AnimationLayer>);
     // Runtime user properties can toggle an animation layer after the puppet has been prepared.
-    // The layer list and animation pointers stay stable, but the normalized blend weights and the
-    // fallback base-pose weight must be rebuilt whenever visibility or blend changes, otherwise a
-    // disabled full-weight layer can leave the base pose with zero influence and collapse the mesh.
+    // The layer list and animation pointers stay stable, but an already cached pose must be
+    // invalidated whenever visibility or blend changes.
     void RefreshBlendState() noexcept;
 
     std::span<const Eigen::Affine3f> genFrame(double time) noexcept;
@@ -227,7 +227,6 @@ public:
 private:
     struct Layer {
         AnimationLayer                         anim_layer;
-        double                                 blend;
         const WPPuppet::Animation*             anim { nullptr };
         WPPuppet::Animation::InterpolationInfo interp_info {};
 
@@ -238,8 +237,6 @@ private:
         Eigen::Affine3f local_transform { Eigen::Affine3f::Identity() };
     };
     struct RuntimeState {
-        double                           global_blend { 1.0 };
-        double                           total_blend { 0.0 };
         std::vector<Layer>               layers;
         std::vector<BoneOverride>        bone_overrides;
         std::shared_ptr<WPPuppet>        puppet;

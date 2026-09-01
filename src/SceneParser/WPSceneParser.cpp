@@ -474,6 +474,17 @@ bool WPModelObject::FromJson(const nlohmann::json& json, fs::VFS&) {
         GET_JSON_NAME_VALUE_NOWARN(json, "skin", skin);
         GET_JSON_NAME_VALUE_NOWARN(json, "reflected", reflected);
         GET_JSON_NAME_VALUE_NOWARN(json, "castshadow", castshadow);
+        if (json.contains("animationlayers") && json.at("animationlayers").is_array()) {
+            for (const auto& animation_json : json.at("animationlayers")) {
+                WPPuppetLayer::AnimationLayer layer;
+                GET_JSON_NAME_VALUE(animation_json, "animation", layer.id);
+                GET_JSON_NAME_VALUE(animation_json, "blend", layer.blend);
+                GET_JSON_NAME_VALUE(animation_json, "rate", layer.rate);
+                GET_JSON_NAME_VALUE_NOWARN(animation_json, "additive", layer.additive);
+                GET_JSON_NAME_VALUE_NOWARN(animation_json, "visible", layer.visible);
+                animation_layers.push_back(layer);
+            }
+        }
         return ! model.empty();
 }
 
@@ -1186,7 +1197,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
             // Parse-time values use the authored header. After GPU upload the
             // shader updater overwrites g_TextureNResolution from
             // EffectiveImportedTextureResolution() so half/auto follow the
-            // official bind-path GPU extent.
+            // bind-path GPU extent.
 
             RegisterSceneTextureFromHeader(*pScene, name, texh);
             if ((pScene->textures.at(name)).isSprite) {

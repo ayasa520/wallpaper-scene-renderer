@@ -81,8 +81,7 @@ void WPPuppet::prepared() {
 
 std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
                                                     double         time) noexcept {
-    auto&  runtime      = puppet_layer.Runtime();
-    double global_blend = runtime.global_blend;
+    auto& runtime = puppet_layer.Runtime();
 
     puppet_layer.updateInterpolation(time);
 
@@ -94,12 +93,15 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         const Affine3f parent =
             (bone.noParent() || bone.parent >= i) ? Affine3f::Identity() : m_final_affines[bone.parent];
 
-        Vector3f    trans { bone.transform.translation() * global_blend };
-        Vector3f    scale { Vector3f::Ones() * global_blend };
-        Quaterniond quat { Quaterniond::Identity() };
-        Quaterniond ident { Quaterniond::Identity() };
-
-        // double cur_blend { 0.0f };
+        Vector3f trans { bone.transform.translation() };
+        Vector3f scale;
+        Matrix3f bind_rotation = bone.transform.linear();
+        for (Eigen::Index axis = 0; axis < 3; ++axis) {
+            scale[axis] = bind_rotation.col(axis).norm();
+            bind_rotation.col(axis) /= scale[axis];
+        }
+        Quaterniond quat { bind_rotation.cast<double>() };
+        const Quaterniond ident { Quaterniond::Identity() };
 
         for (auto& layer : runtime.layers) {
             auto& alayer = layer.anim_layer;
@@ -107,38 +109,40 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
             assert(i < layer.anim->bframes_array.size());
             if (i >= layer.anim->bframes_array.size()) continue;
 
-            auto&  info    = layer.interp_info;
+            auto&  info       = layer.interp_info;
             auto&  frame_base = layer.anim->bframes_array[i].frames[(usize)0];
-            auto&  frame_a = layer.anim->bframes_array[i].frames[(usize)info.frame_a];
-            auto&  frame_b = layer.anim->bframes_array[i].frames[(usize)info.frame_b];
+            auto&  frame_a    = layer.anim->bframes_array[i].frames[(usize)info.frame_a];
+            auto&  frame_b    = layer.anim->bframes_array[i].frames[(usize)info.frame_b];
 
-            double t = info.t;
-            double one_t   = 1.0f - info.t;
+            const double   blend         = alayer.blend;
+            const float    t             = static_cast<float>(info.t);
+            const Vector3f sampled_trans = frame_a.position * (1.0f - t) + frame_b.position * t;
+            const Vector3f sampled_scale = frame_a.scale * (1.0f - t) + frame_b.scale * t;
+            const Quaterniond sampled_quat = frame_a.quaternion.slerp(info.t, frame_b.quaternion);
 
-            // break up the delta quaternions from the animation start quaternion
-            // blend the starting quaternion using the reduced blending factor
-            // blend the delta using the full blending factor
-            auto frame_a_quat_delta = frame_a.quaternion * frame_base.quaternion.conjugate();
-            auto frame_b_quat_delta = frame_b.quaternion * frame_base.quaternion.conjugate();
-            quat *= frame_a_quat_delta.slerp(info.t, frame_b_quat_delta).slerp(1.0 - layer.anim_layer.blend, ident) 
-                * frame_base.quaternion.slerp(1.0 - (layer.blend), ident);
-                       
-            // break up the delta positions from the animation start position
-            // blend the starting position using the reduced blending factor
-            // blend the delta using the full blending factor
-            auto frame_a_pos_delta = frame_a.position - frame_base.position;
-            auto frame_b_pos_delta = frame_b.position - frame_base.position;
-            trans += (layer.blend * frame_base.position) + (layer.anim_layer.blend * (frame_a_pos_delta * one_t + frame_b_pos_delta * t));
+            // The animation-layer additive flag is stored separately from blend. Later
+            // non-additive layers attenuate earlier poses, while additive layers contribute only
+            // the delta from frame zero. Applying layers in authored order is the same
+            // composition: a normal layer interpolates toward its absolute pose and an additive
+            // layer contributes only its delta. Treating every full-weight layer as additive
+            // sums several complete locomotion rotations and twists articulated models.
+            if (! alayer.additive) {
+                trans = trans * static_cast<float>(1.0 - blend) +
+                        sampled_trans * static_cast<float>(blend);
+                scale = scale * static_cast<float>(1.0 - blend) +
+                        sampled_scale * static_cast<float>(blend);
+                quat = quat.slerp(blend, sampled_quat);
+                continue;
+            }
 
-            // break up the delta scales from the animation start scale
-            // blend the starting scale using the reduced blending factor
-            // blend the delta using the full blending factor
-            auto& frame_a_scale_delta = frame_a.scale - frame_base.scale;
-            auto& frame_b_scale_delta = frame_b.scale - frame_base.scale;
-            scale += (layer.blend * frame_base.scale) + (layer.anim_layer.blend * (frame_a_scale_delta * one_t + frame_b_scale_delta * info.t));
+            trans += static_cast<float>(blend) * (sampled_trans - frame_base.position);
+            scale += static_cast<float>(blend) * (sampled_scale - frame_base.scale);
+            const Quaterniond rotation_delta =
+                sampled_quat * frame_base.quaternion.conjugate();
+            quat *= ident.slerp(blend, rotation_delta);
         }
         affine.pretranslate(trans);
-        affine.rotate(quat.slerp(global_blend, ident).cast<float>());
+        affine.rotate(quat.cast<float>());
         affine.scale(scale);
         if (i < runtime.bone_overrides.size() && runtime.bone_overrides[i].enabled) {
             affine = runtime.bone_overrides[i].local_transform;
@@ -221,7 +225,7 @@ WPPuppet::Animation::getInterpolationInfo(double* cur_time) const {
     return _info;
 }
 
-void WPPuppetLayer::prepared(std::span<AnimationLayer> alayers) {
+void WPPuppetLayer::prepared(std::span<const AnimationLayer> alayers) {
     auto& runtime = Runtime();
     runtime.layers.resize(alayers.size());
     runtime.bone_overrides.assign(runtime.puppet != nullptr ? runtime.puppet->bones.size() : 0,
@@ -255,7 +259,6 @@ void WPPuppetLayer::prepared(std::span<AnimationLayer> alayers) {
             // false->true toggles impossible without reparsing the entire puppet.
             return Layer {
                 .anim_layer = runtime_layer,
-                .blend      = 0.0,
                 .anim       = has_animation ? std::addressof(*it) : nullptr,
             };
         });
@@ -263,38 +266,9 @@ void WPPuppetLayer::prepared(std::span<AnimationLayer> alayers) {
 }
 
 void WPPuppetLayer::RefreshBlendState() noexcept {
-    // Animation-layer visibility and blend are mutable user/script properties. Rebuilding the
-    // normalized weights from the current runtime layer state keeps the base pose available when a
-    // previously full-weight animation is disabled, which is what Wallpaper Engine expects.
-    auto& runtime       = Runtime();
-    runtime.global_blend = 1.0;
-    runtime.total_blend  = 0.0;
-
-    for (const auto& layer : runtime.layers) {
-        if (layer.anim != nullptr && layer.anim_layer.visible) {
-            runtime.total_blend += layer.anim_layer.blend;
-        }
-    }
-
-    double remaining_blend = 1.0;
-    for (auto layer_it = runtime.layers.rbegin(); layer_it != runtime.layers.rend(); ++layer_it) {
-        auto& layer = *layer_it;
-        layer.blend = 0.0;
-        if (layer.anim == nullptr || !layer.anim_layer.visible) continue;
-
-        if (runtime.total_blend > 1.0) {
-            layer.blend = layer.anim_layer.blend / runtime.total_blend;
-            remaining_blend = 0.0;
-        } else {
-            layer.blend = remaining_blend * layer.anim_layer.blend;
-            remaining_blend *= 1.0 - layer.anim_layer.blend;
-            remaining_blend = remaining_blend < 0.0 ? 0.0 : remaining_blend;
-        }
-    }
-
-    runtime.global_blend = remaining_blend;
-    // The skinning matrices depend directly on the rebuilt blend weights, so cached bone matrices
-    // must be invalidated even if the frame serial has not advanced yet.
+    auto& runtime = Runtime();
+    // Blend and visibility are consumed directly in authored order by genFrame(). Invalidate the
+    // cached palette so a script mutation is visible even before the next frame serial is issued.
     runtime.cached_skinning     = {};
     runtime.cached_frame_serial = std::numeric_limits<uint64_t>::max();
     runtime.pose_revision++;

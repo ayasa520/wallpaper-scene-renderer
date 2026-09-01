@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string_view>
 
 using namespace wallpaper;
 
@@ -175,6 +176,23 @@ void ParticleSubSystem::SetRuntimeColorOverride(const std::array<float, 3>& colo
 
 std::optional<std::array<float, 3>> ParticleSubSystem::RuntimeColorOverride() const {
     return m_runtime_color_override;
+}
+
+void ParticleSubSystem::SetRuntimeAlphaOverride(float alpha) {
+    if (!std::isfinite(alpha)) return;
+
+    const float normalized_alpha = std::max(0.0f, alpha);
+    const bool changed = std::abs(m_runtime_alpha_override - normalized_alpha) > 0.000001f;
+    m_runtime_alpha_override = normalized_alpha;
+
+    if (changed) MarkMeshesDirty();
+    for (auto& child : m_children) {
+        if (child) child->SetRuntimeAlphaOverride(normalized_alpha);
+    }
+}
+
+std::optional<float> ParticleSubSystem::RuntimeAlphaOverride() const {
+    return m_runtime_alpha_override;
 }
 
 void ParticleSubSystem::SetRuntimeRateOverride(float rate) {
@@ -628,17 +646,31 @@ void ParticleSubSystem::Emitt() {
         inst->SetNoLiveParticle(! has_live);
     }
 
-    SampleTrailHistory(frameTime);
+    // Multiply frame delta by instanceoverride.rate before advancing the particle system.
+    // Trail history is part of that system state, so sampling it with raw wall time would
+    // make a rate-5 rope move in one time domain while retaining history in another,
+    // producing compressed and misdirected ribbons.
+    SampleTrailHistory(particleTime);
 
     const std::string_view object_name = m_node != nullptr
         ? std::string_view(m_node->Name())
         : std::string_view("(unbound-particle-object)");
     if (! m_suppress_mesh_gen) {
         MarkMeshesDirty();
-        m_sys.gener->GenGLData(m_instances, *m_mesh, m_genSpecOp, m_render_plan, object_name);
+        m_sys.gener->GenGLData(m_instances,
+                              *m_mesh,
+                              m_genSpecOp,
+                              m_render_plan,
+                              object_name,
+                              m_runtime_alpha_override);
         for (auto& extra : m_extra_outputs) {
             if (! extra.mesh) continue;
-            m_sys.gener->GenGLData(m_instances, *extra.mesh, extra.spec_op, extra.plan, object_name);
+            m_sys.gener->GenGLData(m_instances,
+                                  *extra.mesh,
+                                  extra.spec_op,
+                                  extra.plan,
+                                  object_name,
+                                  m_runtime_alpha_override);
         }
     }
 

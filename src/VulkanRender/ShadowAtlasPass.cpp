@@ -2,11 +2,13 @@
 
 #include "Core/ArrayHelper.hpp"
 #include "Core/Literals.hpp"
+#include "Interface/IShaderValueUpdater.h"
 #include "PassCommon.hpp"
 #include "Resource.hpp"
 #include "Scene/ShadowAtlas.hpp"
 #include "Scene/SceneMaterial.h"
 #include "Scene/SceneMesh.h"
+#include "SkinningShaderContract.hpp"
 #include "SpecTexs.hpp"
 #include "Utils/Logging.h"
 #include "Vulkan/Shader.hpp"
@@ -26,7 +28,11 @@ using namespace wallpaper::vulkan;
 namespace
 {
 
-constexpr std::string_view kVert = R"(
+constexpr VkDeviceSize kShadowMvpBytes = sizeof(float) * 16;
+
+std::string ShadowVertexSource(uint32_t bone_count) {
+    if (bone_count == 0) {
+        return R"(
 struct VSInput {
     [[vk::location(0)]] float3 Position : POSITION0;
 };
@@ -35,18 +41,48 @@ struct VSOutput {
     float4 position : SV_Position;
 };
 
-struct ShadowCaster {
-    float4x4 u_MVP;
+[[vk::binding(0, 0)]] cbuffer ShadowCaster {
+    column_major float4x4 u_MVP;
 };
-
-[[vk::binding(0, 0)]] ConstantBuffer<ShadowCaster> g_cb;
 
 VSOutput main_vs(VSInput input) {
     VSOutput output;
-    output.position = mul(g_cb.u_MVP, float4(input.Position, 1.0));
+    output.position = mul(u_MVP, float4(input.Position, 1.0));
     return output;
 }
 )";
+    }
+
+    return R"(
+struct VSInput {
+    [[vk::location(0)]] float3 Position : POSITION0;
+    [[vk::location(1)]] uint4 BlendIndices : BLENDINDICES0;
+    [[vk::location(2)]] float4 BlendWeights : BLENDWEIGHT0;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+};
+
+[[vk::binding(0, 0)]] cbuffer ShadowCaster {
+    column_major float4x4 u_MVP;
+    column_major float3x4 g_Bones[)" + std::to_string(bone_count) + R"(];
+};
+
+VSOutput main_vs(VSInput input) {
+    const float4 position = float4(input.Position, 1.0);
+    const float3 skinned =
+        mul(g_Bones[input.BlendIndices.x], position) * input.BlendWeights.x +
+        mul(g_Bones[input.BlendIndices.y], position) * input.BlendWeights.y +
+        mul(g_Bones[input.BlendIndices.z], position) * input.BlendWeights.z +
+        mul(g_Bones[input.BlendIndices.w], position) * input.BlendWeights.w;
+
+    VSOutput output;
+    output.position = mul(u_MVP, float4(skinned, 1.0));
+    return output;
+}
+)";
+}
 
 constexpr std::string_view kFrag = R"(
 void main_ps() {}
@@ -121,8 +157,27 @@ void WalkCasters(wallpaper::SceneNode* node,
     }
 }
 
-uint64_t ShadowVertexLayoutKey(uint32_t stride, uint32_t position_offset) {
-    return (static_cast<uint64_t>(stride) << 32) | position_offset;
+std::string ShadowVertexLayoutKey(uint32_t stride, uint32_t position_offset, uint32_t bone_count,
+                                  uint32_t blend_indices_offset,
+                                  uint32_t blend_weights_offset) {
+    std::string key = "stride=" + std::to_string(stride) + "|pos=" +
+                      std::to_string(position_offset) + "|bones=" +
+                      std::to_string(bone_count);
+    if (bone_count > 0) {
+        key += "|indices=" + std::to_string(blend_indices_offset) + "|weights=" +
+               std::to_string(blend_weights_offset);
+    }
+    return key;
+}
+
+VkDeviceSize ShadowUniformSize(uint32_t bone_count) {
+    return kShadowMvpBytes +
+           static_cast<VkDeviceSize>(bone_count) *
+               static_cast<VkDeviceSize>(wallpaper::kDxcSkinningMatrixFloatCount * sizeof(float));
+}
+
+VkDeviceSize AlignUniformSize(VkDeviceSize size, VkDeviceSize alignment) {
+    return ((size + alignment - 1) / alignment) * alignment;
 }
 
 } // namespace
@@ -147,18 +202,22 @@ bool ShadowAtlasPass::ensureClearPass(const Device& device) {
     return true;
 }
 
-bool ShadowAtlasPass::ensureShadowShaders() {
-    if (! m_shader_spvs.empty()) return true;
+bool ShadowAtlasPass::ensureShadowShaders(uint32_t bone_count) {
+    if (const auto it = m_shader_spvs.find(bone_count);
+        it != m_shader_spvs.end() && !it->second.empty()) {
+        return true;
+    }
 
     ShaderCompOpt opt;
     opt.target_env = ShaderTargetEnv::VULKAN_1_1;
+    std::vector<Uni_ShaderSpv> compiled;
     std::array<ShaderCompUnit, 2> units {
         ShaderCompUnit {
             .stage           = wallpaper::ShaderType::VERTEX,
             .source_language = ShaderSourceLanguage::HLSL,
-            .debug_name      = "ShadowAtlas.vert",
+            .debug_name      = "ShadowAtlas.vert[bones=" + std::to_string(bone_count) + "]",
             .entry_point     = "main_vs",
-            .src             = std::string(kVert),
+            .src             = ShadowVertexSource(bone_count),
         },
         ShaderCompUnit {
             .stage           = wallpaper::ShaderType::FRAGMENT,
@@ -168,20 +227,26 @@ bool ShadowAtlasPass::ensureShadowShaders() {
             .src             = std::string(kFrag),
         },
     };
-    if (! CompileAndLinkShaderUnits(units, opt, m_shader_spvs)) {
-        LOG_ERROR("ShadowAtlas: shader compile failed");
-        m_shader_spvs.clear();
+    if (! CompileAndLinkShaderUnits(units, opt, compiled)) {
+        LOG_ERROR("ShadowAtlas: shader compile failed bones=%u", bone_count);
         return false;
     }
+    m_shader_spvs.emplace(bone_count, std::move(compiled));
     return true;
 }
 
-bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& rr, uint32_t stride,
-                                    uint32_t position_offset) {
-    if (stride == 0) return false;
-    const uint64_t key = ShadowVertexLayoutKey(stride, position_offset);
+bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& rr,
+                                    const CasterMesh& caster) {
+    if (caster.stride == 0) return false;
+    const std::string key = ShadowVertexLayoutKey(caster.stride,
+                                                  caster.position_offset,
+                                                  caster.bone_count,
+                                                  caster.blend_indices_offset,
+                                                  caster.blend_weights_offset);
     if (auto it = m_pipelines.find(key); it != m_pipelines.end() && it->second.handle) return true;
-    if (! ensureShadowShaders()) return false;
+    if (! ensureShadowShaders(caster.bone_count)) return false;
+    const auto shader_it = m_shader_spvs.find(caster.bone_count);
+    if (shader_it == m_shader_spvs.end()) return false;
 
     auto pass_opt = CreateShadowRenderPass(device.handle());
     if (! pass_opt.has_value()) return false;
@@ -189,15 +254,31 @@ bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& r
 
     VkVertexInputBindingDescription bind {
         .binding   = 0,
-        .stride    = stride,
+        .stride    = caster.stride,
         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
     };
-    VkVertexInputAttributeDescription attr {
-        .location = 0,
-        .binding  = 0,
-        .format   = VK_FORMAT_R32G32B32_SFLOAT,
-        .offset   = position_offset,
+    std::vector<VkVertexInputAttributeDescription> attrs {
+        VkVertexInputAttributeDescription {
+            .location = 0,
+            .binding  = 0,
+            .format   = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset   = caster.position_offset,
+        },
     };
+    if (caster.bone_count > 0) {
+        attrs.push_back(VkVertexInputAttributeDescription {
+            .location = 1,
+            .binding  = 0,
+            .format   = VK_FORMAT_R32G32B32A32_UINT,
+            .offset   = caster.blend_indices_offset,
+        });
+        attrs.push_back(VkVertexInputAttributeDescription {
+            .location = 2,
+            .binding  = 0,
+            .format   = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset   = caster.blend_weights_offset,
+        });
+    }
 
     DescriptorSetInfo descriptor_info;
     descriptor_info.push_descriptor = true;
@@ -216,20 +297,26 @@ bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& r
     pipeline.depth.depthTestEnable  = VK_TRUE;
     pipeline.depth.depthWriteEnable = VK_TRUE;
     pipeline.depth.depthCompareOp   = VK_COMPARE_OP_LESS;
-    params.debug_name               = "ShadowAtlas";
-    params.cache_key                = "ShadowAtlas|d32|less|no-color|stride=" +
-                       std::to_string(stride) + "|pos=" + std::to_string(position_offset);
+    // Wallpaper Engine enables its dedicated slope-scaled rasterizer state while drawing the
+    // shadow atlas. Its D3D11 renderer uses -4.0 with reverse depth; this renderer stores forward
+    // depth and compares LESS, so the equivalent offset has the opposite sign. A constant-only
+    // clip-space offset cannot follow the receiver slope and produces regular self-shadow bands
+    // on large oblique surfaces such as roads.
+    pipeline.raster.depthBiasEnable      = VK_TRUE;
+    pipeline.raster.depthBiasSlopeFactor = 4.0f;
+    params.debug_name = "ShadowAtlas";
+    params.cache_key  = "ShadowAtlas|d32|less|slope-bias|no-color|" + key;
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>())
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .addInputBindingDescription(spanone { bind })
-        .addInputAttributeDescription(spanone { attr });
-    for (const auto& spv : m_shader_spvs) {
+        .addInputAttributeDescription(attrs);
+    for (const auto& spv : shader_it->second) {
         if (! spv) return false;
         pipeline.addStage(std::make_unique<ShaderSpv>(*spv));
     }
     if (! pipeline.create(device, pass, params, rr.pipeline_cache.get())) {
-        LOG_ERROR("ShadowAtlas: pipeline create failed stride=%u pos=%u", stride, position_offset);
+        LOG_ERROR("ShadowAtlas: pipeline create failed %s", key.c_str());
         return false;
     }
     m_pipelines[key] = std::move(params);
@@ -267,8 +354,24 @@ void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, Renderi
         if (mesh.VertexCount() == 0) return;
         const auto& vertex = mesh.GetVertexArray(0);
         const auto  attrs  = vertex.GetAttrOffsetMap();
-        const auto  it     = attrs.find(std::string(wallpaper::WE_IN_POSITION));
-        if (it == attrs.end() || vertex.VertexCount() == 0) return;
+        const auto  position_it = attrs.find(std::string(wallpaper::WE_IN_POSITION));
+        if (position_it == attrs.end() || vertex.VertexCount() == 0) return;
+
+        const uint32_t bone_count = mesh.Skinning().boneCount;
+        auto blend_indices_it = attrs.end();
+        auto blend_weights_it = attrs.end();
+        if (bone_count > 0) {
+            blend_indices_it = attrs.find(std::string(wallpaper::WE_IN_BLENDINDICES));
+            blend_weights_it = attrs.find(std::string(wallpaper::WE_IN_BLENDWEIGHTS));
+            if (blend_indices_it == attrs.end() || blend_weights_it == attrs.end() ||
+                blend_indices_it->second.attr.type != wallpaper::VertexType::UINT4 ||
+                blend_weights_it->second.attr.type != wallpaper::VertexType::FLOAT4) {
+                LOG_ERROR("ShadowAtlas: invalid skinning vertex layout node='%s' bones=%u",
+                          node.Name().c_str(),
+                          bone_count);
+                return;
+            }
+        }
 
         auto gpu = rr.immutable_meshes.getOrCreate(device, mesh);
         if (! gpu || gpu->vertices.empty() || ! gpu->vertices.front()) return;
@@ -277,7 +380,14 @@ void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, Renderi
         caster.node             = &node;
         caster.mesh             = std::move(gpu);
         caster.stride           = static_cast<uint32_t>(vertex.OneSizeOf());
-        caster.position_offset  = static_cast<uint32_t>(it->second.offset);
+        caster.position_offset  = static_cast<uint32_t>(position_it->second.offset);
+        caster.bone_count       = bone_count;
+        if (bone_count > 0) {
+            caster.blend_indices_offset =
+                static_cast<uint32_t>(blend_indices_it->second.offset);
+            caster.blend_weights_offset =
+                static_cast<uint32_t>(blend_weights_it->second.offset);
+        }
         caster.vertex_count     = static_cast<uint32_t>(vertex.VertexCount());
         caster.index_element_bytes = mesh.IndexElementBytes();
         caster.index_count      = mesh.LogicalIndexCount();
@@ -291,8 +401,36 @@ void ShadowAtlasPass::rebuildDrawList() {
     auto* scene = m_desc.scene;
     if (scene == nullptr) return;
 
-    uint32_t slot = 0;
-    const Eigen::Vector3f cascade_center = scene->ShadowCascadeCenter();
+    // Resolve one immutable palette per caster before expanding it across lights and cascades.
+    // Every generated draw then reads the same pose that visible materials received after
+    // PrepareFrame(), while shared puppet runtimes remain owned exclusively by the scene updater.
+    for (auto& caster : m_casters) {
+        caster.skinning_pose     = {};
+        caster.pose_revision     = 0;
+        caster.pose_frame_serial = 0;
+        if (caster.bone_count == 0) continue;
+
+        const auto pose = scene->shaderValueUpdater != nullptr
+                              ? scene->shaderValueUpdater->SkinningPose(caster.node)
+                              : std::nullopt;
+        if (!pose.has_value() || pose->matrices.size() != caster.bone_count) {
+            if (!caster.pose_error_reported) {
+                LOG_ERROR("ShadowAtlas: skinning pose mismatch node='%s' expected=%u actual=%zu",
+                          caster.node != nullptr ? caster.node->Name().c_str() : "<null>",
+                          caster.bone_count,
+                          pose.has_value() ? pose->matrices.size() : 0);
+                caster.pose_error_reported = true;
+            }
+            continue;
+        }
+
+        caster.pose_error_reported = false;
+        caster.skinning_pose       = pose->matrices;
+        caster.pose_revision       = pose->revision;
+        caster.pose_frame_serial   = pose->frame_serial;
+    }
+
+    const DirectionalShadowView cascade_view = scene->ShadowCascadeView();
 
     for (auto& light_ptr : scene->lights) {
         if (! light_ptr) continue;
@@ -303,8 +441,10 @@ void ShadowAtlasPass::rebuildDrawList() {
                              bool point_faces) {
             if (! atlas.packed) return;
             for (uint32_t ci = 0; ci < m_casters.size(); ++ci) {
-                auto* node = m_casters[ci].node;
+                const auto& caster = m_casters[ci];
+                auto*       node   = caster.node;
                 if (node == nullptr || ! node->Visible()) continue;
+                if (caster.bone_count > 0 && caster.skinning_pose.empty()) continue;
                 node->UpdateTrans();
                 Eigen::Matrix4f model = node->ModelTrans().cast<float>();
                 if (auto* mesh = node->Mesh(); mesh != nullptr) {
@@ -318,7 +458,6 @@ void ShadowAtlasPass::rebuildDrawList() {
                         const auto vp = ShadowPointFaceViewport(atlas.x, atlas.y, atlas.size, face);
                         DrawItem item;
                         item.caster_index = ci;
-                        item.ubo_slot     = slot++;
                         item.vp_x         = vp.x;
                         item.vp_y         = vp.y;
                         item.vp_w         = vp.width;
@@ -334,7 +473,6 @@ void ShadowAtlasPass::rebuildDrawList() {
                     const auto vp = ShadowSpotViewport(atlas.x, atlas.y, atlas.size);
                     DrawItem item;
                     item.caster_index = ci;
-                    item.ubo_slot     = slot++;
                     item.vp_x         = vp.x;
                     item.vp_y         = vp.y;
                     item.vp_w         = vp.width;
@@ -353,7 +491,8 @@ void ShadowAtlasPass::rebuildDrawList() {
             for (int cascade = 0; cascade < 3; ++cascade) {
                 const auto& atlas = light.cascadeAtlasSlot(cascade);
                 emit_tile(atlas,
-                          light.ShadowCascadeWorldToLightClip(cascade, cascade_center, true),
+                          light.ShadowCascadeWorldToLightClip(
+                              cascade, cascade_view, atlas.size, true),
                           false);
             }
             continue;
@@ -388,7 +527,7 @@ void ShadowAtlasPass::prepare(Scene& scene, const Device& device, RenderingResou
     if (! ensureClearPass(device)) return;
     collectCasters(scene, device, rr);
     for (const auto& caster : m_casters) {
-        if (! ensurePipeline(device, rr, caster.stride, caster.position_offset)) return;
+        if (! ensurePipeline(device, rr, caster)) return;
     }
     if (! ensureFramebuffer(device)) return;
     setPrepared();
@@ -414,8 +553,16 @@ void ShadowAtlasPass::refreshResources(Scene& scene, const Device& device, Rende
 void ShadowAtlasPass::updateBeforeUpload() {
     rebuildDrawList();
     if (m_dyn_buf == nullptr) return;
-    const VkDeviceSize bytes =
-        m_draws.empty() ? m_ubo_align : static_cast<VkDeviceSize>(m_draws.size()) * m_ubo_align;
+
+    VkDeviceSize bytes = 0;
+    for (auto& draw : m_draws) {
+        if (draw.caster_index >= m_casters.size()) continue;
+        draw.ubo_offset = bytes;
+        draw.ubo_size   = ShadowUniformSize(m_casters[draw.caster_index].bone_count);
+        bytes += AlignUniformSize(draw.ubo_size, m_ubo_align);
+    }
+    if (bytes == 0) bytes = m_ubo_align;
+
     if (m_ubo_buf && m_ubo_buf.size < bytes) {
         m_dyn_buf->unallocateSubRef(m_ubo_buf);
     }
@@ -427,11 +574,22 @@ void ShadowAtlasPass::updateBeforeUpload() {
         }
     }
     for (const auto& draw : m_draws) {
-        const auto offset = static_cast<size_t>(draw.ubo_slot) * static_cast<size_t>(m_ubo_align);
+        if (draw.caster_index >= m_casters.size()) continue;
+        const auto& caster = m_casters[draw.caster_index];
+        const auto  offset = static_cast<size_t>(draw.ubo_offset);
         Eigen::Matrix4f mvp = draw.mvp;
         m_dyn_buf->writeToBuf(m_ubo_buf,
-                              { reinterpret_cast<uint8_t*>(mvp.data()), sizeof(float) * 16 },
+                              { reinterpret_cast<uint8_t*>(mvp.data()),
+                                static_cast<size_t>(kShadowMvpBytes) },
                               offset);
+        if (caster.bone_count == 0) continue;
+
+        auto packed_pose = wallpaper::PackDxcRowVectorSkinningUniform(caster.skinning_pose);
+        m_dyn_buf->writeToBuf(
+            m_ubo_buf,
+            { reinterpret_cast<uint8_t*>(packed_pose.data()),
+              packed_pose.size() * sizeof(float) },
+            offset + static_cast<size_t>(kShadowMvpBytes));
     }
 }
 
@@ -461,8 +619,13 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
         if (! caster.mesh || caster.mesh->vertices.empty()) continue;
         VkBuffer gpu = caster.mesh->vertices.front().handle();
         if (gpu == VK_NULL_HANDLE) continue;
-        if (! ensurePipeline(device, rr, caster.stride, caster.position_offset)) continue;
-        auto pipe_it = m_pipelines.find(ShadowVertexLayoutKey(caster.stride, caster.position_offset));
+        if (! ensurePipeline(device, rr, caster)) continue;
+        const auto pipeline_key = ShadowVertexLayoutKey(caster.stride,
+                                                        caster.position_offset,
+                                                        caster.bone_count,
+                                                        caster.blend_indices_offset,
+                                                        caster.blend_weights_offset);
+        auto pipe_it = m_pipelines.find(pipeline_key);
         if (pipe_it == m_pipelines.end() || ! pipe_it->second.handle) continue;
         auto& pipeline = pipe_it->second;
         if (bound != &pipeline) {
@@ -495,8 +658,8 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
         if (m_dyn_buf != nullptr && m_ubo_buf) {
             VkDescriptorBufferInfo buffer_info {
                 .buffer = m_dyn_buf->gpuBuf(),
-                .offset = m_ubo_buf.offset + static_cast<VkDeviceSize>(draw.ubo_slot) * m_ubo_align,
-                .range  = sizeof(float) * 16,
+                .offset = m_ubo_buf.offset + draw.ubo_offset,
+                .range  = draw.ubo_size,
             };
             VkWriteDescriptorSet write {
                 .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -533,6 +696,7 @@ void ShadowAtlasPass::destory(const Device&, RenderingResources&) {
     if (m_dyn_buf != nullptr && m_ubo_buf) m_dyn_buf->unallocateSubRef(m_ubo_buf);
     releaseCasters();
     m_pipelines.clear();
+    m_shader_spvs.clear();
     m_clear_pass.reset();
     m_dyn_buf = nullptr;
 }

@@ -196,9 +196,9 @@ const char* TextureResolutionRequestedName(int quality) {
 bool TextureResolutionShouldDropMip0(int quality, uint32_t width, uint32_t height) {
     if (quality == 1) return true;
     if (quality != 2) return false;
-    // Official Wallpaper Engine 2.8.42 auto: one global bool for the whole
-    // wallpaper, not a per-texture 1920x1080 test. Compare output pixel area
-    // (floatA * floatB) against 1969920 (1920 * 1080 * 0.95). Below → half.
+    // Auto resolution is one global bool for the whole wallpaper, not a
+    // per-texture 1920x1080 test. Compare output pixel area (floatA * floatB)
+    // against 1969920 (1920 * 1080 * 0.95). Below → half.
     const uint64_t area =
         static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
     return area < kOfficialTextureResolutionAutoArea;
@@ -977,17 +977,33 @@ void Scene::UpdateActiveCameraLayer() {
 
         if (camera_layer != nullptr && camera_layer->node) {
             auto& node = *camera_layer->node;
-            node.UpdateTrans();
-            const Eigen::Matrix4d model = node.ModelTrans();
+            // Routed parent layers are intentionally kept as root-owned proxy nodes in the
+            // physical scene graph. Their authored parent transform is resolved by the shader
+            // updater's WPNodeTransformResolver, which also handles nested routed parents and
+            // attachments. Reuse that resolver here so the active camera consumes the same world
+            // matrix as the model draw path; reading node.ModelTrans() alone would discard the
+            // CameraBoneMoveMesh roll even though the scene script has already written it.
+            const Eigen::Matrix4d model =
+                shaderValueUpdater->ResolveModelTransformForProjection(&node, nullptr, false);
             const Eigen::Vector3d eye   = model.block<3, 1>(0, 3);
             Eigen::Vector3d       zaxis = model.block<3, 1>(0, 2);
             Eigen::Vector3d       yaxis = model.block<3, 1>(0, 1);
             if (zaxis.norm() > 1e-12 && yaxis.norm() > 1e-12) {
                 zaxis.normalize();
                 yaxis.normalize();
-                camera_it->second->SetExplicitView(eye, eye - zaxis, yaxis);
-                camera_it->second->Update();
-                UpdateLinkedCamera(modelPerspectiveCameraName);
+                auto& camera = *camera_it->second;
+
+                // This branch already applied the selected camera layer's world-space pose, so
+                // it must apply the FOV stored by that same layer's setter as part of one
+                // projection state. Keeping the scene-general FOV here would discard the
+                // click-driven FOV animation after the setter had successfully run.
+                camera.SetExplicitView(eye, eye - zaxis, yaxis);
+                ApplyCameraProjectionState(*this,
+                                           modelPerspectiveCameraName,
+                                           camera,
+                                           camera_layer->zoom,
+                                           camera_layer->fov,
+                                           next_layer_id);
             }
         }
 
@@ -1038,8 +1054,8 @@ void Scene::UpdateActiveCameraLayer() {
     activeCamera = camera_it->second.get();
 
     if (activeCameraLayerId != next_layer_id) {
-        // This transition log is intentionally sparse: it proves which authored camera layer owns
-        // the view without flooding frame logs while keyframed zoom/origin values animate.
+        // Log camera-layer transitions only. Keyframed zoom/origin animation would flood
+        // the log if every frame were recorded.
         LOG_INFO("SceneCameraLayerActive: previous=%d active=%d camera='%s' zoom=%.3f origin=[%.3f, %.3f, %.3f]",
                  activeCameraLayerId,
                  next_layer_id,

@@ -213,15 +213,21 @@ public:
     void ApplyAllLayerVisibility();
     void UpdateModelCameraPath();
     void UpdateCameraShake();
-    Eigen::Vector3f ShadowCascadeCenter() const {
+    DirectionalShadowView ShadowCascadeView() const {
+        const SceneCamera* camera = activeCamera;
         if (! modelPerspectiveCameraName.empty()) {
             auto it = cameras.find(modelPerspectiveCameraName);
             if (it != cameras.end() && it->second) {
-                return it->second->GetPosition().cast<float>();
+                camera = it->second.get();
             }
         }
-        if (activeCamera != nullptr) return activeCamera->GetPosition().cast<float>();
-        return Eigen::Vector3f::Zero();
+        if (camera == nullptr) return {};
+
+        DirectionalShadowView view;
+        view.eye          = camera->GetPosition().cast<float>();
+        view.forward      = camera->GetDirection().cast<float>().normalized();
+        view.orthographic = cameraOrthographic;
+        return view;
     }
     Eigen::Vector3f ResolveCameraLayerNodeTranslation(
         const std::array<float, 3>& authored_origin) const;
@@ -429,9 +435,9 @@ public:
     MsaaSettings         msaa;
 
     struct TextureResolutionSettings {
-        // Official Wallpaper Engine 2.8.42 `generalSettings.resolution`.
-        // 0=full (High Quality), 1=half (High Performance), 2=auto.
-        // Independent of Low/Medium/High/Ultra quality presets.
+        // generalSettings.resolution: 0=full (High Quality), 1=half (High
+        // Performance), 2=auto. Independent of Low/Medium/High/Ultra quality
+        // presets.
         int      quality { 0 };
         bool     drop_mip0 { false };
         uint32_t output_width { 0 };

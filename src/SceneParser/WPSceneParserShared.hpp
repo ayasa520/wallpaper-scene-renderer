@@ -96,6 +96,7 @@ struct WPModelObject {
     std::string          model;
     int32_t              skin { 0 };
     bool                 reflected { false };
+    std::vector<wallpaper::WPPuppetLayer::AnimationLayer> animation_layers;
     // 3D models omit this key when they should cast. Non-casters write false.
     bool                 castshadow { true };
 

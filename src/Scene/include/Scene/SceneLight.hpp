@@ -18,6 +18,12 @@ enum class SceneLightType
     Other,
 };
 
+struct DirectionalShadowView {
+    Eigen::Vector3f eye { Eigen::Vector3f::Zero() };
+    Eigen::Vector3f forward { 0.0f, 0.0f, -1.0f };
+    bool            orthographic { false };
+};
+
 class SceneLight {
 public:
     SceneLight(Eigen::Vector3f color, float radius, float intensity)
@@ -100,6 +106,16 @@ public:
         if (index == 1) return m_cascade1;
         return m_cascade2;
     }
+
+    Eigen::Vector2f ShadowCascadeExtents(int index) const {
+        const float xy_extent = cascadeDistance(index);
+        const float shared_depth_extent = m_cascade1 * 4.0f;
+        const float depth_extent = index < 2
+                                       ? shared_depth_extent
+                                       : std::max(m_cascade2 * 1.5f, shared_depth_extent);
+        return { xy_extent, depth_extent };
+    }
+
     void setCascadeDistances(float d0, float d1, float d2) {
         m_cascade0 = d0;
         m_cascade1 = d1;
@@ -187,10 +203,14 @@ public:
     }
 
     Eigen::Vector3f WorldForward() const {
-        if (m_node == nullptr && ! m_hasResolvedWorld) return Eigen::Vector3f(0.0f, 0.0f, 1.0f);
-        Eigen::Vector3f forward = WorldTransform().block<3, 1>(0, 2).cast<float>();
+        // Wallpaper Engine lights travel along their authored local +X axis. Its light-array
+        // builder reads transform column zero for spot direction and negates the same column for
+        // directional LightingV1. Using the conventional +Z model-forward axis rotates both the
+        // direct-light lobe and every shadow camera away from the authored sun direction.
+        if (m_node == nullptr && ! m_hasResolvedWorld) return Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+        Eigen::Vector3f forward = WorldTransform().block<3, 1>(0, 0).cast<float>();
         if (forward.squaredNorm() > 1e-12f) return forward.normalized();
-        return Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+        return Eigen::Vector3f(1.0f, 0.0f, 0.0f);
     }
 
     // Degrees to radians for g_RenderVar1 inner/outer cone cosines.
@@ -270,31 +290,73 @@ public:
         return clip;
     }
 
-    // Directional cascade VP. Authored cascadedistanceN is the ortho half-extent
-    // of cascade N. The eye sits cascadeDistance along -forward from `center`
-    // so the frustum covers that box. Sampling uses render_bias=false.
-    Eigen::Matrix4f ShadowCascadeWorldToLightClip(int cascade, const Eigen::Vector3f& center,
-                                                  bool render_bias) const {
-        const float               half = std::max(cascadeDistance(cascade), 0.01f);
-        const Eigen::Vector3f     fwd  = WorldForward();
-        const Eigen::Vector3f     eye  = center - fwd * half;
-        const Eigen::Matrix4f     axes = LightAxes();
-        Eigen::Matrix4f           world_to_light = Eigen::Matrix4f::Identity();
-        world_to_light.block<3, 3>(0, 0)         = axes.block<3, 3>(0, 0).transpose();
-        const Eigen::Vector3f t = -world_to_light.block<3, 3>(0, 0) * eye;
+    Eigen::Vector3f ShadowCascadeCenter(int cascade,
+                                        const DirectionalShadowView& view) const {
+        const float half_xy = ShadowCascadeExtents(cascade).x() * 0.5f;
+        const Eigen::Vector3f light_forward = WorldForward();
+
+        // Move each cascade away from the eye by half of its authored XY extent. Before applying
+        // that distance, remove half of the camera-forward component parallel to the light travel
+        // direction. An eye-centered square spends half of every authored cascade behind the
+        // camera, causing distant receivers to leave the far cascade and nearer receivers to use
+        // a coarser cascade than intended. The perspective path applies the offset in all axes;
+        // the orthographic path pins the resulting world Z coordinate to zero.
+        const Eigen::Vector3f offset_direction =
+            view.forward - light_forward * (0.5f * view.forward.dot(light_forward));
+        Eigen::Vector3f center = view.eye + offset_direction * half_xy;
+        if (view.orthographic) center.z() = 0.0f;
+        return center;
+    }
+
+    Eigen::Vector3f StabilizedShadowCascadeCenter(int cascade,
+                                                  const DirectionalShadowView& view,
+                                                  int shadow_map_size) const {
+        Eigen::Vector3f center = ShadowCascadeCenter(cascade, view);
+        const float world_texel = ShadowCascadeExtents(cascade).x() /
+                                  static_cast<float>(shadow_map_size);
+        const Eigen::Matrix4f axes = LightAxes();
+        const Eigen::Vector3f light_x = axes.block<3, 1>(0, 0);
+        const Eigen::Vector3f light_y = axes.block<3, 1>(0, 1);
+
+        // Project the moving cascade center onto both axes of the shadow plane, remove each
+        // coordinate's floating remainder by one world-space shadow texel, and only then build
+        // the light view. Keeping render and sample matrices on this identical quantized center
+        // prevents camera motion and camera shake from sliding stationary geometry through the
+        // far-cascade texels.
+        const float remainder_x = std::fmod(light_x.dot(center), world_texel);
+        const float remainder_y = std::fmod(light_y.dot(center), world_texel);
+        return center - light_x * remainder_x - light_y * remainder_y;
+    }
+
+    // Directional cascade VP. Authored cascadedistanceN is the full XY extent, while the
+    // light-space depth is a separate full extent: 4*d1 for cascades 0/1 and max(1.5*d2, 4*d1)
+    // for cascade 2. Keeping depth tied to each cascade's XY size clips distant casters as a
+    // receiver enters a nearer cascade, which appears as a shadow being cut at a fixed
+    // screen-space boundary. Center the orthographic Z interval on the cascade center so the
+    // near/far planes stay symmetric. Sampling uses render_bias=false.
+    Eigen::Matrix4f ShadowCascadeWorldToLightClip(int cascade,
+                                                  const DirectionalShadowView& view,
+                                                  int shadow_map_size, bool render_bias) const {
+        const Eigen::Vector2f extents    = ShadowCascadeExtents(cascade);
+        const float           half_xy    = extents.x() * 0.5f;
+        const float           half_depth = extents.y() * 0.5f;
+        const Eigen::Matrix4f axes       = LightAxes();
+        const Eigen::Vector3f stable_center =
+            StabilizedShadowCascadeCenter(cascade, view, shadow_map_size);
+        Eigen::Matrix4f       world_to_light = Eigen::Matrix4f::Identity();
+        world_to_light.block<3, 3>(0, 0)     = axes.block<3, 3>(0, 0).transpose();
+        const Eigen::Vector3f t = -world_to_light.block<3, 3>(0, 0) * stable_center;
         world_to_light(0, 3)    = t.x();
         world_to_light(1, 3)    = t.y();
         world_to_light(2, 3)    = t.z();
 
-        const float n = ShadowNearPlane();
-        const float f = std::max(half * 2.0f, n + 0.01f);
         Eigen::Matrix4f proj = Eigen::Matrix4f::Zero();
-        proj(0, 0)           = 1.0f / half;
-        proj(1, 1)           = 1.0f / half;
-        // D3D / Vulkan clip z is [0, 1]. Official cascade sampling feeds this z
-        // straight to texSample2DCompare and treats abs(ndc) > 0.99 as out of tile.
-        proj(2, 2)           = 1.0f / (f - n);
-        float b              = -n / (f - n);
+        proj(0, 0)           = 1.0f / half_xy;
+        proj(1, 1)           = 1.0f / half_xy;
+        // D3D/Vulkan clip Z is [0, 1]. Symmetric [-halfDepth, +halfDepth] near/far values map
+        // light-space zero to 0.5.
+        proj(2, 2)           = 1.0f / (half_depth * 2.0f);
+        float b              = 0.5f;
         if (render_bias) b += 0.0005f;
         proj(2, 3) = b;
         proj(3, 3) = 1.0f;

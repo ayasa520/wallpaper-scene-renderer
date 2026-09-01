@@ -4,8 +4,12 @@
 #include "Core/MapSet.hpp"
 
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 
+#include <cstdint>
 #include <functional>
+#include <optional>
+#include <span>
 #include <string_view>
 
 namespace wallpaper
@@ -30,6 +34,14 @@ struct ShaderUniformOverrides {
     bool             use_active_camera_for_parallax { false };
 };
 
+struct ShaderSkinningPose {
+    // The matrices are immutable for the current prepared frame. Render passes must consume or copy
+    // the span before the next PrepareFrame(), which is the only operation allowed to advance it.
+    std::span<const Eigen::Affine3f> matrices;
+    uint64_t                         revision { 0 };
+    uint64_t                         frame_serial { 0 };
+};
+
 class IShaderValueUpdater : NoCopy, NoMove {
 public:
     IShaderValueUpdater()          = default;
@@ -49,6 +61,11 @@ public:
     // independent from the concrete Wallpaper Engine updater implementation.
     virtual Eigen::Matrix4d ResolveModelTransformForProjection(
         SceneNode* node, const SceneCamera* camera, bool apply_parallax) = 0;
+
+    // Depth-only material passes need the exact palette selected for the visible material in the
+    // same frame. Keeping this query on the updater interface prevents render backends from owning
+    // or advancing Wallpaper Engine animation state.
+    virtual std::optional<ShaderSkinningPose> SkinningPose(SceneNode* node) const = 0;
 
     virtual void MouseInput(double x, double y) = 0;
     virtual void SetTexelSize(float x, float y) = 0;
