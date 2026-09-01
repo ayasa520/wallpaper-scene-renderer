@@ -196,6 +196,7 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
              GET_JSON_NAME_VALUE(jLayer, "animation", layer.id);
              GET_JSON_NAME_VALUE(jLayer, "blend", layer.blend);
              GET_JSON_NAME_VALUE(jLayer, "rate", layer.rate);
+             GET_JSON_NAME_VALUE_NOWARN(jLayer, "additive", layer.additive);
              GET_JSON_NAME_VALUE_NOWARN(jLayer, "visible", layer.visible);
              puppet_layers.push_back(layer);
         }

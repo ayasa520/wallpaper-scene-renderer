@@ -41,9 +41,9 @@ std::string TextPipelineCompatibilityKey(bool offscreen_output,
 }
 
 int IntendedTextSampleCount(const wallpaper::Scene* scene, std::string_view output) {
-    // Official compose text writes `_rt_FullFrameBufferMultiSampled`. Effect
-    // ping-pong / text-bridge targets stay 1x: official effect shaders sample
-    // them as Texture2D, and the exe has no multisampled ping-pong RT name.
+    // Compose text writes `_rt_FullFrameBufferMultiSampled`. Effect ping-pong /
+    // text-bridge targets stay 1x: effect shaders sample them as Texture2D, and
+    // there is no multisampled ping-pong render-target name.
     if (scene != nullptr && wallpaper::vulkan::ComposeOutputUsesMsaa(*scene, output)) {
         return std::max(1, scene->MsaaSampleCount());
     }

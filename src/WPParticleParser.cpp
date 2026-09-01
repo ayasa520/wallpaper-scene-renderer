@@ -224,11 +224,14 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       w
             VecRandom::ReadFromJson(wpj, r);
             const auto min_color = DecodeParticleColorEndpoint(r.min);
             const auto max_color = DecodeParticleColorEndpoint(r.max);
-            return [min_color, max_color](Particle& p, const ParticleInitInfo&) {
-                // A single random value selects a point on the authored RGB gradient and is retained
-                // so later instanceoverride color edits can transform the endpoints first.
+            const float exponent = r.exponent;
+            return [min_color, max_color, exponent](Particle& p, const ParticleInitInfo&) {
+                // Shape one random sample with the authored exponent, then use that same sample
+                // for all three RGB channels. Retaining the shaped interpolation value also lets
+                // later instanceoverride edits transform both endpoints before the identical RGB
+                // interpolation is evaluated again.
                 PM::InitColorRandom(
-                    p, min_color, max_color, static_cast<float>(Random::get(0.0, 1.0)));
+                    p, min_color, max_color, SampleRangedRandom(0.0f, 1.0f, exponent));
             };
         } else if (name == "lifetimerandom") {
             SingleRandom r = { 0.0f, 1.0f };
@@ -347,7 +350,6 @@ ParticleInitOp WPParticleParser::genParticleInitOp(const nlohmann::json&       w
 ParticleInitOp WPParticleParser::genOverrideInitOp(const wpscene::ParticleInstanceoverride& over) {
     return [=](Particle& p, const ParticleInitInfo&) {
         PM::MutiplyInitLifeTime(p, over.lifetime);
-        PM::MutiplyInitAlpha(p, over.alpha);
         PM::MutiplyInitSize(p, over.size);
         PM::MutiplyVelocity(p, over.speed);
         if (over.overColor) {

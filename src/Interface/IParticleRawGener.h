@@ -23,6 +23,6 @@ public:
 
     virtual void GenGLData(std::span<const std::unique_ptr<ParticleInstance>>, SceneMesh&,
                            ParticleRawGenSpecOp&, const ParticleRenderPlan&,
-                           std::string_view object_name) = 0;
+                           std::string_view object_name, float alpha_multiplier) = 0;
 };
 } // namespace wallpaper

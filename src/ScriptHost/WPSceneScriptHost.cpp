@@ -338,6 +338,10 @@ bool IsParticleColorProperty(std::string_view property_name) {
     return property_name == "colorn" || property_name == "color";
 }
 
+bool IsParticleAlphaProperty(std::string_view property_name) {
+    return property_name == "alpha";
+}
+
 bool IsParticleSizeProperty(std::string_view property_name) {
     return property_name == "size";
 }
@@ -372,6 +376,12 @@ std::optional<float> NormalizeParticleSizeValue(const WPDynamicValue& value) {
     float size = 0.0f;
     if (!value.tryGet(&size) || !std::isfinite(size)) return std::nullopt;
     return size;
+}
+
+std::optional<float> NormalizeParticleAlphaValue(const WPDynamicValue& value) {
+    float alpha = 0.0f;
+    if (!value.tryGet(&alpha) || !std::isfinite(alpha)) return std::nullopt;
+    return std::max(0.0f, alpha);
 }
 
 std::optional<float> NormalizeParticleRateValue(const WPDynamicValue& value) {
@@ -2021,8 +2031,8 @@ std::optional<WPDynamicValue> ReadOriginalLayerPropertyValue(
 std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost::Opaque* opaque,
                                                         int32_t layer_id,
                                                         std::string_view property_name) {
-    if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name) &&
-         !IsParticleRateProperty(property_name)) ||
+    if ((!IsParticleColorProperty(property_name) && !IsParticleAlphaProperty(property_name) &&
+         !IsParticleSizeProperty(property_name) && !IsParticleRateProperty(property_name)) ||
         opaque == nullptr || opaque->scene == nullptr || layer_id == 0) {
         return std::nullopt;
     }
@@ -2032,6 +2042,11 @@ std::optional<WPDynamicValue> ReadParticlePropertyValue(const WPSceneScriptHost:
         if (IsParticleColorProperty(property_name)) {
             if (auto color = subsystem->RuntimeColorOverride(); color.has_value()) {
                 return WPDynamicValue(*color);
+            }
+        }
+        if (IsParticleAlphaProperty(property_name)) {
+            if (auto alpha = subsystem->RuntimeAlphaOverride(); alpha.has_value()) {
+                return WPDynamicValue(*alpha);
             }
         }
         if (IsParticleSizeProperty(property_name)) {
@@ -2075,8 +2090,8 @@ bool ApplyParticleSubsystemValue(Scene& scene, int32_t layer_id, Apply&& apply) 
 
 bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                                 std::string_view property_name, const WPDynamicValue& value) {
-    if ((!IsParticleColorProperty(property_name) && !IsParticleSizeProperty(property_name) &&
-         !IsParticleRateProperty(property_name)) ||
+    if ((!IsParticleColorProperty(property_name) && !IsParticleAlphaProperty(property_name) &&
+         !IsParticleSizeProperty(property_name) && !IsParticleRateProperty(property_name)) ||
         opaque == nullptr || opaque->scene == nullptr || layer_id == 0) {
         return false;
     }
@@ -2091,6 +2106,17 @@ bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer
         }
         return ApplyParticleSubsystemValue(scene, layer_id, [&](ParticleSubSystem& subsystem) {
             subsystem.SetRuntimeColorOverride(*color);
+        });
+    }
+
+    if (IsParticleAlphaProperty(property_name)) {
+        const auto alpha = NormalizeParticleAlphaValue(value);
+        if (! alpha.has_value()) {
+            LogInvalidParticlePropertyValue("Alpha", layer_id, property_name, value);
+            return false;
+        }
+        return ApplyParticleSubsystemValue(scene, layer_id, [&](ParticleSubSystem& subsystem) {
+            subsystem.SetRuntimeAlphaOverride(*alpha);
         });
     }
 
@@ -3934,22 +3960,6 @@ bool ApplyMaterialUniformPropertyValue(WPSceneScriptHost::Opaque*       opaque,
     // Updating this map is therefore enough for live user-property colors to reach the next draw
     // without rebuilding the render graph or reloading the scene package.
     material->customShader.constValues[registration.property_name] = *shader_value;
-    // Temporary diagnostic: trace a few effect uniforms while bringing up script-driven chains.
-    {
-        static const bool trace = std::getenv("VIVID_DRAW_TRACE") != nullptr;
-        static int        budget = 200;
-        if (trace && budget > 0 &&
-            (registration.property_name == "u_lineOpacity" ||
-             registration.property_name == "u_globalScale" ||
-             registration.property_name == "u_trailEnable" ||
-             registration.property_name == "u_maxAB")) {
-            budget--;
-            LOG_INFO("UNIFTRACE layer=%d uniform='%s' value=%s",
-                     registration.object_id,
-                     registration.property_name.c_str(),
-                     value.describe().c_str());
-        }
-    }
     (void)opaque;
     return true;
 }
@@ -4830,15 +4840,6 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                 float alpha = 0.0f;
                 if (! value.tryGet(&alpha)) return false;
 
-                static const char* alpha_dump = std::getenv("VIVID_ALPHA_DUMP");
-                if (alpha_dump != nullptr && layer_id == std::atoi(alpha_dump)) {
-                    LOG_INFO("ALPHADUMP layer=%d alpha=%.4f writer={%s}",
-                             layer_id,
-                             alpha,
-                             DescribeScriptInstance(opaque, opaque->current_running_instance)
-                                 .c_str());
-                }
-
                 bool applied     = false;
                 auto apply_alpha = [&](SceneMaterial& material, bool update_user_alpha) {
                     bool updated = false;
@@ -5160,11 +5161,11 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         update_scene_bloom_uniform("u_enabled", ShaderValue(enabled ? 1.0f : 0.0f));
 
         if (topology_changed) {
-            // The official renderer uses the scene Bloom bit to include or exclude the whole
-            // post-process, rather than drawing neutral black through the disabled chain. Preserve
-            // parsed shader nodes for a future enable, but rebuild graph topology so disabled Bloom
-            // has no per-frame GPU cost. Private Bloom targets are retired only after the old graph
-            // releases its pass descriptors; enabling again cancels any not-yet-drained retirement.
+            // The scene Bloom bit includes or excludes the whole post-process, rather than
+            // drawing neutral black through the disabled chain. Preserve parsed shader nodes for
+            // a future enable, but rebuild graph topology so disabled Bloom has no per-frame GPU
+            // cost. Private Bloom targets are retired only after the old graph releases its pass
+            // descriptors; enabling again cancels any not-yet-drained retirement.
             opaque->scene->renderGraphDirty = true;
             opaque->scene->renderGraphTopologyDirty = true;
             for (const auto& output : opaque->scene->bloom.outputs) {
@@ -5332,18 +5333,10 @@ bool ApplyAnimationLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNo
     const auto target_nodes = CollectPuppetLayerNodes(opaque, node);
     if (target_nodes.empty()) return false;
 
-    int32_t logical_layer_id = 0;
-    if (opaque != nullptr) {
-        logical_layer_id = FindOwningLayerId(opaque, node);
-        if (logical_layer_id == 0) logical_layer_id = FindNodeId(opaque, node);
-    }
-
-    bool  applied        = false;
-    bool  logged_visible = false;
-    bool  logged_blend   = false;
-    bool  visible_value  = false;
-    float rate_value     = 0.0f;
-    float blend_value    = 0.0f;
+    bool  applied       = false;
+    bool  visible_value = false;
+    float rate_value    = 0.0f;
+    float blend_value   = 0.0f;
 
     if (property_name == "visible" && ! value.tryGet(&visible_value)) return false;
     if (property_name == "rate" && ! value.tryGet(&rate_value)) return false;
@@ -5362,8 +5355,7 @@ bool ApplyAnimationLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNo
             // every duplicate puppet copy immediately so an effect-backed layer uses the same base
             // pose fallback as a cold parse with this user property already applied.
             data->puppet_layer.RefreshBlendState();
-            applied        = true;
-            logged_visible = true;
+            applied = true;
             continue;
         }
         if (property_name == "rate") {
@@ -5377,33 +5369,14 @@ bool ApplyAnimationLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNo
             // weight and base-pose fallback are derived values, so each rendered puppet copy must
             // rebuild them after the authored blend amount changes.
             data->puppet_layer.RefreshBlendState();
-            applied      = true;
-            logged_blend = true;
+            applied = true;
             continue;
         }
 
         return false;
     }
 
-    if (! applied) return false;
-
-    if (logged_visible || logged_blend) {
-        const auto state       = ReadAnimationLayerPropertyValue(opaque, node, index, "visible");
-        const auto blend_state = ReadAnimationLayerPropertyValue(opaque, node, index, "blend");
-        bool       visible     = visible_value;
-        float      blend       = blend_value;
-        if (state.has_value()) state->tryGet(&visible);
-        if (blend_state.has_value()) blend_state->tryGet(&blend);
-        LOG_INFO("SceneAnimationLayerApply: layer=%d animation-index=%zu visible=%s blend=%.3f "
-                 "blend-refreshed=true targets=%zu",
-                 logical_layer_id,
-                 static_cast<size_t>(index),
-                 visible ? "true" : "false",
-                 blend,
-                 target_nodes.size());
-    }
-
-    return true;
+    return applied;
 }
 
 const SceneImageEffect* FindEffectTarget(const WPSceneScriptHost::Opaque* opaque,
@@ -8977,10 +8950,10 @@ void WPSceneScriptHost::HandleCursorButton(bool down) {
         // onto an outdated hover set.
         m_impl->pressed_instances.clear();
         HandleCursorMove();
-        // Every hovered layer shares the press, matching observed official behavior: dragging a
-        // panel also feeds the fullscreen camera-rotation surface below it, and celestial labels
-        // rely on their own drag thresholds to suppress clicks during a rotation drag. The press
-        // is not exclusive to the top-most layer.
+        // Every hovered layer shares the press: dragging a panel also feeds the fullscreen
+        // camera-rotation surface below it, and celestial labels rely on their own drag
+        // thresholds to suppress clicks during a rotation drag. The press is not exclusive to
+        // the top-most layer.
         m_impl->pressed_instances = m_impl->hovered_instances;
         for (const auto& instance_ptr : m_impl->instances) {
             auto& instance = *instance_ptr;

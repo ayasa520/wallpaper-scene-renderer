@@ -118,6 +118,8 @@ public:
     void      SetSceneNode(SceneNode* node);
     void      SetRuntimeColorOverride(const std::array<float, 3>& color);
     std::optional<std::array<float, 3>> RuntimeColorOverride() const;
+    void      SetRuntimeAlphaOverride(float alpha);
+    std::optional<float> RuntimeAlphaOverride() const;
     void      SetRuntimeRateOverride(float rate);
     std::optional<float> RuntimeRateOverride() const;
     void      SetRuntimeSizeReference(float size);
@@ -187,6 +189,10 @@ private:
     // both future spawns and already alive particles receive Wallpaper Engine's HSV reference-delta
     // transform without losing colorrandom variation.
     std::optional<std::array<float, 3>> m_runtime_color_override;
+    // Layer alpha is a render-time multiplier. Keeping it outside Particle::init prevents a
+    // scripted transition through zero from destroying the authored per-particle alpha that fade
+    // operators restore on subsequent frames.
+    float                m_runtime_alpha_override { 1.0f };
     // Wallpaper particle `instanceoverride.size` is a multiplier baked into each particle's
     // initializer state. Remember the parse-time multiplier as a reference so live edits can scale
     // existing particles by the precise ratio instead of treating the property as an absolute pixel

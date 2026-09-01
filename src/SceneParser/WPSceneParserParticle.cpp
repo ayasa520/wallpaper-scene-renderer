@@ -97,6 +97,44 @@ struct ParticleRendererSpec {
     }
 };
 
+struct ParticleOrientationBasis {
+    std::array<float, 3> right { 1.0f, 0.0f, 0.0f };
+    std::array<float, 3> up { 0.0f, 1.0f, 0.0f };
+    std::array<float, 3> forward { 0.0f, 0.0f, 1.0f };
+};
+
+// The stock particle shaders expand a sprite in the authored orientation basis before applying
+// the scene camera. A fixed orientation is a world-space plane: its authored axis is the sprite U
+// direction and a perpendicular world direction is V. Keeping this basis in the parser preserves
+// the shader contract and makes beam textures point along their 3D travel plane instead of using
+// the old screen-space identity basis.
+ParticleOrientationBasis ResolveParticleOrientationBasis(const wpscene::ParticleRender& renderer) {
+    ParticleOrientationBasis basis;
+    if (renderer.orientation != "fixed") return basis;
+
+    Eigen::Vector3f axis { renderer.axis[0], renderer.axis[1], renderer.axis[2] };
+    if (axis.squaredNorm() < 1e-12f) axis = Eigen::Vector3f::UnitY();
+    axis.normalize();
+
+    Eigen::Vector3f up;
+    if (std::abs(axis.x()) < 1e-6f && std::abs(axis.z()) < 1e-6f) {
+        up = Eigen::Vector3f(0.0f, 0.0f, axis.y() >= 0.0f ? 1.0f : -1.0f);
+    } else {
+        up = axis.cross(Eigen::Vector3f::UnitY()).normalized();
+    }
+    const Eigen::Vector3f forward = axis.cross(up).normalized();
+    basis.right = { axis.x(), axis.y(), axis.z() };
+    basis.up = { up.x(), up.y(), up.z() };
+    basis.forward = { forward.x(), forward.y(), forward.z() };
+    return basis;
+}
+
+int ResolveParticleOrientationCombo(std::string_view orientation) {
+    if (orientation == "upright") return 1;
+    if (orientation == "fixed") return 2;
+    return 0;
+}
+
 constexpr std::array kParticleRendererSpecs {
     ParticleRendererSpec { "sprite",
                            ParticleRendererKind::Sprite,
@@ -355,11 +393,14 @@ void AttachExtraParticleRenderer(ParseContext& context, wpscene::WPParticleObjec
     WPShaderValueData svData;
     svData.CopyParallaxContractFrom(parent_sv);
 
+    const ParticleOrientationBasis orientation_basis =
+        ResolveParticleOrientationBasis(particle_renderer);
+
     WPShaderInfo shaderInfo;
     shaderInfo.baseConstSvs                         = context.global_base_uniforms;
-    shaderInfo.baseConstSvs["g_OrientationUp"]      = std::array { 0.0f, 1.0f, 0.0f };
-    shaderInfo.baseConstSvs["g_OrientationRight"]   = std::array { 1.0f, 0.0f, 0.0f };
-    shaderInfo.baseConstSvs["g_OrientationForward"] = std::array { 0.0f, 0.0f, 1.0f };
+    shaderInfo.baseConstSvs["g_OrientationUp"]      = orientation_basis.up;
+    shaderInfo.baseConstSvs["g_OrientationRight"]   = orientation_basis.right;
+    shaderInfo.baseConstSvs["g_OrientationForward"] = orientation_basis.forward;
     shaderInfo.baseConstSvs["g_ViewUp"]             = std::array { 0.0f, 1.0f, 0.0f };
     shaderInfo.baseConstSvs["g_ViewRight"]          = std::array { 1.0f, 0.0f, 0.0f };
     shaderInfo.baseConstSvs["g_EyePosition"]        = std::array {
@@ -367,6 +408,8 @@ void AttachExtraParticleRenderer(ParseContext& context, wpscene::WPParticleObjec
         static_cast<float>(context.ortho_h) / 2.0f,
         1000.0f,
     };
+    shaderInfo.combos["ORIENTATION"] =
+        std::to_string(ResolveParticleOrientationCombo(particle_renderer.orientation));
 
     const uint16_t trail_length = render_rope_trail
         ? static_cast<uint16_t>(
@@ -526,7 +569,13 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     // wppartobj.origin[1] = context.ortho_h - wppartobj.origin[1];
 
-    if (particle_obj.flags[wpscene::Particle::FlagEnum::perspective]) {
+    if (! context.scene->cameraOrthographic &&
+        ! context.scene->modelPerspectiveCameraName.empty()) {
+        // In a 3D scene particles and model geometry share one perspective camera. This keeps the
+        // view-dependent billboard basis and projection synchronized while the authored camera
+        // scripts move the Sonic shot.
+        spNode->SetCamera(context.scene->modelPerspectiveCameraName);
+    } else if (particle_obj.flags[wpscene::Particle::FlagEnum::perspective]) {
         spNode->SetCamera("global_perspective");
     }
 
@@ -538,11 +587,14 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         svData.parallaxDepthAuthored = wppartobj.parallaxDepthAuthored;
     }
 
+    const ParticleOrientationBasis orientation_basis =
+        ResolveParticleOrientationBasis(particle_renderer);
+
     WPShaderInfo shaderInfo;
     shaderInfo.baseConstSvs                         = context.global_base_uniforms;
-    shaderInfo.baseConstSvs["g_OrientationUp"]      = std::array { 0.0f, 1.0f, 0.0f };
-    shaderInfo.baseConstSvs["g_OrientationRight"]   = std::array { 1.0f, 0.0f, 0.0f };
-    shaderInfo.baseConstSvs["g_OrientationForward"] = std::array { 0.0f, 0.0f, 1.0f };
+    shaderInfo.baseConstSvs["g_OrientationUp"]      = orientation_basis.up;
+    shaderInfo.baseConstSvs["g_OrientationRight"]   = orientation_basis.right;
+    shaderInfo.baseConstSvs["g_OrientationForward"] = orientation_basis.forward;
     shaderInfo.baseConstSvs["g_ViewUp"]             = std::array { 0.0f, 1.0f, 0.0f };
     shaderInfo.baseConstSvs["g_ViewRight"]          = std::array { 1.0f, 0.0f, 0.0f };
     shaderInfo.baseConstSvs["g_EyePosition"]        = std::array {
@@ -550,6 +602,8 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         static_cast<float>(context.ortho_h) / 2.0f,
         1000.0f,
     };
+    const int orientation_combo = ResolveParticleOrientationCombo(particle_renderer.orientation);
+    shaderInfo.combos["ORIENTATION"] = std::to_string(orientation_combo);
 
     const auto spawn_type              = ParseSpawnType(child_data.type);
     const u32  authored_child_maxcount = static_cast<u32>(std::max<i32>(1, child_data.maxcount));
@@ -678,24 +732,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     };
     ConfigureParticleMesh(mesh, *mesh_capacity, render_plan);
 
-    const std::string geometry_shader = material_result->geometry_stage_loaded
-        ? effective_material.shader + ".geom"
-        : "(none)";
-    LOG_INFO("ParticleRenderPlan: object='%.*s' renderer='%s' shader='%s' vertex='%s.vert' "
-             "geometry='%s' fragment='%s.frag' expansion=%s primitive=%s thick=%s history=%s",
-             static_cast<int>(particle_debug_name.size()),
-             particle_debug_name.data(),
-             particle_renderer.name.c_str(),
-             effective_material.shader.c_str(),
-             effective_material.shader.c_str(),
-             geometry_shader.c_str(),
-             effective_material.shader.c_str(),
-             render_plan.expansion == ParticleExpansionMode::GeometryPoint ? "GeometryPoint"
-                                                                            : "IndexedQuad",
-             mesh.Primitive() == MeshPrimitive::POINT ? "point" : "triangle",
-             render_plan.thick_format ? "true" : "false",
-             render_plan.UsesHistory() ? "true" : "false");
-
     std::function<void(float)> trail_uniform_update;
     if (render_rope_trail) {
         std::weak_ptr<SceneMesh> weak_mesh = spMesh;
@@ -741,6 +777,11 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         std::move(trail_uniform_update));
     auto* particle_subsystem = particleSub.get();
     particleSub->SetSceneNode(spNode.get());
+    // PARTICLE_OVERRIDE_SCHEMA stores alpha in the live layer override record. It multiplies the
+    // fully evaluated particle alpha at render time, rather than becoming part of the particle's
+    // initializer state; this is what lets authored scripts fade all existing speed-line particles
+    // to zero immediately when Sonic enters the slow state.
+    particleSub->SetRuntimeAlphaOverride(override.alpha);
     // instanceoverride.size is baked into initializer output during cold parse. Keep that parsed
     // multiplier as the runtime reference so later user-property size edits can rescale live
     // particles by ratio instead of mistaking the multiplier for an absolute particle size.

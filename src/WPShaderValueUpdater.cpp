@@ -1,5 +1,6 @@
 #include "WPShaderValueUpdater.hpp"
 #include "WPNodeTransformResolver.hpp"
+#include "SkinningShaderContract.hpp"
 #include "Eigen/src/Core/Matrix.h"
 #include "Eigen/src/Geometry/Transform.h"
 #include "Scene/Scene.h"
@@ -41,6 +42,17 @@ constexpr std::array<const char*, 3> kAudioSpectrumRightUniforms {
     "g_AudioSpectrum32Right",
     "g_AudioSpectrum64Right",
 };
+
+std::array<float, 4> TextureTexelUniform(const std::array<i32, 4>& resolution) {
+    const auto width  = static_cast<float>(resolution[0]);
+    const auto height = static_cast<float>(resolution[1]);
+    // Read the dimensions of the resource actually bound to the texture slot and publish
+    // reciprocal dimensions in `.xy` followed by the dimensions in `.zw`. Shadow PCF uses `.xy`
+    // as its atlas sampling step, so this value must describe the physical allocation rather
+    // than its logical content rectangle; otherwise every PCF tap collapses onto the same
+    // comparison coordinate.
+    return { 1.0f / width, 1.0f / height, width, height };
+}
 
 struct MeshBounds2D {
     bool     valid { false };
@@ -134,24 +146,7 @@ ShaderValue ToDxcCBufferMatrixUniform(const Matrix4d& matrix) {
 }
 
 ShaderValue ToDxcRowVectorSkinningUniform(std::span<const Affine3f> matrices) {
-    // WE authors skinning uniforms as GLSL `mat4x3`: four columns (xyz + translation) by three
-    // rows, then multiplies `mul(float4(position, 1), g_Bones[i])` to get xyz. The DXC bridge spells
-    // that type as HLSL `float3x4` and swaps the multiply to native `mul(M, v)`, which SPIR-V lowers
-    // as a row-major matrix with ArrayStride 64. Therefore each bone needs four std140 vec4 slots:
-    // the affine matrix's x/y/z rows in the first three lanes, plus a padded fourth lane that remains
-    // zero. Packing compact 12-float matrices here misaligns every bone after the first one.
-    std::vector<float> packed;
-    packed.reserve(matrices.size() * 16);
-    for (const auto& affine : matrices) {
-        const Matrix4f matrix = affine.matrix();
-        for (int column = 0; column < 4; ++column) {
-            packed.push_back(matrix(0, column));
-            packed.push_back(matrix(1, column));
-            packed.push_back(matrix(2, column));
-            packed.push_back(0.0f);
-        }
-    }
-    return ShaderValue(std::span<const float>(packed.data(), packed.size()));
+    return ShaderValue(PackDxcRowVectorSkinningUniform(matrices));
 }
 
 Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
@@ -376,11 +371,19 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_LFEAT_SHADOW_POINT_XFORM = existsOp(G_LFEAT_SHADOW_POINT_XFORM);
     info.has_LFEAT_SHADOW_PROJ        = existsOp(G_LFEAT_SHADOW_PROJ);
     info.has_LFEAT_SHADOW_PROJ_XFORM  = existsOp(G_LFEAT_SHADOW_PROJ_XFORM);
-    info.has_EYE_POSITION     = IsModelRenderNode(pNode) && existsOp(G_EYE_POSITION);
+    // Particle shaders in a 3D scene are fed by the same camera/destination chain as model
+    // shaders. Their eye and view basis must therefore follow the named model camera as it
+    // moves; leaving the parse-time orthographic constants in place rotates trail ribbons and
+    // view-dependent particle quads against a different camera than their projection matrix.
+    const bool follows_scene_camera =
+        IsModelRenderNode(pNode) ||
+        (m_scene != nullptr && ! m_scene->modelPerspectiveCameraName.empty() && pNode != nullptr &&
+         pNode->Camera() == m_scene->modelPerspectiveCameraName);
+    info.has_EYE_POSITION     = follows_scene_camera && existsOp(G_EYE_POSITION);
     info.has_NORMAL_MODEL_MATRIX = existsOp(G_NORMAL_MODEL_MATRIX);
-    info.has_VIEWUP           = IsModelRenderNode(pNode) && existsOp(G_VIEWUP);
-    info.has_VIEWRIGHT        = IsModelRenderNode(pNode) && existsOp(G_VIEWRIGHT);
-    info.has_VIEWFORWARD      = IsModelRenderNode(pNode) && existsOp(G_VIEWFORWARD);
+    info.has_VIEWUP           = follows_scene_camera && existsOp(G_VIEWUP);
+    info.has_VIEWRIGHT        = follows_scene_camera && existsOp(G_VIEWRIGHT);
+    info.has_VIEWFORWARD      = follows_scene_camera && existsOp(G_VIEWFORWARD);
     for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {
         info.has_audio_spectrum_left[index] = existsOp(kAudioSpectrumLeftUniforms[index]);
         info.has_audio_spectrum_right[index] = existsOp(kAudioSpectrumRightUniforms[index]);
@@ -388,6 +391,7 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
 
     std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
         value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
+        value.has_texel      = existsOp(WE_GLTEX_TEXEL_NAMES[index]);
         value.has_mipmap     = existsOp(WE_GLTEX_MIPMAPINFO_NAMES[index]);
         return index + 1;
     });
@@ -548,15 +552,18 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             const auto& rt = m_scene->renderTargets[el.second];
 
             const auto& unifrom_tex = info.texs[el.first];
+            const auto  resolution  = rt.ResolutionVector();
 
             if (unifrom_tex.has_resolution) {
                 // Runtime render targets expose one canonical resolution contract through
                 // `ResolutionVector()`: physical size in `.xy`, logical content size in `.zw`.
                 // Uniform updates should always forward that authoritative scene-side contract
                 // directly instead of layering text-specific interpretation on top of it.
-                std::array<i32, 4> resolution_uint(rt.ResolutionVector());
                 updateOp(WE_GLTEX_RESOLUTION_NAMES[el.first],
-                         ShaderValue(array_cast<float>(resolution_uint)));
+                         ShaderValue(array_cast<float>(resolution)));
+            }
+            if (unifrom_tex.has_texel) {
+                updateOp(WE_GLTEX_TEXEL_NAMES[el.first], TextureTexelUniform(resolution));
             }
             if (unifrom_tex.has_mipmap) {
                 updateOp(WE_GLTEX_MIPMAPINFO_NAMES[el.first], (float)rt.mipmap_level);
@@ -575,14 +582,21 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (material != nullptr) {
         const auto tex_count = std::min(material->textures.size(), info.texs.size());
         for (size_t i = 0; i < tex_count; i++) {
-            if (! info.texs[i].has_resolution) continue;
+            const auto& texture_uniforms = info.texs[i];
+            if (! texture_uniforms.has_resolution && ! texture_uniforms.has_texel) continue;
             const auto& name = material->textures[i];
             if (name.empty() || m_scene->renderTargets.count(name) != 0) continue;
             const auto texture_it = m_scene->textures.find(name);
             if (texture_it == m_scene->textures.end()) continue;
-            updateOp(WE_GLTEX_RESOLUTION_NAMES[i],
-                     ShaderValue(array_cast<float>(
-                         m_scene->EffectiveImportedTextureResolution(texture_it->second))));
+            const auto resolution =
+                m_scene->EffectiveImportedTextureResolution(texture_it->second);
+            if (texture_uniforms.has_resolution) {
+                updateOp(WE_GLTEX_RESOLUTION_NAMES[i],
+                         ShaderValue(array_cast<float>(resolution)));
+            }
+            if (texture_uniforms.has_texel) {
+                updateOp(WE_GLTEX_TEXEL_NAMES[i], TextureTexelUniform(resolution));
+            }
         }
     }
 
@@ -632,14 +646,25 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         modelTrans = ApplyMeshGeometryTransform(modelTrans, pNode->Mesh());
 
         if (info.has_NORMAL_MODEL_MATRIX) {
-            // World normals transform by the inverse transpose of the model linear part. Leaving
-            // this uniform at its zero-initialized cbuffer default makes every lit model normalize
-            // a zero vector, which turns lighting into NaN washout on the whole surface.
+            // Wallpaper Engine's stock model vertex shaders normalize the transformed vertex
+            // normal, but pass the transformed tangent and bitangent to the fragment shader
+            // without normalizing either one. Consequently g_NormalModelMatrix is a direction
+            // basis, not an arbitrary scaled inverse-transpose: retaining a uniform model scale of
+            // 0.01 here produces tangent vectors of length 100, and a normal-map XY perturbation
+            // then inflates N.L by the same factor in the PBR helpers. Compute the mathematically
+            // correct inverse-transpose first, then remove only the per-axis magnitude while
+            // preserving rotation, reflection, and the directional effect of non-uniform scale.
             Eigen::Matrix3d linear = modelTrans.topLeftCorner<3, 3>();
             if (std::abs(linear.determinant()) < 1e-18) {
                 linear = Eigen::Matrix3d::Identity();
             } else {
                 linear = linear.inverse().transpose().eval();
+            }
+            for (int column = 0; column < 3; ++column) {
+                const double magnitude = linear.col(column).norm();
+                if (magnitude > 1e-12) {
+                    linear.col(column) /= magnitude;
+                }
             }
             const Eigen::Matrix3f normal_matrix = linear.cast<float>();
             std::array<float, 12> packed {};
@@ -790,9 +815,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                      m_screen_size[0], m_screen_size[1], m_screen_size[0] / m_screen_size[1] });
 
     if (info.has_EYE_POSITION || info.has_VIEWUP || info.has_VIEWRIGHT || info.has_VIEWFORWARD) {
-        // These camera basis uniforms are gated by IsModelRenderNode() during InitUniforms. Updating
-        // them here gives 3D model shaders coherent camera-path lighting/reflection data without
-        // introducing a new uniform contract for unrelated 2D image/effect/particle shaders.
+        // InitUniforms restricts these updates to model materials and nodes explicitly routed
+        // through the scene's 3D camera. Canvas-space image/effect particles keep their authored
+        // constants while perspective particles receive one coherent projection and view basis.
         const auto eye = camera->GetPosition().cast<float>();
         Vector3f forward = camera->GetDirection().cast<float>();
         if (forward.norm() > 1e-6f) forward.normalize();
@@ -900,7 +925,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         info.has_LFEAT_SHADOW_PROJ_XFORM;
     if (has_lighting_v1) {
         const bool shadows_on = m_scene->shadows.quality != 0;
-        const Vector3f cascade_center = m_scene->ShadowCascadeCenter();
+        const DirectionalShadowView cascade_view = m_scene->ShadowCascadeView();
         std::vector<float> point_origin;
         std::vector<float> point_color;
         std::vector<float> point_proj;
@@ -960,12 +985,20 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                 }
             } else if (light.type() == SceneLightType::Directional) {
                 append_vec4(dir_color, color.x(), color.y(), color.z(), light.intensity());
-                append_vec4(dir_direction, forward.x(), forward.y(), forward.z(), 0);
+                // SceneLight::WorldForward() is the direction in which a directional light
+                // travels. LightingV1 consumes the opposite convention: its PBR helper takes the
+                // vector from the shaded surface toward the light. Keep the authored forward axis
+                // unchanged for cascade shadow cameras, but reverse it at this lighting-uniform
+                // boundary so direct illumination and the shadow projection describe the same sun.
+                append_vec4(dir_direction, -forward.x(), -forward.y(), -forward.z(), 0);
                 if (shadows_on && light.castsShadows()) {
                     for (int cascade = 0; cascade < 3; ++cascade) {
                         append_mat4(feat_proj,
                                     light.ShadowCascadeWorldToLightClip(
-                                        cascade, cascade_center, false));
+                                        cascade,
+                                        cascade_view,
+                                        light.cascadeAtlasSlot(cascade).size,
+                                        false));
                         const auto uv = light.cascadeAtlasSlot(cascade).packed
                                             ? Eigen::Vector4f(
                                                   static_cast<float>(light.cascadeAtlasSlot(cascade).x) /
@@ -1026,6 +1059,26 @@ const WPShaderValueData* WPShaderValueUpdater::GetNodeData(const void* node_addr
 WPShaderValueData* WPShaderValueUpdater::GetNodeData(const void* node_addr) {
     auto it = m_nodeDataMap.find(const_cast<void*>(node_addr));
     return it == m_nodeDataMap.end() ? nullptr : std::addressof(it->second);
+}
+
+std::optional<ShaderSkinningPose>
+WPShaderValueUpdater::SkinningPose(SceneNode* node) const {
+    const auto* node_data = GetNodeData(node);
+    if (node_data == nullptr || !node_data->puppet_layer.hasPuppet()) return std::nullopt;
+
+    const auto pose = node_data->puppet_layer.PoseSnapshot();
+    if (pose.frame_serial != m_puppet_frame_serial) {
+        LOG_ERROR("SkinningPose: node='%s' pose frame=%llu current frame=%llu",
+                  node != nullptr ? node->Name().c_str() : "<null>",
+                  static_cast<unsigned long long>(pose.frame_serial),
+                  static_cast<unsigned long long>(m_puppet_frame_serial));
+        return std::nullopt;
+    }
+    return ShaderSkinningPose {
+        .matrices     = pose.skinning,
+        .revision     = pose.revision,
+        .frame_serial = pose.frame_serial,
+    };
 }
 
 void WPShaderValueUpdater::SetTexelSize(float x, float y) { m_texelSize = { x, y }; }

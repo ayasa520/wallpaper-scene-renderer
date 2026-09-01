@@ -1398,9 +1398,175 @@ bool ConsumeMdlaZeroPadding(fs::MemBinaryStream& f, uint32_t declared_end,
     }
     return f.Tell() == end;
 }
+
+bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view path,
+                                     WPMdl& mdl) {
+    const std::string str_path(path);
+    mdl.mdls = ReadMDLVesion(f);
+    if (mdl.mdls == 0) {
+        mdl.mdls = SeekNextMDLVersion(f, "MDLS");
+    }
+    if (mdl.mdls == 0) {
+        LOG_ERROR("failed to locate MDLS section: %s", str_path.c_str());
+        return false;
+    }
+
+    const size_t bones_file_end = f.ReadUint32();
+    (void)bones_file_end;
+
+    const uint16_t bones_num = f.ReadUint16();
+    f.ReadUint16(); // MDLS bone-table header value.
+
+    mdl.puppet  = std::make_shared<WPPuppet>();
+    auto& bones = mdl.puppet->bones;
+    auto& anims = mdl.puppet->anims;
+
+    bones.resize(bones_num);
+    for (uint i = 0; i < bones_num; i++) {
+        auto& bone = bones[i];
+        bone.name = f.ReadStr();
+        f.ReadInt32(); // Authored MDLS bone metadata.
+
+        bone.parent = f.ReadUint32();
+        if (bone.parent >= i && ! bone.noParent()) {
+            LOG_INFO("mdl bone %u has out-of-order parent index %u, fallback to root",
+                     i,
+                     bone.parent);
+            bone.parent = 0xFFFFFFFFu;
+        }
+
+        const uint32_t size = f.ReadUint32();
+        if (size != 64) {
+            LOG_ERROR("mdl unsupport bones size: %d", size);
+            return false;
+        }
+        for (auto column : bone.transform.matrix().colwise()) {
+            for (auto& value : column) value = f.ReadFloat();
+        }
+
+        f.ReadStr(); // Bone simulation JSON.
+    }
+
+    if (mdl.mdls > 1) {
+        const int16_t reserved = f.ReadInt16();
+        if (reserved != 0) {
+            LOG_INFO("puppet: one unk is not 0, may be wrong");
+        }
+
+        const uint8_t has_transforms = f.ReadUint8();
+        if (has_transforms) {
+            for (uint i = 0; i < bones_num; i++) {
+                for (uint j = 0; j < 16; j++) f.ReadFloat();
+            }
+        }
+        const uint32_t metadata_count = f.ReadUint32();
+        for (uint i = 0; i < metadata_count; i++) {
+            for (int j = 0; j < 3; j++) f.ReadUint32();
+        }
+
+        f.ReadUint32(); // MDLS metadata field.
+
+        const uint8_t has_offset_transforms = f.ReadUint8();
+        if (has_offset_transforms) {
+            for (uint i = 0; i < bones_num; i++) {
+                for (uint j = 0; j < 3; j++) f.ReadFloat();
+                for (uint j = 0; j < 16; j++) f.ReadFloat();
+            }
+        }
+
+        const uint8_t has_indices = f.ReadUint8();
+        if (has_indices) {
+            for (uint i = 0; i < bones_num; i++) f.ReadUint32();
+        }
+    }
+
+    {
+        const auto probe_pos = f.Tell();
+        bool       aligned   = false;
+        for (const auto prefix : { std::string_view("MDAT"), std::string_view("MDLA") }) {
+            const auto version = ReadVersion(prefix, f);
+            f.SeekSet(probe_pos);
+            if (version > 0) {
+                aligned = true;
+                break;
+            }
+        }
+        constexpr std::array<std::string_view, 2> kAnimSections { "MDAT", "MDLA" };
+        if (! aligned) SeekNextMDLSection(f, kAnimSections);
+    }
+
+    // MDAT attachment blocks may occur between MDLS and MDLA. Preserve their bone-local matrices
+    // while walking to the animation table so both legacy single-mesh puppets and MDLV0023 model
+    // chunks share exactly one skeleton/animation parser.
+    std::string section_type;
+    std::string section_version;
+    do {
+        if (f.Tell() >= f.Size()) {
+            LOG_ERROR("failed to locate MDLA section before EOF: %s", str_path.c_str());
+            return false;
+        }
+        const std::string section = f.ReadStr();
+        if (section.length() != 8) continue;
+
+        section_type    = section.substr(0, 4);
+        section_version = section.substr(4, 4);
+        if (section_type != "MDAT") continue;
+
+        f.ReadUint32();
+        const uint16_t attachment_count = f.ReadUint16();
+        for (uint16_t i = 0; i < attachment_count; i++) {
+            WPPuppet::Attachment attachment;
+            attachment.bone_index = f.ReadUint16();
+            attachment.name       = f.ReadStr();
+            for (auto column : attachment.transform.matrix().colwise()) {
+                for (auto& value : column) value = f.ReadFloat();
+            }
+            mdl.puppet->attachments.push_back(std::move(attachment));
+        }
+    } while (section_type != "MDLA");
+
+    if (! section_version.empty()) {
+        mdl.mdla = std::stoi(section_version);
+        if (mdl.mdla != 0) {
+            if (mdl.mdla < 1 || mdl.mdla > 6) {
+                LOG_ERROR("unsupported MDLA version %d: %s", mdl.mdla, str_path.c_str());
+                return false;
+            }
+            const uint32_t declared_end = f.ReadUint32();
+            if (declared_end > static_cast<uint32_t>(f.Size()) ||
+                (declared_end > 0 && declared_end < static_cast<uint32_t>(f.Tell()))) {
+                LOG_ERROR("MDLA declared end 0x%x is outside file size 0x%llx: %s",
+                          declared_end,
+                          static_cast<unsigned long long>(f.Size()),
+                          str_path.c_str());
+                return false;
+            }
+
+            const uint32_t animation_count = f.ReadUint32();
+            anims.resize(animation_count);
+            for (auto& animation : anims) {
+                if (! ParseAnimationRecord(f, animation, mdl.mdla, declared_end, str_path)) {
+                    return false;
+                }
+            }
+            if (! ConsumeMdlaZeroPadding(f, declared_end, str_path)) return false;
+        }
+    }
+
+    mdl.puppet->prepared();
+    ComputePuppetAnimationBounds(mdl);
+    LOG_INFO("read puppet: mdlv: %d, nmdls: %d, mdla: %d, bones: %d, anims: %d",
+             mdl.mdlv,
+             mdl.mdls,
+             mdl.mdla,
+             mdl.puppet->bones.size(),
+             mdl.puppet->anims.size());
+    return true;
+}
 } // namespace
 
-bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
+bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& mdl,
+                                   bool load_animation_data) {
     auto str_path = std::string(path);
     auto pfile    = vfs.Open("/assets/" + str_path);
     if (! pfile) {
@@ -1487,6 +1653,15 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
             chunk.material_json_variants = prefixed_material_paths;
         }
         mdl.static_chunks.push_back(std::move(chunk));
+    }
+
+    const bool has_skinning = std::any_of(
+        mdl.static_chunks.begin(), mdl.static_chunks.end(), [](const WPMdl::StaticChunk& chunk) {
+            return StaticVertexHasSkinAttributes(chunk.vertex_flag);
+        });
+    if (load_animation_data && has_skinning) {
+        mdl.kind = WPMdl::MeshKind::Puppet;
+        return ReadPuppetSkeletonAndAnimations(f, path, mdl);
     }
     return true;
 }
@@ -1607,178 +1782,7 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
 
     if (! ReadPuppetPartsAndMasks(f, path, vertex_num, mdl)) return false;
 
-    mdl.mdls = ReadMDLVesion(f);
-    if (mdl.mdls == 0) {
-        mdl.mdls = SeekNextMDLVersion(f, "MDLS");
-    }
-    if (mdl.mdls == 0) {
-        LOG_ERROR("failed to locate MDLS section");
-        return false;
-    }
-
-    size_t bones_file_end = f.ReadUint32();
-    (void)bones_file_end;
-
-    uint16_t bones_num = f.ReadUint16();
-    // 1 byte
-    f.ReadUint16(); // unk
-
-    mdl.puppet  = std::make_shared<WPPuppet>();
-    auto& bones = mdl.puppet->bones;
-    auto& anims = mdl.puppet->anims;
-
-    bones.resize(bones_num);
-    for (uint i = 0; i < bones_num; i++) {
-        auto&       bone = bones[i];
-        bone.name = f.ReadStr();
-        f.ReadInt32(); // unk
-
-        bone.parent = f.ReadUint32();
-        if (bone.parent >= i && !bone.noParent()) {
-            LOG_INFO("mdl bone %u has out-of-order parent index %u, fallback to root", i, bone.parent);
-            bone.parent = 0xFFFFFFFFu;
-        }
-
-        uint32_t size = f.ReadUint32();
-        if (size != 64) {
-            LOG_ERROR("mdl unsupport bones size: %d", size);
-            return false;
-        }
-        for (auto row : bone.transform.matrix().colwise()) {
-            for (auto& x : row) x = f.ReadFloat();
-        }
-
-        std::string bone_simulation_json = f.ReadStr();
-        /*
-        auto trans = bone.transform.translation();
-        LOG_INFO("trans: %f %f %f", trans[0], trans[1], trans[2]);
-        */
-    }
-
-    if (mdl.mdls > 1) {
-        int16_t unk = f.ReadInt16();
-        if (unk != 0) {
-            LOG_INFO("puppet: one unk is not 0, may be wrong");
-        }
-
-        uint8_t has_trans = f.ReadUint8();
-        if (has_trans) {
-            for (uint i = 0; i < bones_num; i++)
-                for (uint j = 0; j < 16; j++) f.ReadFloat(); // mat
-        }
-        uint32_t size_unk = f.ReadUint32();
-        for (uint i = 0; i < size_unk; i++)
-            for (int j = 0; j < 3; j++) f.ReadUint32();
-
-        f.ReadUint32(); // unk
-
-        uint8_t has_offset_trans = f.ReadUint8();
-        if (has_offset_trans) {
-            for (uint i = 0; i < bones_num; i++) {
-                for (uint j = 0; j < 3; j++) f.ReadFloat();  // like pos
-                for (uint j = 0; j < 16; j++) f.ReadFloat(); // mat
-            }
-        }
-
-        uint8_t has_index = f.ReadUint8();
-        if (has_index) {
-            for (uint i = 0; i < bones_num; i++) {
-                f.ReadUint32();
-            }
-        }
-    }
-
-    {
-        const auto probe_pos = f.Tell();
-        bool aligned = false;
-        for (const auto prefix : { std::string_view("MDAT"), std::string_view("MDLA") }) {
-            auto ver = ReadVersion(prefix, f);
-            f.SeekSet(probe_pos);
-            if (ver > 0) {
-                aligned = true;
-                break;
-            }
-        }
-        constexpr std::array<std::string_view, 2> kAnimSections { "MDAT", "MDLA" };
-        if (!aligned)
-            SeekNextMDLSection(f, kAnimSections);
-    }
-
-    // sometimes there can be one or more zero bytes and/or MDAT sections containing
-    // attachments before the MDLA section, so we need to skip them
-    std::string mdType = "";
-    std::string mdVersion;
-    
-    do {
-        if (f.Tell() >= f.Size()) {
-            LOG_ERROR("failed to locate MDLA section before EOF");
-            return false;
-        }
-        std::string mdPrefix = f.ReadStr();
-
-        // sometimes there can be other garbage in this gap, so we need to 
-        // skip over that as well
-        if(mdPrefix.length() == 8){
-            mdType = mdPrefix.substr(0, 4);
-            mdVersion = mdPrefix.substr(4, 4);
-
-            if(mdType == "MDAT"){
-                f.ReadUint32(); // skip 4 bytes
-                uint32_t num_attachments = f.ReadUint16(); // number of attachments in the MDAT section
-
-                for(int i = 0; i < num_attachments; i++){
-                    WPPuppet::Attachment attachment;
-                    attachment.bone_index = f.ReadUint16();
-                    attachment.name       = f.ReadStr();
-                    // The 64-byte MDAT affine is expressed in the selected bone's local space. It
-                    // must remain byte-for-byte in that coordinate system until WPPuppet combines
-                    // it with the current animated bone model transform at runtime.
-                    for (auto col : attachment.transform.matrix().colwise()) {
-                        for (auto& x : col) x = f.ReadFloat();
-                    }
-                    mdl.puppet->attachments.push_back(std::move(attachment));
-                }
-            }
-        }
-    } while (mdType != "MDLA");
-    
-
-    if(mdType == "MDLA" && mdVersion.length() > 0){
-        mdl.mdla = std::stoi(mdVersion);
-        if (mdl.mdla != 0) {
-            if (mdl.mdla < 1 || mdl.mdla > 6) {
-                LOG_ERROR("unsupported MDLA version %d: %s", mdl.mdla, str_path.c_str());
-                return false;
-            }
-            const uint32_t declared_end = f.ReadUint32();
-            if (declared_end > static_cast<uint32_t>(f.Size()) ||
-                (declared_end > 0 && declared_end < static_cast<uint32_t>(f.Tell()))) {
-                LOG_ERROR("MDLA declared end 0x%x is outside file size 0x%llx: %s",
-                          declared_end,
-                          static_cast<unsigned long long>(f.Size()),
-                          str_path.c_str());
-                return false;
-            }
-
-            const uint32_t anim_num = f.ReadUint32();
-            anims.resize(anim_num);
-            for (auto& anim : anims) {
-                if (!ParseAnimationRecord(f, anim, mdl.mdla, declared_end, str_path)) return false;
-            }
-            if (!ConsumeMdlaZeroPadding(f, declared_end, str_path)) return false;
-        }
-    }
-    
-    mdl.puppet->prepared();
-    ComputePuppetAnimationBounds(mdl);
-
-    LOG_INFO("read puppet: mdlv: %d, nmdls: %d, mdla: %d, bones: %d, anims: %d",
-             mdl.mdlv,
-             mdl.mdls,
-             mdl.mdla,
-             mdl.puppet->bones.size(),
-             mdl.puppet->anims.size());
-    return true;
+    return ReadPuppetSkeletonAndAnimations(f, path, mdl);
 }
 
 void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {

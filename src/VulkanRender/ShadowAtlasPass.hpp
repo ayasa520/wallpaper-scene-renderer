@@ -11,8 +11,10 @@
 #include "Vulkan/StagingBuffer.hpp"
 
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -51,15 +53,23 @@ private:
         std::shared_ptr<ImmutableMeshGpu> mesh;
         uint32_t                          stride { 0 };
         uint32_t                          position_offset { 0 };
+        uint32_t                          blend_indices_offset { 0 };
+        uint32_t                          blend_weights_offset { 0 };
+        uint32_t                          bone_count { 0 };
         uint32_t                          index_count { 0 };
         uint32_t                          vertex_count { 0 };
         uint32_t                          index_element_bytes { 2 };
         bool                              indexed { false };
+        bool                              pose_error_reported { false };
+        std::span<const Eigen::Affine3f>  skinning_pose;
+        uint64_t                          pose_revision { 0 };
+        uint64_t                          pose_frame_serial { 0 };
     };
 
     struct DrawItem {
         uint32_t caster_index { 0 };
-        uint32_t ubo_slot { 0 };
+        VkDeviceSize ubo_offset { 0 };
+        VkDeviceSize ubo_size { 0 };
         float    vp_x { 0.0f };
         float    vp_y { 0.0f };
         float    vp_w { 0.0f };
@@ -72,9 +82,8 @@ private:
     };
 
     bool ensureClearPass(const Device&);
-    bool ensureShadowShaders();
-    bool ensurePipeline(const Device&, RenderingResources&, uint32_t stride,
-                        uint32_t position_offset);
+    bool ensureShadowShaders(uint32_t bone_count);
+    bool ensurePipeline(const Device&, RenderingResources&, const CasterMesh&);
     bool ensureFramebuffer(const Device&);
     void collectCasters(Scene&, const Device&, RenderingResources&);
     void releaseCasters();
@@ -86,8 +95,8 @@ private:
     VkDeviceSize       m_ubo_align { 256 };
     vvk::RenderPass    m_clear_pass;
     vvk::Framebuffer   m_fb;
-    std::vector<Uni_ShaderSpv> m_shader_spvs;
-    std::unordered_map<uint64_t, PipelineParameters> m_pipelines;
+    std::unordered_map<uint32_t, std::vector<Uni_ShaderSpv>> m_shader_spvs;
+    std::unordered_map<std::string, PipelineParameters> m_pipelines;
     VkExtent2D         m_fb_extent {};
     std::vector<CasterMesh> m_casters;
     std::vector<DrawItem>   m_draws;

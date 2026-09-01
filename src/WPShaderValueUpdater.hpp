@@ -4,6 +4,7 @@
 #include <array>
 #include <unordered_map>
 #include <cstdint>
+#include <optional>
 
 #include <Eigen/Dense>
 
@@ -90,6 +91,7 @@ struct WPUniformInfo {
 
     struct Tex {
         bool has_resolution { false };
+        bool has_texel { false };
         bool has_mipmap { false };
     };
     std::array<Tex, 12> texs;
@@ -233,6 +235,7 @@ public:
     void FrameEnd() override;
     Eigen::Matrix4d ResolveModelTransformForProjection(
         SceneNode* node, const SceneCamera* camera, bool apply_parallax) override;
+    std::optional<ShaderSkinningPose> SkinningPose(SceneNode* node) const override;
     void MouseInput(double, double) override;
     void SetTexelSize(float x, float y) override;
 

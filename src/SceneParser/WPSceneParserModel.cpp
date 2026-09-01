@@ -312,7 +312,8 @@ public:
         return source->renderPolicy.transparent;
     }
 
-    bool LoadChunkMaterial(const WPMdl::StaticChunk& chunk, SceneNode* chunk_node,
+    bool LoadChunkMaterial(const WPMdl& mdl, const WPMdl::StaticChunk& chunk,
+                           SceneNode* chunk_node,
                            SceneMaterial& material, WPShaderValueData& node_data,
                            wpscene::WPMaterial& resolved_wp_material,
                            WPShaderInfo& resolved_shader_info,
@@ -330,8 +331,16 @@ public:
         WPShaderInfo shader_info;
         shader_info.baseConstSvs = context_.global_base_uniforms;
         SeedModelCameraUniforms(context_, shader_info);
+        auto effective_material = source->material;
+        if (mdl.puppet != nullptr) {
+            // MDLV0023 model chunks retain their authored interleaved blend-index/weight
+            // attributes. Enabling the stock shader combos here declares the g_Bones float4x3
+            // array consumed by those attributes on every material chunk.
+            WPMdlParser::AddPuppetMatInfo(effective_material, mdl);
+            WPMdlParser::AddPuppetShaderInfo(shader_info, mdl);
+        }
         if (! LoadMaterial(*context_.vfs,
-                           source->material,
+                           effective_material,
                            context_.scene.get(),
                            chunk_node,
                            &material,
@@ -345,8 +354,8 @@ public:
             return false;
         }
 
-        LoadConstvalue(material, source->material, shader_info);
-        LoadUserShaderValue(material, source->material, shader_info, context_.user_properties);
+        LoadConstvalue(material, effective_material, shader_info);
+        LoadUserShaderValue(material, effective_material, shader_info, context_.user_properties);
         const auto render_state =
             BuildRenderState(color_load_mode,
                              mirrored_handedness,
@@ -356,7 +365,7 @@ public:
         // Model material JSON and shader metadata are returned to the caller so binding
         // registration can happen after mesh->AddMaterial() and node->AddMesh(). That keeps 3D
         // model chunks on the same material-ready registration path as ordinary scene layers.
-        resolved_wp_material = source->material;
+        resolved_wp_material = std::move(effective_material);
         resolved_shader_info = shader_info;
         return true;
     }
@@ -502,14 +511,24 @@ struct ModelChunkNodeRequest {
 
 class ModelLayerMaterializer {
 public:
-    ModelLayerMaterializer(ParseContext& context, const WPModelObject& model_obj)
+    ModelLayerMaterializer(ParseContext& context, const WPModelObject& model_obj,
+                           const WPMdl& mdl)
         : context_(context),
           model_obj_(model_obj),
+          mdl_(mdl),
           sidecar_json_(LoadModelSidecarJson(*context.vfs, model_obj.model)),
           material_loader_(context_, model_obj_, SidecarJson()) {}
 
     void Materialize(const WPMdl& mdl) {
         root_ = CreateRootNode();
+        if (mdl.puppet != nullptr) {
+            // One model owns one animation-layer stack even when its geometry is split across
+            // several material chunks. Copies of WPPuppetLayer share the same runtime state, so
+            // scripts mutate the logical root once and every chunk uploads the identical pose
+            // snapshot during the frame transaction.
+            shared_puppet_pose_ = WPPuppetLayer(mdl.puppet);
+            shared_puppet_pose_.prepared(model_obj_.animation_layers);
+        }
         RegisterRootNode();
         const bool material_samples_reflection = material_loader_.AnyChunkSamplesReflection(mdl);
         if (model_obj_.reflected || material_samples_reflection) {
@@ -539,6 +558,7 @@ private:
 
     void RegisterRootNode() {
         WPShaderValueData root_data;
+        if (shared_puppet_pose_.hasPuppet()) root_data.puppet_layer = shared_puppet_pose_;
         ConfigureBoneAttachment(context_,
                                 model_obj_.parent,
                                 model_obj_.attachment,
@@ -632,12 +652,17 @@ private:
 
         auto mesh = std::make_shared<SceneMesh>();
         WPMdlParser::GenStaticMesh(*mesh, chunk);
+        if (shared_puppet_pose_.hasPuppet()) {
+            mesh->SetSkinning(
+                { .boneCount = static_cast<uint32_t>(shared_puppet_pose_.Puppet()->bones.size()) });
+        }
 
         SceneMaterial       material;
         WPShaderValueData   node_data;
         wpscene::WPMaterial wp_material;
         WPShaderInfo        shader_info;
-        if (! material_loader_.LoadChunkMaterial(chunk,
+        if (! material_loader_.LoadChunkMaterial(mdl_,
+                                                 chunk,
                                                  node.get(),
                                                  material,
                                                  node_data,
@@ -671,6 +696,7 @@ private:
         // attached root resolves to its plain scene-graph transform through the same path, which
         // keeps unparented and bone-attached models unchanged.
         node_data.InheritParentTransform(root_.get(), false);
+        if (shared_puppet_pose_.hasPuppet()) node_data.puppet_layer = shared_puppet_pose_;
         context_.shader_updater->SetNodeData(node.get(), node_data);
         context_.scene->AddLayerRuntimeNode(model_obj_.id, node.get());
         return node;
@@ -700,16 +726,21 @@ private:
 
     ParseContext&                 context_;
     const WPModelObject&          model_obj_;
+    const WPMdl&                  mdl_;
     std::optional<nlohmann::json> sidecar_json_;
     ModelMaterialLoader           material_loader_;
     std::shared_ptr<SceneNode>    root_;
+    WPPuppetLayer                 shared_puppet_pose_;
 };
 
 } // namespace
 
 void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
     WPMdl mdl;
-    if (! WPMdlParser::ParseStaticModel(model_obj.model, *context.vfs, mdl)) {
+    if (! WPMdlParser::ParseStaticModel(model_obj.model,
+                                        *context.vfs,
+                                        mdl,
+                                        ! model_obj.animation_layers.empty())) {
         LOG_ERROR("ModelObjectParse: static mdl parse failed layer=%d name='%s' model='%s'",
                   model_obj.id,
                   model_obj.name.c_str(),
@@ -717,5 +748,5 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
         return;
     }
 
-    ModelLayerMaterializer(context, model_obj).Materialize(mdl);
+    ModelLayerMaterializer(context, model_obj, mdl).Materialize(mdl);
 }

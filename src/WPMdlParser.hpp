@@ -99,7 +99,8 @@ class SceneMesh;
 class WPMdlParser {
 public:
     static bool Parse(std::string_view path, fs::VFS&, WPMdl&);
-    static bool ParseStaticModel(std::string_view path, fs::VFS&, WPMdl&);
+    static bool ParseStaticModel(std::string_view path, fs::VFS&, WPMdl&,
+                                 bool load_animation_data = false);
 
     static void AddPuppetShaderInfo(WPShaderInfo& info, const WPMdl& mdl);
     static void AddPuppetMatInfo(wpscene::WPMaterial& mat, const WPMdl& mdl);

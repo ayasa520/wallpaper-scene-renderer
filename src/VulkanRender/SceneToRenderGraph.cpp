@@ -1256,9 +1256,9 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
     }
     LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu", scene.layerOrder.size());
     if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
-        // Keep the official empty-buffer contract when reflections are off: receivers still
-        // sample `_rt_Reflection`, so the target stays registered and is cleared instead of
-        // destroyed. The clear is a no-op while the quality checkbox is on.
+        // Keep the empty-buffer contract when reflections are off: receivers still sample
+        // `_rt_Reflection`, so the target stays registered and is cleared instead of destroyed.
+        // The clear is a no-op while the quality checkbox is on.
         rg::addClearPass(*rgraph,
                          rg::createTexDesc(std::string(SpecTex_Reflection), &scene),
                          { 0.0f, 0.0f, 0.0f, 0.0f },

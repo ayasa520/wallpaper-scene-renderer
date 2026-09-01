@@ -50,6 +50,8 @@ public:
     float       minlength { 0.0f };
     float       subdivision { 3.0f };
     i32         segments { 4 };
+    std::string orientation { "screen" };
+    std::array<float, 3> axis { 0.0f, 0.0f, 0.0f };
 };
 
 class Initializer {

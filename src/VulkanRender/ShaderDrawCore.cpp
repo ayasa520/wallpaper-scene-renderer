@@ -20,7 +20,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
 
 using namespace wallpaper::vulkan;
 
@@ -511,12 +510,12 @@ bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
     // translucent frame and visually crushes the lighting. Keep the RGB blend factors intact for
     // translucent model materials, but preserve the target alpha just like global 2D passes.
     // Offscreen targets such as `_rt_volumetricsLightBuffer` must keep the shader alpha:
-    // volumetricsfront writes a=1 and the official additive combine (SRC_ALPHA, ONE) multiplies
-    // by the sampled LightBuffer alpha. Suppressing A left the buffer at the clear value 0 and
-    // the passthrough combine added nothing.
+    // volumetricsfront writes a=1 and the additive combine (SRC_ALPHA, ONE) multiplies by the
+    // sampled LightBuffer alpha. Suppressing A left the buffer at the clear value 0 and the
+    // passthrough combine added nothing.
     if (is_model_pass && output == wallpaper::SpecTex_Default) return false;
     // Volumetric nodes have an empty camera name, so the 2D compositor gate below would still
-    // drop A. Offscreen model targets must store the shader alpha: official additive combine
+    // drop A. Offscreen model targets must store the shader alpha: the additive combine
     // (SRC_ALPHA, ONE) samples LightBuffer.a, and volumetricsfront writes a=1.
     if (is_model_pass && output != wallpaper::SpecTex_Default) return true;
 
@@ -1847,26 +1846,6 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // visibility turns the shader into a no-op for the frame. Releasing final-read keys here
         // prevents temporary render targets from staying pinned only because no draw was recorded.
         return;
-    }
-
-    // Temporary diagnostic: trace model-chunk draw submissions with their visibility flags so a
-    // frame capture can prove which pass painted an unexpected mesh. Enabled by VIVID_DRAW_TRACE.
-    {
-        static const bool draw_trace = std::getenv("VIVID_DRAW_TRACE") != nullptr;
-        static int        draw_trace_budget = 400;
-        if (draw_trace && draw_trace_budget > 0 && m_desc.node != nullptr &&
-            m_desc.node->Name().find("__hanabi_model_chunk") != std::string::npos) {
-            draw_trace_budget--;
-            LOG_INFO("DRAWTRACE model-chunk execute node=%p name='%s' vis=%d(l%d,L%d) "
-                     "when-hidden=%d output='%s'",
-                     (void*)m_desc.node,
-                     m_desc.node->Name().c_str(),
-                     (int)m_desc.node->Visible(),
-                     (int)m_desc.node->LocalVisible(),
-                     (int)m_desc.node->LayerVisible(),
-                     (int)m_desc.execute_when_hidden,
-                     m_desc.output.c_str());
-        }
     }
 
     if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;

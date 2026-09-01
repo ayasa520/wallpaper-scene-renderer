@@ -258,13 +258,17 @@ struct SpriteParticleRenderData {
 
 SpriteParticleRenderData PrepareSpriteParticleData(const ParticleInstance& instance,
                                                    const Particle& particle,
-                                                   const ParticleRawGenSpecOp& specOp) {
+                                                   const ParticleRawGenSpecOp& specOp,
+                                                   float alpha_multiplier) {
     float animation_lifetime = particle.lifetime;
     specOp(particle, { &animation_lifetime });
     const auto& render_velocity = ParticleModify::GetRenderVelocity(particle);
     return SpriteParticleRenderData {
         .position = RenderParticlePosition(instance, particle.position),
-        .color = { particle.color[0], particle.color[1], particle.color[2], particle.alpha },
+        .color = { particle.color[0],
+                   particle.color[1],
+                   particle.color[2],
+                   particle.alpha * alpha_multiplier },
         .velocity_lifetime = { render_velocity[0],
                                render_velocity[1],
                                render_velocity[2],
@@ -285,12 +289,13 @@ bool WriteSpriteCommonAttributes(ParticleVertexWriter& writer,
 
 bool GenParticlePointData(std::span<const std::unique_ptr<ParticleInstance>> instances,
                           const ParticleRawGenSpecOp& specOp, bool thick_format,
-                          ParticleVertexWriter& writer) {
+                          ParticleVertexWriter& writer, float alpha_multiplier) {
     if (! writer.EnsureCapacity(CountLiveParticles(instances), "sprite-point")) return false;
 
     return ForEachLiveParticle(instances, [&](const ParticleInstance& instance,
                                                const Particle& particle) {
-        const auto data = PrepareSpriteParticleData(instance, particle, specOp);
+        const auto data =
+            PrepareSpriteParticleData(instance, particle, specOp, alpha_multiplier);
         writer.BeginVertex();
         // Point-expanded materials receive simulation rotation and size directly; their geometry
         // stage creates the four authored corners after the vertex shader has run once.
@@ -306,7 +311,7 @@ bool GenParticlePointData(std::span<const std::unique_ptr<ParticleInstance>> ins
 
 bool GenParticleQuadData(std::span<const std::unique_ptr<ParticleInstance>> instances,
                          const ParticleRawGenSpecOp& specOp, bool thick_format,
-                         ParticleVertexWriter& writer) {
+                         ParticleVertexWriter& writer, float alpha_multiplier) {
     constexpr std::array<std::array<float, 2>, 4> kCorners {
         std::array { 0.0f, 1.0f },
         std::array { 1.0f, 1.0f },
@@ -334,7 +339,8 @@ bool GenParticleQuadData(std::span<const std::unique_ptr<ParticleInstance>> inst
 
     return ForEachLiveParticle(instances, [&](const ParticleInstance& instance,
                                                const Particle& particle) {
-        const auto data = PrepareSpriteParticleData(instance, particle, specOp);
+        const auto data =
+            PrepareSpriteParticleData(instance, particle, specOp, alpha_multiplier);
 
         // A non-GS particle shader receives four invocations with identical simulation data. Only
         // the authored corner changes, and the rotation pair remains in TexCoordC2 exactly as the
@@ -409,7 +415,7 @@ private:
 };
 
 bool GenRopeParticleData(const ParticleInstance& instance, bool thick_format,
-                         ParticleVertexWriter& writer) {
+                         ParticleVertexWriter& writer, float alpha_multiplier) {
     /*
     attribute vec4 a_PositionVec4;
     attribute vec4 a_TexCoordVec4;
@@ -483,7 +489,7 @@ bool GenRopeParticleData(const ParticleInstance& instance, bool thick_format,
                 ! writer.Write(
                     ParticleVertexAttr::TexCoordVec4C3,
                     std::array { p2_src.color[0], p2_src.color[1], p2_src.color[2],
-                                 p2_src.alpha })) {
+                                 p2_src.alpha * alpha_multiplier })) {
                 return false;
             }
         } else if (! writer.Write(
@@ -493,7 +499,10 @@ bool GenRopeParticleData(const ParticleInstance& instance, bool thick_format,
         }
         if (! writer.Write(
                 ParticleVertexAttr::Color,
-                std::array { p1_src.color[0], p1_src.color[1], p1_src.color[2], p1_src.alpha }) ||
+                std::array { p1_src.color[0],
+                             p1_src.color[1],
+                             p1_src.color[2],
+                             p1_src.alpha * alpha_multiplier }) ||
             ! writer.Commit()) {
             return false;
         }
@@ -504,7 +513,7 @@ bool GenRopeParticleData(const ParticleInstance& instance, bool thick_format,
 
 bool GenRopeTrailSegments(const ParticleInstance& instance, const Particle& particle,
                           const ParticleTrail& trail, bool thick_format,
-                          ParticleVertexWriter& writer) {
+                          ParticleVertexWriter& writer, float alpha_multiplier) {
     const size_t trail_length = trail.Length();
     if (trail_length == 0) return true;
 
@@ -545,7 +554,7 @@ bool GenRopeTrailSegments(const ParticleInstance& instance, const Particle& part
                 ! writer.Write(
                     ParticleVertexAttr::TexCoordVec4C3,
                     std::array { particle.color[0], particle.color[1], particle.color[2],
-                                 particle.alpha })) {
+                                 particle.alpha * alpha_multiplier })) {
                 return false;
             }
         } else if (! writer.Write(
@@ -556,7 +565,7 @@ bool GenRopeTrailSegments(const ParticleInstance& instance, const Particle& part
         if (! writer.Write(
                 ParticleVertexAttr::Color,
                 std::array { particle.color[0], particle.color[1], particle.color[2],
-                             particle.alpha }) ||
+                             particle.alpha * alpha_multiplier }) ||
             ! writer.Commit()) {
             return false;
         }
@@ -565,7 +574,8 @@ bool GenRopeTrailSegments(const ParticleInstance& instance, const Particle& part
 }
 
 bool GenRopeTrailData(std::span<const std::unique_ptr<ParticleInstance>> instances,
-                      bool thick_format, ParticleVertexWriter& writer) {
+                      bool thick_format, ParticleVertexWriter& writer,
+                      float alpha_multiplier) {
     for (size_t instance_index = 0; instance_index < instances.size(); instance_index++) {
         const auto& instance = *instances[instance_index];
         if (instance.IsNoLiveParticle()) continue;
@@ -592,7 +602,8 @@ bool GenRopeTrailData(std::span<const std::unique_ptr<ParticleInstance>> instanc
                                        particles[slot],
                                        trails[slot],
                                        thick_format,
-                                       writer)) {
+                                       writer,
+                                       alpha_multiplier)) {
                 return false;
             }
         }
@@ -649,7 +660,7 @@ bool ValidateParticleMeshContract(const SceneMesh& mesh, const ParticleRenderPla
 void WPParticleRawGener::GenGLData(std::span<const std::unique_ptr<ParticleInstance>> instances,
                                    SceneMesh& mesh, ParticleRawGenSpecOp& specOp,
                                    const ParticleRenderPlan& plan,
-                                   std::string_view object_name) {
+                                   std::string_view object_name, float alpha_multiplier) {
     const auto* material = mesh.Material();
     const std::string_view material_name = material != nullptr
         ? std::string_view(material->name)
@@ -677,21 +688,25 @@ void WPParticleRawGener::GenGLData(std::span<const std::unique_ptr<ParticleInsta
     case ParticleRendererKind::Sprite:
     case ParticleRendererKind::SpriteTrail:
         generated = plan.expansion == ParticleExpansionMode::GeometryPoint
-            ? GenParticlePointData(instances, specOp, plan.thick_format, writer)
-            : GenParticleQuadData(instances, specOp, plan.thick_format, writer);
+            ? GenParticlePointData(
+                  instances, specOp, plan.thick_format, writer, alpha_multiplier)
+            : GenParticleQuadData(
+                  instances, specOp, plan.thick_format, writer, alpha_multiplier);
         break;
     case ParticleRendererKind::Rope:
         for (size_t instance_index = 0; instance_index < instances.size(); instance_index++) {
             const auto& instance = instances[instance_index];
             if (instance->IsNoLiveParticle()) continue;
-            if (! GenRopeParticleData(*instance, plan.thick_format, writer)) {
+            if (! GenRopeParticleData(
+                    *instance, plan.thick_format, writer, alpha_multiplier)) {
                 generated = false;
                 break;
             }
         }
         break;
     case ParticleRendererKind::RopeTrail:
-        generated = GenRopeTrailData(instances, plan.thick_format, writer);
+        generated =
+            GenRopeTrailData(instances, plan.thick_format, writer, alpha_multiplier);
         break;
     }
 

@@ -709,10 +709,11 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterScenePropertyBinding(context, object_json, "text", WPDynamicValue::Type::String);
         RegisterScenePropertyBinding(context, object_json, "font", WPDynamicValue::Type::String);
         RegisterScenePropertyBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
-        // Particle controls such as mouse-tail `colorn`, scalar `size`, and audio-reactive
-        // `rate` are nested below instanceoverride, so the generic top-level scans above never see
-        // them. Register the nested override names here so user-property edits and persistent
-        // scripts can reach live particles instead of being frozen at parse-time values.
+        // Particle controls are nested below instanceoverride, so the generic top-level scans
+        // never see them. Register the nested override names here so user-property edits and
+        // persistent scripts can reach the live particle subsystem.
+        RegisterSceneParticleOverridePropertyBinding(
+            context, object_json, "alpha", WPDynamicValue::Type::Float);
         RegisterSceneParticleOverridePropertyBinding(
             context, object_json, "colorn", WPDynamicValue::Type::Float3);
         RegisterSceneParticleOverridePropertyBinding(
@@ -721,6 +722,8 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             context, object_json, "size", WPDynamicValue::Type::Float);
         RegisterSceneParticleOverridePropertyBinding(
             context, object_json, "rate", WPDynamicValue::Type::Float);
+        RegisterSceneParticleOverrideScriptBinding(
+            context, object_json, "alpha", WPDynamicValue::Type::Float);
         RegisterSceneParticleOverrideScriptBinding(
             context, object_json, "rate", WPDynamicValue::Type::Float);
         RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
@@ -921,8 +924,9 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterScenePropertyBinding(context, object_json, "font", WPDynamicValue::Type::String);
     RegisterScenePropertyBinding(context, object_json, "color", WPDynamicValue::Type::Float3);
     // Dynamic layer materialization uses this per-object registration path, so particle
-    // instanceoverride color, size, and rate bindings must be added here as well as during the
-    // initial full-scene scan above.
+    // instanceoverride bindings must be added here as well as during the initial full-scene scan.
+    RegisterSceneParticleOverridePropertyBinding(
+        context, object_json, "alpha", WPDynamicValue::Type::Float);
     RegisterSceneParticleOverridePropertyBinding(
         context, object_json, "colorn", WPDynamicValue::Type::Float3);
     RegisterSceneParticleOverridePropertyBinding(
@@ -931,6 +935,8 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
         context, object_json, "size", WPDynamicValue::Type::Float);
     RegisterSceneParticleOverridePropertyBinding(
         context, object_json, "rate", WPDynamicValue::Type::Float);
+    RegisterSceneParticleOverrideScriptBinding(
+        context, object_json, "alpha", WPDynamicValue::Type::Float);
     RegisterSceneParticleOverrideScriptBinding(
         context, object_json, "rate", WPDynamicValue::Type::Float);
     RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
