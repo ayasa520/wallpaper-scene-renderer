@@ -32,13 +32,6 @@ bool CreateDynamicSceneLayer(Scene&                                      scene,
                              std::string*                                out_initial_config_json              = nullptr,
                              int32_t*                                    out_layer_id                         = nullptr);
 
-bool MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
-                                      const UserPropertyMap* user_properties);
-bool MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
-                                  const UserPropertyMap* user_properties);
-bool MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
-                                   const UserPropertyMap* user_properties);
-
 bool ConfigureSceneVolumetrics(Scene& scene, fs::VFS& vfs);
 bool ConfigureSceneBloom(Scene& scene, fs::VFS& vfs);
 } // namespace wallpaper

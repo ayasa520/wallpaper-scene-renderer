@@ -1405,10 +1405,9 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     m_deferred_waiting_indices_logged.clear();
     m_device->tex_cache().CancelDeferredGraphActivation();
     if (clear_scene_caches) {
-        // Scene switches and renderer shutdown still own a full cache teardown. Ordinary topology
-        // rebuilds no longer do this: visibility-driven residency now releases only the keys that
-        // became unreachable, so showing one deferred layer cannot evict every unrelated texture
-        // and video decoder in the wallpaper.
+        // Scene switches and renderer shutdown own a full cache teardown. Structural graph rebuilds
+        // keep scene-level caches alive; dynamic layer destruction releases only keys that no
+        // surviving object references.
         m_device->tex_cache().Clear();
         m_device->video_tex_cache().Clear();
         if (m_rendering_resources.pipeline_cache) {
@@ -1628,12 +1627,9 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                 reusable_it != reusable_passes.end()) {
                 auto reusable_vpass = std::dynamic_pointer_cast<VulkanPass>(reusable_it->second);
                 if (reusable_vpass && reusable_vpass->canReuseForResidency(*vpass)) {
-                    // Mature renderers do not destroy every pipeline just because one layer toggled
-                    // visibility. The new render graph describes the fresh topology, while this
-                    // handoff keeps matching prepared pass objects alive and updates only their
-                    // graph-local gates/texture declarations. Removed passes are retired below,
-                    // which preserves hidden-layer resource release without a whole-scene PSO
-                    // rebuild.
+                    // Structural graph changes can preserve passes whose residency identity is
+                    // unchanged. The handoff updates graph-local gates and texture declarations;
+                    // only removed passes are retired below.
                     reusable_vpass->absorbResidencyGraphState(*vpass);
                     pass_ref = reusable_it->second;
                     vpass = reusable_vpass.get();
@@ -1718,10 +1714,8 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
                 had_resident_graph && !refresh_resources_only && p != m_prepass.get() &&
                 p != m_finpass.get() && !is_copy_dependency;
             if (can_defer_runtime_prepare) {
-                // Runtime visibility changes should not monopolize the render thread by making
-                // every newly-visible layer allocate textures, framebuffers, and staging uploads in
-                // one compile call. Queue cold passes and let drawFrame() advance residency a pass
-                // at a time while already-prepared scene content keeps rendering.
+                // Dynamic object creation can add many cold passes to an already-running scene.
+                // Queue them so drawFrame() advances preparation within the existing frame budget.
                 if (p->requestDeferredPrepareResources(scene, *m_device) ==
                     DeferredPrepareResourcesState::Waiting) {
                     deferred_waiting_count++;
@@ -1738,7 +1732,8 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     }
 
     LOG_INFO("RenderGraphCompileSummary: total=%zu reused-refreshed=%zu refreshed=%zu "
-             "prepared=%zu dependency-prepared=%zu deferred=%zu already-prepared=%zu mode=%s",
+             "prepared=%zu dependency-prepared=%zu deferred=%zu already-prepared=%zu mode=%s "
+             "texture-bytes=%zu texture-images=%zu video-bytes=%zu video-entries=%zu",
              m_passes.size(),
              reused_refreshed_count,
              refreshed_count,
@@ -1746,7 +1741,11 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
              dependency_prepared_count,
              deferred_count,
              already_prepared_count,
-             refresh_resources_only ? "resources" : "topology");
+             refresh_resources_only ? "resources" : "topology",
+             m_device->tex_cache().GetTrackedBytes(),
+             m_device->tex_cache().GetTrackedImageCount(),
+             m_device->video_tex_cache().GetTrackedBytes(),
+             m_device->video_tex_cache().GetTrackedEntryCount());
     if (deferred_count > 0) {
         m_device->tex_cache().BeginDeferredGraphActivation();
         LOG_INFO("RenderGraphDeferredPrepareQueued: count=%zu max-passes-per-frame=%zu "
@@ -1758,8 +1757,8 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     }
 
     // Upload work queued by prepare() is recorded at the start of the next frame command buffer.
-    // Avoiding a compile-time queue submit + DeviceWaitIdle is what keeps visibility-driven graph
-    // changes from behaving like a scene load.
+    // Avoiding a compile-time queue submit + DeviceWaitIdle keeps structural dynamic-layer changes
+    // from behaving like a scene load.
     m_pass_loaded = true;
 };
 

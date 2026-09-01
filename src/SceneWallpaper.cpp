@@ -354,12 +354,10 @@ private:
         const bool requires_topology_rebuild = m_rg == nullptr || m_scene->renderGraphTopologyDirty;
         if (m_rg) {
             if (requires_topology_rebuild) {
-                // Runtime visibility changes can alter graph topology, but treating that as a
-                // scene switch destroys every prepared pass and recreates hundreds of pipelines on
-                // the next frame. Mature game renderers diff the new graph against the resident one:
-                // unchanged passes keep their PSO/descriptors, removed hidden branches are retired,
-                // and the queued per-layer resource releases drain only after those old passes have
-                // dropped their references. VulkanRender::compileRenderGraph owns that handoff.
+                // Visibility never reaches this branch: its runtime gates keep the authored graph
+                // stable. Real structural changes such as dynamic object creation/destruction or
+                // render-feature reconfiguration still diff the new graph against the resident one
+                // so unchanged prepared passes can retain their Vulkan state.
             } else {
                 // Minute-level effect text updates only resize existing offscreen resources.
                 // Reusing the compiled graph topology while recreating pass-owned GPU resources
@@ -725,7 +723,6 @@ private:
             if (audio_samples) {
                 m_scene->scriptHost->ApplyAudioSamples(*audio_samples);
             }
-            m_scene->scriptHost->MaterializeDeferredRuntimeLayersForResidency();
             // Scene scripts distinguish the authored canvas (engine.canvasSize, scene ortho) from
             // the physical wallpaper output (engine.screenResolution). UI layout scripts derive
             // their resolution-adaptive scale from screenResolution, so publish the real output

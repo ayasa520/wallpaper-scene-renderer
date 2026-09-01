@@ -2,9 +2,8 @@
 #include "WPSceneParserShared.hpp"
 
 // Script, user-property, property-animation, and effect-visibility binding registration for
-// parsed scenes. Split from WPSceneParser.cpp as a cohesive unit: the core parser dispatches
-// into RegisterSceneScripts / RegisterSceneScriptsForObject / RegisterEffectVisibilityBindings
-// (declared in the shared header) after objects are materialized.
+// parsed scenes. Object-level registration runs after materialization so effect targets already
+// exist and visibility updates never need to rebuild their pass/FBO topology.
 
 #include "Utils/Logging.h"
 #include "Core/StringHelper.hpp"
@@ -432,6 +431,8 @@ void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json
     WPUserSetting setting;
     if (! ParseUserSetting(visible_json, setting, WPDynamicValue::Type::Boolean)) return;
 
+    // The target points at the fully materialized SceneImageEffect. Runtime dispatch changes only
+    // its local execution bit; all pass nodes and named render targets remain attached.
     WPSceneScriptRegistration registration {
         .object_id     = object_id,
         .object_name   = effect_name,
@@ -485,9 +486,6 @@ void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::jso
 
     uint32_t effect_index = 0;
     for (const auto& effect_json : object_json.at("effects")) {
-        // Effect material scripts are registered later while each concrete pass material is being
-        // built, because only that stage knows the resolved GLSL uniform name and pass SceneNode.
-        // Visibility bindings still stay here where the authored effect index is available.
         RegisterEffectVisibilityBinding(context, object_json, effect_json, effect_index);
         effect_index++;
     }
@@ -1102,4 +1100,3 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
         layer_index++;
     }
 }
-

@@ -115,10 +115,6 @@ bool IsModelRenderNode(SceneNode* node) {
     return material != nullptr && material->modelRenderState.has_value();
 }
 
-bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
-    return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
-}
-
 Matrix4d ToD3dClipZViewProjection(const Matrix4d& view_projection) {
     // Vivid Ortho() maps near→NDC z=1 and far→NDC z=0 (GL-like reverse Z after the Vulkan
     // [0,1] remap). Official volumetricsfront.vert FULLSCREEN writes gl_Position.z=0 when
@@ -156,38 +152,6 @@ ShaderValue ToDxcRowVectorSkinningUniform(std::span<const Affine3f> matrices) {
         }
     }
     return ShaderValue(std::span<const float>(packed.data(), packed.size()));
-}
-
-SceneNode* RemapSceneNodeReference(SceneNode* node, SceneNode* old_node, SceneNode* new_node) {
-    return node == old_node ? new_node : node;
-}
-
-void PreserveDeferredRuntimeParallaxContract(const WPShaderValueData& old_data,
-                                             WPShaderValueData&       new_data,
-                                             SceneNode*               old_node,
-                                             SceneNode*               new_node) {
-    bool preserved = false;
-
-    if (IsZeroParallaxDepth(new_data.parallaxDepth) &&
-        ! IsZeroParallaxDepth(old_data.parallaxDepth)) {
-        // Hidden logical placeholders can receive importer-side parallax repairs after the initial
-        // parse, especially compose/effect containers whose authored JSON omits parallaxDepth but
-        // whose descendants must still use the container as a camera-parallax anchor. Runtime
-        // materialization reparses the real layer from JSON, so copy only this repaired parallax
-        // contract when the replacement still has no authored depth of its own.
-        new_data.parallaxDepth = old_data.parallaxDepth;
-        preserved = true;
-    }
-
-    if (new_data.parallax_anchor == nullptr && old_data.parallax_anchor != nullptr) {
-        new_data.parallax_anchor =
-            RemapSceneNodeReference(old_data.parallax_anchor, old_node, new_node);
-        preserved = true;
-    }
-
-    if (preserved && old_data.suppress_model_parallax) {
-        new_data.suppress_model_parallax = true;
-    }
 }
 
 Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
@@ -533,12 +497,10 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                 transformResolver.UpdateAttachmentParentIfNeeded(worldNodeData);
                 if (worldNodeData.IsBoneAttached()) {
                     // Effect-backed layers draw their source into a private camera, then composite a
-                    // detached final node back into the visible scene. When a deferred hidden layer is
-                    // later promoted to a real bone attachment, the visible world node no longer gets a
-                    // normal SceneNode tree update that would carry the puppet bone and inherited
-                    // parallax into that final writer. Resolve the attachment here before syncing the
-                    // effect output matrix so runtime-revealed puppet parts keep the same camera
-                    // parallax as layers that were visible at parse time.
+                    // detached final node back into the visible scene. That world node does not get a
+                    // normal SceneNode tree update carrying the puppet bone and inherited parallax
+                    // into the detached writer. Resolve the attachment here before synchronizing the
+                    // effect output matrix so visibility changes preserve the same camera parallax.
                     auto localTransform = transformResolver.ResolveAttachmentLocalTransform(worldNode);
                     if (localTransform.has_value()) {
                         worldNode->SetLocalAffine(*localTransform);
@@ -1055,35 +1017,6 @@ void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& 
     m_nodeDataMap[nodeAddr] = data;
 }
 
-void WPShaderValueUpdater::ReplaceNodeReferences(SceneNode* old_node, SceneNode* new_node) {
-    if (old_node == nullptr || new_node == nullptr || old_node == new_node) return;
-
-    auto old_data_it = m_nodeDataMap.find(old_node);
-    auto new_data_it = m_nodeDataMap.find(new_node);
-    if (old_data_it != m_nodeDataMap.end() && new_data_it != m_nodeDataMap.end()) {
-        PreserveDeferredRuntimeParallaxContract(
-            old_data_it->second, new_data_it->second, old_node, new_node);
-    }
-
-    for (auto& [_, data] : m_nodeDataMap) {
-        (void)_;
-        if (data.parallax_anchor == old_node) data.parallax_anchor = new_node;
-        if (data.transform_binding.parent == old_node) data.transform_binding.parent = new_node;
-        if (data.effect_texture_projection.node == old_node) {
-            data.effect_texture_projection.node = new_node;
-        }
-    }
-
-    // Deferred materialization destroys the hidden placeholder after the real layer node is built.
-    // Any remaining shader-data/cache entry keyed by the placeholder address can later match a
-    // recycled allocation and send transform resolution through freed memory, so remove every
-    // per-frame structure that treats the raw SceneNode pointer as an identity key.
-    m_nodeDataMap.erase(old_node);
-    m_nodeUniformInfoMap.erase(old_node);
-    m_modelTransformCache.clear();
-    m_parallaxOffsetCache.clear();
-    m_attachmentTransformCache.clear();
-}
 
 const WPShaderValueData* WPShaderValueUpdater::GetNodeData(const void* node_addr) const {
     auto it = m_nodeDataMap.find(const_cast<void*>(node_addr));

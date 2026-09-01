@@ -1526,10 +1526,10 @@ ShaderDrawCore::requestDeferredPrepareResources(Scene& scene, const Device& devi
         const auto texture_it = scene.textures.find(tex_name);
         if (texture_it == scene.textures.end() || texture_it->second.isVideo) return;
 
-        // Deferred visibility prepare follows the same split as modern streaming renderers:
+        // Deferred structural preparation follows the same split as modern streaming renderers:
         // expensive disk/decompression work is requested from the scene asset cache first, and the
         // render thread only builds Vulkan residency after those CPU bytes are ready. This keeps a
-        // newly visible deferred layer from blocking the whole frame on WPTexImageParser::Parse().
+        // newly created dynamic layer from blocking the whole frame on WPTexImageParser::Parse().
         const auto request = scene.RequestParsedImageAsync(tex_name);
         switch (request.state) {
         case Scene::ParsedImageRequestState::Ready:

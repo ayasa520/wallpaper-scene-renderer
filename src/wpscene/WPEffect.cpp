@@ -24,7 +24,6 @@ void ReadVisibleBinding(const nlohmann::json& json, wallpaper::VisibleBinding* b
         GET_JSON_VALUE(user, binding->user.name);
         return;
     }
-
     if (! user.is_object()) return;
 
     GET_JSON_NAME_VALUE_NOWARN(user, "name", binding->user.name);
@@ -50,6 +49,7 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
 
     GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
     GET_JSON_NAME_VALUE_NOWARN(json, "fit", fit);
+    GET_JSON_NAME_VALUE_NOWARN(json, "unique", unique);
     if(scale == 0) { 
         LOG_ERROR("fbo scale can't be 0");
         scale = 1;
@@ -177,19 +177,11 @@ std::unordered_set<std::string> WPImageEffect::FeedbackFboNames() const {
 bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     std::string filePath;
     GET_JSON_NAME_VALUE(json, "file", filePath);
-    GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
-    if (json.contains("visible")) {
-        visible_json             = json.at("visible");
-        ReadVisibleBinding(visible_json, &visible_binding);
-    }
     if(this->IsEffectBlacklisted(filePath)) {
-        // Hide blacklisted effects at parse time so every object type consumes the same sanitized
-        // shared effect representation. Log the exact resource path because a blacklist hit is
-        // otherwise silent and looks identical to a missing or unsupported effect in render logs.
-        LOG_INFO("SceneEffectBlacklist: file='%s' hidden-at-parse-time=true", filePath.c_str());
-        visible = false;
-        visible_json = nlohmann::json();
-        visible_binding = {};
+        // A blacklist entry rejects the effect rather than changing its visibility. Log the exact
+        // resource path so the missing effect has an explicit parse-time cause.
+        LOG_INFO("SceneEffectBlacklist: file='%s' rejected=true", filePath.c_str());
+        return false;
     }
 	GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
     nlohmann::json jEffect;
@@ -209,6 +201,20 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
             WPMaterialPass pass;
             pass.FromJson(jP);
             passes[i++].Update(pass);
+        }
+    }
+
+    // Parse the shared effect resource and pass overrides first, then apply the scene instance
+    // property table. Visibility records execution state but never prevents the resource, its
+    // pass materials, or its framebuffer declarations from being parsed.
+    if (json.contains("visible")) {
+        visible_json = json.at("visible");
+        if (visible_json.is_object()) {
+            ReadVisibleBinding(visible_json, &visible_binding);
+            visible = visible_binding.value;
+        } else {
+            GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
+            visible_binding.value = visible;
         }
     }
     return true;

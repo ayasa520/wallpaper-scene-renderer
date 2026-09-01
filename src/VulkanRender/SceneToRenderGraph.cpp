@@ -76,7 +76,8 @@ TexNode* addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode::Desc* out_desc =
     return copy;
 }
 
-TexNode* addDefaultComposeSnapshot(RenderGraph& rgraph, TexNode* in) {
+TexNode* addDefaultComposeSnapshot(RenderGraph& rgraph, TexNode* in,
+                                   std::function<bool()> should_execute = {}) {
     // `_rt_default` is both the compose write target and the FullFrameBuffer sampler. A unique
     // `_rt_default_<version>_copy` per self-write keeps a screen-sized image alive for every
     // overlapping letter. Reuse one screen-sized partner for that snapshot instead.
@@ -87,7 +88,7 @@ TexNode* addDefaultComposeSnapshot(RenderGraph& rgraph, TexNode* in) {
     TexNode::Desc snapshot = in->genDesc();
     snapshot.key           = std::string(SpecTex_DefaultPingPong);
     snapshot.name          = snapshot.key;
-    return addCopyPass(rgraph, in, &snapshot);
+    return addCopyPass(rgraph, in, &snapshot, std::move(should_execute));
 }
 
 void addClearPass(RenderGraph& rgraph, const TexNode::Desc& target,
@@ -184,6 +185,12 @@ static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::st
     return output != SpecTex_Default;
 }
 
+static bool ShouldExecuteLayerDestination(Scene& scene, SceneNode* node,
+                                          std::string_view output) {
+    if (node == nullptr || node->Visible()) return true;
+    return ShouldExecuteHiddenDependency(scene, node, output);
+}
+
 struct DelayLinkInfo {
     using BindTexture = void (*)(rg::Pass&, u32, std::string_view);
 
@@ -208,7 +215,6 @@ struct ExtraInfo {
     // clear depth once for each target, then load it for later chunks without touching 2D passes.
     std::unordered_set<std::string> model_depth_outputs_seen {};
     bool                       use_mipmap_framebuffer { false };
-    bool                       include_hidden_for_pipeline_warmup { false };
 };
 
 static bool IsOffscreenDependencyLayer(const ExtraInfo& extra, i32 imgId) {
@@ -272,21 +278,6 @@ struct TraversalRoute {
 
 static bool HasRenderableMeshMaterial(SceneNode* node) {
     return node != nullptr && node->Mesh() != nullptr && node->Mesh()->Material() != nullptr;
-}
-
-static bool ShouldEmitLayerNodeForResidency(Scene& scene, SceneNode* node, const ExtraInfo& extra) {
-    if (node == nullptr || node == scene.sceneGraph.get()) return true;
-    if (extra.include_hidden_for_pipeline_warmup) return true;
-
-    const int32_t layer_id = NodeLayerId(scene, node);
-    if (layer_id == 0) return true;
-    if (scene.IsLayerVisible(layer_id)) return true;
-
-    // Dependency-source layers are the one hidden case that must stay resident in the graph: other
-    // visible effects can sample their private offscreen outputs. Ordinary hidden layers are
-    // pruned so their passes, framebuffers, descriptors, imported textures, and video decoders can
-    // be released until the layer becomes visible again.
-    return scene.IsLayerOffscreenDependencySource(layer_id);
 }
 
 static size_t NodeLayerOrderIndex(SceneNode* node, const ExtraInfo& extra) {
@@ -601,13 +592,24 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
         };
     }
 
+    // A destination draw can contain preparatory copies as well as the shader submission itself.
+    // Hidden layers skip the complete destination-draw operation, so all graph commands owned by
+    // this pass share one runtime gate. This is especially important for framebuffer self-reads:
+    // copying `_rt_default` for an invisible layer would still consume bandwidth and mutate its
+    // snapshot target even though the subsequent shader is correctly skipped.
+    auto pass_execution_gate =
+        [node, &scene, output_key, inner = std::move(should_execute)]() {
+            if (inner && !inner()) return false;
+            return ShouldExecuteLayerDestination(scene, node, output_key);
+        };
+
     std::string passName = material->name;
     rgraph.addPass<PassT>(
         passName,
         rg::PassNode::Type::CustomShader,
         [material, node, output_key, imgId, &rgraph, &scene, &extra,
          clear_model_depth, options = std::move(options),
-         should_execute = std::move(should_execute)](
+         pass_execution_gate = std::move(pass_execution_gate)](
             rg::RenderGraphBuilder& builder, typename PassT::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
             // Passing the live scene into the prepared pass lets resource refreshes resolve current
@@ -617,7 +619,7 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
             pdesc.node       = node;
             pdesc.layer_id   = imgId;
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
-            pdesc.should_execute      = should_execute;
+            pdesc.should_execute      = pass_execution_gate;
             pdesc.output     = output_key;
             pdesc.alpha_write_policy = output_key != SpecTex_Default
                 ? options.alpha_write_policy
@@ -696,8 +698,12 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
                     // Compose self-writes reuse one screen-sized snapshot. Other self-writes
                     // still get a versioned copy name because their destinations are not a
                     // shared compose buffer.
-                    input = url == SpecTex_Default ? rg::addDefaultComposeSnapshot(rgraph, input)
-                                                   : rg::addCopyPass(rgraph, input);
+                    input = url == SpecTex_Default
+                        ? rg::addDefaultComposeSnapshot(rgraph, input, pass_execution_gate)
+                        : rg::addCopyPass(rgraph,
+                                          input,
+                                          static_cast<rg::TexNode::Desc*>(nullptr),
+                                          pass_execution_gate);
                 }
                 builder.read(input);
                 pdesc.textures.emplace_back(input->key());
@@ -811,16 +817,6 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         }
     }
 
-    if (node != nullptr && !ShouldEmitLayerNodeForResidency(scene, node, extra)) {
-        LOG_INFO("SceneRenderGraphResidencySkip: layer=%d name='%s' local-visible=%s "
-                 "layer-visible=%s",
-                 NodeLayerId(scene, node),
-                 node->Name().c_str(),
-                 scene.GetLayerLocalVisibility(NodeLayerId(scene, node)) ? "true" : "false",
-                 node->LayerVisible() ? "true" : "false");
-        return;
-    }
-
     std::string_view         output = inherited_output;
     SceneImageEffectLayer*   imgeff { nullptr };
     const auto resolved_route_model = ResolveRouteModel(node, route.model);
@@ -846,7 +842,15 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                  static_cast<int>(output.size()),
                  output.data(),
                  source_route.active_compose_source_camera.c_str());
-        rg::addClearPass(*extra.rgraph, rg::createTexDesc(std::string(output), extra.scene));
+        const std::string clear_output(output);
+        rg::addClearPass(
+            *extra.rgraph,
+            rg::createTexDesc(clear_output, extra.scene),
+            { 0.0f, 0.0f, 0.0f, 0.0f },
+            [node, &scene, clear_output, outer_gate = node_execute_gate]() {
+                if (outer_gate && !outer_gate()) return false;
+                return ShouldExecuteLayerDestination(scene, node, clear_output);
+            });
     }
 
     if (source_route.seed_empty_proxy_compose_from_framebuffer &&
@@ -1136,16 +1140,23 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                               &resolved_effect_world_affine,
                               final_output_capability);
 
+        const std::string layer_private_output(output);
+        auto layer_destination_gate = [node, &scene, layer_private_output]() {
+            return ShouldExecuteLayerDestination(scene, node, layer_private_output);
+        };
+
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
             auto& eff     = imgeff->GetEffect(i);
             auto  cmdItor = eff->commands.begin();
             auto  cmdEnd  = eff->commands.end();
             int   nodePos = 0;
-            auto  effect_visible_gate = [eff]() {
-                return eff == nullptr || eff->LocalVisible();
+            auto  effect_visible_gate = [eff, layer_destination_gate]() {
+                return layer_destination_gate() &&
+                    (eff == nullptr || eff->LocalVisible());
             };
-            auto effect_hidden_gate = [eff]() {
-                return eff != nullptr && !eff->LocalVisible();
+            auto effect_hidden_gate = [eff, layer_destination_gate]() {
+                return layer_destination_gate() &&
+                    eff != nullptr && !eff->LocalVisible();
             };
             for (auto& effect_node : eff->nodes) {
                 if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
@@ -1237,19 +1248,13 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     }
 }
 
-static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
-    Scene& scene, bool include_hidden_for_pipeline_warmup) {
+static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
     std::unique_ptr<rg::RenderGraph> rgraph = std::make_unique<rg::RenderGraph>();
-    ExtraInfo                        extra { .rgraph = rgraph.get(),
-                                             .scene = &scene,
-                                             .include_hidden_for_pipeline_warmup =
-                                                 include_hidden_for_pipeline_warmup };
+    ExtraInfo                        extra { .rgraph = rgraph.get(), .scene = &scene };
     for (size_t index = 0; index < scene.layerOrder.size(); index++) {
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
-    LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu warmup-hidden=%s",
-             scene.layerOrder.size(),
-             include_hidden_for_pipeline_warmup ? "true" : "false");
+    LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu", scene.layerOrder.size());
     if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
         // Keep the official empty-buffer contract when reflections are off: receivers still
         // sample `_rt_Reflection`, so the target stays registered and is cleared instead of
@@ -1386,9 +1391,9 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
 }
 
 std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
-    return SceneToRenderGraphImpl(scene, false);
+    return SceneToRenderGraphImpl(scene);
 }
 
 std::unique_ptr<rg::RenderGraph> wallpaper::sceneToPipelineWarmupRenderGraph(Scene& scene) {
-    return SceneToRenderGraphImpl(scene, true);
+    return SceneToRenderGraphImpl(scene);
 }

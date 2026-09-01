@@ -71,27 +71,6 @@ static void TestLayerNodeSlotTriState() {
     assert(scene.FindLayerIdByNode(&handle) == 0);
 }
 
-static void TestDeferredRuntimeKind() {
-    Scene scene;
-    assert(!scene.IsLayerDeferredRuntime(5));
-
-    scene.MarkLayerDeferredRuntime(5, SceneDeferredRuntimeKind::Text);
-    assert(scene.IsLayerDeferredRuntime(5));
-    assert(scene.IsLayerDeferredRuntime(5, SceneDeferredRuntimeKind::Text));
-    assert(!scene.IsLayerDeferredRuntime(5, SceneDeferredRuntimeKind::Image));
-
-    // A stale clear for another kind is a no-op.
-    scene.ClearLayerDeferredRuntime(5, SceneDeferredRuntimeKind::Image);
-    assert(scene.IsLayerDeferredRuntime(5, SceneDeferredRuntimeKind::Text));
-
-    scene.ClearLayerDeferredRuntime(5, SceneDeferredRuntimeKind::Text);
-    assert(!scene.IsLayerDeferredRuntime(5));
-
-    scene.MarkLayerDeferredRuntime(6, SceneDeferredRuntimeKind::Image);
-    assert(scene.DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Image) == 1);
-    assert(scene.DeferredRuntimeLayerIds(SceneDeferredRuntimeKind::Image).size() == 1);
-}
-
 static void TestRuntimeResourceLists() {
     Scene scene;
     assert(scene.GetLayerRuntimeLights(9).empty());
@@ -198,7 +177,6 @@ int main() {
     TestLayerIdForNode();
     TestIdentityLifecycle();
     TestLayerNodeSlotTriState();
-    TestDeferredRuntimeKind();
     TestRuntimeResourceLists();
     TestCameraLayerState();
     TestEffectBridgeOwnership();
