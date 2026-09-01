@@ -708,8 +708,6 @@ private:
 } // namespace
 
 void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
-    if (! model_obj.visible) return;
-
     WPMdl mdl;
     if (! WPMdlParser::ParseStaticModel(model_obj.model, *context.vfs, mdl)) {
         LOG_ERROR("ModelObjectParse: static mdl parse failed layer=%d name='%s' model='%s'",
@@ -721,4 +719,3 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
 
     ModelLayerMaterializer(context, model_obj).Materialize(mdl);
 }
-

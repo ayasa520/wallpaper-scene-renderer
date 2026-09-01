@@ -41,6 +41,7 @@ public:
     std::string name;
     std::string format;
     uint32_t    scale { 1 };
+    bool        unique { false };
     // Wallpaper Engine effect FBOs can use either `scale` (divide the source size) or `fit`
     // (fit the source aspect into a fixed longest edge). Cursor ripple uses `fit=512` for its
     // simulation buffers; treating that as scale=1 makes the propagation texel step several times
@@ -62,9 +63,10 @@ public:
     int32_t                      id { 0 };
     std::string                  name;
     bool                         visible { true };
-    // Keep the authored visible property intact so the parser can build one visibility contract
-    // for user bindings, scripts, and animations. A bool-only field is not enough because
-    // visible=false with a script still has to materialize an effect runtime target.
+    // Instance visibility belongs to the scene effect entry, not to the shared effect resource.
+    // Preserve the complete property object after loading the resource so parser/runtime binding
+    // code can apply the same boolean, user, script, or animation value without changing the
+    // material/pass/FBO topology that was already constructed.
     nlohmann::json               visible_json;
     VisibleBinding               visible_binding;
     int32_t                      version;
@@ -74,7 +76,7 @@ public:
     std::vector<WPEffectFbo>     fbos;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, fit);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, fit, unique);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageEffect, name, visible, passes, fbos, materials);
 
 } // namespace wpscene

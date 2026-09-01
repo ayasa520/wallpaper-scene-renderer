@@ -239,7 +239,6 @@ public:
     void SetNodeData(void*, const WPShaderValueData&);
     const WPShaderValueData* GetNodeData(const void* node_addr) const;
     WPShaderValueData*       GetNodeData(const void* node_addr);
-    void ReplaceNodeReferences(SceneNode* old_node, SceneNode* new_node);
     void SetCameraParallax(const WPCameraParallax& value) {
         m_parallax = value;
         // Camera parallax changes alter the derived model transforms even when the authored layer

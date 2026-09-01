@@ -53,9 +53,9 @@ public:
     virtual DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) {
         return DeferredPrepareResourcesState::Ready;
     }
-    // Deferred preparation is used for runtime visibility changes after a resident graph already
-    // exists. The default path is equivalent to ordinary prepare(), while heavier passes can
-    // override it to enforce a non-blocking streaming contract before any synchronous fallback work
+    // Deferred preparation is used when a structural runtime operation adds a pass after a resident
+    // graph already exists. The default path is equivalent to ordinary prepare(), while heavier
+    // passes can override it to enforce a non-blocking streaming contract before synchronous work
     // is allowed to run on the render thread.
     virtual void prepareDeferred(Scene& scene, const Device& device, RenderingResources& resources) {
         prepare(scene, device, resources);
@@ -63,9 +63,8 @@ public:
     virtual void execute(const Device&, RenderingResources&)         = 0;
     virtual void destory(const Device&, RenderingResources&)         = 0;
     // Pipeline warm-up mirrors PSO precompilation in game engines: build immutable pipeline state
-    // without binding layer-owned textures, framebuffers, or mesh buffers. Hidden deferred layers
-    // can therefore keep memory residency at zero while their future visible frame avoids
-    // vkCreateGraphicsPipelines.
+    // without binding pass-owned textures, framebuffers, or mesh buffers. A dynamically created
+    // pass can therefore avoid delaying its first rendered frame on vkCreateGraphicsPipelines.
     virtual bool warmupPipeline(Scene&, const Device&, RenderingResources&) { return false; }
     virtual std::string residencyKey() const { return {}; }
     // Human-readable identity for frame profiling. Defaults to the residency key; passes that

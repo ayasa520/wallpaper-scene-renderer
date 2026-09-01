@@ -128,17 +128,6 @@ public:
     // helper nodes (bloom, volumetrics) keep the default id 0, which callers treat as "no owner".
     int32_t LayerIdForNode(const SceneNode* node) const;
 
-    // Deferred-runtime bookkeeping, backed by SceneObject::DeferredRuntimeKind. Semantics match
-    // the former deferredRuntime{Image,Particle,Text}LayerIds sets: marking records the kind on
-    // the owning object, clearing is kind-checked so a stale clear for another kind is a no-op,
-    // and destroying the SceneObject drops the record together with the rest of the identity.
-    void MarkLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind);
-    void ClearLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind);
-    bool IsLayerDeferredRuntime(int32_t layer_id, SceneDeferredRuntimeKind kind) const;
-    bool IsLayerDeferredRuntime(int32_t layer_id) const;
-    std::vector<int32_t> DeferredRuntimeLayerIds(SceneDeferredRuntimeKind kind) const;
-    std::size_t          DeferredRuntimeLayerCount(SceneDeferredRuntimeKind kind) const;
-
     // Sound-stream bookkeeping, backed by SceneObject::SoundHandle. Same semantics as the former
     // objectRuntimeSoundHandles map, including keeping a failed mount's 0 handle as "present".
     void                    SetLayerSoundHandle(int32_t layer_id, uint32_t handle);
@@ -152,9 +141,9 @@ public:
 
     // Layer-handle bookkeeping, backed by SceneObject's tri-state layer-node slot. Same semantics
     // as the former layerNodes map: HasLayerNodeSlot is the registration check (a slot may hold
-    // nullptr mid-rematerialization or for node-less sound layers), GetLayerNode returns nullptr
-    // both for an absent slot and for a registered null handle, and FindLayerIdByNode is the
-    // reverse lookup over live handles only.
+    // nullptr for node-less sound layers), GetLayerNode returns nullptr both for an absent slot and
+    // for a registered null handle, and FindLayerIdByNode is the reverse lookup over live handles
+    // only.
     void       SetLayerNode(int32_t layer_id, SceneNode* node);
     SceneNode* GetLayerNode(int32_t layer_id) const;
     bool       HasLayerNodeSlot(int32_t layer_id) const;
@@ -207,7 +196,7 @@ public:
     // correctness while its authored binding routes it under a parent (parent_id != 0 with no
     // attachment); the render graph then draws it at the parent's authored sibling position and
     // skips its physical root visit. Deriving at query time keeps the answers correct across
-    // deferred placeholder swaps and script-driven reparenting without stale-table maintenance.
+    // dynamic layer replacement and script-driven reparenting without stale-table maintenance.
     bool IsRenderOrderProxyNode(const SceneNode* node) const;
     std::vector<SceneNode*> RenderOrderProxyChildrenOf(const SceneNode* parent_node) const;
 

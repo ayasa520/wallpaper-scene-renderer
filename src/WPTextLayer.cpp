@@ -730,9 +730,8 @@ std::array<float, 2> ComputeCroppedContentCenter(std::array<float, 2> full_displ
 }
 
 std::array<float, 2> ResolveVisibleTextDisplaySize(const TextLayerRuntimeState& state) {
-    // Once a text layer has been materialized, the live scene primitive is the only authoritative
-    // source of visible geometry. Falling back to the authored object is only for deferred logical
-    // layers that do not have a shaped primitive yet.
+    // The live scene primitive is the authoritative source of visible geometry. A null primitive can
+    // only occur while a failed or incomplete runtime text object is being rejected by its caller.
     if (state.primitive != nullptr) {
         return state.object.opaquebackground || state.render_contract.RequiresBridge()
             ? state.primitive->layout.logical_size
@@ -747,9 +746,7 @@ std::array<float, 2> ResolveVisibleTextSourceSize(const TextLayerRuntimeState& s
             ? state.primitive->layout.logical_source_size
             : state.primitive->layout.glyph_source_size;
     }
-    // Deferred text layers have no rasterized primitive yet, so there is no authoritative source
-    // texture rectangle to report. Returning the authored box here keeps diagnostics and placeholder
-    // alignment stable until the primitive is materialized.
+    // There is no shaped source rectangle for an incomplete runtime text object.
     return state.object.size;
 }
 
@@ -3224,7 +3221,7 @@ void SyncTextPrimitiveCanonicalState(TextLayerRuntimeState& state, bool rebuild_
     // Opaque-background toggles and similar geometry-only updates do not require reshaping glyphs,
     // but they do change how the already-shaped glyph pages are placed inside the canonical text
     // box. Rebuilding just the meshes keeps the direct text pass and the bridge source aligned
-    // with the new visibility contract without rerasterizing the atlas itself.
+    // with the updated geometry without rerasterizing the atlas itself.
     if (state.primitive->background_mesh != nullptr) {
         state.primitive->background_mesh = BuildTextPrimitiveBackgroundMesh(*state.primitive);
     }
@@ -3481,7 +3478,6 @@ void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
         if (text_state == nullptr) continue;
         auto& state = *text_state;
         if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
-            scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text) ||
             !TextLayerNeedsBridgeResidency(scene, layer_id)) {
             continue;
         }
@@ -3540,7 +3536,6 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
         auto* text_state = object != nullptr ? object->TextRuntimeState() : nullptr;
         if (text_state == nullptr) continue;
         auto& state = *text_state;
-        if (scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) continue;
         if (! HasExplicitTextScreenAnchor(state.object)) continue;
 
         const auto binding = scene.GetLayerParentBinding(layer_id);
@@ -3631,10 +3626,6 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
 }
 
 bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
-    if (scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
-        return true;
-    }
-
     auto* text_state = scene.FindTextLayerState(layer_id);
     if (text_state == nullptr || scene.vfs == nullptr) {
         return false;

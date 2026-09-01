@@ -34,18 +34,6 @@ enum class SceneObjectKind
     Shape,
 };
 
-// A hidden authored layer may stay a lightweight logical placeholder until it is first needed.
-// The deferred kind records which materializer owns the layer; None means fully materialized.
-// A layer is deferred for at most one kind (its authored kind), so a single field carries the
-// same information as the former per-kind Scene sets.
-enum class SceneDeferredRuntimeKind
-{
-    None,
-    Image,
-    Particle,
-    Text,
-};
-
 // Image layers keep a small always-available runtime state (authored quad size plus alignment)
 // that scripts read and write independently from any render node. It lives on the SceneObject so
 // the object is the single source for layer-level state.
@@ -121,7 +109,7 @@ public:
         m_attachment.clear();
     }
 
-    // Authored effect count from scene.json (before parse-time pruning).
+    // Parsed effect count from the authored scene entry. Visibility never changes this count.
     int32_t EffectCount() const { return m_effect_count; }
     void    SetEffectCount(int32_t count) { m_effect_count = count; }
 
@@ -136,9 +124,6 @@ public:
     bool IsOffscreenDependencySource() const { return m_offscreen_dependency_source; }
     void MarkOffscreenDependencySource() { m_offscreen_dependency_source = true; }
 
-    SceneDeferredRuntimeKind DeferredRuntimeKind() const { return m_deferred_runtime_kind; }
-    void SetDeferredRuntimeKind(SceneDeferredRuntimeKind kind) { m_deferred_runtime_kind = kind; }
-
     // Sound layers mount a SoundManager stream; the handle is that layer's runtime resource.
     // nullopt means no stream was mounted. A stored 0 is kept as a value on purpose: it is what a
     // failed mount recorded in the former Scene map, and presence checks must keep matching it.
@@ -148,9 +133,9 @@ public:
 
     // The layer's script-visible handle node. The slot is tri-state to preserve the former
     // Scene::layerNodes semantics: no slot means the layer is not registered, a slot holding
-    // nullptr means the layer is registered but its handle is temporarily absent
-    // (mid-rematerialization, or node-less sound layers), and otherwise the slot is the live
-    // handle. Registration checks must use HasLayerNodeSlot, not the node value.
+    // nullptr means the layer is registered but has no drawable handle (for example a node-less
+    // sound layer), and otherwise the slot is the live handle. Registration checks must use
+    // HasLayerNodeSlot, not the node value.
     bool       HasLayerNodeSlot() const { return m_has_layer_node_slot; }
     SceneNode* LayerNode() const { return m_layer_node; }
     void       SetLayerNode(SceneNode* node) {
@@ -187,11 +172,10 @@ public:
         return m_runtime_particle_subsystems;
     }
 
-    // The layer's live draw handles: world/placeholder node, detached effect-source node, model
-    // material nodes, particle renderer nodes. Same append-only contract as the lists above.
-    // The list must be cleared at the exact point the nodes are freed (layer destroy and
-    // re-materialization), because readers walk these pointers for visibility, residency, and
-    // material updates.
+    // The layer's live draw handles: world node, detached effect-source node, model material nodes,
+    // and particle renderer nodes. Same append-only contract as the lists above. The list must be
+    // cleared at the exact point the nodes are freed because readers walk these pointers for
+    // visibility, resource ownership, and material updates.
     void AddRuntimeNode(SceneNode* node) { m_runtime_nodes.push_back(node); }
     const std::vector<SceneNode*>& RuntimeNodes() const { return m_runtime_nodes; }
     void ClearRuntimeNodes() { m_runtime_nodes.clear(); }
@@ -217,9 +201,9 @@ public:
         m_has_camera_runtime_state = true;
     }
 
-    // The authored scene.json record for this object, normalized to its parse-time id. Deferred
-    // layers re-parse it on materialization and scripts read originalOrigin and the initial
-    // config from it. nullptr means no record (sound-only and some helper layers).
+    // The authored scene.json record for this object, normalized to its parse-time id. Scripts read
+    // originalOrigin and the initial config from it. nullptr means no record (sound-only and some
+    // helper layers).
     const std::string* InitialConfigJson() const {
         return m_initial_config_json.has_value() ? &*m_initial_config_json : nullptr;
     }
@@ -228,8 +212,8 @@ public:
     }
     void ClearInitialConfigJson() { m_initial_config_json.reset(); }
 
-    // Image runtime state exists only for materialized image layers (concrete or logical); other
-    // kinds return nullptr, which is what tells scripts "this is not an image layer".
+    // Image runtime state exists only for parsed image layers; other kinds return nullptr, which is
+    // what tells scripts "this is not an image layer".
     SceneImageLayerRuntimeState*       ImageRuntimeState() {
         return m_has_image_runtime_state ? &m_image_runtime_state : nullptr;
     }
@@ -262,7 +246,6 @@ private:
     bool    m_passthrough { false };
     bool    m_offscreen_dependency_source { false };
 
-    SceneDeferredRuntimeKind   m_deferred_runtime_kind { SceneDeferredRuntimeKind::None };
     std::optional<uint32_t>    m_sound_handle;
     std::optional<std::string> m_initial_config_json;
 

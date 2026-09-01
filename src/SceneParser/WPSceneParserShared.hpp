@@ -33,29 +33,6 @@
 #include "wpscene/WPImageObject.h"
 #include "wpscene/WPParticleObject.h"
 
-// A hidden layer whose visibility can flip at runtime is registered as a lightweight logical
-// placeholder first; the kind records which materializer owns it.
-enum class LazyMaterializeKind
-{
-    None,
-    Image,
-    Particle,
-    Text,
-};
-
-struct VisibilityContract {
-    bool                authored_visible { true };
-    bool                initial_visible { true };
-    bool                has_user_binding { false };
-    bool                has_script { false };
-    bool                has_animation { false };
-    bool                referenced_by_script { false };
-    bool                dependency_source { false };
-    bool                requires_runtime_contract { false };
-    bool                can_prune_at_parse_time { false };
-    LazyMaterializeKind lazy_materialize_kind { LazyMaterializeKind::None };
-};
-
 struct ParseContext {
     std::shared_ptr<wallpaper::Scene> scene;
     wallpaper::WPShaderValueUpdater*  shader_updater;
@@ -69,8 +46,6 @@ struct ParseContext {
     std::shared_ptr<wallpaper::SceneNode>                              global_camera_node;
     std::shared_ptr<wallpaper::SceneNode>                              global_perspective_camera_node;
     std::unordered_set<int32_t>                                        dependent_parent_ids;
-    std::unordered_map<int32_t, VisibilityContract>                    layer_visibility_contracts;
-    std::unordered_map<int32_t, int32_t>                               initial_parent_by_layer_id;
     std::unordered_map<int32_t, std::shared_ptr<wallpaper::SceneNode>> object_nodes;
     std::unordered_map<int32_t, const wallpaper::WPPuppet*>            object_puppets;
     // Model chunk passes share the main scene target. Tracking their parse order here lets the
@@ -174,26 +149,16 @@ void LogTextLayerRegistration(const char* event_name, int32_t object_id,
 bool IsCameraLayerObjectJson(const nlohmann::json& object_json);
 bool IsCameraLayerRuntimeProperty(std::string_view property_name);
 
-// Defined in WPSceneParserBindings.cpp; the core parser registers script/property/effect
-// visibility bindings through these after objects are materialized.
-void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::json& object_json);
+// Defined in WPSceneParserBindings.cpp; the core parser registers layer and effect property
+// bindings after objects and their complete effect chains are materialized.
 void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json);
 void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& object_json);
 
 // Defined in WPSceneParser.cpp; shared with the particle unit.
-bool ShouldDeferRuntimeLayerMaterialization(const ParseContext& context, int32_t layer_id,
-                                            bool local_initial_visible,
-                                            const VisibilityContract* contract,
-                                            bool force_runtime_materialization);
-const VisibilityContract* FindLayerVisibilityContract(const ParseContext& context,
-                                                      int32_t layer_id);
 bool  LayerUsesRoutedParent(int32_t parent_id, std::string_view attachment);
 float RandomParticleFrameLifetime(const wallpaper::Particle& p, float sprite_frame_count_value);
 void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
                                      wallpaper::WPShaderValueData& node_data);
-void RegisterLogicalParticleLayer(ParseContext& context,
-                                  wallpaper::wpscene::WPParticleObject& wppartobj);
-
 // Parent linkage for recursive particle child parsing. Members are the parsing-time capacity
 // contract for child subsystems; see the field comments at the use sites in
 // WPSceneParserParticle.cpp.

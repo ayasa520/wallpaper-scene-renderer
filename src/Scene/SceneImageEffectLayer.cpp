@@ -14,17 +14,33 @@ using namespace wallpaper;
 
 namespace
 {
-std::string ResolvePingPongInputAlias(std::string_view value, std::string_view ppong_a,
+std::string ResolvePingPongInputAlias(std::string_view value,
+                                      std::string_view initial_ppong_a,
+                                      std::string_view initial_ppong_b,
+                                      std::string_view ppong_a,
                                       std::string_view ppong_b) {
-    if (sstart_with(value, WE_EFFECT_PPONG_PREFIX_A)) return std::string(ppong_a);
-    if (sstart_with(value, WE_EFFECT_PPONG_PREFIX_B)) return std::string(ppong_b);
+    // The old private render-target names also doubled as the symbolic A/B aliases because they
+    // started with `_rt_effect_pingpong_a|b_`. Destination names (`sc.W.H.*`) contain no layer
+    // identity and therefore do not carry that accidental type information. Match the bridge's
+    // initial named targets explicitly so every authored `previous` input continues to follow the
+    // current side after each effect swaps the pair. Without this distinction, effect two reads
+    // and writes the same named target and the render graph must allocate a full-size snapshot
+    // for every repeated language branch.
+    if (sstart_with(value, WE_EFFECT_PPONG_PREFIX_A) || value == initial_ppong_a)
+        return std::string(ppong_a);
+    if (sstart_with(value, WE_EFFECT_PPONG_PREFIX_B) || value == initial_ppong_b)
+        return std::string(ppong_b);
     return std::string(value);
 }
 
-std::string ResolvePingPongOutputAlias(std::string_view value, std::string_view ppong_a,
+std::string ResolvePingPongOutputAlias(std::string_view value,
+                                       std::string_view initial_ppong_a,
+                                       std::string_view initial_ppong_b,
+                                       std::string_view ppong_a,
                                        std::string_view ppong_b) {
     if (value == SpecTex_Default) return std::string(ppong_b);
-    return ResolvePingPongInputAlias(value, ppong_a, ppong_b);
+    return ResolvePingPongInputAlias(
+        value, initial_ppong_a, initial_ppong_b, ppong_a, ppong_b);
 }
 
 bool IsCurrentEffectOutput(std::string_view authored_output) {
@@ -510,13 +526,16 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
         for (auto& cmd : eff->commands) {
             const auto authored_src = ResolveTemplateOrCurrent(cmd.authored_src, cmd.src);
             const auto authored_dst = ResolveTemplateOrCurrent(cmd.authored_dst, cmd.dst);
-            cmd.src                 = ResolvePingPongInputAlias(authored_src, ppong_a, ppong_b);
-            cmd.dst                 = ResolvePingPongInputAlias(authored_dst, ppong_a, ppong_b);
+            cmd.src = ResolvePingPongInputAlias(
+                authored_src, m_pingpong_a, m_pingpong_b, ppong_a, ppong_b);
+            cmd.dst = ResolvePingPongInputAlias(
+                authored_dst, m_pingpong_a, m_pingpong_b, ppong_a, ppong_b);
         }
 
         for (auto it = eff->nodes.begin(); it != eff->nodes.end(); it++) {
             const auto authored_output = ResolveTemplateOrCurrent(it->authored_output, it->output);
-            it->output                 = ResolvePingPongOutputAlias(authored_output, ppong_a, ppong_b);
+            it->output = ResolvePingPongOutputAlias(
+                authored_output, m_pingpong_a, m_pingpong_b, ppong_a, ppong_b);
             if (IsCurrentEffectOutput(authored_output)) {
                 fallback_last_output = &(*it);
                 m_final_composite.output_effect = eff.get();
@@ -539,7 +558,8 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
                 texs = it->authored_textures;
             }
             for (auto& texture : texs) {
-                texture = ResolvePingPongInputAlias(texture, ppong_a, ppong_b);
+                texture = ResolvePingPongInputAlias(
+                    texture, m_pingpong_a, m_pingpong_b, ppong_a, ppong_b);
             }
         }
 

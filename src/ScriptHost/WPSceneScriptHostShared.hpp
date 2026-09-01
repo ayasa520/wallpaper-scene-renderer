@@ -188,22 +188,13 @@ struct LayerResidencyResources {
     std::unordered_set<std::string> render_targets;
 };
 
-// Defined in WPSceneScriptHostResidency.cpp: residency bookkeeping and deferred-layer
-// materialization entry points the core script host dispatches into.
-bool MaterializeDeferredImageLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
-bool MaterializeDeferredParticleLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
-bool MaterializeDeferredTextLayerIfNeeded(WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
-bool MaterializeDeferredVisibleLayerTreeIfNeeded(WPSceneScriptHost::Opaque* opaque,
-                                                 int32_t                    root_layer_id);
-bool RetainsGpuResidencyWhileHidden(const Scene& scene, int32_t layer_id);
+// Defined in WPSceneScriptHostResidency.cpp: resource ownership bookkeeping used by dynamic layer
+// destruction.
 LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32_t layer_id);
 LayerResidencyResources CollectRetainedResidencyResources(
     const Scene& scene, const std::unordered_set<int32_t>& excluded_layers);
 void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
                                const LayerResidencyResources& retained, const char* reason);
-void QueueHiddenLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque,
-                                         int32_t                    root_layer_id);
-void CancelLayerTreeResourceRelease(WPSceneScriptHost::Opaque* opaque, int32_t root_layer_id);
 
 // Defined in WPSceneScriptHost.cpp: the registration and node-resolution helpers the
 // residency unit calls back into.

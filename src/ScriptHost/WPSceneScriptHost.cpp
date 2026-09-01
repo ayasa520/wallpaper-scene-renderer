@@ -264,7 +264,6 @@ bool ApplyPropertyAnimationInstance(WPSceneScriptHost::Opaque* opaque,
 bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
                             const WPSceneScriptRegistration& registration,
                             const WPDynamicValue&            value);
-bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id);
 bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance);
 void ResortLayerTree(SceneNode* parent, const WPSceneScriptHost::Opaque* opaque);
 std::optional<Eigen::Matrix4d> GetAttachmentWorldTransform(const WPSceneScriptHost::Opaque* opaque,
@@ -1043,35 +1042,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    });\n"
         << "    return builder;\n"
         << "  }\n"
-        << "  function createDeferredTextureAnimation() {\n"
-        << "    // Deferred runtime layer placeholders intentionally have no mesh/material yet, "
-           "but\n"
-        << "    // authored wallpaper scripts may still drive their texture animation every "
-           "frame.\n"
-        << "    // Keep that script contract stable with a cheap no-op object so hidden "
-           "multilingual\n"
-        << "    // branches stay logical-only until visibility materialization is actually "
-           "required.\n"
-        << "    return {\n"
-        << "      get frameCount() { return 0; },\n"
-        << "      get duration() { return 0; },\n"
-        << "      get rate() { return 1; },\n"
-        << "      set rate(_value) {},\n"
-        << "      play() {},\n"
-        << "      stop() {},\n"
-        << "      pause() {},\n"
-        << "      isPlaying() { return false; },\n"
-        << "      getFrame() { return 0; },\n"
-        << "      setFrame(_frame) {},\n"
-        << "      join() {}\n"
-        << "    };\n"
-        << "  }\n"
         << "  function createTextureAnimation(slot = 0, nodeId = __nodeId) {\n"
-        << "    if (!__native.hasTextureAnimation(nodeId, slot)) {\n"
-        << "      if (__native.isDeferredRuntimeLayer(nodeId)) return "
-           "createDeferredTextureAnimation();\n"
-        << "      return undefined;\n"
-        << "    }\n"
+        << "    if (!__native.hasTextureAnimation(nodeId, slot)) return undefined;\n"
         << "    return {\n"
         << "      get frameCount() { return __native.textureAnimationGet(nodeId, slot, "
            "'frameCount'); },\n"
@@ -2090,12 +2062,7 @@ void LogInvalidParticlePropertyValue(const char* property_kind, int32_t layer_id
 template<typename Apply>
 bool ApplyParticleSubsystemValue(Scene& scene, int32_t layer_id, Apply&& apply) {
     const auto& subsystems = scene.GetLayerRuntimeParticleSubsystems(layer_id);
-    if (subsystems.empty()) {
-        // Deferred particle layers intentionally have no live subsystem. Their current property
-        // snapshot is consumed when visibility materializes the layer, so accepting the write here
-        // keeps the script-facing property contract identical before and after materialization.
-        return scene.IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Particle);
-    }
+    if (subsystems.empty()) return false;
 
     bool applied = false;
     for (auto* subsystem : subsystems) {
@@ -2340,9 +2307,9 @@ bool SameRegistrationTarget(const WPSceneScriptRegistration& lhs,
     if (lhs.target_kind != rhs.target_kind || lhs.object_id != rhs.object_id) return false;
 
     if (lhs.target_kind == WPSceneScriptTargetKind::Effect) {
-        // Authored effect ids survive parse-time pruning better than array positions, but older
-        // registrations may only have an index. Prefer ids when both sides have one and fall back
-        // to the materialized index for generated/synthetic effect entries.
+        // Authored effect ids stay stable across parse failures and synthetic entries, while array
+        // positions do not. Prefer ids when both sides have one; registrations without authored ids
+        // are compared by their materialized effect index.
         if (lhs.target_id != 0 && rhs.target_id != 0) return lhs.target_id == rhs.target_id;
         return lhs.target_index == rhs.target_index;
     }
@@ -2406,9 +2373,9 @@ void RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque, int32_t layer_i
         if (registration.object_id == layer_id &&
             (registration.target_kind == WPSceneScriptTargetKind::Layer ||
              registration.target_kind == WPSceneScriptTargetKind::Effect)) {
-            // Deferred text/particle materialization replaces the lightweight logical node with
-            // the real runtime node. Effect registrations still target the effect by id/index, but
-            // their script environment also needs the owner layer node id for thisObject helpers.
+            // A structural dynamic-layer replacement can install a new runtime node for the same
+            // authored id. Effect registrations still target the effect by id/index, but their
+            // script environment also needs the current owner node for thisObject helpers.
             registration.node = node;
         }
     };
@@ -2480,10 +2447,10 @@ void RegisterSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque,
     if (! SceneRegistrationRangeHasNewEntries(opaque, resolved_range)) return;
 
     if (opaque->applying_user_properties) {
-        // A visible-property write can materialize a hidden language branch while ApplyUserProperties()
-        // is iterating the current binding vector. Queue the newly parsed registrations and attach
-        // them after that pass, so vector growth cannot invalidate the active dispatch entry while the
-        // same user-property payload still reaches the late-created bindings.
+        // A property callback can create a dynamic layer while ApplyUserProperties() is iterating
+        // the current binding vector. Queue its newly parsed registrations until that pass ends so
+        // vector growth cannot invalidate the active dispatch entry, while the same property payload
+        // still reaches bindings installed by the callback.
         opaque->pending_scene_registration_ranges.push_back(std::move(resolved_range));
         return;
     }
@@ -2617,10 +2584,6 @@ bool ApplyTextLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t laye
         return true;
     }
 
-    if (opaque->scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
-        return true;
-    }
-
     const auto update_strategy =
         wallpaper::ResolveTextLayerPropertyUpdateStrategy(*state, property_name);
     if (update_strategy == TextLayerPropertyUpdateStrategy::MaterialOnly) {
@@ -2653,15 +2616,6 @@ int32_t FindNodeId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* nod
 int32_t FindOwningLayerId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* node) {
     if (opaque == nullptr || opaque->scene == nullptr) return 0;
     return opaque->scene->LayerIdForNode(node);
-}
-
-bool IsDeferredRuntimeLayer(const WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
-    if (opaque == nullptr || opaque->scene == nullptr || layer_id == 0) return false;
-
-    // The script API is intentionally asked about the logical layer id instead of probing render
-    // resources. Deferred image/text/particle placeholders all preserve their layer identity while
-    // skipping heavy runtime nodes, which keeps this predicate independent from material layout.
-    return opaque->scene->IsLayerDeferredRuntime(layer_id);
 }
 
 // Shared with WPSceneScriptHostResidency.cpp (declared in the shared header).
@@ -3250,7 +3204,13 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         if (const auto* destroyed_object = opaque->scene->FindSceneObject(layer_id)) {
             if (const auto effect_layer = destroyed_object->ImageEffectLayer()) {
                 for (const auto& render_target : effect_layer->RuntimeRenderTargetNames()) {
-                    opaque->scene->renderTargets.erase(render_target);
+                    // Named effect targets can be shared by any number of authored layers. The
+                    // retained-resource set was collected with every pending deletion excluded,
+                    // so a name present there has a concrete surviving owner and must stay in the
+                    // scene table when this layer disappears.
+                    if (! retained_resources.render_targets.contains(render_target)) {
+                        opaque->scene->renderTargets.erase(render_target);
+                    }
                 }
                 for (const auto& camera_name : effect_layer->RuntimeCameraNames()) {
                     for (auto& [linked_name, linked_cameras] : opaque->scene->linkedCameras) {
@@ -3293,15 +3253,15 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
                 subsystems.end());
         }
         // Deleting a layer removes its authored SceneObject entirely: parent binding, local
-        // visibility, identity, image runtime state, deferred kind, sound handle, and the
-        // light/particle records all live there now. Children keep their dangling parent id,
-        // exactly like the previous per-concern maps did.
+        // visibility, identity, image runtime state, sound handle, and the light/particle records
+        // all live there now. Children keep their dangling parent id, exactly like the previous
+        // per-concern maps did.
         opaque->scene->DestroySceneObject(layer_id);
-        // The deferred-runtime record, the layer-node slot, and the text runtime state live on
-        // the SceneObject, so DestroySceneObject above already dropped them together with the
-        // rest of the identity; a later dynamic layer that reuses this authored id starts from a
-        // fresh object. First-class text primitives own their atlas pages directly, so dropping
-        // the text record needs no separate image unregistration.
+        // The layer-node slot and text runtime state live on the SceneObject, so
+        // DestroySceneObject above already dropped them together with the rest of the identity; a
+        // later dynamic layer that reuses this authored id starts from a fresh object. First-class
+        // text primitives own their atlas pages directly, so dropping the text record needs no
+        // separate image unregistration.
         opaque->scene->scriptRegistrations.erase(
             std::remove_if(opaque->scene->scriptRegistrations.begin(),
                            opaque->scene->scriptRegistrations.end(),
@@ -4264,8 +4224,8 @@ ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
 
     if (const auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
         // First-class text no longer needs a SceneMesh to render, which means mesh-only cursor
-        // bounds would drop Clock-style hover scripts. Prefer the live primitive's visible box
-        // when it exists and fall back to the authored text size for deferred logical layers.
+        // bounds would drop Clock-style hover scripts. Use the live primitive's visible box when
+        // it exists, otherwise use the authored text size.
         const std::array<float, 2> text_size = text_layer->primitive != nullptr
                                                    ? text_layer->primitive->VisibleDisplaySize()
                                                    : text_layer->object.size;
@@ -4712,25 +4672,8 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
         if (opaque != nullptr && opaque->scene != nullptr) {
             const auto layer_id = FindNodeId(opaque, node);
             if (layer_id != 0) {
-                const bool was_effectively_visible = opaque->scene->IsLayerVisible(layer_id);
                 opaque->scene->SetLayerLocalVisibility(layer_id, visible);
-                if (visible && ! MaterializeDeferredVisibleLayerTreeIfNeeded(opaque, layer_id)) {
-                    return false;
-                }
                 opaque->scene->ApplyLayerVisibility(layer_id);
-                const bool is_effectively_visible = opaque->scene->IsLayerVisible(layer_id);
-                if (was_effectively_visible != is_effectively_visible) {
-                    // Visibility is now a render-graph residency boundary, not just a draw-time
-                    // branch. Hidden layers are pruned from the graph so their pass-owned GPU
-                    // resources can be released; visible layers must be reintroduced into the
-                    // topology before their next frame can draw.
-                    opaque->scene->MarkRenderGraphTopologyDirty();
-                    if (!is_effectively_visible) {
-                        QueueHiddenLayerTreeResourceRelease(opaque, layer_id);
-                    } else {
-                        CancelLayerTreeResourceRelease(opaque, layer_id);
-                    }
-                }
                 return true;
             }
         }
@@ -6974,27 +6917,6 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     std::string command;
     if (! ReadJSString(context, argv[1], &command)) return JS_UNDEFINED;
 
-    const bool command_requires_video_decoder =
-        command == "play" || command == "pause" || command == "stop" ||
-        command == "setCurrentTime" || command == "getCurrentTime" ||
-        command == "duration" || command == "rate";
-    if (command_requires_video_decoder &&
-        opaque->scene->IsLayerDeferredRuntime(node_id, SceneDeferredRuntimeKind::Image)) {
-        // Some Wallpaper Engine intro layers intentionally start hidden, then call
-        // getVideoTexture().stop()/setCurrentTime() during init before their first visible=true
-        // update tick. Visibility-driven materialization is too late for those scripts: the
-        // placeholder has no mesh/material, so the video command would resolve to an empty no-op
-        // controller. Materialize on the first concrete video command instead, keeping
-        // getVideoTexture() itself cheap while preserving hidden one-shot video setup.
-        if (! MaterializeDeferredImageLayerIfNeeded(opaque, node_id)) {
-            LOG_ERROR("SceneVideoTextureCall: failed to materialize deferred layer=%d command='%s'",
-                      node_id,
-                      command.c_str());
-            return JS_UNDEFINED;
-        }
-        opaque->scene->ApplyLayerVisibility(node_id);
-    }
-
     auto* node = FindNodeById(opaque, node_id);
     if (node == nullptr) {
         if (command == "isPlaying") return JS_NewBool(context, false);
@@ -7142,28 +7064,6 @@ JSValue NativeHasTextureAnimation(JSContext* context, JSValueConst, int argc, JS
     if (node == nullptr) return JS_FALSE;
     return JS_NewBool(
         context, ResolveTextureAnimationNode(opaque, node, static_cast<usize>(slot)) != nullptr);
-}
-
-JSValue NativeIsDeferredRuntimeLayer(JSContext* context, JSValueConst, int argc,
-                                     JSValueConst* argv) {
-    auto* opaque = GetOpaque(context);
-    if (opaque == nullptr || argc < 1) return JS_FALSE;
-
-    int32_t node_id = 0;
-    if (JS_ToInt32(context, &node_id, argv[0]) != 0) return JS_FALSE;
-
-    auto* node = FindNodeById(opaque, node_id);
-    if (node == nullptr) return JS_FALSE;
-
-    int32_t layer_id = FindOwningLayerId(opaque, node);
-    if (layer_id == 0) {
-        // Layer proxies pass their logical layer id as the node id. A deferred placeholder may be
-        // the only scene node for that layer, so the bridge must fall back to the proxy id when no
-        // owner record is available yet.
-        layer_id = node_id;
-    }
-
-    return JS_NewBool(context, IsDeferredRuntimeLayer(opaque, layer_id));
 }
 
 JSValue NativeGetAnimationLayerCount(JSContext* context, JSValueConst, int argc,
@@ -8373,11 +8273,6 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
         m_impl->native_bridge,
         "hasTextureAnimation",
         JS_NewCFunction(context, NativeHasTextureAnimation, "hasTextureAnimation", 2));
-    JS_SetPropertyStr(context,
-                      m_impl->native_bridge,
-                      "isDeferredRuntimeLayer",
-                      JS_NewCFunction(
-                          context, NativeIsDeferredRuntimeLayer, "isDeferredRuntimeLayer", 1));
     JS_SetPropertyStr(
         context,
         m_impl->native_bridge,
@@ -8660,66 +8555,6 @@ void WPSceneScriptHost::Initialize() {
     ApplyMediaState(m_impl->media_state, true);
 }
 
-void WPSceneScriptHost::MaterializeDeferredRuntimeLayersForResidency() {
-    if (!Ready() || m_scene == nullptr) return;
-
-    std::vector<int32_t>        layer_ids;
-    std::unordered_set<int32_t> queued;
-    auto append_if_deferred = [&](int32_t layer_id) {
-        if (layer_id == 0 || !queued.insert(layer_id).second) return;
-        if (m_scene->IsLayerDeferredRuntime(layer_id, SceneDeferredRuntimeKind::Text)) {
-            // Hidden text remains a logical placeholder until its parent chain first becomes
-            // effectively visible. Materializing it during residency warm-up would retain Pango
-            // shaping state, glyph bitmaps, atlas payloads, and effect bridge objects even though
-            // render-graph pruning keeps the layer from drawing. The visibility path already
-            // materializes the selected text variant before rebuilding its graph resources.
-            return;
-        }
-        if (!IsDeferredRuntimeLayer(m_impl, layer_id)) return;
-        layer_ids.push_back(layer_id);
-    };
-
-    for (const auto layer_id : m_scene->layerOrder) {
-        append_if_deferred(layer_id);
-    }
-    for (const auto layer_id : m_scene->DeferredRuntimeLayerIds(SceneDeferredRuntimeKind::Image)) {
-        append_if_deferred(layer_id);
-    }
-    for (const auto layer_id :
-         m_scene->DeferredRuntimeLayerIds(SceneDeferredRuntimeKind::Particle)) {
-        append_if_deferred(layer_id);
-    }
-    if (layer_ids.empty()) return;
-
-    const auto started_at = std::chrono::steady_clock::now();
-    std::size_t materialized_layers = 0;
-
-    for (const auto layer_id : layer_ids) {
-        if (!IsDeferredRuntimeLayer(m_impl, layer_id)) continue;
-
-        // This is a residency warm-up: build the full CPU/runtime layer identity after init scripts
-        // have had a chance to settle visibility, but rely on render-graph pruning to keep hidden
-        // layers out of GPU memory. Later visible=true toggles then skip JSON/material parsing and
-        // only need to compile/prepare the graph resources for the newly visible branch.
-        if (!MaterializeDeferredImageLayerIfNeeded(m_impl, layer_id)) continue;
-        if (!MaterializeDeferredParticleLayerIfNeeded(m_impl, layer_id)) continue;
-
-        materialized_layers++;
-    }
-
-    const auto elapsed_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - started_at)
-            .count();
-    LOG_INFO("DeferredRuntimeResidencyWarmup: requested=%zu materialized=%zu duration=%.2fms "
-             "remaining-image=%zu remaining-particle=%zu remaining-text=%zu",
-             layer_ids.size(),
-             materialized_layers,
-             elapsed_us / 1000.0,
-             m_scene->DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Image),
-             m_scene->DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Particle),
-             m_scene->DeferredRuntimeLayerCount(SceneDeferredRuntimeKind::Text));
-}
 
 void WPSceneScriptHost::FrameBegin(double frame_time) {
     if (m_impl != nullptr) {

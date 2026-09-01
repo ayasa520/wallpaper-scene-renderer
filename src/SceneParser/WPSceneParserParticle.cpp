@@ -478,18 +478,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
     ChildData                  child_data;
 
     bool        is_child            = child_ptr.child != nullptr;
-    const auto* visibility_contract = FindLayerVisibilityContract(context, wppartobj.id);
-    if (! is_child &&
-        ShouldDeferRuntimeLayerMaterialization(
-            context, wppartobj.id, wppartobj.visible, visibility_contract, false)) {
-        // Hidden dynamic particles keep only their logical registration at parse time. The check
-        // uses effective initial visibility through the parent chain, so language branches hidden
-        // by a runtime-controlled container do not allocate particle systems until that branch is
-        // actually shown.
-        RegisterLogicalParticleLayer(context, wppartobj);
-        return;
-    }
-
     if (is_child) {
         p_particle_obj = &(child_ptr.child->obj);
         spNode         = std::make_shared<SceneNode>(Vector3f(child_ptr.child->origin.data()),
@@ -835,4 +823,3 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         particle_subsystem->Prewarm(static_cast<double>(particle_obj.starttime));
     }
 }
-
