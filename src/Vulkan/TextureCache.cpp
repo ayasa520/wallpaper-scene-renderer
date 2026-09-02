@@ -117,8 +117,11 @@ VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
                                        .addressModeW     = (ToVkType(sam.wrapT)),
                                        .anisotropyEnable = (false),
                                        .maxAnisotropy    = (1.0f),
+                                       // Shadow atlases hold reversed depth (near = 1): a receiver
+                                       // is lit when its light-space depth is GREATER than the
+                                       // stored caster depth.
                                        .compareEnable    = compare,
-                                       .compareOp        = compare ? VK_COMPARE_OP_LESS
+                                       .compareOp        = compare ? VK_COMPARE_OP_GREATER
                                                                    : VK_COMPARE_OP_NEVER,
                                        .minLod           = (0.0f),
                                        .maxLod           = max_lod,
@@ -254,17 +257,6 @@ std::size_t ImageSlotUploadBytes(const Image::Slot& slot) {
     std::size_t total = 0;
     for (const auto& mipmap : slot.mipmaps) {
         total += ImageMipmapUploadBytes(mipmap);
-    }
-    return total;
-}
-
-std::size_t PendingImageUploadBytes(
-    std::span<const TextureCachePendingImageUpload> uploads) {
-    std::size_t total = 0;
-    for (const auto& upload : uploads) {
-        for (const auto& stage : upload.stage_bufs) {
-            total += stage.req_size;
-        }
     }
     return total;
 }
@@ -830,7 +822,11 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
 ImageSlotsRef TextureCache::CreateTex(Image& image) {
     m_streaming_tex_uploads.erase(image.key);
     const auto image_revision = CacheRevisionFor(image);
-    if (exists(m_tex_map, image.key)) {
+    // Dynamic textures (live text glyph pages, script-updated images) re-enter here every frame
+    // with a new revision. Only a key's first residency is reported; revision re-uploads and
+    // slot re-creations for an already-known key stay quiet.
+    const bool first_residency = ! exists(m_tex_map, image.key);
+    if (! first_residency) {
         auto& cached = m_tex_map.at(image.key);
         const auto cached_revision_it = m_tex_revision_map.find(image.key);
         if (cached_revision_it != m_tex_revision_map.end() &&
@@ -847,10 +843,6 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                   m_pending_image_uploads)) {
             m_tex_revision_map[image.key] = image_revision;
-            LOG_INFO("TextureCacheUploadQueued: key='%s' slots=%zu revision=%zu reuse=true",
-                     image.key.c_str(),
-                     image.slots.size(),
-                     static_cast<size_t>(image.revision));
             return cached;
         }
 
@@ -867,10 +859,12 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
     }
     m_tex_map[image.key] = std::move(img_slots);
     m_tex_revision_map[image.key] = image_revision;
-    LOG_INFO("TextureCacheUploadQueued: key='%s' slots=%zu revision=%zu reuse=false",
-             image.key.c_str(),
-             image.slots.size(),
-             static_cast<size_t>(image.revision));
+    if (first_residency) {
+        LOG_INFO("TextureCacheUploadQueued: key='%s' slots=%zu revision=%zu",
+                 image.key.c_str(),
+                 image.slots.size(),
+                 static_cast<size_t>(image.revision));
+    }
     return m_tex_map[image.key];
 }
 
@@ -1356,11 +1350,6 @@ void TextureCache::purgeQueuedWorkForKey(std::string_view key) {
 void TextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
     if (m_pending_render_target_clears.empty() && m_pending_image_uploads.empty()) return;
 
-    const auto started_at = std::chrono::steady_clock::now();
-    const auto clear_count = m_pending_render_target_clears.size();
-    const auto upload_count = m_pending_image_uploads.size();
-    const auto upload_bytes = PendingImageUploadBytes(m_pending_image_uploads);
-
     for (const auto& clear : m_pending_render_target_clears) {
         RecordClearNewRenderTargetToTransparentBlack(cmd, clear.image);
     }
@@ -1384,25 +1373,9 @@ void TextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
         m_inflight_image_uploads.emplace_back(std::move(upload));
     }
     m_pending_image_uploads.clear();
-
-    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now() - started_at)
-                                .count();
-    LOG_INFO("TextureCacheRecordUploads: clears=%zu image-uploads=%zu upload-bytes=%zu "
-             "duration=%.2fms",
-             clear_count,
-             upload_count,
-             upload_bytes,
-             static_cast<double>(elapsed_us) / 1000.0);
 }
 
 void TextureCache::RetireCompletedUploads() {
-    if (m_inflight_image_uploads.empty()) return;
-
-    const auto upload_bytes = PendingImageUploadBytes(m_inflight_image_uploads);
-    LOG_INFO("TextureCacheRetireUploads: image-uploads=%zu upload-bytes=%zu",
-             m_inflight_image_uploads.size(),
-             upload_bytes);
     m_inflight_image_uploads.clear();
 }
 

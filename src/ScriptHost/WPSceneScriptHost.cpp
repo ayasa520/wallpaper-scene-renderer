@@ -4823,7 +4823,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                         applied = true;
                         effect_targets++;
                     });
-                if (applied) {
+                if (applied && opaque->color_apply_reported_layers.insert(layer_id).second) {
                     LOG_INFO("SceneLayerColorApply: layer=%d color=[%.3f, %.3f, %.3f] "
                              "base-targets=%zu effect-targets=%zu",
                              layer_id,

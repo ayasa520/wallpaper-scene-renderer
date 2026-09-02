@@ -68,6 +68,17 @@ std::filesystem::path GetPkgCachePath(std::string_view pkgpath) {
     return platform::GetCachePath(PKG_CACHE_DIR) / (sha + ".wpkg");
 }
 
+// Package lookups are case-insensitive: entry names and requested paths are both folded to
+// lowercase before they meet. Only ASCII A-Z is folded, so UTF-8 multibyte sequences in
+// authored directory names pass through untouched and keep hashing to the same key.
+std::string PkgLookupKey(std::string_view path) {
+    std::string key(path);
+    for (auto& ch : key) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + ('a' - 'A'));
+    }
+    return key;
+}
+
 bool LoadPkgFilesFromCache(std::string_view pkgpath, const PkgFileStamp& stamp, std::string& version,
                            std::vector<CachePkgFile>& files) {
     auto cache_file = CreateCBinaryStream(GetPkgCachePath(pkgpath).string());
@@ -133,7 +144,7 @@ std::unique_ptr<WPPkgFs> WPPkgFs::CreatePkgFs(std::string_view pkgpath) {
     if (QueryPkgFileStamp(pkgpath, stamp) && LoadPkgFilesFromCache(pkgpath, stamp, version, pkgfiles)) {
         LOG_INFO("pkg version: %s", version.c_str());
         for (const auto& el : pkgfiles) {
-            pkgfs->m_files.insert({ el.path, { el.path, el.offset, el.length } });
+            pkgfs->AddEntry(el.path, el.offset, el.length);
         }
         return pkgfs;
     }
@@ -160,7 +171,7 @@ std::unique_ptr<WPPkgFs> WPPkgFs::CreatePkgFs(std::string_view pkgpath) {
     idx headerSize   = pkg.Tell();
     for (auto& el : pkgfiles) {
         el.offset += headerSize;
-        pkgfs->m_files.insert({ el.path, { el.path, el.offset, el.length } });
+        pkgfs->AddEntry(el.path, el.offset, el.length);
     }
 
     if (QueryPkgFileStamp(pkgpath, stamp)) {
@@ -169,16 +180,24 @@ std::unique_ptr<WPPkgFs> WPPkgFs::CreatePkgFs(std::string_view pkgpath) {
     return pkgfs;
 }
 
-bool WPPkgFs::Contains(std::string_view path) const { return m_files.count(std::string(path)) > 0; }
+void WPPkgFs::AddEntry(const std::string& path, idx offset, idx length) {
+    // The authored entry name is kept for diagnostics; the map key is the folded lookup key so a
+    // model or material that spells a directory with different casing than the packer still
+    // resolves to the same package entry.
+    m_files.insert({ PkgLookupKey(path), { path, offset, length } });
+}
+
+bool WPPkgFs::Contains(std::string_view path) const {
+    return m_files.count(PkgLookupKey(path)) > 0;
+}
 
 std::shared_ptr<IBinaryStream> WPPkgFs::Open(std::string_view path) {
+    const auto entry = m_files.find(PkgLookupKey(path));
+    if (entry == m_files.end()) return nullptr;
+
     auto pkg = fs::CreateCBinaryStream(m_pkgPath);
     if (! pkg) return nullptr;
-    if (Contains(path)) {
-        const auto& file = m_files.at(std::string(path));
-        return std::make_shared<LimitedBinaryStream>(pkg, file.offset, file.length);
-    }
-    return nullptr;
+    return std::make_shared<LimitedBinaryStream>(pkg, entry->second.offset, entry->second.length);
 }
 
 std::shared_ptr<IBinaryStreamW> WPPkgFs::OpenW(std::string_view) { return nullptr; }

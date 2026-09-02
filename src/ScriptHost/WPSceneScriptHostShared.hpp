@@ -173,6 +173,9 @@ struct WPSceneScriptHost::Opaque {
     WPSceneScriptMediaState      dispatched_media_state;
     std::unordered_set<uint32_t> hovered_instances;
     std::unordered_set<uint32_t> pressed_instances;
+    // Layers whose script-driven color routing has already been reported. Animated colors change
+    // every frame, so only the first application per layer is logged.
+    std::unordered_set<int32_t>  color_apply_reported_layers;
     std::vector<SceneRegistrationRange> pending_scene_registration_ranges;
     // Physical wallpaper output extent (engine.screenResolution). Zero until the wallpaper
     // surface publishes its size; cursor screen coordinates then fall back to the scene canvas.

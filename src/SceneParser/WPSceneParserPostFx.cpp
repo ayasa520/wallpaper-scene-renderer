@@ -1103,10 +1103,10 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     back_state.depthWrite    = true;
     back_state.cullMode      = SceneCullMode::Back;
     back_state.colorLoadMode = SceneModelColorLoadMode::Clear;
-    // The hull is drawn before the camera-inside test, so both hemispheres rasterize
-    // when the eye is inside the volume. Default LESS keeps the near wall and the
-    // fullscreen ray (shader z=0 = D3D near) never enters the light. GREATER + clear 0
-    // keeps max window Z, matching a D3D depth RT sampled as backDepth.
+    // Scene depth is reversed (near = 1, far = 0). The inward-facing hull leaves the volume exit
+    // wall for each pixel; GREATER against a 0-cleared buffer stores that exit depth as
+    // backDepth, and the fullscreen ray (shader z = 1 under REVERSEDEPTH) starts at the near
+    // plane.
     back_state.depthGreater  = true;
     back_state.depthClear    = 0.0f;
 

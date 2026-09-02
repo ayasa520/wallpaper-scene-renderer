@@ -44,9 +44,10 @@ struct SceneModelRenderState {
     bool          depthTest { true };
     bool          depthWrite { true };
     SceneCullMode cullMode { SceneCullMode::Back };
-    // Volumetrics back hull keeps the far window-Z when both hemispheres rasterize (camera inside).
-    bool          depthGreater { false };
-    float         depthClear { 1.0f };
+    // Scene depth is reversed (near = 1, far = 0), so the ordinary nearest-wins test is GREATER
+    // against a buffer cleared to 0.
+    bool          depthGreater { true };
+    float         depthClear { 0.0f };
     // Reflection model chunks may be drawn with a negative scale on the floor normal, which changes
     // the transform handedness and reverses triangle winding. Carry that fact as explicit model-only
     // material state so the Vulkan pass can correct culling without changing legacy 2D materials.
