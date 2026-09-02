@@ -201,7 +201,7 @@ void WPShaderValueUpdater::PrepareFrame() {
                                                m_parallaxOffsetCache,
                                                m_attachmentTransformCache,
                                                nullptr,
-                                               m_mousePos,
+                                               m_parallaxPointerPos,
                                                m_puppet_frame_serial);
         for (auto& light : m_scene->lights) {
             if (! light || light->node() == nullptr) continue;
@@ -221,11 +221,23 @@ void WPShaderValueUpdater::PrepareFrame() {
             (((cTime->tm_hour * 60) + cTime->tm_min) * 60 + cTime->tm_sec) / (24.0f * 60.0f
        * 60.0f);
     */
-    const std::array<float, 2> previousMousePos = m_mousePos;
-    if (!(m_parallax.delay > 0.0f) || !std::isfinite(m_parallax.delay)) {
-        m_mousePosLast     = previousMousePos;
-        m_mousePos         = m_mousePosInput;
-        AdvanceAllPuppets();
+    UpdatePointerState();
+    AdvanceAllPuppets();
+}
+
+void WPShaderValueUpdater::FrameBegin() {}
+
+void WPShaderValueUpdater::UpdatePointerState() {
+    m_pointerPosLast = m_pointerPos;
+    m_pointerPos     = m_pointerPosInput;
+
+    // Disabling camera parallax bypasses the complete official look-at update, so retain the last
+    // filtered target while disabled. Raw pointer uniforms above must continue advancing every
+    // frame independently; otherwise cursor feedback inherits camera-only delay semantics.
+    if (! m_parallax.enable) return;
+
+    if (!(m_parallax.delay > 0.0f) || ! std::isfinite(m_parallax.delay)) {
+        m_parallaxPointerPos = m_pointerPosInput;
         return;
     }
 
@@ -236,13 +248,11 @@ void WPShaderValueUpdater::PrepareFrame() {
     const double responseRate =
         kParallaxResponseRate * (1.0 - static_cast<double>(m_parallax.delay) / kParallaxDelayRange);
     const double t = std::min(1.0, responseRate * frameTime);
-    m_mousePosLast     = previousMousePos;
-    m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
-                                      (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
-    AdvanceAllPuppets();
+    m_parallaxPointerPos = std::array {
+        (float)algorism::lerp(t, m_parallaxPointerPos[0], m_pointerPosInput[0]),
+        (float)algorism::lerp(t, m_parallaxPointerPos[1], m_pointerPosInput[1]),
+    };
 }
-
-void WPShaderValueUpdater::FrameBegin() {}
 
 void WPShaderValueUpdater::AdvanceAllPuppets() {
     if (!m_scene) return;
@@ -300,7 +310,7 @@ Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
                                                local_parallax_cache,
                                                local_attachment_cache,
                                                camera,
-                                               m_mousePos,
+                                               m_parallaxPointerPos,
                                                m_puppet_frame_serial);
 
     if (const auto* node_data = GetNodeData(node); node_data != nullptr) {
@@ -316,8 +326,8 @@ Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
 }
 
 void WPShaderValueUpdater::MouseInput(double x, double y) {
-    m_mousePosInput[0] = SanitizeMouseCoord(x);
-    m_mousePosInput[1] = SanitizeMouseCoord(y);
+    m_pointerPosInput[0] = SanitizeMouseCoord(x);
+    m_pointerPosInput[1] = SanitizeMouseCoord(y);
 }
 
 void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp& existsOp) {
@@ -457,7 +467,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                                               use_camera_local_transform_caches
                                                   ? model_parallax_camera
                                                   : m_scene->activeCamera,
-                                              m_mousePos,
+                                              m_parallaxPointerPos,
                                               m_puppet_frame_serial);
 
     if (exists(m_nodeDataMap, pNode)) {
@@ -788,8 +798,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
     if (info.has_DAYTIME) updateOp(G_DAYTIME, (float)m_dayTime);
 
-    if (info.has_POINTERPOSITION) updateOp(G_POINTERPOSITION, m_mousePos);
-    if (info.has_POINTERPOSITIONLAST) updateOp(G_POINTERPOSITIONLAST, m_mousePosLast);
+    if (info.has_POINTERPOSITION) updateOp(G_POINTERPOSITION, m_pointerPos);
+    if (info.has_POINTERPOSITIONLAST) updateOp(G_POINTERPOSITIONLAST, m_pointerPosLast);
     if (info.has_POINTERSTATE) {
         // Wallpaper Engine cursor ripple shaders treat `.z` as the left-button impulse term. Keep
         // the other lanes neutral because their exact editor-side meanings are effect-specific, and
@@ -840,7 +850,8 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     if (info.has_PARALLAXPOSITION) {
         Vector2f para { 0.5f, 0.5f };
         if (m_parallax.enable) {
-            const Vector2f mouseCentered = Vector2f(&m_mousePos[0]) - Vector2f { 0.5f, 0.5f };
+            const Vector2f mouseCentered =
+                Vector2f(&m_parallaxPointerPos[0]) - Vector2f { 0.5f, 0.5f };
             para = Vector2f { 0.5f, 0.5f } +
                    (Scaling(1.0f, -1.0f) * mouseCentered) * m_parallax.mouseinfluence;
         }
