@@ -195,6 +195,7 @@ struct VulkanRender::Impl {
      */
     bool m_offscreen_fence_pending { false };
     bool m_offscreen_acquire_export_ok { false };
+    bool m_trace_next_offscreen_frame { true };
     std::deque<std::size_t> m_deferred_prepare_indices;
     std::unordered_set<std::size_t> m_deferred_waiting_indices_logged;
 
@@ -1055,6 +1056,12 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     }
 
     const uint32_t slot_id = static_cast<uint32_t>(inprogress_handle->id());
+    const bool trace_frame = m_trace_next_offscreen_frame;
+    if (trace_frame) {
+        LOG_INFO("OffscreenFirstFrameTrace: stage=frame-begin slot=%u passes=%zu",
+                 slot_id,
+                 m_passes.size());
+    }
     if (m_offscreen_frame_release_cb) {
         /*
          * Vivid reuses the exported offscreen image ring directly as the display
@@ -1075,6 +1082,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     rr.scene = &scene;
     m_finpass->setPresent(image);
 
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=pass-update-begin");
     for (auto* p : m_passes) {
         if (p->prepared()) {
             // Offscreen rendering exports the result to GTK, making stale particle bytes visible as
@@ -1083,6 +1091,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
             p->updateBeforeUpload();
         }
     }
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=pass-update-complete");
 
     if (!checkVkResult(rr.command.Begin(VkCommandBufferBeginInfo {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1090,6 +1099,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=command-begin-complete");
     const bool gpu_profile_frame = gpuProfilerActive();
     if (gpu_profile_frame) {
         auto& profiler = m_gpu_profiler;
@@ -1100,11 +1110,13 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
     }
 
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=uploads-begin");
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
     rr.immutable_meshes.recordUploads(rr.command);
     m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=uploads-complete");
 
     if (gpu_profile_frame && m_gpu_profiler.used < m_gpu_profiler.capacity) {
         auto& profiler = m_gpu_profiler;
@@ -1113,19 +1125,34 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         profiler.pending_names.emplace_back("__uploads");
     }
 
-    for (auto* p : m_passes) {
+    for (std::size_t pass_index = 0; pass_index < m_passes.size(); pass_index++) {
+        auto* p = m_passes[pass_index];
         if (! p->prepared()) continue;
+        std::string pass_name;
+        if (trace_frame || gpu_profile_frame) pass_name = p->profileName();
+        if (trace_frame) {
+            LOG_INFO("OffscreenFirstFrameTrace: stage=pass-begin index=%zu name='%s'",
+                     pass_index,
+                     pass_name.c_str());
+        }
         p->execute(*m_device, rr);
+        if (trace_frame) {
+            LOG_INFO("OffscreenFirstFrameTrace: stage=pass-complete index=%zu name='%s'",
+                     pass_index,
+                     pass_name.c_str());
+        }
         if (gpu_profile_frame && m_gpu_profiler.used < m_gpu_profiler.capacity) {
             auto& profiler = m_gpu_profiler;
             rr.command.WriteTimestamp(
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
-            profiler.pending_names.emplace_back(p->profileName());
+            profiler.pending_names.emplace_back(std::move(pass_name));
         }
     }
 
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=command-end-begin");
     if (!checkVkResult(rr.command.End(), "end offscreen frame command buffer"))
         return;
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=command-end-complete");
 
     const bool pipelined = m_offscreen_acquire_export_ok &&
                            slot_id < rr.sem_offscreen_acquire.size() &&
@@ -1140,9 +1167,14 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         sub_info.signalSemaphoreCount = 1;
         sub_info.pSignalSemaphores    = rr.sem_offscreen_acquire[slot_id].address();
     }
+    if (trace_frame) {
+        LOG_INFO("OffscreenFirstFrameTrace: stage=submit-begin pipelined=%s",
+                 pipelined ? "true" : "false");
+    }
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=submit-complete");
     if (gpu_profile_frame && m_gpu_profiler.used >= 2) {
         m_gpu_profiler.pending = true;
     }
@@ -1171,6 +1203,10 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         if (export_result == VK_SUCCESS && acquire_fd >= 0) {
             m_ex_swapchain->storeAcquireFd(slot_id, acquire_fd);
             m_offscreen_fence_pending = true;
+            if (trace_frame) {
+                LOG_INFO("OffscreenFirstFrameTrace: stage=acquire-fd-export-complete fd=%d",
+                         acquire_fd);
+            }
         } else {
             checkVkResult(export_result, "export offscreen acquire SYNC_FD");
             LOG_INFO("offscreen acquire SYNC_FD export failed; "
@@ -1182,16 +1218,22 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!m_offscreen_fence_pending) {
         if (!checkVkResult(rr.fence_frame.Wait(vk_wait_time), "wait offscreen frame fence"))
             return;
+        if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=fence-wait-complete");
         m_device->tex_cache().RetireCompletedUploads();
         rr.immutable_meshes.retireStaging();
         if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
             return;
     }
     m_ex_swapchain->renderFrame();
+    if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=slot-publish-complete");
     if (m_offscreen_frame_ready_cb) {
         // The slot just became eatFrame()-visible; wake the IPC relay so it
         // publishes now instead of on its next fixed-rate poll tick.
         m_offscreen_frame_ready_cb(slot_id);
+    }
+    if (trace_frame) {
+        LOG_INFO("OffscreenFirstFrameTrace: stage=frame-ready-callback-complete");
+        m_trace_next_offscreen_frame = false;
     }
 }
 
@@ -1392,6 +1434,14 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     }
     // Pass destruction below must not race the deferred offscreen submission.
     (void)drainOffscreenFrame();
+
+    /*
+     * The next submitted frame is the first point where a newly compiled
+     * graph records every pass together. Keep a bounded stage trace enabled
+     * until that frame is published so a process-level crash identifies the
+     * exact CPU recording boundary without logging every steady-state frame.
+     */
+    m_trace_next_offscreen_frame = true;
 
     // A topology rebuild invalidates the compiled pass list and the backing mesh buffers that were
     // uploaded for the previous graph. Reallocating those buffers keeps the full rebuild path
