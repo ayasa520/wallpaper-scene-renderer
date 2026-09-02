@@ -616,7 +616,7 @@ struct FinalShaderCapabilityEntry {
     FinalOutputCapability capability;
 };
 
-constexpr std::array<FinalShaderCapabilityEntry, 2> kFinalShaderCapabilities {{
+constexpr std::array<FinalShaderCapabilityEntry, 5> kFinalShaderCapabilities {{
     // Scroll evaluates UV/time in the authored layer projection. Running its visible raster in a
     // source-sized private target quantizes repeated pixel art before the layer is scaled to the
     // display. The capability is attached to the shader contract itself, never to a wallpaper,
@@ -629,6 +629,16 @@ constexpr std::array<FinalShaderCapabilityEntry, 2> kFinalShaderCapabilities {{
     // shader in scene space so its matrix, pointer coordinates, and visible layer geometry remain
     // one coherent projection contract.
     { "effects/xray", FinalOutputCapability::SceneAuthoredWriter },
+    // Vertex-mode distortions displace `a_Position` before multiplying by g_MVP, and the
+    // displacement is authored in layer pixels: skew adds `g_Texture0Resolution.zw * g_Left` (and
+    // friends), foliagesway adds `g_Strength * 100`, transform rotates/offsets the raw position.
+    // That arithmetic is correct on the authored final pass: a +/-(W/2, H/2) pixel card with the
+    // unscaled layer MVP. The private effect-camera pass instead draws the 2x2 clip-space helper
+    // card, where a 0.27 skew on a 244 px box moves the left edge ~66 clip units off-target and
+    // the whole layer vanishes. Keep these shaders in scene space.
+    { "effects/skew", FinalOutputCapability::SceneAuthoredWriter },
+    { "effects/foliagesway", FinalOutputCapability::SceneAuthoredWriter },
+    { "effects/transform", FinalOutputCapability::SceneAuthoredWriter },
 }};
 
 FinalOutputCapability ResolveFinalShaderCapability(std::string_view shader) {
@@ -3783,6 +3793,9 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
 
         const std::string in_rt        = primitive->bridge.pingpong_a;
         int32_t           effect_index = -1;
+        // Same final-writer contract as image layers: the shader of the last pass that writes the
+        // chain output decides whether that pass may draw in scene space or must stay private.
+        FinalOutputCapability final_shader_capability = FinalOutputCapability::PrivateThenPublish;
         for (const auto& wp_effect : text_obj.effects) {
             effect_index++;
             std::shared_ptr<SceneImageEffect> img_effect = std::make_shared<SceneImageEffect>();
@@ -3903,6 +3916,9 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                     effect_materials_ok = false;
                     break;
                 }
+                if (IsCurrentEffectWriterTarget(material_output)) {
+                    final_shader_capability = ResolveFinalShaderCapability(material_source.shader);
+                }
                 LoadConstvalue(effect_material, material_source, effect_shader_info);
                 LoadUserShaderValue(
                     effect_material, material_source, effect_shader_info, context.user_properties);
@@ -3963,6 +3979,24 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 imgEffectLayer->AddEffect(img_effect);
             }
         }
+
+        // Mirror the image-layer priority: a dependency source must stay sampleable, otherwise the
+        // final writer shader decides. ResolveFinalOutputCapability() still forces the private
+        // route for chains with runtime-toggled effects and for composition-source routing.
+        if (scene.IsLayerOffscreenDependencySource(text_obj.id)) {
+            imgEffectLayer->SetFinalOutputCapability(FinalOutputCapability::PrivateDependency);
+        } else {
+            imgEffectLayer->SetFinalOutputCapability(final_shader_capability);
+        }
+        LOG_INFO("SceneTextEffectOutputCapability: layer=%d name='%s' capability=%.*s "
+                 "dependency=%s",
+                 text_obj.id,
+                 text_obj.name.c_str(),
+                 static_cast<int>(FinalOutputCapabilityName(
+                     imgEffectLayer->DeclaredFinalOutputCapability()).size()),
+                 FinalOutputCapabilityName(
+                     imgEffectLayer->DeclaredFinalOutputCapability()).data(),
+                 scene.IsLayerOffscreenDependencySource(text_obj.id) ? "true" : "false");
     }
 
     if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
