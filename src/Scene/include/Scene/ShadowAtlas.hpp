@@ -37,15 +37,15 @@ inline constexpr float kShadowPointViewportScaleY = 0.3333f;
 //   clip.w = info.z * view_z + info.w
 // The six face views in CalculateProjectedCoordsPoint put a point in front of
 // the light at negative view-z (e.g. +X: view_z = light.x - world.x). The
-// right-handed 0-near/1-far pair maps distance d in [near, far] to ndc.z in
-// [0, 1]. The left-handed (f/(f-n), -n*f/(f-n), 1, 0) pair yields ndc.z > 1
-// for every in-front sample, so SampleCmp LESS vs a far-1.0 empty tile fails
-// for all rays.
+// right-handed reversed pair maps distance d in [near, far] to ndc.z in
+// [1, 0], the same convention as the scene camera: the near plane is 1 and an
+// empty (far-cleared) atlas tile is 0, so SampleCmp GREATER lights every
+// unoccluded ray.
 inline Eigen::Vector4f ShadowProjectionInfo(float nearp, float farp) {
     const float n     = nearp;
     const float f     = std::max(farp, n + 0.01f);
     const float denom = std::max(f - n, 1.0e-6f);
-    return Eigen::Vector4f(-f / denom, -n * f / denom, -1.0f, 0.0f);
+    return Eigen::Vector4f(n / denom, n * f / denom, -1.0f, 0.0f);
 }
 
 // Same z/w as ShadowProjectionInfo. Rendering also bakes FOV into xy so NDC
@@ -58,9 +58,11 @@ inline Eigen::Matrix4f ShadowPointProjection(float nearp, float farp, float fov_
         std::max(fov_degrees, 0.1f) * 0.5f * 0.01745329238474369f;
     const float fl    = 1.0f / std::tan(half);
     const float denom = std::max(f - n, 1.0e-6f);
-    const float a     = -f / denom;
-    float       b     = -n * f / denom;
-    if (render_bias) b -= kShadowDepthBiasB;
+    const float a     = n / denom;
+    float       b     = n * f / denom;
+    // The constant render bias moves stored casters slightly toward the light; with reversed
+    // depth that is the positive direction.
+    if (render_bias) b += kShadowDepthBiasB;
     Eigen::Matrix4f proj = Eigen::Matrix4f::Zero();
     proj(0, 0)           = fl;
     proj(1, 1)           = fl;

@@ -3389,42 +3389,47 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
     }
 
     const auto& layout = primitive->layout;
-    LOG_INFO("SceneTextLayoutContract: layer=%d name='%s' bridge=%s authored-effects=%s "
-             "shader-blend=%s pointsize=%.3f pointsize-authoring=%.3f conversion=%.3f "
-             "object-scale=[%.5f %.5f %.5f] render-scale=%.3f backing-density=%.3f "
-             "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
-             "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
-             "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
-             "source-crop=[%.3f %.3f %.3f %.3f]",
-             object.id,
-             object.name.c_str(),
-             render_contract.RequiresBridge() ? "true" : "false",
-             render_contract.has_materialized_authored_effects ? "true" : "false",
-             render_contract.uses_shader_color_blend_bridge ? "true" : "false",
-             object.pointsize,
-             layout.point_size_authoring_units,
-             static_cast<float>(kTextPointSizeToAuthoringUnits),
-             object.scale[0],
-             object.scale[1],
-             object.scale[2],
-             render_scale,
-             layout.backing_density,
-             layout.logical_size[0],
-             layout.logical_size[1],
-             layout.logical_source_size[0],
-             layout.logical_source_size[1],
-             layout.glyph_display_size[0],
-             layout.glyph_display_size[1],
-             layout.glyph_source_size[0],
-             layout.glyph_source_size[1],
-             layout.glyph_offset[0],
-             layout.glyph_offset[1],
-             layout.visible_display_offset[0],
-             layout.visible_display_offset[1],
-             layout.glyph_source_crop[0],
-             layout.glyph_source_crop[1],
-             layout.glyph_source_crop[2],
-             layout.glyph_source_crop[3]);
+    // Only the parse-time layout (atlas version 0) is reported. Script-driven text such as clocks
+    // and live readouts rebuilds its primitive every frame, and repeating the contract for each
+    // reraster would flood the log without adding information.
+    if (texture_version == 0) {
+        LOG_INFO("SceneTextLayoutContract: layer=%d name='%s' bridge=%s authored-effects=%s "
+                 "shader-blend=%s pointsize=%.3f pointsize-authoring=%.3f conversion=%.3f "
+                 "object-scale=[%.5f %.5f %.5f] render-scale=%.3f backing-density=%.3f "
+                 "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
+                 "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
+                 "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
+                 "source-crop=[%.3f %.3f %.3f %.3f]",
+                 object.id,
+                 object.name.c_str(),
+                 render_contract.RequiresBridge() ? "true" : "false",
+                 render_contract.has_materialized_authored_effects ? "true" : "false",
+                 render_contract.uses_shader_color_blend_bridge ? "true" : "false",
+                 object.pointsize,
+                 layout.point_size_authoring_units,
+                 static_cast<float>(kTextPointSizeToAuthoringUnits),
+                 object.scale[0],
+                 object.scale[1],
+                 object.scale[2],
+                 render_scale,
+                 layout.backing_density,
+                 layout.logical_size[0],
+                 layout.logical_size[1],
+                 layout.logical_source_size[0],
+                 layout.logical_source_size[1],
+                 layout.glyph_display_size[0],
+                 layout.glyph_display_size[1],
+                 layout.glyph_source_size[0],
+                 layout.glyph_source_size[1],
+                 layout.glyph_offset[0],
+                 layout.glyph_offset[1],
+                 layout.visible_display_offset[0],
+                 layout.visible_display_offset[1],
+                 layout.glyph_source_crop[0],
+                 layout.glyph_source_crop[1],
+                 layout.glyph_source_crop[2],
+                 layout.glyph_source_crop[3]);
+    }
 
     *out_primitive = std::move(primitive);
     return true;

@@ -27,7 +27,11 @@ private:
         idx offset { 0 };
         idx length { 0 };
     };
-    std::string                              m_pkgPath;
+
+    void AddEntry(const std::string& path, idx offset, idx length);
+
+    std::string m_pkgPath;
+    // Keyed by the case-folded entry path (see PkgLookupKey); PkgFile::path keeps the authored name.
     std::unordered_map<std::string, PkgFile> m_files;
 };
 } // namespace fs

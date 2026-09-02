@@ -2817,6 +2817,12 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
         return true;
     };
 
+    // Scene depth runs reversed (near plane at clip depth 1, far at 0, GREATER test). Stock
+    // shaders branch on this combo for their depth-dependent code (volumetric ray clipping,
+    // occlusion-test placement, cascade bounds), so every compile carries it. It also feeds the
+    // prepared-shader cache key through the combo list.
+    shader_info->combos["REVERSEDEPTH"] = "1";
+
     bool has_cache_dir = vfs.IsMounted("cache");
 
     if (has_cache_dir) {

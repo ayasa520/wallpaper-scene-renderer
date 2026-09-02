@@ -294,18 +294,19 @@ bool ShadowAtlasPass::ensurePipeline(const Device& device, RenderingResources& r
     PipelineParameters params;
     GraphicsPipeline   pipeline;
     pipeline.toDefault();
+    // The atlas stores reversed depth (near = 1, far = 0) like the scene, so the nearest caster
+    // wins with GREATER against a 0-cleared tile.
     pipeline.depth.depthTestEnable  = VK_TRUE;
     pipeline.depth.depthWriteEnable = VK_TRUE;
-    pipeline.depth.depthCompareOp   = VK_COMPARE_OP_LESS;
-    // Wallpaper Engine enables its dedicated slope-scaled rasterizer state while drawing the
-    // shadow atlas. Its D3D11 renderer uses -4.0 with reverse depth; this renderer stores forward
-    // depth and compares LESS, so the equivalent offset has the opposite sign. A constant-only
-    // clip-space offset cannot follow the receiver slope and produces regular self-shadow bands
-    // on large oblique surfaces such as roads.
+    pipeline.depth.depthCompareOp   = VK_COMPARE_OP_GREATER;
+    // A dedicated slope-scaled rasterizer bias pushes casters away from the light while the atlas
+    // is drawn; with reversed depth "away" is the negative direction. A constant-only clip-space
+    // offset cannot follow the receiver slope and produces regular self-shadow bands on large
+    // oblique surfaces such as roads.
     pipeline.raster.depthBiasEnable      = VK_TRUE;
-    pipeline.raster.depthBiasSlopeFactor = 4.0f;
+    pipeline.raster.depthBiasSlopeFactor = -4.0f;
     params.debug_name = "ShadowAtlas";
-    params.cache_key  = "ShadowAtlas|d32|less|slope-bias|no-color|" + key;
+    params.cache_key  = "ShadowAtlas|d32|greater|slope-bias|no-color|" + key;
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>())
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -595,13 +596,13 @@ void ShadowAtlasPass::updateBeforeUpload() {
 
 void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
     if (m_desc.vk_target.handle == VK_NULL_HANDLE) return;
-    // First bind always far-clears the atlas (depth 1.0), including zero casters.
-    // Empty tiles stay at far so comparison sampling keeps the unoccluded path.
+    // First bind always far-clears the atlas (reversed depth 0.0), including zero casters.
+    // Empty tiles stay at far so GREATER comparison sampling keeps the unoccluded path.
     if (! ensureClearPass(device) || ! ensureFramebuffer(device) || ! m_fb) return;
 
     const VkExtent2D extent { m_desc.vk_target.extent.width, m_desc.vk_target.extent.height };
     VkClearValue     clear {};
-    clear.depthStencil = { 1.0f, 0 };
+    clear.depthStencil = { 0.0f, 0 };
     VkRenderPassBeginInfo begin {
         .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass      = *m_clear_pass,

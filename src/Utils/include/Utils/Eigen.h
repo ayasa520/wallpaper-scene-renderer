@@ -29,35 +29,36 @@ Matrix4d inline LookAt(Vector3d eye, Vector3d center, Vector3d up) noexcept {
     return trans.matrix();
 }
 
+// Scene depth is reversed: both projections place the near plane at clip depth 1 and the far
+// plane at 0. Depth buffers are cleared to 0 and tested with GREATER. With a floating-point
+// depth attachment this keeps near-uniform relative precision along the whole view distance, so
+// concentric shells a fraction of a percent apart (planet surface, clouds, atmosphere) still
+// resolve when the camera is tens of thousands of near-plane distances away.
 Matrix4d inline Ortho(double left, double right, double bottom, double top, double nearz,
                       double farz) noexcept {
-    // translate to orgin + scale to [-1,1]
-    Affine3d trans = Affine3d::Identity();
-    trans.pretranslate(
-        Vector3d(-(left + right) / 2.0f, -(top + bottom) / 2.0f, -(nearz + farz) / 2.0f));
-    trans.prescale(Vector3d(2.0f / (right - left), 2.0f / (top - bottom), 2.0f / (farz - nearz)));
-    // look at neg z, switch z before
-    trans.scale(Vector3d(1.0f, 1.0f, -1.0f));
-
-    // to [0, 1]
-    trans.prescale(Vector3d(1.0f, 1.0f, 0.5f));
-    trans.pretranslate(Vector3d(0.0f, 0.0f, 0.5f));
-    return trans.matrix();
+    // Right-handed view space looks down -z: a point at distance d in front of the eye has
+    // view z = -d and maps to (farz - d) / (farz - nearz).
+    Matrix4d m   = Matrix4d::Identity();
+    m(0, 0)      = 2.0 / (right - left);
+    m(0, 3)      = -(right + left) / (right - left);
+    m(1, 1)      = 2.0 / (top - bottom);
+    m(1, 3)      = -(top + bottom) / (top - bottom);
+    m(2, 2)      = 1.0 / (farz - nearz);
+    m(2, 3)      = farz / (farz - nearz);
+    return m;
 }
 
 Matrix4d inline Perspective(double fov, double aspect, double nearz, double farz) noexcept {
-    Projective3d trans = Projective3d::Identity();
-    // no need to deal with neg z
-    trans.prescale(Vector3d(nearz, nearz, (nearz + farz)));
-    trans(3, 2)  = 1.0f;
-    trans(3, 3)  = 0.0f;
-    trans(2, 3)  = -nearz * farz;
-    double top   = std::tan(fov / 2.0f) * std::abs(nearz);
-    double right = top * aspect;
-    // as look at neg z, switch z before
-    trans.scale(Vector3d(1.0f, 1.0f, -1.0f));
-    // as ortho also switch, do switch after to cancle
-    trans.prescale(Vector3d(1.0f, 1.0f, -1.0f));
-    return Ortho(-right, right, -top, top, nearz, farz) * trans.matrix();
+    // Vertical field of view; clip z = (nearz * view_z + nearz * farz) / (farz - nearz) with
+    // clip w = -view_z, so depth d in front of the eye yields nearz * (farz - d) / ((farz - nearz) * d).
+    const double height = 1.0 / std::tan(fov / 2.0);
+    const double width  = height / aspect;
+    Matrix4d     m      = Matrix4d::Zero();
+    m(0, 0)             = width;
+    m(1, 1)             = height;
+    m(2, 2)             = nearz / (farz - nearz);
+    m(2, 3)             = nearz * farz / (farz - nearz);
+    m(3, 2)             = -1.0;
+    return m;
 }
 } // namespace Eigen

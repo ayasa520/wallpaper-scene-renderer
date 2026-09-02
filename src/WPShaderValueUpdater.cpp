@@ -127,16 +127,6 @@ bool IsModelRenderNode(SceneNode* node) {
     return material != nullptr && material->modelRenderState.has_value();
 }
 
-Matrix4d ToD3dClipZViewProjection(const Matrix4d& view_projection) {
-    // Vivid Ortho() maps near→NDC z=1 and far→NDC z=0 (GL-like reverse Z after the Vulkan
-    // [0,1] remap). Official volumetricsfront.vert FULLSCREEN writes gl_Position.z=0 when
-    // REVERSEDEPTH is off, which is D3D near. clip_z' = clip_w - clip_z makes NDC' = 1 - NDC
-    // so the hull window Z and g_EffectModelMatrix unprojection share that D3D convention.
-    Matrix4d d3d = view_projection;
-    d3d.row(2)   = view_projection.row(3) - view_projection.row(2);
-    return d3d;
-}
-
 ShaderValue ToDxcCBufferMatrixUniform(const Matrix4d& matrix) {
     // The DXC WE prologue maps authored `mul(v, M)` to native `mul(M, v)` so shader code observes
     // the same column-vector transform contract as the renderer. Keep Eigen's column-major matrix
@@ -736,11 +726,13 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         if (vol.volumetric_pass && vol.volumetric_light != nullptr) {
             const SceneLight& light = *vol.volumetric_light;
             const Matrix4d    alt_vp = light.AltViewProjection().cast<double>();
-            const Matrix4d    d3d_vp = ToD3dClipZViewProjection(viewProTrans);
-            if (info.has_VP) updateOp(G_VP, ToDxcCBufferMatrixUniform(d3d_vp));
+            // The camera projection is already reversed-depth, which is the convention the
+            // volumetric shaders expect under REVERSEDEPTH for both the hull window Z and the
+            // g_EffectModelMatrix unprojection.
+            if (info.has_VP) updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
             if (info.has_AVP) updateOp(G_AVP, ToDxcCBufferMatrixUniform(alt_vp));
             if (info.has_EM) {
-                updateOp(G_EM, ToDxcCBufferMatrixUniform(d3d_vp.inverse()));
+                updateOp(G_EM, ToDxcCBufferMatrixUniform(viewProTrans.inverse()));
             }
             if (info.has_AM) {
                 if (light.type() == SceneLightType::Point) {
@@ -990,7 +982,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                             std::cos(light.innerCone() * SceneLight::Deg2Rad()));
                 append_vec4(spot_exponent, light.exponent(), 0, 0, 0);
                 if (shadows_on && (light.castsShadows() || light.hasCookie())) {
-                    append_mat4(feat_proj, light.WorldToLightClip());
+                    // Shadow sampling compares against the reversed-depth atlas; cookie lookups
+                    // only consume the xy of the same projection.
+                    append_mat4(feat_proj, light.ShadowSpotWorldToLightClip(false));
                     const auto uv = light.ShadowAtlasUv();
                     append_vec4(feat_xform, uv.x(), uv.y(), uv.z(), uv.w());
                 }

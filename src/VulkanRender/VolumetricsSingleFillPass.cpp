@@ -295,7 +295,8 @@ void VolumetricsSingleFillPass::clearFar(RenderingResources& rr) const {
                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_DEPENDENCY_BY_REGION_BIT,
                                to_transfer);
-    const VkClearColorValue far_depth { 1.0f, 1.0f, 1.0f, 1.0f };
+    // Reversed scene depth: the far plane is 0.
+    const VkClearColorValue far_depth { 0.0f, 0.0f, 0.0f, 1.0f };
     rr.command.ClearColorImage(img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far_depth, range);
     VkImageMemoryBarrier to_shader {
         .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -331,7 +332,7 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
         depth_image = &raw->second;
     }
     if (depth_image == nullptr) {
-        // A cleared scene depth is far 1.0 when reverse-depth is off.
+        // No model wrote scene depth this frame: expose an all-far (0) limit depth.
         clearFar(rr);
         return;
     }

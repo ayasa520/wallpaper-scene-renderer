@@ -174,12 +174,13 @@ public:
 
     // Point lights with SHADOW write projectionInfo into g_RenderVar3.
     // Must match CalculateProjectedCoordsPoint: negative view-z in front of
-    // each cube face, so clip.w = -view_z and ndc.z stays in [0, 1].
+    // each cube face, so clip.w = -view_z and ndc.z runs reversed from 1 at the
+    // near plane to 0 at the far plane, like the atlas it is compared against.
     Eigen::Vector4f ShadowProjectionInfo() const {
         const float n     = ShadowNearPlane();
         const float f     = ShadowFarPlane();
         const float denom = std::max(f - n, 1.0e-6f);
-        return Eigen::Vector4f(-f / denom, -n * f / denom, -1.0f, 0.0f);
+        return Eigen::Vector4f(n / denom, n * f / denom, -1.0f, 0.0f);
     }
 
     // Parented lights compose the authored ancestor chain at draw time like every other routed
@@ -259,7 +260,7 @@ public:
         return trans * LightAxes() * scale;
     }
 
-    Eigen::Matrix4f WorldToLightClip() const {
+    Eigen::Matrix4f WorldToLight() const {
         const Eigen::Vector3f origin  = WorldOrigin();
         const Eigen::Matrix4f axes    = LightAxes();
         Eigen::Matrix4f       world_to_light = Eigen::Matrix4f::Identity();
@@ -268,7 +269,12 @@ public:
         world_to_light(0, 3)    = t.x();
         world_to_light(1, 3)    = t.y();
         world_to_light(2, 3)    = t.z();
+        return world_to_light;
+    }
 
+    // Spot cone clip used by the cookie projection and the volumetric hull: light space looks
+    // down +z, near maps to clip depth 0 and far to 1.
+    Eigen::Matrix4f WorldToLightClip() const {
         const float fov   = std::max(m_outer_cone * 2.0f, 0.1f) * Deg2Rad();
         const float nearp = std::max(m_radius * 0.001f, 0.01f);
         const float farp  = std::max(m_radius, nearp + 0.01f);
@@ -279,16 +285,28 @@ public:
         proj(2, 2)           = farp / (farp - nearp);
         proj(2, 3)           = -nearp * farp / (farp - nearp);
         proj(3, 2)           = 1.0f;
-        return proj * world_to_light;
+        return proj * WorldToLight();
     }
 
-    // Same clip transform as WorldToLightClip, with a constant B bias for the
-    // shadow rasterizer. Sampling still uses the unbiased matrix.
-    Eigen::Matrix4f ShadowWorldToLightClip() const {
-        Eigen::Matrix4f clip = WorldToLightClip();
-        clip(2, 3) -= 0.0005f;
-        return clip;
+    // Spot shadow clip: same cone, but depth runs reversed (near = 1, far = 0) like the shadow
+    // atlas it is rasterized into and sampled against. The render variant adds a constant B
+    // bias that moves stored casters slightly toward the light; sampling stays unbiased.
+    Eigen::Matrix4f ShadowSpotWorldToLightClip(bool render_bias) const {
+        const float fov   = std::max(m_outer_cone * 2.0f, 0.1f) * Deg2Rad();
+        const float nearp = std::max(m_radius * 0.001f, 0.01f);
+        const float farp  = std::max(m_radius, nearp + 0.01f);
+        const float f     = 1.0f / std::tan(fov * 0.5f);
+        Eigen::Matrix4f proj = Eigen::Matrix4f::Zero();
+        proj(0, 0)           = f;
+        proj(1, 1)           = f;
+        proj(2, 2)           = -nearp / (farp - nearp);
+        proj(2, 3)           = nearp * farp / (farp - nearp);
+        if (render_bias) proj(2, 3) += 0.0005f;
+        proj(3, 2)           = 1.0f;
+        return proj * WorldToLight();
     }
+
+    Eigen::Matrix4f ShadowWorldToLightClip() const { return ShadowSpotWorldToLightClip(true); }
 
     Eigen::Vector3f ShadowCascadeCenter(int cascade,
                                         const DirectionalShadowView& view) const {
@@ -353,11 +371,12 @@ public:
         Eigen::Matrix4f proj = Eigen::Matrix4f::Zero();
         proj(0, 0)           = 1.0f / half_xy;
         proj(1, 1)           = 1.0f / half_xy;
-        // D3D/Vulkan clip Z is [0, 1]. Symmetric [-halfDepth, +halfDepth] near/far values map
-        // light-space zero to 0.5.
-        proj(2, 2)           = 1.0f / (half_depth * 2.0f);
+        // Reversed depth over the symmetric [-halfDepth, +halfDepth] interval: light-space zero
+        // maps to 0.5, the near limit to 1 and the far limit to 0. The render bias pushes stored
+        // casters slightly away from the light, which is the negative direction here.
+        proj(2, 2)           = -1.0f / (half_depth * 2.0f);
         float b              = 0.5f;
-        if (render_bias) b += 0.0005f;
+        if (render_bias) b -= 0.0005f;
         proj(2, 3) = b;
         proj(3, 3) = 1.0f;
         return proj * world_to_light;
