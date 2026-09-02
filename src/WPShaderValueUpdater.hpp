@@ -257,16 +257,21 @@ public:
     void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
 
 private:
+    void UpdatePointerState();
+
     Scene*               m_scene;
     WPCameraParallax     m_parallax;
     double               m_dayTime { 0.0f };
     std::array<float, 2> m_texelSize { 1.0f / 1920.0f, 1.0f / 1080.0f };
 
-    std::array<float, 2> m_mousePos { 0.5f, 0.5f };
-    // Stores the position published on the previous FrameBegin. Feedback effects compare this with
-    // g_PointerPosition to decide whether to inject a new cursor impulse into their simulation FBOs.
-    std::array<float, 2> m_mousePosLast { 0.5f, 0.5f };
-    std::array<float, 2> m_mousePosInput { 0.5f, 0.5f };
+    // Pointer uniforms expose the unsmoothed engine input. Camera-parallax delay owns a separate
+    // sample because Wallpaper Engine applies that temporal filter only to its look-at target;
+    // sharing one sample would delay cursor feedback shaders whenever a scene authored parallax
+    // delay, including scenes where camera parallax itself is disabled.
+    std::array<float, 2> m_pointerPos { 0.5f, 0.5f };
+    std::array<float, 2> m_pointerPosLast { 0.5f, 0.5f };
+    std::array<float, 2> m_pointerPosInput { 0.5f, 0.5f };
+    std::array<float, 2> m_parallaxPointerPos { 0.5f, 0.5f };
 
     std::array<float, 2> m_screen_size { 1920, 1080 };
 
