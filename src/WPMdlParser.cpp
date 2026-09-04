@@ -49,6 +49,10 @@ enum class StaticMaterialPathLayout
 enum class StaticChunkLayout
 {
     LegacyReservedVertexBlock,
+    // Versions 15 and 16: each chunk starts with an info word (plus one extra word when its
+    // bit 1 is set) and its own vertex flag, then the vertex and index blobs. There are no
+    // bounds floats and no trailing aux/part/record data; bounds come from the vertices.
+    PerChunkVertexFlag,
     Version23Chunk,
 };
 
@@ -79,9 +83,20 @@ struct StaticMdlHeader {
     bool UsesVersion23Chunks() const {
         return chunk_layout == StaticChunkLayout::Version23Chunk;
     }
+
+    bool UsesPerChunkVertexFlag() const {
+        return chunk_layout == StaticChunkLayout::PerChunkVertexFlag;
+    }
+
+    // Formats whose header material count is the number of material strings stored inside every
+    // chunk (the first one names the chunk material), as opposed to one interleaved string per
+    // chunk or a prefixed table before the chunks.
+    bool ReadsMaterialStringsPerChunk() const {
+        return UsesVersion23Chunks() || UsesPerChunkVertexFlag();
+    }
 };
 
-constexpr std::array<StaticMdlFormat, 3> kStaticMdlFormats {{
+constexpr std::array<StaticMdlFormat, 5> kStaticMdlFormats {{
     { 4,
       StaticHeaderFieldRole::MaterialPathCount,
       StaticHeaderFieldRole::GeometryChunkCount,
@@ -92,6 +107,16 @@ constexpr std::array<StaticMdlFormat, 3> kStaticMdlFormats {{
       StaticHeaderFieldRole::GeometryAndMaterialPathCount,
       StaticMaterialPathLayout::InterleavedPerChunk,
       StaticChunkLayout::LegacyReservedVertexBlock },
+    { 15,
+      StaticHeaderFieldRole::MaterialPathCount,
+      StaticHeaderFieldRole::GeometryChunkCount,
+      StaticMaterialPathLayout::InterleavedPerChunk,
+      StaticChunkLayout::PerChunkVertexFlag },
+    { 16,
+      StaticHeaderFieldRole::MaterialPathCount,
+      StaticHeaderFieldRole::GeometryChunkCount,
+      StaticMaterialPathLayout::InterleavedPerChunk,
+      StaticChunkLayout::PerChunkVertexFlag },
     { 23,
       StaticHeaderFieldRole::MaterialPathCount,
       StaticHeaderFieldRole::GeometryChunkCount,
@@ -568,11 +593,46 @@ bool SkipStaticV23ChunkTail(fs::IBinaryStream& f, uint32_t chunk_index, std::str
     return true;
 }
 
-bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
-                        uint32_t chunk_index, std::string_view path,
-                        WPMdl::StaticChunk& chunk) {
-    if (! CanReadBytes(f, sizeof(uint32_t) + sizeof(float) * 6 + sizeof(uint32_t) * 2)) {
-        LOG_ERROR("static mdl v23 chunk %u header is truncated: path='%.*s' material='%s'",
+// Reads the chunk info word that opens every chunk of the flagged layouts (v15+): bit 1 announces
+// one extra word that is skipped. The info word is returned so the index reader can pick the
+// index width from it.
+bool ReadStaticChunkInfo(fs::IBinaryStream& f, const char* layout, uint32_t chunk_index,
+                         std::string_view path, const std::string& material,
+                         uint32_t& chunk_info) {
+    if (! CanReadBytes(f, sizeof(uint32_t))) {
+        LOG_ERROR("static mdl %s chunk %u header is truncated: path='%.*s' material='%s'",
+                  layout,
+                  chunk_index,
+                  static_cast<int>(path.size()),
+                  path.data(),
+                  material.c_str());
+        return false;
+    }
+    chunk_info = f.ReadUint32();
+    if ((chunk_info & kStaticExtraFieldFlag) != 0) {
+        if (! CanReadBytes(f, sizeof(uint32_t))) {
+            LOG_ERROR("static mdl %s chunk %u extra field is truncated: path='%.*s' "
+                      "material='%s'",
+                      layout,
+                      chunk_index,
+                      static_cast<int>(path.size()),
+                      path.data(),
+                      material.c_str());
+            return false;
+        }
+        f.ReadUint32();
+    }
+    return true;
+}
+
+// Reads a chunk's own vertex flag, the vertex blob, and the index blob. The stride comes from the
+// attribute-mask table for that flag; the index width comes from the chunk info word.
+bool ReadStaticFlaggedGeometry(fs::IBinaryStream& f, const char* layout, uint32_t chunk_info,
+                               std::string material_json_file, uint32_t chunk_index,
+                               std::string_view path, WPMdl::StaticChunk& chunk) {
+    if (! CanReadBytes(f, sizeof(uint32_t) * 2)) {
+        LOG_ERROR("static mdl %s chunk %u vertex header is truncated: path='%.*s' material='%s'",
+                  layout,
                   chunk_index,
                   static_cast<int>(path.size()),
                   path.data(),
@@ -580,30 +640,15 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
         return false;
     }
 
-    const uint32_t chunk_info = f.ReadUint32();
-    if ((chunk_info & kStaticExtraFieldFlag) != 0) {
-        if (! CanReadBytes(f, sizeof(uint32_t))) {
-            LOG_ERROR("static mdl v23 chunk %u extra field is truncated: path='%.*s' "
-                      "material='%s'",
-                      chunk_index,
-                      static_cast<int>(path.size()),
-                      path.data(),
-                      material_json_file.c_str());
-            return false;
-        }
-        f.ReadUint32();
-    }
-    for (auto& v : chunk.bounds_min) v = f.ReadFloat();
-    for (auto& v : chunk.bounds_max) v = f.ReadFloat();
-
     const uint32_t vertex_flag        = f.ReadUint32();
     const uint32_t vertex_size        = f.ReadUint32();
     const uint32_t vertex_float_count = StaticVertexFloatCount(vertex_flag);
     const uint32_t official_stride    = OfficialVertexStride(vertex_flag);
     if (vertex_float_count == 0 || official_stride == 0 ||
         official_stride != vertex_float_count * sizeof(float)) {
-        LOG_ERROR("static mdl v23 chunk %u has unknown vertex flag 0x%x: path='%.*s' "
+        LOG_ERROR("static mdl %s chunk %u has unknown vertex flag 0x%x: path='%.*s' "
                   "material='%s' official-stride=%u unpack-floats=%u",
+                  layout,
                   chunk_index,
                   vertex_flag,
                   static_cast<int>(path.size()),
@@ -617,8 +662,9 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
     const uint32_t vertex_stride = official_stride;
     if (vertex_size == 0 || vertex_size % vertex_stride != 0 ||
         ! CanReadBytes(f, vertex_size)) {
-        LOG_ERROR("static mdl v23 chunk %u has unsupported vertex byte size %u for stride %u: "
+        LOG_ERROR("static mdl %s chunk %u has unsupported vertex byte size %u for stride %u: "
                   "path='%.*s' material='%s' flag=0x%x",
+                  layout,
                   chunk_index,
                   vertex_size,
                   vertex_stride,
@@ -634,7 +680,8 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
     chunk.vertex_stride      = vertex_stride;
     chunk.vertex_blob.resize(vertex_size);
     if (f.Read(chunk.vertex_blob.data(), vertex_size) != vertex_size) {
-        LOG_ERROR("static mdl v23 chunk %u vertex blob is truncated: path='%.*s' material='%s'",
+        LOG_ERROR("static mdl %s chunk %u vertex blob is truncated: path='%.*s' material='%s'",
+                  layout,
                   chunk_index,
                   static_cast<int>(path.size()),
                   path.data(),
@@ -643,7 +690,8 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
     }
 
     if (! CanReadBytes(f, sizeof(uint32_t))) {
-        LOG_ERROR("static mdl v23 chunk %u index size is truncated: path='%.*s' material='%s'",
+        LOG_ERROR("static mdl %s chunk %u index size is truncated: path='%.*s' material='%s'",
+                  layout,
                   chunk_index,
                   static_cast<int>(path.size()),
                   path.data(),
@@ -662,8 +710,9 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
     chunk.index_element_bytes        = index_value_bytes;
     if (indices_size == 0 || indices_size % triangle_bytes != 0 ||
         ! CanReadBytes(f, indices_size)) {
-        LOG_ERROR("static mdl v23 chunk %u has unsupported index byte size %u (width=%u): "
+        LOG_ERROR("static mdl %s chunk %u has unsupported index byte size %u (width=%u): "
                   "path='%.*s' material='%s' verts=%u info=%u",
+                  layout,
                   chunk_index,
                   indices_size,
                   index_value_bytes,
@@ -684,8 +733,9 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
         }
     }
     if (max_index >= vertex_count) {
-        LOG_ERROR("static mdl v23 chunk %u index %u is outside vertex count %u: path='%.*s' "
+        LOG_ERROR("static mdl %s chunk %u index %u is outside vertex count %u: path='%.*s' "
                   "material='%s' stride=%u width=%u",
+                  layout,
                   chunk_index,
                   max_index,
                   vertex_count,
@@ -696,7 +746,55 @@ bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
                   index_value_bytes);
         return false;
     }
+    return true;
+}
 
+// Versions 15 and 16: info word, own vertex flag, vertex blob, index blob. No bounds floats are
+// stored, so the bounds are derived from the vertex positions.
+bool ReadStaticPerChunkVertexFlagChunk(fs::IBinaryStream& f, std::string material_json_file,
+                                       uint32_t chunk_index, std::string_view path,
+                                       WPMdl::StaticChunk& chunk) {
+    constexpr const char* kLayout = "v15/v16";
+    uint32_t chunk_info { 0 };
+    if (! ReadStaticChunkInfo(f, kLayout, chunk_index, path, material_json_file, chunk_info)) {
+        return false;
+    }
+    if (! ReadStaticFlaggedGeometry(
+            f, kLayout, chunk_info, std::move(material_json_file), chunk_index, path, chunk)) {
+        return false;
+    }
+    UpdateStaticBounds(chunk);
+    return true;
+}
+
+bool ReadStaticV23Chunk(fs::IBinaryStream& f, std::string material_json_file,
+                        uint32_t chunk_index, std::string_view path,
+                        WPMdl::StaticChunk& chunk) {
+    constexpr const char* kLayout = "v23";
+    uint32_t chunk_info { 0 };
+    if (! ReadStaticChunkInfo(f, kLayout, chunk_index, path, material_json_file, chunk_info)) {
+        return false;
+    }
+    if (! CanReadBytes(f, sizeof(float) * 6)) {
+        LOG_ERROR("static mdl v23 chunk %u bounds are truncated: path='%.*s' material='%s'",
+                  chunk_index,
+                  static_cast<int>(path.size()),
+                  path.data(),
+                  material_json_file.c_str());
+        return false;
+    }
+    for (auto& v : chunk.bounds_min) v = f.ReadFloat();
+    for (auto& v : chunk.bounds_max) v = f.ReadFloat();
+
+    if (! ReadStaticFlaggedGeometry(
+            f, kLayout, chunk_info, std::move(material_json_file), chunk_index, path, chunk)) {
+        return false;
+    }
+
+    const uint32_t vertex_count =
+        chunk.vertex_stride > 0
+            ? static_cast<uint32_t>(chunk.vertex_blob.size() / chunk.vertex_stride)
+            : 0;
     if (! SkipStaticV23ChunkTail(f, chunk_index, path, chunk.material_json_file, vertex_count)) {
         return false;
     }
@@ -1614,12 +1712,13 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
 
     for (uint32_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
         std::string material_json_file;
-        if (header.UsesVersion23Chunks()) {
+        if (header.ReadsMaterialStringsPerChunk()) {
             for (uint32_t material_index = 0; material_index < header.material_path_count;
                  material_index++) {
                 std::string material_path;
                 if (! ReadBoundedString(f, material_path) || material_path.empty()) {
-                    LOG_ERROR("static mdl v23 chunk %u material %u is empty: %s",
+                    LOG_ERROR("static mdl v%d chunk %u material %u is empty: %s",
+                              mdl.mdlv,
                               chunk_index,
                               material_index,
                               str_path.c_str());
@@ -1641,6 +1740,11 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
         WPMdl::StaticChunk chunk;
         if (header.UsesVersion23Chunks()) {
             if (! ReadStaticV23Chunk(f, std::move(material_json_file), chunk_index, path, chunk)) {
+                return false;
+            }
+        } else if (header.UsesPerChunkVertexFlag()) {
+            if (! ReadStaticPerChunkVertexFlagChunk(
+                    f, std::move(material_json_file), chunk_index, path, chunk)) {
                 return false;
             }
         } else if (! ReadStaticChunk(f, mdl_flag, std::move(material_json_file), chunk)) {
