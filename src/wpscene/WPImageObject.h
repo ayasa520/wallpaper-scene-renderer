@@ -63,10 +63,12 @@ public:
     std::string                attachment;
     std::string                alignment { "center" };
     std::array<float, 2>       effectSourceSize { 0.0f, 0.0f };
-    // Some source-less effect layers need framebuffer-sized intermediate targets while their
-    // visible output still follows ordinary world-space layer geometry. This is intentionally
-    // separate from fullscreen, which also changes final projection and transform semantics.
-    bool                       effectSourceScreenBound { false };
+    // Some source-less effect layers (direct-draw shapes) resolve their effect target size to a
+    // canvas-derived pixel extent at parse time while their visible output still follows ordinary
+    // world-space layer geometry. Such sizes are used as-is and skip perspective density scaling.
+    // This is intentionally separate from fullscreen, which also changes final projection and
+    // transform semantics.
+    bool                       effectSourceSizeIsPixelExtent { false };
     // Optional final writer UV coverage. Effects such as DIRECTDRAW lightshafts can generate
     // visible pixels outside the canonical [0, 1] quad; expanding only the final writer prevents
     // clipping without changing the shader's authored domain.

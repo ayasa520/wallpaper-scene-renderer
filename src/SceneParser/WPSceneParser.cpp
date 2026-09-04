@@ -75,6 +75,11 @@ std::string EffectCameraName(int32_t layer_id) {
 }
 
 std::string SceneDestinationRenderTargetBaseName(int32_t width, int32_t height, char suffix) {
+    // Destination render targets are interned by name, and the name is only the pixel size plus
+    // the suffix. Every destination target is a fixed-size image: a layer whose source is the
+    // output framebuffer takes that framebuffer's pixel size at load, so two layers that resolve
+    // to the same pixel size legitimately share one backing image. There is no separate
+    // screen-following identity.
     return "sc." + std::to_string(std::max(1, width)) + "." +
            std::to_string(std::max(1, height)) + "." + suffix;
 }
@@ -111,6 +116,20 @@ std::array<std::string, 2> SceneDestinationRenderTargetNames(
         }
     }
     return names;
+}
+
+// A fullscreen layer samples the output framebuffer, so its effect targets take that framebuffer's
+// pixel size. The renderer hands the parser its live output extent at load; a scene parsed without
+// a live output (tests, tooling) falls back to the authored canvas.
+std::array<float, 2> OutputFramebufferEffectTargetSize(const ParseContext& context) {
+    if (context.scene != nullptr) {
+        const auto& extent = context.scene->physicalOutputExtent;
+        if (extent[0] > 0u && extent[1] > 0u) {
+            return { static_cast<float>(extent[0]), static_cast<float>(extent[1]) };
+        }
+    }
+    return { static_cast<float>(std::max(1, context.ortho_w)),
+             static_cast<float>(std::max(1, context.ortho_h)) };
 }
 
 std::string EffectFboRenderTargetName(const wpscene::WPEffectFbo& fbo, int32_t effect_id) {
@@ -2724,21 +2743,25 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     // output turns blank.
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
     bool use_detached_effect_world_node = hasEffect && ! isCompose;
-    // Screen-bound effect sources are only the fullscreen flag and assets that already mark
-    // themselves that way (direct-draw shapes without an authored size). An ortho-sized image
-    // layer keeps its authored ping-pong; object scale is applied when that result is composited.
-    const bool effect_source_screen_bound =
-        wpimgobj.fullscreen || wpimgobj.effectSourceScreenBound;
     const std::array<float, 2> effect_source_size =
         wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
             ? wpimgobj.effectSourceSize
             : wpimgobj.size;
-    // Perspective scenes rasterize effect chains at canvas density. A unit-space layer's
-    // authored size would allocate a private target of a few texels, and procedural detail
-    // such as orbit lines or atmosphere rims cannot survive that sampling. The private target
-    // keeps the authored aspect ratio, because effect shaders derive their own aspect
+    // Effect chains allocate fixed-size private targets. A fullscreen layer's source texture is
+    // the output framebuffer, so its targets take that framebuffer's pixel size at load. Layers
+    // whose effect source size is already a resolved pixel extent (direct-draw shapes) use it
+    // as-is. Otherwise, perspective scenes rasterize effect chains at canvas density: a unit-space
+    // layer's authored size would allocate a private target of a few texels, and procedural
+    // detail such as orbit lines or atmosphere rims cannot survive that sampling. The private
+    // target keeps the authored aspect ratio, because effect shaders derive their own aspect
     // correction from the target resolution; only the pixel density rises toward the canvas.
     const std::array<float, 2> effect_target_resolution = [&] {
+        if (wpimgobj.fullscreen) {
+            return OutputFramebufferEffectTargetSize(context);
+        }
+        if (wpimgobj.effectSourceSizeIsPixelExtent) {
+            return effect_source_size;
+        }
         if (context.scene == nullptr || context.scene->cameraOrthographic) {
             return effect_source_size;
         }
@@ -3135,7 +3158,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 imgEffectLayer->AddRuntimeRenderTargetName(puppet_surface_target);
             }
         }
-        // set renderTarget for ping-pong operate
+        // set renderTarget for ping-pong operate. Destination targets are fixed-size images even
+        // for fullscreen layers: they keep the output framebuffer size resolved at load instead of
+        // following later output resizes, so the interned name always describes the backing image.
         {
             SceneRenderTarget pingpong_a_target {
                 .width      = effect_target_width,
@@ -3145,9 +3170,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 .allowReuse = true,
                 .sample     = source_sampler,
             };
-            if (effect_source_screen_bound) {
-                pingpong_a_target.bind = { .enable = true, .screen = true };
-            }
             InternNamedRenderTarget(scene, effect_ppong_a, pingpong_a_target);
 
             SceneRenderTarget pingpong_b_target = pingpong_a_target;
@@ -3163,16 +3185,18 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             InternNamedRenderTarget(scene, effect_ppong_b, pingpong_b_target);
             imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_a);
             imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_b);
-            if (effect_source_screen_bound) {
+            if (wpimgobj.fullscreen || wpimgobj.effectSourceSizeIsPixelExtent) {
                 LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
                          "pingpong-a='%s' pingpong-b='%s' authored-size=[%.3f, %.3f] "
-                         "screen-bound=true fullscreen=%s",
+                         "target=%dx%d fullscreen=%s",
                          wpimgobj.id,
                          wpimgobj.name.c_str(),
                          effect_ppong_a.c_str(),
                          effect_ppong_b.c_str(),
                          effect_source_size[0],
                          effect_source_size[1],
+                         effect_target_width,
+                         effect_target_height,
                          wpimgobj.fullscreen ? "true" : "false");
             }
         }
@@ -3278,6 +3302,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                     const auto& wpfbo  = wpeffobj.fbos.at(i);
                     const std::string rtname =
                         EffectFboRenderTargetName(wpfbo, wpeffobj.id);
+                    // Effect FBOs are fixed images derived from the layer's effect target size
+                    // (divided by the authored scale, or fitted). A fullscreen layer therefore gets
+                    // framebuffer-sized FBOs at load without a screen binding, matching its
+                    // fixed destination targets above.
                     const auto  fbo_size = wpfbo.ResolveSize(effect_target_resolution);
                     const bool  persistent_feedback_fbo =
                         feedback_fbos.count(wpfbo.name) != 0;
@@ -3288,17 +3316,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                         .mapHeight  = fbo_size[1],
                         .allowReuse = ! persistent_feedback_fbo,
                     };
-                    if (effect_source_screen_bound && wpfbo.fit == 0) {
-                        fbo_target.width     = 2;
-                        fbo_target.height    = 2;
-                        fbo_target.mapWidth  = 2;
-                        fbo_target.mapHeight = 2;
-                        fbo_target.bind = {
-                            .enable = true,
-                            .screen = true,
-                            .scale  = 1.0 / wpfbo.scale,
-                        };
-                    }
                     // `fit`-sized feedback buffers are authored simulation textures, not
                     // display-space framebuffers. Their resolved descriptor enters the same global
                     // name table and the first registration owns the size.
@@ -4281,13 +4298,21 @@ std::array<float, 2> ResolveImplicitDirectDrawShapeVisualSize(const ParseContext
 struct DirectDrawShapeMetrics {
     std::array<float, 2> visual_size { 1.0f, 1.0f };
     std::array<float, 2> effect_source_size { 0.0f, 0.0f };
-    bool                 effect_source_screen_bound { false };
+    bool                 effect_source_size_is_pixel_extent { false };
     bool                 final_texcoord_bounds_enabled { false };
     std::array<float, 4> final_texcoord_bounds { 0.0f, 0.0f, 1.0f, 1.0f };
     const char*          visual_policy { "authored-size" };
     const char*          effect_source_policy { "layer-size" };
     const char*          final_uv_policy { "default" };
 };
+
+// Shape effect chains run in a destination target that is half the canvas in each dimension
+// (integer halves), independent of the shape's own card size. The value is already a pixel
+// extent, so it bypasses perspective density scaling.
+std::array<float, 2> ResolveDirectDrawShapeEffectTargetSize(const ParseContext& context) {
+    return { static_cast<float>(std::max(1, context.ortho_w / 2)),
+             static_cast<float>(std::max(1, context.ortho_h / 2)) };
+}
 
 DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context,
                                                      const WPShapeObject& shape_obj) {
@@ -4296,15 +4321,15 @@ DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context
         metrics.visual_size        = shape_obj.size;
         metrics.effect_source_size = shape_obj.size;
     } else {
-        // Source-less DIRECTDRAW quads carry three separate size contracts. Their visible shader
-        // domain follows the scene short edge, while the intermediate effect buffers bind to the
-        // live framebuffer. This preserves world transforms without forcing the layer through the
-        // fullscreen postprocess path.
-        metrics.visual_size                = ResolveImplicitDirectDrawShapeVisualSize(context);
-        metrics.effect_source_size         = { 0.0f, 0.0f };
-        metrics.effect_source_screen_bound = true;
-        metrics.visual_policy              = "implicit-short-edge-square";
-        metrics.effect_source_policy       = "screen-bound";
+        // Source-less DIRECTDRAW quads keep two separate size contracts. Their visible shader
+        // domain follows the scene short edge, while the intermediate effect buffers are the
+        // fixed half-canvas shape destination. This preserves world transforms without forcing
+        // the layer through the fullscreen postprocess path.
+        metrics.visual_size                        = ResolveImplicitDirectDrawShapeVisualSize(context);
+        metrics.effect_source_size                 = ResolveDirectDrawShapeEffectTargetSize(context);
+        metrics.effect_source_size_is_pixel_extent = true;
+        metrics.visual_policy                      = "implicit-short-edge-square";
+        metrics.effect_source_policy               = "half-canvas";
     }
 
     if (auto bounds = ResolveLightshaftsDirectDrawFinalTexCoordBounds(shape_obj);
@@ -4399,8 +4424,8 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj) {
     image_obj.image            = "__hanabi_shape_directdraw";
     image_obj.parent           = shape_obj.parent;
     image_obj.attachment       = shape_obj.attachment;
-    image_obj.effectSourceSize = metrics.effect_source_size;
-    image_obj.effectSourceScreenBound = metrics.effect_source_screen_bound;
+    image_obj.effectSourceSize              = metrics.effect_source_size;
+    image_obj.effectSourceSizeIsPixelExtent = metrics.effect_source_size_is_pixel_extent;
     image_obj.effectFinalTexCoordBoundsEnabled = metrics.final_texcoord_bounds_enabled;
     image_obj.effectFinalTexCoordBounds        = metrics.final_texcoord_bounds;
     image_obj.material         = std::move(transparent_source_material);
@@ -4776,8 +4801,9 @@ bool wallpaper::CreateDynamicSceneLayer(
 
 std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std::string& buf,
                                             fs::VFS& vfs, audio::SoundManager& sm,
-                                            const UserPropertyMap* user_properties,
-                                            double                 text_render_scale) {
+                                            const UserPropertyMap*  user_properties,
+                                            double                  text_render_scale,
+                                            std::array<uint32_t, 2> output_extent) {
     nlohmann::json json;
     if (! PARSE_JSON(buf, json)) return nullptr;
 
@@ -4912,6 +4938,10 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
     context.scene->has3dModels  = has_3d_models;
     context.scene->soundManager = &sm;
+    // The output framebuffer already exists when a scene loads. Record its extent before objects
+    // are materialized so fullscreen layers can size their effect targets from it; the renderer
+    // refreshes the same field with the identical extent when it frames the first output.
+    context.scene->physicalOutputExtent = output_extent;
     // Text atlases and effect ping-pong stay in the authored letter box. Desktop density is
     // applied when those results are composited, not by rebuilding glyphs at the output scale.
     (void)text_render_scale;
