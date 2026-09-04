@@ -344,6 +344,10 @@ public:
         return 1.0;
     }
 
+    // Pixel size of the output framebuffer the renderer was initialized (or last reconfigured)
+    // with. Scene loading uses it to size fullscreen effect targets, which sample that framebuffer.
+    std::array<uint32_t, 2> outputExtent() const { return { m_output_width, m_output_height }; }
+
 private:
     void RefreshRenderGraphIfNeeded() {
         if (! m_scene || ! m_scene->renderGraphDirty) return;
@@ -1158,7 +1162,8 @@ void MainHandler::loadScene() {
                                      vfs,
                                      *m_sound_manager,
                                      &m_user_properties,
-                                     m_render_handler->textRenderScale());
+                                     m_render_handler->textRenderScale(),
+                                     m_render_handler->outputExtent());
         scene->reflectionsEnabled = m_reflections_enabled;
         scene->volumetrics.quality = m_volumetrics_quality;
         scene->shadows.quality     = m_shadows_quality;
