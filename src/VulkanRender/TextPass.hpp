@@ -77,6 +77,9 @@ private:
     bool recreateFramebuffer(const Device&);
 
     Desc m_desc;
+    // Store the node identity independently of the raw node pointer because an old text pass can be
+    // queried for residency after a topology rebuild has released its SceneNode owner.
+    uint64_t m_node_identity { 0 };
     MeshBuffers m_background_buffers;
     std::vector<MeshBuffers> m_page_buffers;
     uint32_t m_loaded_atlas_version { std::numeric_limits<uint32_t>::max() };

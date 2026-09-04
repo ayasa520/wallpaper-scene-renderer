@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <cstdint>
 #include <list>
 #include <vector>
 #include <memory>
@@ -133,6 +135,13 @@ public:
     i32& ID() { return m_id; }
     i32  ID() const { return m_id; }
 
+    // Render-graph residency can outlive the SceneNode object that originally described a pass:
+    // topology rebuilds replace synthetic effect nodes before the old Vulkan pass is retired. A
+    // raw address is therefore not an identity -- the allocator may hand the same address to the
+    // next node and make a newly compiled shader pass look reusable. Keep a process-local monotonic
+    // identity on each node so residency matching remains valid across destruction and allocation.
+    uint64_t RenderIdentity() const noexcept { return m_render_identity; }
+
 private:
     // mark self and all children
     void MarkTransDirty();
@@ -144,7 +153,12 @@ private:
 
     // 0 means "no authored layer": detached helper nodes keep the default so layer-id resolution
     // deterministically treats them as unowned instead of reading uninitialized memory.
+    inline static std::atomic<uint64_t> s_next_render_identity { 1 };
+
     i32         m_id { 0 };
+    uint64_t    m_render_identity {
+        s_next_render_identity.fetch_add(1, std::memory_order_relaxed)
+    };
     std::string m_name;
 
     bool            m_dirty;
