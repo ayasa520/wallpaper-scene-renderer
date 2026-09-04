@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <type_traits>
 
@@ -448,7 +449,18 @@ std::optional<WPDynamicValue> WPDynamicValue::FromJsonLiteral(const nlohmann::js
     }
 
     if (json.is_boolean()) return WPDynamicValue(json.get<bool>());
-    if (json.is_number_unsigned()) return WPDynamicValue(json.get<uint32_t>());
+    if (json.is_number_unsigned()) {
+        const auto value = json.get<uint32_t>();
+        // JSON parsers classify every non-negative integer as unsigned, but SceneScript numeric
+        // options are JavaScript Numbers and a zero-valued option can later receive a negative user
+        // slider value. Preserve signedness throughout the common int32 range so applying that user
+        // value cannot wrap around to a multi-billion coordinate; retain UInt32 only for literals
+        // that actually require its additional positive range.
+        if (value <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+            return WPDynamicValue(static_cast<int32_t>(value));
+        }
+        return WPDynamicValue(value);
+    }
     if (json.is_number_integer()) return WPDynamicValue(json.get<int32_t>());
     if (json.is_number_float()) return WPDynamicValue(json.get<float>());
 
