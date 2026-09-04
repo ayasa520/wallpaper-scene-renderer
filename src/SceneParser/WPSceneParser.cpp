@@ -74,14 +74,22 @@ std::string EffectCameraName(int32_t layer_id) {
     return "__hanabi_effect_camera_" + std::to_string(layer_id);
 }
 
+// A layer destination target is never created smaller than 4x4 pixels; the same clamped extent
+// is both the interned name and the backing image size.
+constexpr int32_t kMinDestinationRenderTargetExtent = 4;
+
+int32_t ClampDestinationRenderTargetExtent(int32_t extent) {
+    return std::max(kMinDestinationRenderTargetExtent, extent);
+}
+
 std::string SceneDestinationRenderTargetBaseName(int32_t width, int32_t height, char suffix) {
     // Destination render targets are interned by name, and the name is only the pixel size plus
     // the suffix. Every destination target is a fixed-size image: a layer whose source is the
     // output framebuffer takes that framebuffer's pixel size at load, so two layers that resolve
     // to the same pixel size legitimately share one backing image. There is no separate
     // screen-following identity.
-    return "sc." + std::to_string(std::max(1, width)) + "." +
-           std::to_string(std::max(1, height)) + "." + suffix;
+    return "sc." + std::to_string(ClampDestinationRenderTargetExtent(width)) + "." +
+           std::to_string(ClampDestinationRenderTargetExtent(height)) + "." + suffix;
 }
 
 std::array<std::string, 2> SceneDestinationRenderTargetNames(
@@ -94,19 +102,23 @@ std::array<std::string, 2> SceneDestinationRenderTargetNames(
     std::unordered_set<int32_t> visited;
 
     // Destination names start as `sc.W.H.b|n`. Walk only the current object's parent chain and
-    // append the number of ancestors whose destination-slot name exactly equals that base.
-    // Siblings therefore intern the same named RT (the multilingual case), while a nested
-    // same-sized effect does not alias the target that is still active for its parent. Compare
-    // exact names rather than inventing a layer id or a global occurrence counter.
+    // append the number of ancestors whose destination-slot name exactly equals that base. Only
+    // ancestors flagged passthrough take part in the comparison; every other ancestor is walked
+    // through without contributing. Siblings therefore intern the same named RT (the multilingual
+    // case), while a nested same-sized effect under a passthrough parent does not alias the target
+    // that parent still uses. Compare exact names rather than inventing a layer id or a global
+    // occurrence counter.
     while (parent_id != 0 && visited.insert(parent_id).second) {
-        if (const auto* effect_layer = scene.FindImageEffectLayer(parent_id)) {
-            if (effect_layer->FirstTarget() == names[0]) {
-                ancestor_collisions[0]++;
-                ancestor_collisions[1]++;
+        const auto* parent = scene.FindSceneObject(parent_id);
+        if (parent != nullptr && parent->Passthrough()) {
+            if (const auto* effect_layer = scene.FindImageEffectLayer(parent_id)) {
+                if (effect_layer->FirstTarget() == names[0]) {
+                    ancestor_collisions[0]++;
+                    ancestor_collisions[1]++;
+                }
             }
         }
 
-        const auto* parent = scene.FindSceneObject(parent_id);
         parent_id = parent != nullptr ? parent->ParentId() : 0;
     }
 
@@ -3068,10 +3080,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                      hasAnimatedPuppetMesh ? "true" : "false");
         }
         spImgNode->SetCamera(effect_camera_name);
-        const int32_t effect_target_width = std::max(
-            1, static_cast<int32_t>(std::lround(effect_target_resolution[0])));
-        const int32_t effect_target_height = std::max(
-            1, static_cast<int32_t>(std::lround(effect_target_resolution[1])));
+        const int32_t effect_target_width = ClampDestinationRenderTargetExtent(
+            static_cast<int32_t>(std::lround(effect_target_resolution[0])));
+        const int32_t effect_target_height = ClampDestinationRenderTargetExtent(
+            static_cast<int32_t>(std::lround(effect_target_resolution[1])));
         const auto effect_destination_names = SceneDestinationRenderTargetNames(
             scene, wpimgobj.parent, effect_target_width, effect_target_height);
         const std::string& effect_ppong_a = effect_destination_names[0];
@@ -3694,10 +3706,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         const std::string camera_name = EffectCameraName(text_obj.id);
         primitive->bridge.camera_name = camera_name;
         primitive->bridge.bridge_backing_extent = {
-            static_cast<uint32_t>(std::max(
-                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0])))),
-            static_cast<uint32_t>(std::max(
-                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1])))),
+            static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
+                static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0])))),
+            static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
+                static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1])))),
         };
         const auto bridge_destination_names = SceneDestinationRenderTargetNames(
             scene,
@@ -3748,10 +3760,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         SceneRenderTarget text_pingpong_target {
             .width = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
             .height = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
-            .mapWidth = std::max(
-                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0]))),
-            .mapHeight = std::max(
-                1, static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1]))),
+            .mapWidth = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
+            .mapHeight = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
             // Text targets keep the authored letter box for both the physical backing and the
             // logical effect grid. Persisting the cache entry replaces the old image in place.
             .allowReuse = false,
@@ -4308,28 +4318,28 @@ struct DirectDrawShapeMetrics {
 
 // Shape effect chains run in a destination target that is half the canvas in each dimension
 // (integer halves), independent of the shape's own card size. The value is already a pixel
-// extent, so it bypasses perspective density scaling.
+// extent, so it bypasses perspective density scaling; the destination intern applies the common
+// minimum-extent clamp.
 std::array<float, 2> ResolveDirectDrawShapeEffectTargetSize(const ParseContext& context) {
-    return { static_cast<float>(std::max(1, context.ortho_w / 2)),
-             static_cast<float>(std::max(1, context.ortho_h / 2)) };
+    return { static_cast<float>(context.ortho_w / 2), static_cast<float>(context.ortho_h / 2) };
 }
 
 DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context,
                                                      const WPShapeObject& shape_obj) {
     DirectDrawShapeMetrics metrics;
+    // Shapes keep two separate size contracts. The intermediate effect buffers are always the
+    // fixed half-canvas shape destination, whether or not the shape carries an authored size;
+    // the authored size (or the implicit short-edge square) only shapes the visible card. This
+    // preserves world transforms without forcing the layer through the fullscreen postprocess
+    // path.
+    metrics.effect_source_size                 = ResolveDirectDrawShapeEffectTargetSize(context);
+    metrics.effect_source_size_is_pixel_extent = true;
+    metrics.effect_source_policy               = "half-canvas";
     if (shape_obj.has_size) {
-        metrics.visual_size        = shape_obj.size;
-        metrics.effect_source_size = shape_obj.size;
+        metrics.visual_size = shape_obj.size;
     } else {
-        // Source-less DIRECTDRAW quads keep two separate size contracts. Their visible shader
-        // domain follows the scene short edge, while the intermediate effect buffers are the
-        // fixed half-canvas shape destination. This preserves world transforms without forcing
-        // the layer through the fullscreen postprocess path.
-        metrics.visual_size                        = ResolveImplicitDirectDrawShapeVisualSize(context);
-        metrics.effect_source_size                 = ResolveDirectDrawShapeEffectTargetSize(context);
-        metrics.effect_source_size_is_pixel_extent = true;
-        metrics.visual_policy                      = "implicit-short-edge-square";
-        metrics.effect_source_policy               = "half-canvas";
+        metrics.visual_size   = ResolveImplicitDirectDrawShapeVisualSize(context);
+        metrics.visual_policy = "implicit-short-edge-square";
     }
 
     if (auto bounds = ResolveLightshaftsDirectDrawFinalTexCoordBounds(shape_obj);
