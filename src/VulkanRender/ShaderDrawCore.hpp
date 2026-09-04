@@ -173,6 +173,10 @@ public:
 
 private:
     ShaderDrawData       m_desc;
+    // Keep the node identity by value. The render graph may destroy the node before it asks the
+    // previous pass for a residency key, so recomputing identity through m_desc.node would read a
+    // dangling pointer during a topology diff.
+    uint64_t             m_node_identity { 0 };
     ShaderDrawExtension* m_extension { nullptr };
 };
 

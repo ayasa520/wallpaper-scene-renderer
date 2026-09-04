@@ -370,7 +370,8 @@ std::array<float, 4> ResolveTextColor(const wallpaper::SceneTextPrimitive& primi
 }
 } // namespace
 
-TextPass::TextPass(const Desc& desc) {
+TextPass::TextPass(const Desc& desc)
+    : m_node_identity(desc.node != nullptr ? desc.node->RenderIdentity() : 0) {
     // The pass description intentionally stores only the authored/runtime identity fields here.
     // Vulkan handles such as framebuffers and pipeline objects are non-copyable and must always be
     // created during `prepare()` against the live device, so the constructor avoids copying any of
@@ -385,7 +386,7 @@ TextPass::TextPass(const Desc& desc) {
 TextPass::~TextPass() = default;
 
 std::string TextPass::residencyKey() const {
-    return "TextPass|node=" + std::to_string(reinterpret_cast<std::uintptr_t>(m_desc.node)) +
+    return "TextPass|node=" + std::to_string(m_node_identity) +
            "|layer=" + std::to_string(m_desc.layer_id) + "|output=" + m_desc.output;
 }
 
@@ -409,6 +410,7 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     if (next == nullptr) return;
     m_desc.scene               = next->m_desc.scene;
     m_desc.node                = next->m_desc.node;
+    m_node_identity            = next->m_node_identity;
     m_desc.layer_id            = next->m_desc.layer_id;
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
     m_desc.output              = next->m_desc.output;

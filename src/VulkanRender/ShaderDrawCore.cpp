@@ -132,7 +132,8 @@ std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, Vk
 
 } // namespace
 
-ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc) {
+ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
+    : m_node_identity(desc.node != nullptr ? desc.node->RenderIdentity() : 0) {
     // The render graph builder already classifies hidden offscreen dependencies and gives passes
     // a live scene pointer for diagnostics. Preserve that prepared intent here; dropping these
     // fields forced text/effect passes back through generic visibility and null-scene behavior.
@@ -160,7 +161,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc) {
 
 std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
     return std::string(pass_kind) + "|layer=" + std::to_string(m_desc.layer_id) +
-           "|node=" + std::to_string(reinterpret_cast<std::uintptr_t>(m_desc.node)) +
+           "|node=" + std::to_string(m_node_identity) +
            "|output=" + m_desc.output;
 }
 
@@ -188,7 +189,7 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
     const int this_samples = static_cast<int>(m_desc.sample_count);
     const int next_samples = IntendedShaderDrawSampleCount(next.m_desc);
     return m_desc.layer_id == next.m_desc.layer_id &&
-           m_desc.node == next.m_desc.node &&
+           m_node_identity == next.m_node_identity &&
            m_desc.output == next.m_desc.output &&
            m_desc.execute_when_hidden == next.m_desc.execute_when_hidden &&
            m_desc.model_pass == next.m_desc.model_pass &&
@@ -222,6 +223,8 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     // Texture handles are rebound by refreshResources()/prepare(), and the runtime gate must follow
     // the newly built graph so effect bypass/final-composite branches stay correct.
     m_desc.scene          = next.m_desc.scene;
+    m_desc.node           = next.m_desc.node;
+    m_node_identity       = next.m_node_identity;
     m_desc.layer_id       = next.m_desc.layer_id;
     m_desc.should_execute = next.m_desc.should_execute;
     m_desc.textures       = next.m_desc.textures;
