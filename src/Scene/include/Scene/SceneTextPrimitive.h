@@ -73,12 +73,10 @@ struct TextSourceBridge {
     std::string pingpong_a;
     std::string pingpong_b;
 
-    // The Vulkan backing follows final projected screen coverage at the glyph raster density.
-    // Authored local geometry and the logical effect sampling grid remain owned by TextLayoutResult
-    // and the bridge camera; the backing therefore retains text antialiasing headroom without
-    // reverting to the full authored source rectangle for a heavily downscaled layer.
+    // The destination extent of the current shaped text box (clamped to the destination minimum).
+    // The pair above is registered for this extent and resized in place when a re-layout changes
+    // it.
     std::array<uint32_t, 2> bridge_backing_extent { 1u, 1u };
-    std::array<uint32_t, 2> projected_output_extent { 0u, 0u };
     std::vector<TextBridgeRenderTarget> render_targets;
 };
 

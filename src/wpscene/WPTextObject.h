@@ -49,8 +49,9 @@ struct WPTextObject {
     bool                       limituseellipsis { false };
     bool                       limitwidth { false };
     int32_t                    maxrows { 1 };
-    int32_t                    padding { 0 };
-    std::array<int32_t, 4>     padding_edges { 0, 0, 0, 0 }; // top, right, bottom, left
+    // Default padding is 32 on both axes; it only enters the layout box of effect-backed text.
+    int32_t                    padding { 32 };
+    std::array<int32_t, 4>     padding_edges { 32, 32, 32, 32 }; // top, right, bottom, left
     int32_t                    parent { 0 };
     std::string                attachment;
     std::string                text;
