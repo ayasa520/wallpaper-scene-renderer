@@ -4768,35 +4768,9 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                 }
             }
 
-            if (auto* resize_effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
-                resize_effect_layer != nullptr && old_size[0] > 0.0f && old_size[1] > 0.0f) {
-                const double scale_x =
-                    static_cast<double>(new_size[0]) / static_cast<double>(old_size[0]);
-                const double scale_y =
-                    static_cast<double>(new_size[1]) / static_cast<double>(old_size[1]);
-                for (const auto& render_target_name :
-                     resize_effect_layer->RuntimeRenderTargetNames()) {
-                    auto render_target_it = opaque->scene->renderTargets.find(render_target_name);
-                    if (render_target_it == opaque->scene->renderTargets.end()) continue;
-                    auto& render_target = render_target_it->second;
-                    if (render_target.bind.enable) continue;
-                    render_target.width = std::max(
-                        1, static_cast<int32_t>(std::lround(render_target.width * scale_x)));
-                    render_target.height = std::max(
-                        1, static_cast<int32_t>(std::lround(render_target.height * scale_y)));
-                    // Regular image-layer resizes scale both the backing image and the logical
-                    // content rectangle together. Dedicated text bridges manage their own exact-
-                    // size render-target updates through the text runtime path instead of sharing
-                    // this generic image-layer resize contract.
-                    render_target.mapWidth = std::max(
-                        1,
-                        static_cast<int32_t>(std::lround(render_target.ContentWidth() * scale_x)));
-                    render_target.mapHeight = std::max(
-                        1,
-                        static_cast<int32_t>(std::lround(render_target.ContentHeight() * scale_y)));
-                }
-            }
-
+            // A script-driven size change only moves the card. The layer's destination targets and
+            // effect FBOs keep the extent they were interned with at load; they are sized from the
+            // source texture, not from the card, and a registered target is never resized.
             image_layer->size = new_size;
             // Image-layer size edits keep the same scene nodes and pass topology. Marking this as
             // a resource-only rebuild lets the renderer recreate effect targets/cameras without
