@@ -652,7 +652,6 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
                 pdesc.model_pass = true;
                 pdesc.depth_test = model_state->depthTest;
                 pdesc.depth_write = model_state->depthWrite;
-                pdesc.depth_greater = model_state->depthGreater;
                 pdesc.depth_clear = model_state->depthClear;
                 // The shared Back RT is rebound per light, so each hull must start
                 // from a cleared depth instead of the first-writer-wins model-chunk rule.

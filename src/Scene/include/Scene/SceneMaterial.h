@@ -44,9 +44,8 @@ struct SceneModelRenderState {
     bool          depthTest { true };
     bool          depthWrite { true };
     SceneCullMode cullMode { SceneCullMode::Back };
-    // Scene depth is reversed (near = 1, far = 0), so the ordinary nearest-wins test is GREATER
-    // against a buffer cleared to 0.
-    bool          depthGreater { true };
+    // Scene depth is reversed (near = 1, far = 0): the nearest-wins test is always GREATER
+    // against a buffer cleared to 0, so there is no per-material compare mode.
     float         depthClear { 0.0f };
     // Reflection model chunks may be drawn with a negative scale on the floor normal, which changes
     // the transform handedness and reverses triangle winding. Carry that fact as explicit model-only
