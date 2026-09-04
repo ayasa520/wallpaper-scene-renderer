@@ -92,6 +92,11 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     // Project-layer is authored in the utility model JSON. Reading it here keeps the later parser
     // decision tied to the resolved asset metadata instead of relying only on a hard-coded path.
     GET_JSON_NAME_VALUE_NOWARN(jImage, "projectlayer", projectlayer);
+    // passthrough, solidlayer and instanced are model-asset keys alongside fullscreen/autosize.
+    // The scene object's `config.passthrough` is a separate editor field read further down.
+    GET_JSON_NAME_VALUE_NOWARN(jImage, "passthrough", config.passthrough);
+    GET_JSON_NAME_VALUE_NOWARN(jImage, "solidlayer", solidlayer);
+    GET_JSON_NAME_VALUE_NOWARN(jImage, "instanced", instanced);
 	GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
 	GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
 	GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
@@ -201,9 +206,9 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
              puppet_layers.push_back(layer);
         }
     }
-    if(json.contains("config")) {
+    if (json.contains("config")) {
         const auto& jConf = json.at("config");
-        GET_JSON_NAME_VALUE_NOWARN(jConf, "passthrough", config.passthrough);
+        GET_JSON_NAME_VALUE_NOWARN(jConf, "passthrough", config.suppressHiddenFinalComposite);
     }
     return true;
 }

@@ -27,7 +27,14 @@ namespace wpscene
 class WPImageObject {
 public:
     struct Config {
+        // Model-asset marker (`models/util/composelayer.json`, `projectlayer.json`,
+        // `fullscreenlayer.json`): the layer is a routing helper whose destination stays active
+        // while its children draw. Read from the model JSON, not from the scene object.
         bool passthrough { false };
+        // Scene-object `config.passthrough` as written by the editor. It only feeds the renderer's
+        // hidden-final-composite publication policy (suppress instead of preserving the source
+        // when the final effect is hidden); it is not the model passthrough marker above.
+        bool suppressHiddenFinalComposite { false };
         FinalOutputCapability finalOutputCapability {
             FinalOutputCapability::PrivateThenPublish
         };
@@ -55,6 +62,11 @@ public:
     // not on the scene object itself. Keeping it on the parsed image object lets the scene parser
     // distinguish logical framebuffer helper layers from normal drawable image layers.
     bool                       projectlayer { false };
+    // Model-asset markers of `models/util/solidlayer.json` and its instanced variant. Together
+    // with passthrough they decide whether a textured, non-fullscreen layer sizes its effect
+    // destination from the card instead of the texture content.
+    bool                       solidlayer { false };
+    bool                       instanced { false };
     bool                       nopadding { false };
     bool                       visible { true };
     VisibleBinding             visible_binding;
