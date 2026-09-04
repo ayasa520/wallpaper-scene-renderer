@@ -29,6 +29,7 @@
 
 #include "Fs/VFS.h"
 #include "Scene/include/Scene/SceneCamera.h"
+#include "Scene/include/Scene/SceneDestinationTarget.h"
 #include "Scene/include/Scene/SceneImageEffectLayer.h"
 #include "Scene/include/Scene/SceneNode.h"
 #include "Scene/include/Scene/Scene.h"
@@ -48,7 +49,6 @@ constexpr double kTextPointSizeToAuthoringUnits { 4.0 };
 constexpr float  kMinTextVisualScaleFactor { 0.0625f };
 constexpr int    kTextGlyphAtlasMaxExtent { 1024 };
 constexpr int    kTextGlyphAtlasPadding { 1 };
-constexpr uint32_t kTextBridgeBackingAlignment { 16u };
 constexpr float  kScreenAnchoredTextStackGap { 1.0f };
 constexpr float  kTextPlacementEpsilon { 0.000001f };
 
@@ -570,18 +570,21 @@ bool TextLayerUsesTightTransparentGlyphBounds(
     return !object.opaquebackground && !render_contract.RequiresBridge();
 }
 
+// Each padding edge contributes at most this many layout pixels to the text box.
+constexpr int32_t kMaxTextPaddingEdge = 512;
+
 std::array<int32_t, 4> ResolveTextLayoutPadding(
     const wpscene::WPTextObject& object,
     const TextLayerRenderContract& render_contract) {
-    // Wallpaper Engine's padding belongs to text that keeps its authored logical rectangle alive:
-    // opaque-background text needs room for the background quad, and effect-backed text needs the
-    // extra transparent source pixels that shaders may sample. Plain transparent text, however,
-    // exposes tight glyph coverage to the scene; carrying padding through that direct path turns
-    // invisible padding into visible placement geometry and moves the crop center away from the
-    // authored text placement.
-    return TextLayerUsesTightTransparentGlyphBounds(object, render_contract)
-               ? UniformTextPadding(0)
-               : ClampTextPaddingEdges(object.padding_edges);
+    // Padding enters the text box only for effect-backed text, which needs the extra transparent
+    // source pixels that effect shaders sample around the glyphs. Text without effects, including
+    // opaque-background text, keeps the bare glyph box: its card and background quad hug the
+    // shaped glyph bounds, and carrying padding through the direct path would turn invisible
+    // padding into visible placement geometry.
+    if (! render_contract.RequiresBridge()) return UniformTextPadding(0);
+    auto edges = ClampTextPaddingEdges(object.padding_edges);
+    for (auto& edge : edges) edge = std::min(edge, kMaxTextPaddingEdge);
+    return edges;
 }
 
 bool TextObjectUsesImplicitSceneAlignment(const wpscene::WPTextObject& object) {
@@ -765,15 +768,8 @@ std::array<int32_t, 2> RoundTextExtent(std::array<float, 2> extent) {
 bool UpdateTextDependencyRenderTarget(SceneRenderTarget&  render_target,
                                       std::array<float, 2> physical_extent,
                                       std::array<float, 2> logical_extent) {
-    /*
-     * Text effect targets keep two names for the same authored letter box:
-     *
-     *  - width/height are the Vulkan backing pixels;
-     *  - mapWidth/mapHeight are the effect grid sampled by g_TextureNResolution.
-     *
-     * Both stay on the authored box plus any FBO scale or fit. Object scale is applied when the
-     * result is composited, so kernel offsets do not change when a parent scales the layer.
-     */
+    // width/height are the Vulkan backing pixels; mapWidth/mapHeight are the effect grid sampled
+    // by g_TextureNResolution. Both follow the text box plus any FBO scale or fit.
     const auto physical = RoundTextExtent(physical_extent);
     const auto logical = RoundTextExtent(logical_extent);
     const bool changed = physical[0] != render_target.width ||
@@ -2187,297 +2183,89 @@ bool IsCameraLinkedFromScene(const Scene& scene, std::string_view camera_name) {
         });
 }
 
-uint32_t ResolveProjectedPixelLength(double length) {
-    // The backing represents local texel density rather than the quad's phase against the output
-    // pixel grid. Measuring edge length makes allocation invariant under rigid translation. Values
-    // that differ from an integer only by matrix round-off are normalized before the final ceil so
-    // a stable transform cannot manufacture a one-pixel resize.
-    const double span = std::max(0.0, length);
-    const double integer_span = std::round(span);
-    const double tolerance =
-        std::numeric_limits<double>::epsilon() * std::max(1.0, span) * 32.0;
-    const double stable_span =
-        std::abs(span - integer_span) <= tolerance ? integer_span : span;
-    const double extent = std::max(1.0, std::ceil(stable_span));
-    return static_cast<uint32_t>(
-        std::min(extent, static_cast<double>(std::numeric_limits<uint32_t>::max())));
-}
-
-double ResolveProjectedEdgeDensityLength(const Eigen::Vector2d& first,
-                                         const Eigen::Vector2d& second,
-                                         double                 first_clip_w,
-                                         double                 second_clip_w) {
-    const double projected_length = (second - first).norm();
-    const double minimum_w = std::min(first_clip_w, second_clip_w);
-    const double maximum_w = std::max(first_clip_w, second_clip_w);
-    if (!std::isfinite(projected_length) || !std::isfinite(minimum_w) ||
-        !std::isfinite(maximum_w) || minimum_w <= 0.0) {
-        return 0.0;
-    }
-
-    // Perspective interpolation is non-linear along an edge. Endpoint distance describes average
-    // density; max(w) / min(w) converts it to the maximum endpoint derivative for a projective
-    // line. Orthographic projection naturally keeps the factor at one.
-    return projected_length * (maximum_w / minimum_w);
-}
-
-uint32_t AlignTextBridgeBackingExtent(uint32_t required_extent) {
-    const uint64_t required = std::max<uint64_t>(required_extent, 1u);
-    const uint64_t aligned =
-        ((required + kTextBridgeBackingAlignment - 1u) / kTextBridgeBackingAlignment) *
-        kTextBridgeBackingAlignment;
-    return static_cast<uint32_t>(
-        std::min<uint64_t>(aligned, std::numeric_limits<uint32_t>::max()));
-}
-
-std::array<uint32_t, 2> ResolveTextBridgeRasterExtent(
-    std::array<uint32_t, 2> projected_extent,
-    std::array<float, 2>    source_extent,
-    float                   backing_density) {
-    (void)projected_extent;
-    (void)backing_density;
-
-    // Effect ping-pong follows the authored source raster. Object scale and desktop density are
-    // applied when that result is composited, so audio-driven node scale must not recreate the
-    // ping-pong images.
-    std::array<uint32_t, 2> raster_extent {};
-    for (size_t axis = 0; axis < raster_extent.size(); axis++) {
-        raster_extent[axis] = ResolveProjectedPixelLength(
-            std::max(1.0, static_cast<double>(source_extent[axis])));
-    }
-    return raster_extent;
-}
-
-std::array<uint32_t, 2> StabilizeTextBridgeBackingExtent(
-    std::array<uint32_t, 2> required_extent,
-    std::array<uint32_t, 2> current_extent,
-    std::array<uint32_t, 2> backing_limit,
-    bool                    reset_for_output_change) {
-    std::array<uint32_t, 2> stable_extent {};
-    for (size_t axis = 0; axis < stable_extent.size(); axis++) {
-        const uint32_t required = std::max(required_extent[axis], 1u);
-        const uint32_t aligned = std::min(
-            AlignTextBridgeBackingExtent(required), std::max(backing_limit[axis], 1u));
-        const uint32_t current = current_extent[axis];
-
-        if (reset_for_output_change || current == 0u || aligned > current) {
-            stable_extent[axis] = aligned;
-            continue;
-        }
-
-        // Audio-driven scale often oscillates across one 16-pixel bucket boundary. Recreating two
-        // ping-pong images on every crossing is more expensive than retaining that small margin.
-        // A shrink larger than 40% still releases a genuine content/output-scale peak instead of
-        // keeping a lifetime high-water allocation. The target wallpaper's authored 0.9..1.1 audio
-        // scale crosses the 25% range once projection and integer buckets are included, so a lower
-        // threshold would continuously recreate both ping-pong images during normal playback.
-        const bool substantial_shrink =
-            static_cast<uint64_t>(required) * 5u < static_cast<uint64_t>(current) * 3u;
-        stable_extent[axis] = substantial_shrink ? aligned : current;
-    }
-    return stable_extent;
-}
-
 bool TextLayerNeedsBridgeResidency(const Scene& scene, int32_t layer_id) {
     return scene.IsLayerVisible(layer_id) ||
            scene.IsLayerOffscreenDependencySource(layer_id);
 }
 
-std::optional<std::array<uint32_t, 2>> ResolveTextBridgeProjection(
-    Scene& scene, int32_t layer_id, const TextLayerRuntimeState& state) {
-    if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
-        scene.activeCamera == nullptr || scene.shaderValueUpdater == nullptr ||
-        scene.physicalOutputExtent[0] == 0u || scene.physicalOutputExtent[1] == 0u) {
-        return std::nullopt;
-    }
-
-    SceneNode* layer_node = scene.GetLayerNode(layer_id);
-    if (layer_node == nullptr) {
-        return std::nullopt;
-    }
-
-    const auto logical_extent = ResolveVisibleTextDisplaySize(state);
-    if (!std::isfinite(logical_extent[0]) || !std::isfinite(logical_extent[1]) ||
-        !(logical_extent[0] > 0.0f) || !(logical_extent[1] > 0.0f)) {
-        return std::nullopt;
-    }
-
-    const Eigen::Matrix4d model =
-        scene.shaderValueUpdater->ResolveModelTransformForProjection(
-            layer_node, scene.activeCamera, true);
-    const Eigen::Matrix4d local_to_clip =
-        scene.activeCamera->GetViewProjectionMatrix() * model;
-
-    std::array<uint32_t, 2> backing_extent { 1u, 1u };
-    const uint32_t maximum_edge_extent = ResolveProjectedPixelLength(std::hypot(
-        static_cast<double>(scene.physicalOutputExtent[0]),
-        static_cast<double>(scene.physicalOutputExtent[1])));
-
-    const double half_width = static_cast<double>(logical_extent[0]) * 0.5;
-    const double half_height = static_cast<double>(logical_extent[1]) * 0.5;
-    const std::array<Eigen::Vector4d, 4> corners {
-        Eigen::Vector4d { -half_width, -half_height, 0.0, 1.0 },
-        Eigen::Vector4d { -half_width, half_height, 0.0, 1.0 },
-        Eigen::Vector4d { half_width, -half_height, 0.0, 1.0 },
-        Eigen::Vector4d { half_width, half_height, 0.0, 1.0 },
-    };
-
-    constexpr double kMinimumClipW = 1e-6;
-    std::array<Eigen::Vector4d, 4> clip_corners;
-    size_t front_corner_count = 0;
-    for (size_t index = 0; index < corners.size(); index++) {
-        clip_corners[index] = local_to_clip * corners[index];
-        if (std::isfinite(clip_corners[index].w()) &&
-            clip_corners[index].w() > kMinimumClipW) {
-            front_corner_count++;
-        }
-    }
-
-    if (front_corner_count == 0) {
-        // A quad entirely behind a perspective camera has no screen coverage. A one-pixel backing
-        // keeps the stable render-target identity valid until it moves back into view.
-    } else if (front_corner_count != corners.size()) {
-        // An edge crossing the camera plane is unbounded before clipping. The maximum visible
-        // output-edge length is the conservative finite allocation for that transient state.
-        backing_extent = { maximum_edge_extent, maximum_edge_extent };
-    } else {
-        std::array<Eigen::Vector2d, 4> pixel_corners;
-        for (size_t index = 0; index < clip_corners.size(); index++) {
-            const auto& clip = clip_corners[index];
-            const double ndc_x = clip.x() / clip.w();
-            const double ndc_y = clip.y() / clip.w();
-            if (!std::isfinite(ndc_x) || !std::isfinite(ndc_y)) {
-                return std::nullopt;
-            }
-            pixel_corners[index] = Eigen::Vector2d {
-                (ndc_x * 0.5 + 0.5) * static_cast<double>(scene.physicalOutputExtent[0]),
-                (ndc_y * 0.5 + 0.5) * static_cast<double>(scene.physicalOutputExtent[1]),
-            };
-        }
-
-        // Backing X/Y correspond to the text quad's local U/V axes, not to a screen-space AABB.
-        // Measuring both opposite local edges preserves density under rotation, non-uniform scale,
-        // shear, and perspective without allocating both AABB dimensions at a 45-degree rotation.
-        const double projected_u_length = std::max(
-            ResolveProjectedEdgeDensityLength(pixel_corners[0],
-                                              pixel_corners[2],
-                                              clip_corners[0].w(),
-                                              clip_corners[2].w()),
-            ResolveProjectedEdgeDensityLength(pixel_corners[1],
-                                              pixel_corners[3],
-                                              clip_corners[1].w(),
-                                              clip_corners[3].w()));
-        const double projected_v_length = std::max(
-            ResolveProjectedEdgeDensityLength(pixel_corners[0],
-                                              pixel_corners[1],
-                                              clip_corners[0].w(),
-                                              clip_corners[1].w()),
-            ResolveProjectedEdgeDensityLength(pixel_corners[2],
-                                              pixel_corners[3],
-                                              clip_corners[2].w(),
-                                              clip_corners[3].w()));
-        backing_extent = {
-            std::min(ResolveProjectedPixelLength(projected_u_length), maximum_edge_extent),
-            std::min(ResolveProjectedPixelLength(projected_v_length), maximum_edge_extent),
-        };
-    }
-
-    return backing_extent;
-}
-
+// `relayout` marks a call made because the text was shaped again (content or font change); the
+// per-frame and transform-only callers pass false.
 bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
                                           int32_t layer_id,
-                                          TextLayerRuntimeState& state) {
+                                          TextLayerRuntimeState& state,
+                                          bool relayout) {
     if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
         !TextLayerNeedsBridgeResidency(scene, layer_id)) {
         return false;
     }
 
-    const auto projection = ResolveTextBridgeProjection(scene, layer_id, state);
-    if (!projection.has_value()) return false;
-
     auto& bridge = state.primitive->bridge;
-    const auto source_extent = ResolveVisibleTextSourceSize(state);
-    const auto density_adjusted_projection = ResolveTextBridgeRasterExtent(
-        *projection, source_extent, state.primitive->layout.backing_density);
-    const bool output_extent_changed =
-        bridge.projected_output_extent != scene.physicalOutputExtent;
-    const double backing_density = std::isfinite(state.primitive->layout.backing_density)
-        ? std::max(1.0, static_cast<double>(state.primitive->layout.backing_density))
-        : 1.0;
-    const uint32_t maximum_edge_extent = ResolveProjectedPixelLength(
-        std::hypot(static_cast<double>(scene.physicalOutputExtent[0]),
-                   static_cast<double>(scene.physicalOutputExtent[1])) *
-        backing_density);
-    const auto next_backing_extent = StabilizeTextBridgeBackingExtent(
-        density_adjusted_projection,
-        bridge.bridge_backing_extent,
-        { maximum_edge_extent, maximum_edge_extent },
-        output_extent_changed);
-    bridge.bridge_backing_extent = next_backing_extent;
-    bridge.projected_output_extent = scene.physicalOutputExtent;
+    const auto display_size = ResolveVisibleTextDisplaySize(state);
+    if (!std::isfinite(display_size[0]) || !std::isfinite(display_size[1])) return false;
 
-    bool any_target_changed = false;
-    const auto bridge_logical_extent = ResolveVisibleTextDisplaySize(state);
+    // Everything below runs on a re-layout of this layer, or when its shaped box changed. The
+    // scene camera and the output size never enter this decision.
+    const std::array<uint32_t, 2> next_backing_extent {
+        static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
+            static_cast<int32_t>(std::lround(display_size[0])))),
+        static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
+            static_cast<int32_t>(std::lround(display_size[1])))),
+    };
+    const bool extent_changed = next_backing_extent != bridge.bridge_backing_extent;
+    if (!relayout && !extent_changed) return false;
+    const std::array<uint32_t, 2> previous_extent = bridge.bridge_backing_extent;
+    bridge.bridge_backing_extent                  = next_backing_extent;
+
+    // Named effect FBOs (`_rt_FullCompoBuffer1` and friends) are shared by name across layers:
+    // the first layer to reference a name creates it at its own extent, and every later
+    // re-layout of a layer that references it resizes that same image in place to the
+    // re-laid-out layer's extent (a no-op when the extent is unchanged). A layer whose text
+    // never changes therefore renders its effect chain through whatever extent the last
+    // re-laid-out layer left behind.
+    bool any_target_resized = false;
     for (const auto& bridge_target : bridge.render_targets) {
-        auto render_target_it = scene.renderTargets.find(bridge_target.name);
-        if (render_target_it == scene.renderTargets.end()) continue;
-        auto& render_target = render_target_it->second;
-        if (render_target.bind.enable) continue;
-
-        const auto target_logical_extent =
-            ResolveTextBridgeRenderTargetExtent(bridge_target, bridge_logical_extent);
-        // Fit, feedback, and ordinary transient targets all stay in the authored letter box
-        // plus any FBO scale. Object scale is applied when the result is composited.
-        const auto target_physical_extent = target_logical_extent;
-
-        const auto previous_extent = std::array<int32_t, 4> {
-            render_target.width,
-            render_target.height,
-            render_target.ContentWidth(),
-            render_target.ContentHeight(),
-        };
-        if (!UpdateTextDependencyRenderTarget(
-                render_target, target_physical_extent, target_logical_extent)) {
+        if (bridge_target.name == bridge.pingpong_a || bridge_target.name == bridge.pingpong_b) {
             continue;
         }
-
-        scene.MarkRenderTargetResourcesDirty(bridge_target.name);
-        any_target_changed = true;
-        LOG_INFO("SceneTextBridgeBacking: layer=%d name='%s' target='%s' "
-                 "output=[%u %u] projected=[%u %u] source=[%.3f %.3f] "
-                 "density=%.3f required=[%u %u] "
-                 "stable=[%u %u] "
-                 "previous-physical=[%d %d] physical=[%d %d] "
-                 "previous-logical=[%d %d] logical=[%d %d] scale=%u fit=%u feedback=%s",
-                 layer_id,
-                 state.object.name.c_str(),
-                 bridge_target.name.c_str(),
-                 scene.physicalOutputExtent[0],
-                 scene.physicalOutputExtent[1],
-                 (*projection)[0],
-                 (*projection)[1],
-                 source_extent[0],
-                 source_extent[1],
-                 state.primitive->layout.backing_density,
-                 density_adjusted_projection[0],
-                 density_adjusted_projection[1],
-                 next_backing_extent[0],
-                 next_backing_extent[1],
-                 previous_extent[0],
-                 previous_extent[1],
-                 render_target.width,
-                 render_target.height,
-                 previous_extent[2],
-                 previous_extent[3],
-                 render_target.ContentWidth(),
-                 render_target.ContentHeight(),
-                 bridge_target.scale,
-                 bridge_target.fit,
-                 bridge_target.persistent_feedback ? "true" : "false");
+        auto render_target_it = scene.renderTargets.find(bridge_target.name);
+        if (render_target_it == scene.renderTargets.end()) continue;
+        if (render_target_it->second.bind.enable) continue;
+        const auto fbo_extent = ResolveTextBridgeRenderTargetExtent(bridge_target, display_size);
+        if (UpdateTextDependencyRenderTarget(render_target_it->second, fbo_extent, fbo_extent)) {
+            scene.MarkRenderTargetResourcesDirty(bridge_target.name);
+            any_target_resized = true;
+        }
     }
 
-    return any_target_changed;
+    // The destination pair follows the shaped text box as well. Here the registered pair is
+    // resized in place under its existing names and the passes that touch it refresh their
+    // resources. Interning a fresh pair for the new extent and re-pointing the effect chain at it
+    // (leaving the previous images untouched) was tried and left the glyphs undrawn after the
+    // graph rebuild; until that path renders, the pair keeps its names.
+    if (!extent_changed) return any_target_resized;
+    for (const auto* name : { &bridge.pingpong_a, &bridge.pingpong_b }) {
+        auto render_target_it = scene.renderTargets.find(*name);
+        if (render_target_it == scene.renderTargets.end()) continue;
+        const std::array<float, 2> extent { static_cast<float>(next_backing_extent[0]),
+                                            static_cast<float>(next_backing_extent[1]) };
+        if (UpdateTextDependencyRenderTarget(render_target_it->second, extent, extent)) {
+            scene.MarkRenderTargetResourcesDirty(*name);
+            any_target_resized = true;
+        }
+    }
+    if (any_target_resized) {
+        LOG_INFO("SceneTextBridgeBacking: layer=%d name='%s' destination='%s' partner='%s' "
+                 "previous=[%u %u] extent=[%u %u]",
+                 layer_id,
+                 state.object.name.c_str(),
+                 bridge.pingpong_a.c_str(),
+                 bridge.pingpong_b.c_str(),
+                 previous_extent[0],
+                 previous_extent[1],
+                 next_backing_extent[0],
+                 next_backing_extent[1]);
+    }
+    return any_target_resized;
 }
 
 std::string ResolveTextContentAlignment(const wpscene::WPTextObject& object) {
@@ -3241,7 +3029,8 @@ void SyncTextPrimitiveCanonicalState(TextLayerRuntimeState& state, bool rebuild_
 bool ApplyTextLayerSceneGeometry(Scene&                         scene,
                                  int32_t                        layer_id,
                                  TextLayerRuntimeState&         state,
-                                 const TextLayerSceneGeometrySnapshot& previous_geometry) {
+                                 const TextLayerSceneGeometrySnapshot& previous_geometry,
+                                 bool                           relayout = false) {
     const auto next_geometry = CaptureTextLayerSceneGeometry(state);
     const bool placement_display_size_changed =
         TextMetricChanged(previous_geometry.placement_display_size,
@@ -3289,7 +3078,7 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
         }
     }
 
-    UpdateTextLayerBridgeBackingInternal(scene, layer_id, state);
+    UpdateTextLayerBridgeBackingInternal(scene, layer_id, state, relayout);
 
     return true;
 }
@@ -3491,7 +3280,7 @@ void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
         // resolved world transform before sizing and resource refresh so the final composite and
         // its projected backing always describe one frame of scene state.
         SyncTextLayerEffectTransform(scene, layer_id);
-        UpdateTextLayerBridgeBackingInternal(scene, layer_id, state);
+        UpdateTextLayerBridgeBackingInternal(scene, layer_id, state, false);
     }
 }
 
@@ -3680,7 +3469,8 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     if (!ApplyTextLayerSceneGeometry(scene,
                                      layer_id,
                                      state,
-                                     previous_geometry)) {
+                                     previous_geometry,
+                                     /*relayout=*/true)) {
         return false;
     }
 
