@@ -39,9 +39,9 @@ struct ShaderDrawRequest {
     bool                     depth_test { false };
     bool                     depth_write { false };
     bool                     clear_depth { true };
-    // Scene depth is reversed (near = 1, far = 0): the default pass keeps the nearest fragment
-    // with GREATER and starts from a far-cleared buffer of 0.
-    bool                     depth_greater { true };
+    // Scene depth is reversed (near = 1, far = 0): every depth-tested pass keeps the nearest
+    // fragment with GREATER and starts from a far-cleared buffer of 0. There is no other compare
+    // mode; depth-test off and depth-write off are the only variations.
     float                    depth_clear { 0.0f };
 };
 

@@ -1104,10 +1104,9 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     back_state.cullMode      = SceneCullMode::Back;
     back_state.colorLoadMode = SceneModelColorLoadMode::Clear;
     // Scene depth is reversed (near = 1, far = 0). The inward-facing hull leaves the volume exit
-    // wall for each pixel; GREATER against a 0-cleared buffer stores that exit depth as
+    // wall for each pixel; the GREATER test against a 0-cleared buffer stores that exit depth as
     // backDepth, and the fullscreen ray (shader z = 1 under REVERSEDEPTH) starts at the near
     // plane.
-    back_state.depthGreater  = true;
     back_state.depthClear    = 0.0f;
 
     SceneModelRenderState front_hull_state;

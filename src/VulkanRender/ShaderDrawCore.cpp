@@ -155,7 +155,6 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.depth_test          = desc.depth_test;
     m_desc.depth_write         = desc.depth_write;
     m_desc.clear_depth         = desc.clear_depth;
-    m_desc.depth_greater       = desc.depth_greater;
     m_desc.depth_clear         = desc.depth_clear;
 };
 
@@ -196,7 +195,6 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
            m_desc.depth_test == next.m_desc.depth_test &&
            m_desc.depth_write == next.m_desc.depth_write &&
            m_desc.clear_depth == next.m_desc.clear_depth &&
-           m_desc.depth_greater == next.m_desc.depth_greater &&
            m_desc.depth_clear == next.m_desc.depth_clear &&
            // Alpha policy changes the prepared pipeline's color write mask, blend operation, and
            // factors. Reusing a pass across that boundary would keep stale composition coverage.
@@ -588,7 +586,6 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     desc.model_pass    = true;
     desc.depth_test    = model_state->depthTest;
     desc.depth_write   = model_state->depthWrite;
-    desc.depth_greater = model_state->depthGreater;
     desc.depth_clear   = model_state->depthClear;
     // Model passes are the only custom-shader passes allowed to override the historical load/cull
     // defaults. The parser chooses a color-load mode per output target, so offscreen model buffers
@@ -692,8 +689,8 @@ void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  ma
     // path for shader reflection, descriptors, and mesh buffers.
     pipeline.depth.depthTestEnable       = desc.depth_test;
     pipeline.depth.depthWriteEnable      = desc.depth_write;
-    pipeline.depth.depthCompareOp        = desc.depth_greater ? VK_COMPARE_OP_GREATER
-                                                             : VK_COMPARE_OP_LESS_OR_EQUAL;
+    // Reversed depth: the only compare mode is GREATER against a 0-cleared buffer.
+    pipeline.depth.depthCompareOp        = VK_COMPARE_OP_GREATER;
     pipeline.depth.depthBoundsTestEnable = false;
     pipeline.depth.stencilTestEnable     = false;
     const auto effective_cull_mode =
@@ -711,7 +708,7 @@ void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  ma
              desc.depth_test ? "true" : "false",
              desc.depth_write ? "true" : "false",
              desc.clear_depth ? "true" : "false",
-             desc.depth_greater ? "greater" : "less-equal",
+             "greater",
              desc.depth_clear,
              static_cast<unsigned>(pipeline.raster.cullMode));
 }
