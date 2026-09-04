@@ -3786,15 +3786,32 @@ void SyncEffectLayerTransforms(WPSceneScriptHost::Opaque* opaque, int32_t layer_
                                SceneNode* node) {
     if (opaque == nullptr || opaque->scene == nullptr || node == nullptr) return;
 
-    auto* effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
+    auto& scene        = *opaque->scene;
+    auto* effect_layer = scene.FindImageEffectLayer(layer_id);
     if (effect_layer == nullptr) return;
 
-    if (effect_layer->WorldNode() != nullptr) {
-        effect_layer->SyncResolvedNodeToWorld();
-    } else {
+    auto* world_node = effect_layer->WorldNode();
+    if (world_node == nullptr) {
         effect_layer->SyncResolvedNodeToMatrix(
             Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
+        return;
     }
+
+    if (scene.shaderValueUpdater == nullptr) return;
+
+    /*
+     * Effect output nodes are detached render-graph publishers. A compose route can therefore
+     * keep its authored child root-owned in the physical SceneNode tree while assigning a virtual
+     * parent through WPNodeData. Script writes happen after graph construction, so copying
+     * WorldNode::ModelTrans here would replace the correctly routed publisher matrix with the
+     * child's local transform. Resolve the current logical route after every script transform
+     * update. Private final composites publish that raw routed world matrix; ordinary effect
+     * layers use the display camera's parallax in the same way as their shader uniforms.
+     */
+    const bool apply_parallax = !effect_layer->PublishesPrivateFinalComposite();
+    const auto resolved_model = scene.shaderValueUpdater->ResolveModelTransformForProjection(
+        world_node, scene.activeCamera, apply_parallax);
+    effect_layer->SyncResolvedNodeToMatrix(Eigen::Affine3f(resolved_model.cast<float>()));
 }
 
 const ShaderValue* FindMaterialUniformValue(const SceneMaterial& material,

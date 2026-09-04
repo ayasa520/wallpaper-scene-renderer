@@ -611,6 +611,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     bool reqETVPI = info.has_ETVPI;
 
     Matrix4d viewProTrans = camera->GetViewProjectionMatrix();
+    const auto camera_node = camera->GetAttachedNode();
 
     if (info.has_VP) {
         updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
@@ -641,6 +642,22 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                     Affine3d(Eigen::Translation3d((-source_parallax).cast<double>())).matrix() *
                     modelTrans;
             }
+        }
+
+        if (has_named_camera_override && overrides->use_active_camera_for_parallax &&
+            camera_node != nullptr) {
+            // A composition source is rasterized in the owning layer's local coordinate system and
+            // its neutral final composite applies the owning layer's world transform afterwards.
+            // Routed children, however, resolve directly to world space because their physical
+            // SceneNode parent is only an ordering proxy. Rebase those world matrices through the
+            // exact source-camera view used by the pass: VP * inverse(V) cancels the camera pose,
+            // while inverse(cameraWorld) removes the composition root and every routed ancestor.
+            // The resulting source texture therefore contains child-local geometry, leaving the
+            // final publisher as the sole owner of parent translation, rotation, and scale.
+            const auto source_camera_world =
+                transformResolver.ResolveRawModelTransform(camera_node.get());
+            modelTrans = camera->GetViewMatrix().inverse() * source_camera_world.inverse() *
+                modelTrans;
         }
 
         modelTrans = ApplyMeshGeometryTransform(modelTrans, pNode->Mesh());
