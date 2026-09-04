@@ -34,6 +34,7 @@
 #include "Particle/ParticleSystem.h"
 
 #include "WPShaderValueUpdater.hpp"
+#include "Scene/SceneDestinationTarget.h"
 #include "wpscene/WPImageObject.h"
 #include "wpscene/WPParallaxDepth.hpp"
 #include "wpscene/WPParticleObject.h"
@@ -74,62 +75,6 @@ std::string EffectCameraName(int32_t layer_id) {
     return "__hanabi_effect_camera_" + std::to_string(layer_id);
 }
 
-// A layer destination target is never created smaller than 4x4 pixels; the same clamped extent
-// is both the interned name and the backing image size.
-constexpr int32_t kMinDestinationRenderTargetExtent = 4;
-
-int32_t ClampDestinationRenderTargetExtent(int32_t extent) {
-    return std::max(kMinDestinationRenderTargetExtent, extent);
-}
-
-std::string SceneDestinationRenderTargetBaseName(int32_t width, int32_t height, char suffix) {
-    // Destination render targets are interned by name, and the name is only the pixel size plus
-    // the suffix. Every destination target is a fixed-size image: a layer whose source is the
-    // output framebuffer takes that framebuffer's pixel size at load, so two layers that resolve
-    // to the same pixel size legitimately share one backing image. There is no separate
-    // screen-following identity.
-    return "sc." + std::to_string(ClampDestinationRenderTargetExtent(width)) + "." +
-           std::to_string(ClampDestinationRenderTargetExtent(height)) + "." + suffix;
-}
-
-std::array<std::string, 2> SceneDestinationRenderTargetNames(
-    const Scene& scene, int32_t parent_id, int32_t width, int32_t height) {
-    std::array<std::string, 2> names {
-        SceneDestinationRenderTargetBaseName(width, height, 'b'),
-        SceneDestinationRenderTargetBaseName(width, height, 'n'),
-    };
-    std::array<uint32_t, 2> ancestor_collisions {};
-    std::unordered_set<int32_t> visited;
-
-    // Destination names start as `sc.W.H.b|n`. Walk only the current object's parent chain and
-    // append the number of ancestors whose destination-slot name exactly equals that base. Only
-    // ancestors flagged passthrough take part in the comparison; every other ancestor is walked
-    // through without contributing. Siblings therefore intern the same named RT (the multilingual
-    // case), while a nested same-sized effect under a passthrough parent does not alias the target
-    // that parent still uses. Compare exact names rather than inventing a layer id or a global
-    // occurrence counter.
-    while (parent_id != 0 && visited.insert(parent_id).second) {
-        const auto* parent = scene.FindSceneObject(parent_id);
-        if (parent != nullptr && parent->Passthrough()) {
-            if (const auto* effect_layer = scene.FindImageEffectLayer(parent_id)) {
-                if (effect_layer->FirstTarget() == names[0]) {
-                    ancestor_collisions[0]++;
-                    ancestor_collisions[1]++;
-                }
-            }
-        }
-
-        parent_id = parent != nullptr ? parent->ParentId() : 0;
-    }
-
-    for (size_t index = 0; index < names.size(); index++) {
-        if (ancestor_collisions[index] != 0) {
-            names[index] += std::to_string(ancestor_collisions[index]);
-        }
-    }
-    return names;
-}
-
 // A fullscreen layer samples the output framebuffer, so its effect targets take that framebuffer's
 // pixel size. The renderer hands the parser its live output extent at load; a scene parsed without
 // a live output (tests, tooling) falls back to the authored canvas.
@@ -144,35 +89,96 @@ std::array<float, 2> OutputFramebufferEffectTargetSize(const ParseContext& conte
              static_cast<float>(std::max(1, context.ortho_h)) };
 }
 
+struct ImageDestinationExtent {
+    std::array<int32_t, 2> extent { 0, 0 };
+    // 'n' when the layer's source texture is point-sampled, otherwise 'b'.
+    char                   suffix { 'b' };
+    const char*            policy { "" };
+};
+
+// The pixel extent of an effect-backed image layer's destination targets and effect FBOs.
+//
+// It is the content size of the layer's first material texture: one frame for a sprite sheet,
+// the output framebuffer for a fullscreen layer (its texture is the framebuffer itself), the
+// content rectangle for a texture or a named render target. Two cases use the card size
+// (ceil of the authored size) instead: a layer without a texture, and a passthrough or solid
+// layer that is not fullscreen and not instanced. Shapes arrive with an already resolved pixel
+// extent. The value is not scaled by the scene camera or the canvas density.
+ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&           context,
+                                                     const wpscene::WPImageObject& image,
+                                                     const SceneMaterial&          material,
+                                                     const std::array<float, 2>&   card_size) {
+    ImageDestinationExtent result;
+    const auto use_card = [&](const char* policy) {
+        result.extent = { static_cast<int32_t>(std::ceil(card_size[0])),
+                          static_cast<int32_t>(std::ceil(card_size[1])) };
+        result.policy = policy;
+        return result;
+    };
+    if (image.effectSourceSizeIsPixelExtent) {
+        result.extent = { static_cast<int32_t>(std::lround(card_size[0])),
+                          static_cast<int32_t>(std::lround(card_size[1])) };
+        result.policy = "pixel-extent";
+        return result;
+    }
+    if (image.fullscreen) {
+        const auto output = OutputFramebufferEffectTargetSize(context);
+        result.extent     = { static_cast<int32_t>(std::lround(output[0])),
+                              static_cast<int32_t>(std::lround(output[1])) };
+        result.policy     = "output-framebuffer";
+        return result;
+    }
+    if (material.textures.empty() || material.textures.front().empty() ||
+        context.scene == nullptr) {
+        return use_card("card-no-texture");
+    }
+    const auto& texture_name = material.textures.front();
+    // Media-integration system textures are bound to a 1x1 placeholder until a thumbnail arrives
+    // at runtime. At load the slot holds no real texture, so the destination is the card; the
+    // destination is not re-derived when the thumbnail is swapped in later.
+    if (texture_name == WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE ||
+        texture_name == WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE) {
+        return use_card("card-media-placeholder");
+    }
+    const bool  card_sized_helper =
+        (image.config.passthrough || image.solidlayer) && ! image.instanced;
+
+    if (const auto texture_it = context.scene->textures.find(texture_name);
+        texture_it != context.scene->textures.end()) {
+        const auto& texture = texture_it->second;
+        result.suffix = texture.sample.magFilter == TextureFilter::NEAREST ? 'n' : 'b';
+        if (texture.isSprite) {
+            const auto& frames = texture.spriteAnim.Frames();
+            if (! frames.empty() && frames.front().width > 0.0f && frames.front().height > 0.0f) {
+                result.extent = { static_cast<int32_t>(std::lround(frames.front().width)),
+                                  static_cast<int32_t>(std::lround(frames.front().height)) };
+            } else {
+                result.extent = { texture.mapWidth, texture.mapHeight };
+            }
+            result.policy = "sprite-frame";
+        } else if (card_sized_helper) {
+            return use_card("card-passthrough");
+        } else {
+            result.extent = { texture.mapWidth, texture.mapHeight };
+            result.policy = "texture-content";
+        }
+    } else if (const auto target_it = context.scene->renderTargets.find(texture_name);
+               target_it != context.scene->renderTargets.end()) {
+        const auto& target = target_it->second;
+        result.suffix = target.sample.magFilter == TextureFilter::NEAREST ? 'n' : 'b';
+        if (card_sized_helper) return use_card("card-passthrough");
+        result.extent = { target.ContentWidth(), target.ContentHeight() };
+        result.policy = "render-target-content";
+    } else {
+        return use_card("card-unresolved-texture");
+    }
+    if (result.extent[0] <= 0 || result.extent[1] <= 0) return use_card("card-empty-texture");
+    return result;
+}
+
 std::string EffectFboRenderTargetName(const wpscene::WPEffectFbo& fbo, int32_t effect_id) {
     if (! fbo.unique) return fbo.name;
     return fbo.name + "_" + std::to_string(effect_id);
-}
-
-const SceneRenderTarget& InternNamedRenderTarget(Scene& scene, const std::string& name,
-                                                  SceneRenderTarget target) {
-    // Named-RT lookup keys only the string. A hit returns the existing resource without applying
-    // the later caller's dimensions. `try_emplace` makes that first-registration rule explicit
-    // and prevents a later hidden language branch from silently replacing the descriptor shared
-    // by an earlier branch.
-    const auto [it, inserted] = scene.renderTargets.try_emplace(name, target);
-    if (! inserted &&
-        (it->second.width != target.width || it->second.height != target.height ||
-         it->second.ContentWidth() != target.ContentWidth() ||
-         it->second.ContentHeight() != target.ContentHeight())) {
-        LOG_INFO("SceneNamedRenderTargetIntern: name='%s' first-size=%dx%d first-map=%dx%d "
-                 "ignored-size=%dx%d ignored-map=%dx%d",
-                 name.c_str(),
-                 it->second.width,
-                 it->second.height,
-                 it->second.ContentWidth(),
-                 it->second.ContentHeight(),
-                 target.width,
-                 target.height,
-                 target.ContentWidth(),
-                 target.ContentHeight());
-    }
-    return it->second;
 }
 
 uint32_t HashParticleFrameU32(uint32_t seed, uint32_t bits) {
@@ -1442,17 +1448,12 @@ SceneImageEffectLayer::HiddenFinalCompositePolicy
 ResolveHiddenFinalCompositePolicy(const Scene& scene, const wpscene::WPImageObject& image) {
     // This is a source-contract decision rather than a shader or layer-name decision. Normal image
     // layers have a meaningful pre-effect source, so disabling the final effect should reveal that
-    // source. Passthrough compose helpers are source-less routing layers; when their final effect is
-    // hidden they should publish nothing instead of preserving a helper render target that may only
-    // contain previous framebuffer contents.
-    //
-    // The flag is an object-level identity property, so the registered SceneObject is the
-    // authoritative source; the authored config is only the bootstrap value for paths that
-    // materialize before identity registration.
-    const auto* scene_object = scene.FindSceneObject(image.id);
-    const bool  passthrough =
-        scene_object != nullptr ? scene_object->Passthrough() : image.config.passthrough;
-    return passthrough
+    // source. Layers the editor marks with a scene-object `config.passthrough` publish nothing
+    // instead of preserving a helper render target that may only contain previous framebuffer
+    // contents. The model passthrough marker (SceneObject::Passthrough) is a different flag and
+    // does not drive this policy.
+    (void)scene;
+    return image.config.suppressHiddenFinalComposite
         ? SceneImageEffectLayer::HiddenFinalCompositePolicy::SuppressOutput
         : SceneImageEffectLayer::HiddenFinalCompositePolicy::PreserveSource;
 }
@@ -2755,37 +2756,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     // output turns blank.
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
     bool use_detached_effect_world_node = hasEffect && ! isCompose;
+    // The card / compose-camera size: the authored size, or the pixel extent a shape already
+    // resolved. The destination extent itself is derived from the source texture once the material
+    // is loaded (ResolveImageDestinationExtent).
     const std::array<float, 2> effect_source_size =
         wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
             ? wpimgobj.effectSourceSize
             : wpimgobj.size;
-    // Effect chains allocate fixed-size private targets. A fullscreen layer's source texture is
-    // the output framebuffer, so its targets take that framebuffer's pixel size at load. Layers
-    // whose effect source size is already a resolved pixel extent (direct-draw shapes) use it
-    // as-is. Otherwise, perspective scenes rasterize effect chains at canvas density: a unit-space
-    // layer's authored size would allocate a private target of a few texels, and procedural
-    // detail such as orbit lines or atmosphere rims cannot survive that sampling. The private
-    // target keeps the authored aspect ratio, because effect shaders derive their own aspect
-    // correction from the target resolution; only the pixel density rises toward the canvas.
-    const std::array<float, 2> effect_target_resolution = [&] {
-        if (wpimgobj.fullscreen) {
-            return OutputFramebufferEffectTargetSize(context);
-        }
-        if (wpimgobj.effectSourceSizeIsPixelExtent) {
-            return effect_source_size;
-        }
-        if (context.scene == nullptr || context.scene->cameraOrthographic) {
-            return effect_source_size;
-        }
-        const float source_w = std::max(effect_source_size[0], 1.0f);
-        const float source_h = std::max(effect_source_size[1], 1.0f);
-        const float density  = std::max(
-            1.0f,
-            std::min(static_cast<float>(context.ortho_w) / source_w,
-                      static_cast<float>(context.ortho_h) / source_h));
-        return std::array<float, 2> { std::ceil(source_w * density),
-                                      std::ceil(source_h * density) };
-    }();
     // skip no effect fullscreen layer
     if (! hasEffect && wpimgobj.fullscreen) {
         register_logical_only_layer();
@@ -2895,6 +2872,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         source_sampler = ResolvePrimaryMaterialSampler(*context.scene, material);
         if (!material.textures.empty()) primary_source_texture = material.textures.front();
     }
+    // Destination targets and effect FBOs are fixed-size images sized from the source texture
+    // content (or the card for texture-less / passthrough helpers), never from the scene camera.
+    const ImageDestinationExtent destination_extent =
+        ResolveImageDestinationExtent(context, wpimgobj, material, effect_source_size);
+    const std::array<float, 2> effect_target_resolution {
+        static_cast<float>(destination_extent.extent[0]),
+        static_cast<float>(destination_extent.extent[1]),
+    };
 
     // mesh
     SceneMesh effct_final_mesh {};
@@ -3085,7 +3070,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         const int32_t effect_target_height = ClampDestinationRenderTargetExtent(
             static_cast<int32_t>(std::lround(effect_target_resolution[1])));
         const auto effect_destination_names = SceneDestinationRenderTargetNames(
-            scene, wpimgobj.parent, effect_target_width, effect_target_height);
+            scene, wpimgobj.parent, effect_target_width, effect_target_height,
+            destination_extent.suffix);
         const std::string& effect_ppong_a = effect_destination_names[0];
         const std::string& effect_ppong_b = effect_destination_names[1];
         // set image effect
@@ -3197,20 +3183,21 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             InternNamedRenderTarget(scene, effect_ppong_b, pingpong_b_target);
             imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_a);
             imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_b);
-            if (wpimgobj.fullscreen || wpimgobj.effectSourceSizeIsPixelExtent) {
-                LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
-                         "pingpong-a='%s' pingpong-b='%s' authored-size=[%.3f, %.3f] "
-                         "target=%dx%d fullscreen=%s",
-                         wpimgobj.id,
-                         wpimgobj.name.c_str(),
-                         effect_ppong_a.c_str(),
-                         effect_ppong_b.c_str(),
-                         effect_source_size[0],
-                         effect_source_size[1],
-                         effect_target_width,
-                         effect_target_height,
-                         wpimgobj.fullscreen ? "true" : "false");
-            }
+            LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
+                     "pingpong-a='%s' pingpong-b='%s' authored-size=[%.3f, %.3f] "
+                     "target=%dx%d policy=%s suffix=%c texture='%s' fullscreen=%s",
+                     wpimgobj.id,
+                     wpimgobj.name.c_str(),
+                     effect_ppong_a.c_str(),
+                     effect_ppong_b.c_str(),
+                     effect_source_size[0],
+                     effect_source_size[1],
+                     effect_target_width,
+                     effect_target_height,
+                     destination_extent.policy,
+                     destination_extent.suffix,
+                     primary_source_texture.c_str(),
+                     wpimgobj.fullscreen ? "true" : "false");
         }
         // A single static-visible effect pass with no private buffers or commands is the layer's
         // own on-screen writer: its material draws the final quad at output resolution while

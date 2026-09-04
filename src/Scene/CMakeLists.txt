@@ -5,6 +5,7 @@ STATIC
 
 Scene.cpp
 SceneCamera.cpp
+SceneDestinationTarget.cpp
 SceneImageEffectLayer.cpp
 SceneIndexArray.cpp
 SceneNode.cpp
