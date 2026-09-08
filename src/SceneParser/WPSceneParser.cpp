@@ -3966,6 +3966,22 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         return context.object_nodes.count(object.id) != 0;
     }
 
+    if (object_json.contains("shape") && object_json.at("shape").is_string()) {
+        // Runtime creation uses the ordinary shape parser so the canonical owner, retained
+        // effects and resource-setup callback exist before property scripts are registered.
+        // Subsequent size writes and child-boundary setup then share the same owner state and
+        // geometry lifecycle as shapes materialized during initial scene loading.
+        WPShapeObject object;
+        if (! object.FromJson(object_json, *context.vfs)) return false;
+        resolve_visibility(object);
+        FillSceneObjectIdentityFor(*context.scene, object);
+        ParseShapeObj(context, object);
+        context.scene->SetLayerLocalVisibility(object.id, object.visible);
+        context.scene->ApplyLayerVisibility(object.id);
+        if (out_layer_id) *out_layer_id = object.id;
+        return context.object_nodes.count(object.id) != 0;
+    }
+
     WPEmptyObject object;
     if (! object.FromJson(object_json, *context.vfs)) return false;
     resolve_visibility(object);
