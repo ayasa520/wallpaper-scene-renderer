@@ -5,7 +5,6 @@
 #include "Type.hpp"
 #include "Core/NoCopyMove.hpp"
 #include "Core/MapSet.hpp"
-#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -46,13 +45,6 @@ struct TextureCachePendingRenderTargetClear {
     ImageParameters image;
 };
 
-enum class TextureCacheStreamingState
-{
-    Ready,
-    Waiting,
-    Failed,
-};
-
 struct TextureKey {
     i32           width { 0 };
     i32           height { 0 };
@@ -84,14 +76,6 @@ public:
                                                      ExternalFrameMemoryPreference::Default);
     ImageSlotsRef                    CreateTex(Image&);
     std::optional<ImageSlotsRef>     FindTex(std::string_view key) const;
-    // Continue an already-started streaming upload using the TextureCache-owned parsed image. This
-    // keeps Scene free to drop its CPU-side image cache as soon as ownership has crossed into
-    // Vulkan residency, avoiding a second long-lived copy of large decoded texture payloads.
-    TextureCacheStreamingState       StagePendingTexUploads(std::string_view key,
-                                                            std::size_t byte_budget);
-    TextureCacheStreamingState       StageTexUploads(std::shared_ptr<Image> image,
-                                                     std::optional<usize> priority_slot,
-                                                     std::size_t byte_budget);
 
     std::optional<ImageParameters> Query(std::string_view key, TextureKey content_hash,
                                          bool persist = false);
@@ -99,9 +83,6 @@ public:
     void RecordUploads(vvk::CommandBuffer&);
     void RetireCompletedUploads();
     void MarkShareReady(std::string_view key);
-    void BeginDeferredGraphActivation();
-    void EndDeferredGraphActivation();
-    void CancelDeferredGraphActivation();
     std::size_t GetTrackedBytes() const;
     std::size_t GetTrackedImageCount() const;
 
@@ -127,13 +108,6 @@ private:
     Map<std::string, ImageSlots>          m_tex_map;
     Map<std::string, ImageCacheRevision>  m_tex_revision_map;
 
-    struct StreamingTexUpload {
-        std::shared_ptr<Image> image;
-        std::deque<usize>      remaining_slots;
-        VkImageLayout          old_layout { VK_IMAGE_LAYOUT_UNDEFINED };
-    };
-    Map<std::string, StreamingTexUpload> m_streaming_tex_uploads;
-
     struct QueryTex {
         idx                index { 0 };
         bool               share_ready { false };
@@ -148,8 +122,6 @@ private:
     std::vector<TextureCachePendingImageUpload>       m_pending_image_uploads;
     std::vector<TextureCachePendingImageUpload>       m_inflight_image_uploads;
     std::vector<TextureCachePendingRenderTargetClear> m_pending_render_target_clears;
-    std::size_t                                      m_deferred_graph_activation_depth { 0 };
-    Set<std::string>                                 m_deferred_share_ready_keys;
 };
 
 } // namespace vulkan

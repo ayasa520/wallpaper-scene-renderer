@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <string_view>
 #include <unordered_set>
@@ -24,6 +25,37 @@ namespace wallpaper
 // Defined here instead of the header: SceneObject.h only forward-declares the parser-side
 // TextLayerRuntimeState, and this translation unit sees the complete type through Scene.h.
 SceneObject::~SceneObject() = default;
+
+std::shared_ptr<const std::string> Scene::GetSystemTextureBinding(const std::string& name) {
+    const auto [it, inserted] = m_system_texture_bindings.try_emplace(name);
+    if (inserted) it->second = std::make_shared<std::string>();
+    return it->second;
+}
+
+void Scene::SetSystemTextureBinding(const std::string& name, const std::string& texture_key) {
+    GetSystemTextureBinding(name);
+    auto& current = *m_system_texture_bindings.at(name);
+    if (current == texture_key) return;
+    if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
+        LOG_INFO("SceneSystemTextureChange: property='%s' previous='%s' current='%s'",
+                 name.c_str(), current.c_str(), texture_key.c_str());
+    }
+    current = texture_key;
+    // Selecting a system image can replace a render-target input, so this changes graph
+    // dependencies as well as descriptors. All handles are updated on the scene thread before the
+    // next graph build. Pixel replacement under an unchanged key continues to use the
+    // imported-resource path.
+    MarkRenderGraphTopologyDirty();
+}
+
+void SceneObject::SetLayerNode(SceneNode* node) {
+    m_layer_node = node;
+    m_has_layer_node_slot = true;
+    // Sound-only registrations have no spatial draw handle. A structural layer replacement
+    // installs the new record atomically with its handle; retiring passes can still own the old
+    // record until their draw resources are released, without accessing a destroyed SceneObject.
+    m_runtime_transform = node != nullptr ? node->TransformState() : nullptr;
+}
 
 void SceneObject::SetTextRuntimeState(TextLayerRuntimeState state) {
     m_text_runtime_state = std::make_unique<TextLayerRuntimeState>(std::move(state));
@@ -117,14 +149,6 @@ bool ResolveCameraPathSample(const Scene::CameraPathSegment& segment,
 void CollectLayerEffectNodes(const Scene& scene, int32_t layer_id, std::vector<SceneNode*>& nodes) {
     auto* effect_layer = const_cast<Scene&>(scene).FindImageEffectLayer(layer_id);
     if (effect_layer == nullptr) return;
-
-    if (effect_layer->HasFinalComposite()) {
-        // Final composite nodes are owned by the image-effect bridge instead of the authored
-        // scene tree, so they will not be reached by normal parent/child propagation. Treat
-        // them as layer-owned runtime nodes here to keep layer visibility authoritative while
-        // preserving effect-local visibility on the internal shader nodes.
-        nodes.push_back(&effect_layer->FinalNode());
-    }
 
     for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
         auto& effect = effect_layer->GetEffect(effect_index);
@@ -550,6 +574,20 @@ SceneObject& Scene::EnsureSceneObject(int32_t layer_id) {
 void Scene::DestroySceneObject(int32_t layer_id) {
     auto it = sceneObjects.find(layer_id);
     if (it == sceneObjects.end()) return;
+
+    // Deletion ends one authored owner's lifetime. Its direct children become roots with their
+    // existing local transforms and identities. Clear those bindings directly, without running
+    // resource setup: calling SetLayerParentBinding for each child here would rebuild the dying
+    // owner's released effect targets. The script host detaches the surviving drawing resources
+    // before this identity cleanup.
+    for (const auto child_id : GetLayerChildren(layer_id)) {
+        FindSceneObject(child_id)->ClearParentBinding();
+        ApplyLayerVisibility(child_id);
+    }
+    // This notification belongs to the owner's still-live parent. Its final child can be the
+    // object being deleted, so it must observe the empty boundary and reselect its destinations.
+    ClearLayerParentBinding(layer_id);
+
     if (const auto* object = it->second.get();
         object != nullptr && object->LayerNode() != nullptr) {
         auto index_it = layerNodeIndex.find(object->LayerNode());
@@ -755,11 +793,28 @@ int32_t Scene::FindLayerIdByNode(const SceneNode* node) const {
 
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
+    const auto* previous_object = FindSceneObject(layer_id);
+    const int32_t previous_parent = previous_object != nullptr ? previous_object->ParentId() : 0;
     if (parent_id == 0 && attachment.empty()) {
         if (auto* object = FindSceneObject(layer_id)) object->ClearParentBinding();
-        return;
+    } else {
+        EnsureSceneObject(layer_id).SetParentBinding(parent_id, std::move(attachment));
     }
-    EnsureSceneObject(layer_id).SetParentBinding(parent_id, std::move(attachment));
+    if (previous_parent == parent_id) return;
+
+    // Resource setup belongs to the parent whose membership crossed the empty/nonempty boundary.
+    // This canonical mutation serves both dynamic creation's identity registration and script
+    // reparenting; updating only the script host would miss children created with a parent
+    // already present in their config. The initial identity prepass has no materialized bridges
+    // yet and only records ancestry.
+    const auto refresh_boundary = [&](int32_t owner_id, size_t boundary_count) {
+        auto* owner = FindSceneObject(owner_id);
+        if (owner != nullptr && GetLayerChildren(owner_id).size() == boundary_count) {
+            owner->RefreshResources(*this);
+        }
+    };
+    refresh_boundary(previous_parent, 0);
+    refresh_boundary(parent_id, 1);
 }
 
 Scene::LayerParentBinding Scene::GetLayerParentBinding(int32_t layer_id) const {
@@ -772,7 +827,7 @@ Scene::LayerParentBinding Scene::GetLayerParentBinding(int32_t layer_id) const {
 }
 
 void Scene::ClearLayerParentBinding(int32_t layer_id) {
-    if (auto* object = FindSceneObject(layer_id)) object->ClearParentBinding();
+    SetLayerParentBinding(layer_id, 0, {});
 }
 
 std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
@@ -951,6 +1006,16 @@ void Scene::UpdateCameraShake() {
     }
 }
 
+Eigen::Vector3f Scene::FrameEyePosition() const {
+    // Lighting uniforms and volume containment share the frame eye, independently of any private
+    // raster camera. The orthographic camera node already carries the canvas half-size in X/Y;
+    // the frame eye's Z stays at 2000 without moving that camera's projection.
+    constexpr float kOrthographicSceneEyeZ = 2000.0f;
+    Eigen::Vector3f eye = activeCamera->GetPosition().cast<float>();
+    if (cameraOrthographic) eye.z() = kOrthographicSceneEyeZ;
+    return eye;
+}
+
 Eigen::Vector3f Scene::ResolveCameraLayerNodeTranslation(
     const std::array<float, 3>& authored_origin) const {
     // WE 2D camera origins are authored around the static camera origin, where 0/0 means the
@@ -969,11 +1034,12 @@ void Scene::UpdateActiveCameraLayer() {
     if (!cameraOrthographic) {
         // Perspective scenes have a single shared view. A camera layer, when present, owns that
         // view per frame: the layer node's world translation is the eye, the node's local -Z axis
-        // is the look direction, and its +Y axis is the up vector. Without a camera layer the
-        // authored scene camera (or camera-path playback) keeps the view.
+        // is the look direction, and its +Y axis is the up vector. Without a camera layer,
+        // select the authored scene pose or this frame's camera-path sample explicitly.
         if (modelPerspectiveCameraName.empty()) return;
         auto camera_it = cameras.find(modelPerspectiveCameraName);
         if (camera_it == cameras.end() || !camera_it->second) return;
+        auto& camera = *camera_it->second;
 
         if (camera_layer != nullptr && camera_layer->node) {
             auto& node = *camera_layer->node;
@@ -991,21 +1057,40 @@ void Scene::UpdateActiveCameraLayer() {
             if (zaxis.norm() > 1e-12 && yaxis.norm() > 1e-12) {
                 zaxis.normalize();
                 yaxis.normalize();
-                auto& camera = *camera_it->second;
-
-                // This branch already applied the selected camera layer's world-space pose, so
-                // it must apply the FOV stored by that same layer's setter as part of one
-                // projection state. Keeping the scene-general FOV here would discard the
-                // click-driven FOV animation after the setter had successfully run.
                 camera.SetExplicitView(eye, eye - zaxis, yaxis);
-                ApplyCameraProjectionState(*this,
-                                           modelPerspectiveCameraName,
-                                           camera,
-                                           camera_layer->zoom,
-                                           camera_layer->fov,
-                                           next_layer_id);
             }
+        } else if (camera_layer == nullptr && !modelCameraPathEnabled) {
+            // With no layer or path, copy authored eye/center/up into the effective pose every
+            // frame. This camera contains the previously selected view, so merely leaving it
+            // unchanged preserves a hidden layer's translation, direction and roll. Restore all
+            // three independent authored vectors, not a pose captured from a camera that a layer
+            // may already have changed. When a path is enabled, PrepareFrame's
+            // UpdateModelCameraPath has already supplied its current sample; layer removal must
+            // retain that sample.
+            camera.SetExplicitView(ToVector3d(authoredCameraPose.eye),
+                                   ToVector3d(authoredCameraPose.center),
+                                   ToVector3d(authoredCameraPose.up));
         }
+
+        // Every frame selects the layer's FOV when a camera layer is active, otherwise the latest
+        // general FOV. Apply scene clip planes in either case. Updating only inside the layer
+        // branch leaves scripts without a layer writing an unused camera, and retains an old
+        // layer FOV after the layer becomes hidden. The FOV clamp affects only the effective
+        // angle; raw general/layer getters still return their stored values.
+        constexpr float kMinimumFrameFov = 0.1f;
+        constexpr float kMaximumFrameFov = 179.9f;
+        const float selected_fov = camera_layer != nullptr ? camera_layer->fov
+                                                          : generalProjection.fov;
+        const float effective_fov =
+            std::max(kMinimumFrameFov, std::min(kMaximumFrameFov, selected_fov));
+        camera.SetNearClip(generalProjection.nearClip);
+        camera.SetFarClip(generalProjection.farClip);
+        ApplyCameraProjectionState(*this,
+                                   modelPerspectiveCameraName,
+                                   camera,
+                                   defaultGlobalCameraZoom,
+                                   effective_fov,
+                                   next_layer_id);
 
         activeCamera = camera_it->second.get();
         if (activeCameraLayerId != next_layer_id) {
@@ -1113,23 +1198,30 @@ const SceneImageEffect* Scene::FindImageEffectById(int32_t owner_layer_id,
 bool Scene::SetEffectLocalVisibility(int32_t owner_layer_id, uint32_t effect_index,
                                      bool visible) {
     auto* effect = FindImageEffect(owner_layer_id, effect_index);
-    if (effect == nullptr) return false;
-
-    // Only the effect-local bit changes here. The render graph topology remains valid because
-    // hidden effects are handled by conditional execution and a bypass copy, while layer visibility
-    // propagation still owns parent/child effective visibility.
-    effect->SetLocalVisible(visible);
-    ApplyLayerVisibility(owner_layer_id);
-    return true;
+    return effect != nullptr && ApplyEffectLocalVisibility(*effect, visible);
 }
 
 bool Scene::SetEffectLocalVisibilityById(int32_t owner_layer_id, int32_t effect_id,
                                          bool visible) {
     auto* effect = FindImageEffectById(owner_layer_id, effect_id);
-    if (effect == nullptr) return false;
+    return effect != nullptr && ApplyEffectLocalVisibility(*effect, visible);
+}
 
-    effect->SetLocalVisible(visible);
-    ApplyLayerVisibility(owner_layer_id);
+bool Scene::ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible) {
+    if (effect.LocalVisible() == visible) return true;
+    const int32_t layer_id = effect.OwnerLayerId();
+    effect.SetLocalVisible(visible);
+    if (auto* layer = FindImageEffectLayer(layer_id)) layer->RefreshPuppetPublicationState();
+    ApplyLayerVisibility(layer_id);
+    // Skipping an effect changes the next input, the final authored writer and its matrix phase.
+    // Rebuild that sequence before drawing; the renderer's residency diff keeps unaffected GPU
+    // resources alive. Repeated script writes of the same value never enter this path.
+    MarkRenderGraphTopologyDirty();
+    LOG_INFO("SceneEffectVisibilityChange: layer=%d effect-id=%d visible=%s",
+             layer_id, effect.EffectId(), visible ? "true" : "false");
+    if (FindTextLayerState(layer_id) != nullptr) {
+        return SyncTextLayerEffectVisibility(*this, layer_id);
+    }
     return true;
 }
 

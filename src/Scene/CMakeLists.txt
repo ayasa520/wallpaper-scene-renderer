@@ -6,11 +6,14 @@ STATIC
 Scene.cpp
 SceneCamera.cpp
 SceneDestinationTarget.cpp
+SceneDraw.cpp
 SceneImageEffectLayer.cpp
 SceneIndexArray.cpp
 SceneNode.cpp
+SceneTransform.cpp
 SceneVertexArray.cpp
 SceneShader.cpp
+SceneShapeGeometry.cpp
 )
 
 target_link_libraries(${LIB_NAME}

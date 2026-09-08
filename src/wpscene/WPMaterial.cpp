@@ -189,6 +189,7 @@ bool WPMaterialPass::FromJson(const nlohmann::json& json) {
         }
     }
     GET_JSON_NAME_VALUE_NOWARN(json, "target", target);
+    GET_JSON_NAME_VALUE_NOWARN(json, "compose", compose);
     if(json.contains("bind")) {
         for(const auto& jB:json.at("bind")) {
             WPMaterialPassBindItem bindItem;

@@ -114,10 +114,8 @@ static void TestCameraLayerState() {
 
 static void TestEffectBridgeOwnership() {
     Scene scene;
-    SceneNode world;
-    world.ID() = 11;
-
-    auto bridge = std::make_shared<SceneImageEffectLayer>(&world, 100.0f, 100.0f, "a", "b");
+    auto bridge = std::make_shared<SceneImageEffectLayer>(
+        scene.EnsureSceneObject(11), 100.0f, 100.0f, "a", "b");
     bridge->SetBridgeCameraName("cam11");
     bridge->AddRuntimeCameraName("cam11");
     scene.EnsureSceneObject(11).SetImageEffectLayer(bridge);

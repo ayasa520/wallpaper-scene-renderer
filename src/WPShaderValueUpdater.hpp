@@ -28,6 +28,7 @@ struct WPUniformInfo {
     bool has_MI { false };
     bool has_M { false };
     bool has_AM { false };
+    bool has_ANM { false };
     bool has_AVP { false };
     bool has_EM { false };
     bool has_RV0 { false };
@@ -41,6 +42,7 @@ struct WPUniformInfo {
     // shaders get that contract without requiring a g_ModelViewProjectionMatrix declaration too.
     bool has_LMM { false };
     bool has_EMVP { false };
+    bool has_EMVPI { false };
     bool has_MVPI { false };
     bool has_ETVP { false };
     bool has_ETVPI { false };
@@ -109,7 +111,6 @@ struct WPNodeTransformBinding {
     SceneNode*                 parent { nullptr };
     uint32_t                   bone_index { 0xFFFFFFFFu };
     Eigen::Affine3f            bind_transform { Eigen::Affine3f::Identity() };
-    Eigen::Affine3f            local_transform { Eigen::Affine3f::Identity() };
 
     bool InheritsParentTransform() const {
         return mode == WPNodeTransformBindingMode::InheritParent;
@@ -120,85 +121,52 @@ struct WPNodeTransformBinding {
     }
 };
 
-struct EffectTextureProjectionBinding {
-    SceneNode* node { nullptr };
-    SceneMesh* mesh { nullptr };
-};
-
-struct PuppetSurfaceBinding {
+struct EffectLayerProjectionBinding {
     SceneImageEffectLayer* layer { nullptr };
-    SceneMesh*              skinned_mesh { nullptr };
 };
 
 struct WPShaderValueData {
     std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
-    // An omitted scene field and an explicit "1 1" have the same numeric value but different
-    // child-layer semantics: omitted depth inherits the parent contract, while explicit depth is
-    // independent. Internal renderer nodes default to authored.
-    bool                 parallaxDepthAuthored { true };
     // index + name
-    std::vector<std::pair<usize, std::string>> renderTargets;
 
     WPPuppetLayer puppet_layer;
-    SceneNode*     parallax_anchor { nullptr };
     WPNodeTransformBinding transform_binding {};
-    EffectTextureProjectionBinding effect_texture_projection {};
-    PuppetSurfaceBinding           puppet_surface {};
-    // The scene transform already carries the required displacement for these nodes, or they are
-    // private effect sources. Keep their parallax anchor for dependents without adding a second
-    // local model offset.
+    EffectLayerProjectionBinding effect_layer_projection {};
+    // Private source/surface phases rasterize in local coordinates. Their visible destination
+    // applies the authored root's displacement once; raw object matrices never contain it.
     bool                  suppress_model_parallax { false };
 
     // Volumetric util materials pack g_RenderVar0–4 and the light-volume matrices per light.
     SceneLight*           volumetric_light { nullptr };
     bool                  volumetric_pass { false };
 
-    void SetParallaxAnchor(SceneNode* parent) { parallax_anchor = parent; }
-
-    void SetParallaxContract(const std::array<float, 2>& depth, SceneNode* anchor = nullptr,
-                             bool suppress_own_model_parallax = false,
-                             bool depth_authored = true) {
+    void SetParallaxContract(const std::array<float, 2>& depth,
+                             bool suppress_own_model_parallax = false) {
         parallaxDepth           = depth;
-        parallaxDepthAuthored   = depth_authored;
-        parallax_anchor         = anchor;
         suppress_model_parallax = suppress_own_model_parallax;
     }
 
-    void SetEffectTextureProjection(SceneNode* projection_node, SceneMesh* projection_mesh) {
-        effect_texture_projection.node = projection_node;
-        effect_texture_projection.mesh = projection_mesh;
-    }
-
-    void SetPuppetSurface(SceneImageEffectLayer* surface_layer, SceneMesh* skinned_mesh) {
-        puppet_surface.layer = surface_layer;
-        puppet_surface.skinned_mesh = skinned_mesh;
+    void SetEffectLayerProjection(SceneImageEffectLayer* layer) {
+        effect_layer_projection.layer = layer;
     }
 
     void SuppressOwnModelParallax() { suppress_model_parallax = true; }
 
     void CopyParallaxContractFrom(const WPShaderValueData& source) {
-        SetParallaxContract(
-            source.parallaxDepth,
-            source.parallax_anchor,
-            source.suppress_model_parallax,
-            source.parallaxDepthAuthored);
+        SetParallaxContract(source.parallaxDepth, source.suppress_model_parallax);
     }
 
-    void InheritParentTransform(SceneNode* parent, bool inherit_parent_parallax = true) {
-        parallax_anchor        = inherit_parent_parallax ? parent : nullptr;
+    void InheritParentTransform(SceneNode* parent) {
         transform_binding.mode = WPNodeTransformBindingMode::InheritParent;
         transform_binding.parent = parent;
     }
 
     void AttachToBone(SceneNode* parent, uint32_t bone_index,
-                      const Eigen::Affine3f& bind_transform,
-                      const Eigen::Affine3f& local_transform) {
-        parallax_anchor                    = parent;
+                      const Eigen::Affine3f& bind_transform) {
         transform_binding.mode             = WPNodeTransformBindingMode::BoneAttachment;
         transform_binding.parent           = parent;
         transform_binding.bone_index       = bone_index;
         transform_binding.bind_transform   = bind_transform;
-        transform_binding.local_transform  = local_transform;
     }
 
     bool InheritsSceneParentTransform() const {
@@ -208,7 +176,7 @@ struct WPShaderValueData {
     bool IsBoneAttached() const { return transform_binding.IsBoneAttachment(); }
 
     bool AppliesModelParallax() const {
-        return ! suppress_model_parallax && ! transform_binding.IsBoneAttachment();
+        return ! suppress_model_parallax;
     }
 
     SceneNode* TransformParent() const { return transform_binding.parent; }
@@ -229,17 +197,18 @@ public:
     void PrepareFrame() override;
     void FrameBegin() override;
 
-    void InitUniforms(SceneNode*, const ExistsUniformOp&) override;
-    void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
+    void InitUniforms(const SceneDraw&, const ExistsUniformOp&) override;
+    void UpdateUniforms(const SceneDraw&, sprite_map_t&, const UpdateUniformOp&,
                         const ShaderUniformOverrides* overrides = nullptr) override;
     void FrameEnd() override;
     Eigen::Matrix4d ResolveModelTransformForProjection(
-        SceneNode* node, const SceneCamera* camera, bool apply_parallax) override;
+        const SceneDraw& draw, const SceneCamera* camera, bool apply_parallax) override;
     std::optional<ShaderSkinningPose> SkinningPose(SceneNode* node) const override;
     void MouseInput(double, double) override;
     void SetTexelSize(float x, float y) override;
 
     void SetNodeData(void*, const WPShaderValueData&);
+    void RemoveDrawData(const SceneDraw& draw);
     const WPShaderValueData* GetNodeData(const void* node_addr) const;
     WPShaderValueData*       GetNodeData(const void* node_addr);
     void SetCameraParallax(const WPCameraParallax& value) {
@@ -249,7 +218,6 @@ public:
         // cannot leave puppet/model layers using offsets computed with the previous global state.
         m_modelTransformCache.clear();
         m_parallaxOffsetCache.clear();
-        m_attachmentTransformCache.clear();
     }
     void     AdvanceAllPuppets();
     uint64_t NextPuppetFrameSerial() const noexcept { return m_puppet_frame_serial + 1; }
@@ -257,6 +225,13 @@ public:
     void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
 
 private:
+    struct EffectProjectionSnapshot {
+        Eigen::Matrix4d layer_model;
+        Eigen::Matrix4d placed_model;
+        Eigen::Matrix4d view_projection;
+        Eigen::Matrix4d incoming_view_projection;
+    };
+    EffectProjectionSnapshot ResolveEffectProjectionSnapshot(const SceneImageEffectLayer& layer);
     void UpdatePointerState();
 
     Scene*               m_scene;
@@ -278,7 +253,6 @@ private:
     uint64_t                     m_puppet_frame_serial { 0 };
     Map<void*, Eigen::Matrix4d>  m_modelTransformCache;
     Map<void*, Eigen::Vector3f>  m_parallaxOffsetCache;
-    Map<void*, Eigen::Affine3f>  m_attachmentTransformCache;
     Map<void*, WPShaderValueData> m_nodeDataMap;
     Map<void*, WPUniformInfo>     m_nodeUniformInfoMap;
 };

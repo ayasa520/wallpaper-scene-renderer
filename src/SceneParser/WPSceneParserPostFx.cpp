@@ -885,10 +885,10 @@ void ClearSceneVolumetrics(Scene& scene) {
     scene.volumetrics.built_quality = scene.volumetrics.quality == 0 ? 0 : -1;
 }
 
-void AddInwardUnitCube(SceneMesh& mesh) {
+void AddVolumeUnitCube(SceneMesh& mesh) {
     // Cookie hull: eight float3 corners. Combined with AltVP = inverse(light clip)
-    // this is the unit cube in [-1,1]. Inward winding + cullmode "normal" writes
-    // the far faces that volumetricsfront treats as backDepth.
+    // this is the unit cube in [-1,1]. The outward winding is shared by the entry
+    // and exit passes; their opposite cull modes select the required boundary.
     constexpr float p[8 * 3] = {
         -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1, -1,
         -1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1,  1,
@@ -905,11 +905,11 @@ void AddInwardUnitCube(SceneMesh& mesh) {
     mesh.AddIndexArray(std::move(indices));
 }
 
-void AddInwardPointSphere(SceneMesh& mesh) {
+void AddVolumePointSphere(SceneMesh& mesh) {
     // Point hull: unit sphere. AltVP is T(origin)*S(radius).
     // Latitude step π/24, longitude step 2π/24.
     // Poles at (0, ±1, 0), then 23 rings × 25 verts (last duplicates first).
-    // Inward winding: (north[j], north[j+1], south[j]) is CW from outside.
+    // The ring and pole triangles all have outward-facing geometric normals.
     constexpr int    rings       = 23;
     constexpr int    slices      = 24;
     constexpr int    ring_stride = slices + 1;
@@ -962,9 +962,9 @@ void AddInwardPointSphere(SceneMesh& mesh) {
     mesh.AddIndexArray(std::move(indices));
 }
 
-void AddInwardSpotCone(SceneMesh& mesh) {
-    // Spot hull: 32 slices, rings at z=1 and z=0 when reverse-depth is off.
-    // Apex at z=0, unit base at z=1.
+void AddVolumeSpotCone(SceneMesh& mesh) {
+    // Outward-wound spot hull: apex at local z=0 and a 32-slice unit base at
+    // local z=1. These are geometry coordinates, independent of camera clip depth.
     constexpr int slices = 32;
     std::vector<float>    pos;
     std::vector<uint16_t> idx;
@@ -1023,7 +1023,7 @@ bool LoadVolumetricUtilMaterial(fs::VFS& vfs, Scene& scene, WPShaderValueUpdater
     sv_data.volumetric_light = light;
     sv_data.volumetric_pass  = light != nullptr;
     WPShaderInfo shader_info;
-    if (! LoadMaterial(vfs, wpmat, &scene, &node, &material, &sv_data, nullptr, &shader_info)) {
+    if (! LoadMaterial(vfs, wpmat, &scene, &material, &sv_data, nullptr, &shader_info)) {
         LOG_ERROR("SceneVolumetrics: compile failed '%.*s'",
                   static_cast<int>(json_path.size()),
                   json_path.data());
@@ -1101,12 +1101,14 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     SceneModelRenderState back_state;
     back_state.depthTest     = true;
     back_state.depthWrite    = true;
-    back_state.cullMode      = SceneCullMode::Back;
+    back_state.cullMode      = SceneCullMode::Front;
     back_state.colorLoadMode = SceneModelColorLoadMode::Clear;
-    // Scene depth is reversed (near = 1, far = 0). The inward-facing hull leaves the volume exit
-    // wall for each pixel; the GREATER test against a 0-cleared buffer stores that exit depth as
-    // backDepth, and the fullscreen ray (shader z = 1 under REVERSEDEPTH) starts at the near
-    // plane.
+    // backDepth must be the exit wall of the volume. These hulls have outward winding; with the
+    // negative-height Vulkan viewport and CCW front-face convention, culling FRONT retains that
+    // exit wall. The lighting hull below retains the opposite, entry wall. Using BACK for both
+    // passes terminates every forward ray at its entry, before any light is integrated. Keep the
+    // reversed projection and GREATER/clear-zero depth contract, and select the correct geometric
+    // boundary.
     back_state.depthClear    = 0.0f;
 
     SceneModelRenderState front_hull_state;
@@ -1145,14 +1147,14 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
         auto front_mesh = std::make_shared<SceneMesh>();
         auto fs_mesh    = std::make_shared<SceneMesh>();
         if (light->type() == SceneLightType::Point) {
-            AddInwardPointSphere(*back_mesh);
-            AddInwardPointSphere(*front_mesh);
+            AddVolumePointSphere(*back_mesh);
+            AddVolumePointSphere(*front_mesh);
         } else if (light->hasCookie()) {
-            AddInwardUnitCube(*back_mesh);
-            AddInwardUnitCube(*front_mesh);
+            AddVolumeUnitCube(*back_mesh);
+            AddVolumeUnitCube(*front_mesh);
         } else {
-            AddInwardSpotCone(*back_mesh);
-            AddInwardSpotCone(*front_mesh);
+            AddVolumeSpotCone(*back_mesh);
+            AddVolumeSpotCone(*front_mesh);
         }
         fs_mesh->ChangeMeshDataFrom(scene.default_effect_mesh);
 

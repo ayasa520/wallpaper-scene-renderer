@@ -259,22 +259,6 @@ std::size_t ImageSlotsAllocationBytes(const ImageSlots& slots) {
     return total;
 }
 
-std::size_t ImageMipmapUploadBytes(const ImageData& mipmap) {
-    if (mipmap.size > 0) {
-        return static_cast<std::size_t>(mipmap.size);
-    }
-    return static_cast<std::size_t>(std::max(mipmap.width, 0)) *
-           static_cast<std::size_t>(std::max(mipmap.height, 0)) * 4u;
-}
-
-std::size_t ImageSlotUploadBytes(const Image::Slot& slot) {
-    std::size_t total = 0;
-    for (const auto& mipmap : slot.mipmaps) {
-        total += ImageMipmapUploadBytes(mipmap);
-    }
-    return total;
-}
-
 bool TextureSlotsResident(const ImageSlots& slots) {
     if (slots.slots.empty()) return false;
     for (const auto& slot : slots.slots) {
@@ -835,7 +819,6 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
 }
 
 ImageSlotsRef TextureCache::CreateTex(Image& image) {
-    m_streaming_tex_uploads.erase(image.key);
     const auto image_revision = CacheRevisionFor(image);
     // Dynamic textures (live text glyph pages, script-updated images) re-enter here every frame
     // with a new revision. Only a key's first residency is reported; revision re-uploads and
@@ -896,159 +879,10 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
 
 std::optional<ImageSlotsRef> TextureCache::FindTex(std::string_view key) const {
     const std::string key_string(key);
-    if (m_streaming_tex_uploads.count(key_string) != 0) return std::nullopt;
     const auto        texture_it = m_tex_map.find(key_string);
     if (texture_it == m_tex_map.end()) return std::nullopt;
     if (!TextureSlotsResident(texture_it->second)) return std::nullopt;
     return ImageSlotsRef(texture_it->second);
-}
-
-TextureCacheStreamingState TextureCache::StagePendingTexUploads(std::string_view key,
-                                                                std::size_t byte_budget) {
-    const std::string key_string(key);
-    auto              streaming_it = m_streaming_tex_uploads.find(key_string);
-    if (streaming_it == m_streaming_tex_uploads.end()) {
-        return m_tex_map.find(key_string) != m_tex_map.end()
-                   ? TextureCacheStreamingState::Ready
-                   : TextureCacheStreamingState::Failed;
-    }
-
-    auto& streaming = streaming_it->second;
-    auto  slots_it  = m_tex_map.find(key_string);
-    auto abort_streaming = [&]() {
-        purgeQueuedWorkForKey(key_string);
-        m_tex_map.erase(key_string);
-        m_tex_revision_map.erase(key_string);
-    };
-    if (streaming.image == nullptr || slots_it == m_tex_map.end()) {
-        abort_streaming();
-        return TextureCacheStreamingState::Failed;
-    }
-
-    std::size_t staged_bytes = 0;
-    std::size_t staged_slots = 0;
-    while (!streaming.remaining_slots.empty()) {
-        const auto slot_index = streaming.remaining_slots.front();
-        if (slot_index >= streaming.image->slots.size()) {
-            streaming.remaining_slots.pop_front();
-            continue;
-        }
-
-        const auto slot_bytes = ImageSlotUploadBytes(streaming.image->slots[slot_index]);
-        if (staged_slots != 0 && byte_budget != 0 && staged_bytes + slot_bytes > byte_budget) {
-            break;
-        }
-
-        auto& gpu_slot = slots_it->second.slots[slot_index];
-        if (!gpu_slot.handle || !gpu_slot.view || !gpu_slot.sampler) {
-            // Allocate the backing VkImage only for the slot that is about to be streamed. The old
-            // implementation created every sprite-frame image up front, which could still create a
-            // visible hitch even though upload-buffer construction was byte-budgeted. This mirrors
-            // the staged residency model in mature engines: CPU decode, GPU image allocation, and
-            // staging-buffer copies all advance in small chunks while the old frame keeps drawing.
-            if (!CreateImageSlotForTexture(m_device, *streaming.image, slot_index, gpu_slot)) {
-                abort_streaming();
-                return TextureCacheStreamingState::Failed;
-            }
-        }
-
-        auto upload = BuildImageUploadJob(m_device,
-                                          key_string,
-                                          *streaming.image,
-                                          slots_it->second,
-                                          slot_index,
-                                          streaming.old_layout);
-        if (!upload.has_value()) {
-            abort_streaming();
-            return TextureCacheStreamingState::Failed;
-        }
-        m_pending_image_uploads.emplace_back(std::move(upload.value()));
-        streaming.remaining_slots.pop_front();
-        staged_bytes += slot_bytes;
-        staged_slots++;
-    }
-
-    if (staged_slots != 0) {
-        LOG_INFO("TextureCacheStreamingStage: key='%s' staged-slots=%zu staged-bytes=%zu "
-                 "remaining-slots=%zu",
-                 key_string.c_str(),
-                 staged_slots,
-                 staged_bytes,
-                 streaming.remaining_slots.size());
-    }
-
-    if (streaming.remaining_slots.empty()) {
-        m_streaming_tex_uploads.erase(streaming_it);
-        LOG_INFO("TextureCacheStreamingReady: key='%s'", key_string.c_str());
-        return TextureCacheStreamingState::Ready;
-    }
-
-    return TextureCacheStreamingState::Waiting;
-}
-
-TextureCacheStreamingState
-TextureCache::StageTexUploads(std::shared_ptr<Image> image,
-                              std::optional<usize> priority_slot,
-                              std::size_t byte_budget) {
-    if (image == nullptr || image->key.empty()) return TextureCacheStreamingState::Failed;
-    const std::string key = image->key;
-    const auto image_revision = CacheRevisionFor(*image);
-
-    auto cached_it = m_tex_map.find(key);
-    if (cached_it != m_tex_map.end()) {
-        const auto cached_revision_it = m_tex_revision_map.find(key);
-        if (cached_revision_it != m_tex_revision_map.end() &&
-            cached_revision_it->second == image_revision &&
-            m_streaming_tex_uploads.count(key) == 0) {
-            return TextureCacheStreamingState::Ready;
-        }
-
-        if (cached_revision_it == m_tex_revision_map.end() ||
-            !(cached_revision_it->second == image_revision)) {
-            purgeQueuedWorkForKey(key);
-            if (CanReuseTextureSlots(cached_it->second, *image)) {
-                StreamingTexUpload streaming;
-                streaming.image      = std::move(image);
-                streaming.old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                for (usize i = 0; i < cached_it->second.slots.size(); i++) {
-                    streaming.remaining_slots.push_back(i);
-                }
-                m_tex_revision_map[key] = image_revision;
-                m_streaming_tex_uploads[key] = std::move(streaming);
-            } else {
-                m_tex_map.erase(key);
-                m_tex_revision_map.erase(key);
-                m_streaming_tex_uploads.erase(key);
-            }
-        }
-    }
-
-    if (m_tex_map.find(key) == m_tex_map.end()) {
-        ImageSlots img_slots;
-        img_slots.slots.resize(image->slots.size());
-
-        StreamingTexUpload streaming;
-        streaming.image = image;
-        if (priority_slot.has_value() && *priority_slot < image->slots.size()) {
-            streaming.remaining_slots.push_back(*priority_slot);
-        }
-        for (usize i = 0; i < image->slots.size(); i++) {
-            if (priority_slot.has_value() && i == *priority_slot) continue;
-            streaming.remaining_slots.push_back(i);
-        }
-        m_tex_map[key] = std::move(img_slots);
-        m_tex_revision_map[key] = image_revision;
-        m_streaming_tex_uploads[key] = std::move(streaming);
-        const auto priority_label =
-            priority_slot.has_value() ? std::to_string(*priority_slot) : std::string("none");
-        LOG_INFO("TextureCacheStreamingCreate: key='%s' slots=%zu revision=%zu priority=%s",
-                 key.c_str(),
-                 image->slots.size(),
-                 static_cast<size_t>(image->revision),
-                 priority_label.c_str());
-    }
-
-    return StagePendingTexUploads(key, byte_budget);
 }
 
 void TextureCache::allocateCmd() {
@@ -1116,12 +950,9 @@ void TextureCache::Clear() {
     m_tex_revision_map.clear();
     m_query_texs.clear();
     m_query_map.clear();
-    m_streaming_tex_uploads.clear();
     m_pending_image_uploads.clear();
     m_inflight_image_uploads.clear();
     m_pending_render_target_clears.clear();
-    m_deferred_graph_activation_depth = 0;
-    m_deferred_share_ready_keys.clear();
 }
 
 bool TextureCache::ReleaseTexture(std::string_view key) {
@@ -1303,55 +1134,12 @@ void TextureCache::MarkShareReady(std::string_view key) {
     }
     if (query->persist) return;
 
-    if (m_deferred_graph_activation_depth != 0) {
-        // Deferred render-graph activation is allowed to prepare passes across several frames, but
-        // transient aliasing is not allowed to advance across that activation boundary. Feedback
-        // effects such as cursor ripple bind ping-pong render targets from passes that may not be
-        // prepared yet; letting an already-prepared bypass/copy pass mark those targets reusable
-        // lets a later prepare reattach the same physical image to a different logical key. Mature
-        // renderers keep transient attachment aliasing behind the graph/subgraph readiness fence,
-        // so queue the release intent and replay it only after every deferred pass is resident.
-        m_deferred_share_ready_keys.insert(key_string);
-        return;
-    }
-
     // A texture entry is reusable only after every logical key that still references it has reached
     // its last read. This makes per-key resize safe for shared render targets while preserving the
     // old transient-reuse behavior for unshared effect outputs.
     query->query_keys.erase(key_string);
     m_query_map.erase(query_it);
     query->share_ready = query->query_keys.empty();
-}
-
-void TextureCache::BeginDeferredGraphActivation() {
-    m_deferred_graph_activation_depth++;
-    LOG_INFO("TextureCacheDeferredGraphActivation: action=begin depth=%zu pending-share-ready=%zu",
-             m_deferred_graph_activation_depth,
-             m_deferred_share_ready_keys.size());
-}
-
-void TextureCache::EndDeferredGraphActivation() {
-    if (m_deferred_graph_activation_depth == 0) return;
-    m_deferred_graph_activation_depth--;
-    if (m_deferred_graph_activation_depth != 0) return;
-
-    auto deferred_keys = std::move(m_deferred_share_ready_keys);
-    m_deferred_share_ready_keys.clear();
-    LOG_INFO("TextureCacheDeferredGraphActivation: action=end replay-share-ready=%zu",
-             deferred_keys.size());
-    for (const auto& key : deferred_keys) {
-        MarkShareReady(key);
-    }
-}
-
-void TextureCache::CancelDeferredGraphActivation() {
-    if (m_deferred_graph_activation_depth == 0 && m_deferred_share_ready_keys.empty()) return;
-    LOG_INFO("TextureCacheDeferredGraphActivation: action=cancel depth=%zu "
-             "drop-share-ready=%zu",
-             m_deferred_graph_activation_depth,
-             m_deferred_share_ready_keys.size());
-    m_deferred_graph_activation_depth = 0;
-    m_deferred_share_ready_keys.clear();
 }
 
 void TextureCache::purgeQueuedWorkForKey(std::string_view key) {
@@ -1384,7 +1172,6 @@ void TextureCache::purgeQueuedWorkForKey(std::string_view key) {
                        m_pending_render_target_clears.end(),
                        same_key),
         m_pending_render_target_clears.end());
-    m_streaming_tex_uploads.erase(std::string(key));
 }
 
 void TextureCache::RecordUploads(vvk::CommandBuffer& cmd) {

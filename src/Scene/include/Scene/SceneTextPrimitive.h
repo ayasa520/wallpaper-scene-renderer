@@ -53,39 +53,33 @@ struct TextLayoutResult {
     std::vector<TextGlyphRun>       glyph_runs;
 };
 
-struct TextBridgeRenderTarget {
-    // A first-class text bridge owns projected-density offscreen targets that image effects sample.
-    // `scale` and `fit` mirror Wallpaper Engine's authored effect FBO sizing rules so runtime text
-    // updates can recompute the same target dimensions that parse-time image/text effect material
-    // construction used. Keeping the sizing metadata with the bridge avoids texture-resolution
-    // hacks inside shader passes when an effect target is resized after text content changes.
-    std::string name;
-    uint32_t    scale { 1 };
-    uint32_t    fit { 0 };
-    // Feedback targets retain history across frames. Their physical grid must remain in the
-    // authored effect domain instead of following transient projected text scale changes that
-    // would recreate the image and discard the accumulated state.
-    bool        persistent_feedback { false };
-};
-
 struct TextSourceBridge {
     std::string camera_name;
     std::string pingpong_a;
     std::string pingpong_b;
 
     // The destination extent of the current shaped text box (clamped to the destination minimum).
-    // The pair above is registered for this extent and resized in place when a re-layout changes
-    // it.
+    // Re-layout selects a new pair by name when this extent changes; earlier entries retain their
+    // original size in the scene's intern table.
     std::array<uint32_t, 2> bridge_backing_extent { 1u, 1u };
-    std::vector<TextBridgeRenderTarget> render_targets;
 };
 
 struct TextLayerRenderContract {
     bool has_materialized_authored_effects { false };
+    // Resource ownership is stable while visibility changes. Padding instead follows the visible
+    // effect count. An all-hidden ordinary chain draws the glyph primitive directly while its
+    // bridge resources remain resident; independent private publication still needs padding.
+    bool has_visible_authored_effects { false };
+    bool uses_private_dependency_bridge { false };
     bool uses_shader_color_blend_bridge { false };
 
     [[nodiscard]] bool RequiresBridge() const {
-        return has_materialized_authored_effects || uses_shader_color_blend_bridge;
+        return has_materialized_authored_effects || uses_private_dependency_bridge ||
+               uses_shader_color_blend_bridge;
+    }
+    [[nodiscard]] bool UsesEffectPadding() const {
+        return has_visible_authored_effects || uses_private_dependency_bridge ||
+               uses_shader_color_blend_bridge;
     }
 };
 

@@ -237,13 +237,9 @@ struct LayerValueHint {
     bool                 supported { false };
 };
 
-struct NodeScaleSnapshot {
-    Eigen::Vector3f local { 1.0f, 1.0f, 1.0f };
-    Eigen::Vector3f world { 1.0f, 1.0f, 1.0f };
-};
 
 int32_t    FindNodeId(const WPSceneScriptHost::Opaque* opaque, const SceneNode* node);
-bool       ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
+bool       ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                                    std::string_view property_name, const WPDynamicValue& value);
 void       UpdateJSNumericArray(JSContext* context, JSValueConst target,
                                 const std::vector<float>& values);
@@ -291,8 +287,11 @@ LayerValueHint LayerValueType(std::string_view property_name) {
     if (property_name == "backgroundcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "backgroundbrightness") return { WPDynamicValue::Type::Float, true };
     if (property_name == "opaquebackground") return { WPDynamicValue::Type::Boolean, true };
+    if (property_name == "copybackground") return { WPDynamicValue::Type::Boolean, true };
     if (property_name == "pointsize") return { WPDynamicValue::Type::Float, true };
-    if (property_name == "padding") return { WPDynamicValue::Type::Int32, true };
+    // The registered runtime accessor copies two floats; scripts and property animations must
+    // retain both axes and their precision through value conversion.
+    if (property_name == "padding") return { WPDynamicValue::Type::Float2, true };
     if (property_name == "horizontalalign") return { WPDynamicValue::Type::String, true };
     if (property_name == "verticalalign") return { WPDynamicValue::Type::String, true };
     if (property_name == "anchor") return { WPDynamicValue::Type::String, true };
@@ -408,6 +407,7 @@ const char* TargetKindName(WPSceneScriptTargetKind target_kind) {
 }
 
 LayerValueHint SceneValueType(std::string_view property_name) {
+    if (property_name == "clearenabled") return { WPDynamicValue::Type::Boolean, true };
     if (property_name == "clearcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "ambientcolor") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "skylightcolor") return { WPDynamicValue::Type::Float3, true };
@@ -425,6 +425,7 @@ LayerValueHint SceneValueType(std::string_view property_name) {
     if (property_name == "camerashakeroughness") return { WPDynamicValue::Type::Float, true };
     if (property_name == "camerashakespeed") return { WPDynamicValue::Type::Float, true };
     if (property_name == "fov") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "perspectiveoverridefov") return { WPDynamicValue::Type::Float, true };
     if (property_name == "nearz") return { WPDynamicValue::Type::Float, true };
     if (property_name == "farz") return { WPDynamicValue::Type::Float, true };
     return {};
@@ -1306,8 +1307,12 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    const effectObject = __objectKind === 'effect'\n"
         << "      ? (createEffectProxy(__nodeId, __objectIndex, __instanceId) ?? undefined)\n"
         << "      : undefined;\n"
-        << "    const baseObject = effectObject ?? animationObject ?? createLayerProxy(__nodeId, "
-           "__instanceId);\n"
+        // General scripts carry the scene as their real property owner. Keep the common timeline
+        // facade, but resolve ordinary owner properties through scene storage instead of
+        // manufacturing a layer proxy for object id zero.
+        << "    const baseObject = __objectKind === 'scene' ? __sceneProxy\n"
+        << "      : (effectObject ?? animationObject ?? createLayerProxy(__nodeId, "
+           "__instanceId));\n"
         << "    return new Proxy({}, {\n"
         << "      get(_target, prop) {\n"
         << "        if (typeof prop !== 'string') return undefined;\n"
@@ -1379,7 +1384,6 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    }\n"
         << "    return normalized;\n"
         << "  }\n"
-        << "  const __layerProxy = createLayerProxy(__nodeId, 0);\n"
         << "  const __sceneUpdateCallbacks = [];\n"
         << "  const __sceneMethods = {\n"
         << "    on(eventName, callback) {\n"
@@ -1440,6 +1444,11 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "Reflect.has(target, prop);\n"
         << "    }\n"
         << "  });\n"
+        // General script registration also passes the scene as the initial layer context. Build
+        // this facade after __sceneProxy so both thisLayer and thisObject can read/write scene
+        // properties and resolve scene-owned timelines through their persistent instance.
+        << "  const __layerProxy = __objectKind === 'scene'\n"
+        << "    ? createThisObjectProxy() : createLayerProxy(__nodeId, 0);\n"
         << "  // Wallpaper Engine does not make thisLayer immutable; a few authored scene scripts "
            "rebind\n"
         << "  // it to another layer inside their module scope. Keep a separate __layerProxy for "
@@ -2261,11 +2270,6 @@ std::string DescribeScriptInstance(const WPSceneScriptHost::Opaque* opaque, uint
     return description.str();
 }
 
-SceneNode* FindInstanceNode(WPSceneScriptHost::Opaque* opaque, uint32_t instance_id) {
-    auto* instance = FindInstance(opaque, instance_id);
-    return instance != nullptr ? instance->registration.node : nullptr;
-}
-
 PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque* opaque,
                                                  uint32_t                   animation_id) {
     if (opaque == nullptr) return nullptr;
@@ -2284,14 +2288,14 @@ const PropertyAnimationInstance* FindPropertyAnimation(const WPSceneScriptHost::
     return nullptr;
 }
 
-PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
+PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                                                  std::string_view animation_name) {
-    if (opaque == nullptr || node == nullptr) return nullptr;
+    if (opaque == nullptr || layer_id == 0) return nullptr;
     for (auto& animation : opaque->property_animations) {
         // Camera layers expose property animations through the same script-facing layer object as
         // empty/image layers. Include camera targets here so thisLayer.getAnimation("zoom") can
         // resolve the authored camera timeline instead of disappearing behind the target split.
-        if (animation.registration.node != node ||
+        if (animation.registration.object_id != layer_id ||
             (animation.registration.target_kind != WPSceneScriptTargetKind::Layer &&
              animation.registration.target_kind != WPSceneScriptTargetKind::Camera)) {
             continue;
@@ -2311,14 +2315,14 @@ PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque* opaq
 }
 
 const PropertyAnimationInstance* FindPropertyAnimation(const WPSceneScriptHost::Opaque* opaque,
-                                                       SceneNode*                       node,
+                                                       int32_t                          layer_id,
                                                        std::string_view property_name) {
-    if (opaque == nullptr || node == nullptr) return nullptr;
+    if (opaque == nullptr || layer_id == 0) return nullptr;
     for (const auto& animation : opaque->property_animations) {
-        // Runtime property reads use the same node identity for layer and camera registrations;
+        // Runtime property reads use the same authored object for layer and camera registrations;
         // keeping both target kinds discoverable prevents camera keyframes from being treated as
         // unrelated state when scripts query animation handles by property name.
-        if (animation.registration.node == node &&
+        if (animation.registration.object_id == layer_id &&
             animation.registration.property_name == property_name &&
             (animation.registration.target_kind == WPSceneScriptTargetKind::Layer ||
              animation.registration.target_kind == WPSceneScriptTargetKind::Camera)) {
@@ -2344,7 +2348,10 @@ bool SameRegistrationTarget(const WPSceneScriptRegistration& lhs,
         return lhs.target_index == rhs.target_index;
     }
 
-    return lhs.node == rhs.node || lhs.node == nullptr || rhs.node == nullptr;
+    // Different effect/model materials on one object may expose the same property name. Their
+    // material resource is the target; ordinary layer targets are completely identified by id.
+    return lhs.target_kind != WPSceneScriptTargetKind::MaterialUniform ||
+           lhs.material == rhs.material;
 }
 
 PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque*        opaque,
@@ -2373,6 +2380,15 @@ WPShaderValueUpdater* GetShaderUpdater(const WPSceneScriptHost::Opaque* opaque) 
     return dynamic_cast<WPShaderValueUpdater*>(opaque->scene->shaderValueUpdater.get());
 }
 
+Eigen::Matrix4d ResolveLayerModelTransform(const WPSceneScriptHost::Opaque* opaque,
+                                           SceneNode* node) {
+    // Matrix reads use the same authored parent/bone evaluation as drawing. The query has fresh
+    // caches so a script's preceding TRS or parent write is visible before the next GPU pass;
+    // querying a matrix never rewrites the layer properties.
+    return opaque->scene->shaderValueUpdater->ResolveModelTransformForProjection(
+        node, nullptr, false);
+}
+
 const WPShaderValueData* GetNodeData(const WPSceneScriptHost::Opaque* opaque, SceneNode* node) {
     auto* updater = GetShaderUpdater(opaque);
     return updater != nullptr && node != nullptr ? updater->GetNodeData(node) : nullptr;
@@ -2389,41 +2405,6 @@ WPShaderValueData* GetNodeData(WPSceneScriptHost::Opaque* opaque, SceneNode* nod
 SceneNode* FindNodeById(WPSceneScriptHost::Opaque* opaque, int32_t node_id) {
     if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
     return opaque->scene->GetLayerNode(node_id);
-}
-
-void RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
-                              SceneNode* node) {
-    if (opaque == nullptr || opaque->scene == nullptr) return;
-
-    auto rebind_registration = [layer_id, node](WPSceneScriptRegistration& registration) {
-        if (registration.object_id == layer_id &&
-            (registration.target_kind == WPSceneScriptTargetKind::Layer ||
-             registration.target_kind == WPSceneScriptTargetKind::Effect)) {
-            // A structural dynamic-layer replacement can install a new runtime node for the same
-            // authored id. Effect registrations still target the effect by id/index, but their
-            // script environment also needs the current owner node for thisObject helpers.
-            registration.node = node;
-        }
-    };
-
-    for (auto& registration : opaque->scene->bindingRegistrations) {
-        rebind_registration(registration);
-    }
-    for (auto& registration : opaque->scene->scriptRegistrations) {
-        rebind_registration(registration);
-    }
-    for (auto& registration : opaque->scene->propertyAnimationRegistrations) {
-        rebind_registration(registration);
-    }
-    for (auto& registration : opaque->property_bindings) {
-        rebind_registration(registration);
-    }
-    for (auto& animation : opaque->property_animations) {
-        rebind_registration(animation.registration);
-    }
-    for (auto& instance : opaque->instances) {
-        if (instance != nullptr) rebind_registration(instance->registration);
-    }
 }
 
 SceneRegistrationRange CaptureSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque) {
@@ -2654,10 +2635,10 @@ void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, Scen
     }
 
     auto&       states   = opaque->texture_states[node];
-    const auto& textures = node->Mesh()->Material()->textures;
-    for (usize slot = 0; slot < textures.size(); slot++) {
+    const auto& material = *node->Mesh()->Material();
+    for (usize slot = 0; slot < material.textures.size(); slot++) {
         if (states.count(slot) != 0) continue;
-        const auto& name = textures[slot];
+        const auto& name = material.Texture(slot);
         if (name.empty()) continue;
         if (opaque->scene->textures.count(name) == 0) continue;
         const auto& texture = opaque->scene->textures.at(name);
@@ -2710,7 +2691,9 @@ void CollectVideoTextureKeysForNode(const WPSceneScriptHost::Opaque* opaque, Sce
         return;
     }
 
-    for (const auto& key : node->Mesh()->Material()->textures) {
+    const auto& material = *node->Mesh()->Material();
+    for (usize slot = 0; slot < material.textures.size(); ++slot) {
+        const auto& key = material.Texture(slot);
         if (key.empty() || seen_keys->count(key) != 0) continue;
         const auto texture_it = opaque->scene->textures.find(key);
         if (texture_it == opaque->scene->textures.end() || ! texture_it->second.isVideo) continue;
@@ -2793,7 +2776,6 @@ std::vector<SceneNode*> CollectPuppetLayerNodes(const WPSceneScriptHost::Opaque*
 
     if (auto* effect_layer = opaque->scene->FindImageEffectLayer(layer_id);
         effect_layer != nullptr) {
-        add_if_puppet(&effect_layer->FinalNode());
         for (std::size_t effect_index = 0; effect_index < effect_layer->EffectCount();
              effect_index++) {
             auto& effect = effect_layer->GetEffect(effect_index);
@@ -2955,8 +2937,7 @@ bool RebindLayerParent(WPSceneScriptHost::Opaque* opaque, SceneNode* node, Scene
 
     auto*           data          = GetNodeData(opaque, node);
     Eigen::Affine3f current_world = Eigen::Affine3f::Identity();
-    node->UpdateTrans();
-    current_world.matrix() = node->ModelTrans().cast<float>();
+    current_world.matrix() = ResolveLayerModelTransform(opaque, node).cast<float>();
 
     const Eigen::Affine3f          local_before(node->GetLocalTrans().cast<float>());
     std::optional<Eigen::Matrix4d> attachment_world;
@@ -2977,7 +2958,6 @@ bool RebindLayerParent(WPSceneScriptHost::Opaque* opaque, SceneNode* node, Scene
 
     if (data != nullptr) {
         data->transform_binding = {};
-        data->parallax_anchor   = nullptr;
     }
 
     Eigen::Affine3f updated_local = local_before;
@@ -2992,25 +2972,24 @@ bool RebindLayerParent(WPSceneScriptHost::Opaque* opaque, SceneNode* node, Scene
 
         data->AttachToBone(new_parent,
                            attachment_binding->bone_index,
-                           attachment_binding->bind_transform,
-                           updated_local);
+                           attachment_binding->bind_transform);
         scene_parent = nullptr;
     } else if (new_parent != nullptr) {
         if (data != nullptr) {
             if (adjust_transforms) {
-                new_parent->UpdateTrans();
+                const Eigen::Matrix4d parent_model = RemoveImageAlignmentOffsetFromModel(
+                    ResolveLayerModelTransform(opaque, new_parent), new_parent->AlignmentOffset());
                 updated_local = Eigen::Affine3f(
-                    (new_parent->ModelTrans().inverse() * current_world.matrix().cast<double>())
-                        .cast<float>());
+                    (parent_model.inverse() * current_world.matrix().cast<double>()).cast<float>());
             }
             data->InheritParentTransform(new_parent);
             scene_parent = nullptr;
         } else {
             if (adjust_transforms) {
-                new_parent->UpdateTrans();
+                const Eigen::Matrix4d parent_model = RemoveImageAlignmentOffsetFromModel(
+                    ResolveLayerModelTransform(opaque, new_parent), new_parent->AlignmentOffset());
                 updated_local = Eigen::Affine3f(
-                    (new_parent->ModelTrans().inverse() * current_world.matrix().cast<double>())
-                        .cast<float>());
+                    (parent_model.inverse() * current_world.matrix().cast<double>()).cast<float>());
             }
             scene_parent = new_parent;
         }
@@ -3034,11 +3013,46 @@ bool RebindLayerParent(WPSceneScriptHost::Opaque* opaque, SceneNode* node, Scene
     return true;
 }
 
-void CollectNodeSubtree(SceneNode* node, std::unordered_set<SceneNode*>& out_nodes) {
+void CollectLayerNodesForDestroy(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
+                                 SceneNode* node, std::unordered_set<SceneNode*>& out_nodes) {
     if (node == nullptr || out_nodes.contains(node)) return;
     out_nodes.insert(node);
-    for (const auto& child : node->GetChildren()) {
-        CollectNodeSubtree(child.get(), out_nodes);
+    auto& children = node->GetChildren();
+    for (auto it = children.begin(); it != children.end();) {
+        auto child = *it++;
+        const auto child_owner = opaque->scene->LayerIdForNode(child.get());
+        if (child_owner != 0 && child_owner != layer_id) {
+            // A physical render subtree can cross authored ownership boundaries. Keep the other
+            // owner's entire subtree alive and change only its physical attachment. Detaching
+            // preserves its existing local TRS; decomposing a world matrix here would change
+            // those authored properties.
+            node->RemoveChild(child.get());
+            opaque->scene->sceneGraph->AppendChild(child);
+            LOG_INFO("SceneLayerDestroyPreserve: layer=%d child-owner=%d node='%s'",
+                     layer_id, child_owner, child->Name().c_str());
+            continue;
+        }
+        CollectLayerNodesForDestroy(opaque, layer_id, child.get(), out_nodes);
+    }
+}
+
+void ClearDestroyedParentTransformBindings(WPSceneScriptHost::Opaque* opaque, int32_t layer_id) {
+    for (const auto child_id : opaque->scene->GetLayerChildren(layer_id)) {
+        size_t cleared_bindings = 0;
+        for (auto* node : opaque->scene->GetLayerRuntimeNodes(child_id)) {
+            auto* data = GetNodeData(opaque, node);
+            if (data != nullptr &&
+                opaque->scene->LayerIdForNode(data->TransformParent()) == layer_id) {
+                data->transform_binding = {};
+                ++cleared_bindings;
+            }
+        }
+        // Routed children already reside at the graph root, so physical subtree evacuation
+        // alone does not clear their inherited or bone-attached parent handle. The canonical
+        // parent id and attachment are cleared together by Scene::DestroySceneObject below.
+        LOG_INFO("SceneLayerDestroyDetach: layer=%d child=%d transform-bindings=%zu "
+                 "adjust-transforms=0",
+                 layer_id, child_id, cleared_bindings);
     }
 }
 
@@ -3141,22 +3155,22 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
     std::vector<int32_t> pending = std::move(opaque->pending_destroy_layer_ids);
     opaque->pending_destroy_layer_ids.clear();
 
-    std::unordered_set<int32_t> destroying_layers(pending.begin(), pending.end());
-    const auto retained_resources =
-        CollectRetainedResidencyResources(*opaque->scene, destroying_layers);
+    std::vector<std::pair<int32_t, LayerResidencyResources>> retired_resources;
+    std::unordered_set<std::string> retired_render_targets;
 
     for (const int32_t layer_id : pending) {
-        // Dynamic deletion used to get GPU cleanup as an accidental side effect of the broad
-        // topology-rebuild cache clear. Topology rebuilds are now cache-preserving, so delete must
-        // explicitly queue only the resources owned by the removed layer and not by another still
-        // retained layer.
-        QueueLayerResourceRelease(*opaque->scene, layer_id, retained_resources, "destroy");
+        // Capture this owner's resources before its descriptors disappear. A surviving parent's
+        // last-child callback can select different shared targets later in this same batch;
+        // release decisions therefore use the final surviving owners after the loop.
+        retired_resources.emplace_back(
+            layer_id, CollectLayerResidencyResources(*opaque->scene, layer_id));
+        ClearDestroyedParentTransformBindings(opaque, layer_id);
 
         std::unordered_set<SceneNode*>          destroyed_nodes;
         std::vector<std::shared_ptr<SceneNode>> detached_roots;
         for (SceneNode* runtime_node : opaque->scene->GetLayerRuntimeNodes(layer_id)) {
-            if (runtime_node == nullptr) continue;
-            CollectNodeSubtree(runtime_node, destroyed_nodes);
+            if (runtime_node == nullptr || destroyed_nodes.contains(runtime_node)) continue;
+            CollectLayerNodesForDestroy(opaque, layer_id, runtime_node, destroyed_nodes);
             if (auto* parent = runtime_node->Parent()) {
                 if (auto detached = ExtractChildNode(parent, runtime_node)) {
                     detached_roots.push_back(std::move(detached));
@@ -3164,13 +3178,25 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             }
         }
 
+        // Effect nodes are owned by the bridge rather than the physical graph. Their animation
+        // and shader records have the same owner lifetime and must be included in retirement.
+        if (auto* bridge = opaque->scene->FindImageEffectLayer(layer_id)) {
+            for (size_t index = 0; index < bridge->EffectCount(); ++index) {
+                for (const auto& effect_node : bridge->GetEffect(index)->nodes) {
+                    destroyed_nodes.insert(effect_node.sceneNode.get());
+                }
+            }
+        }
+
+        // Script destruction queues one authored owner. Children keep their own script instances,
+        // timers and property animations even if they used to share a physical tree.
         std::unordered_set<uint32_t> removed_instance_ids;
         auto&                        instances = opaque->instances;
         instances.erase(std::remove_if(instances.begin(),
                                        instances.end(),
                                        [&](const std::unique_ptr<ScriptInstance>& instance) {
-                                           if (! instance || ! destroyed_nodes.contains(
-                                                                 instance->registration.node)) {
+                                           if (! instance ||
+                                               instance->registration.object_id != layer_id) {
                                                return false;
                                            }
                                            removed_instance_ids.insert(instance->instance_id);
@@ -3195,11 +3221,12 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             std::remove_if(opaque->property_animations.begin(),
                            opaque->property_animations.end(),
                            [&](const PropertyAnimationInstance& animation) {
-                               return destroyed_nodes.contains(animation.registration.node);
+                               return animation.registration.object_id == layer_id;
                            }),
             opaque->property_animations.end());
 
         for (SceneNode* node : destroyed_nodes) {
+            if (auto* updater = GetShaderUpdater(opaque)) updater->RemoveDrawData(node);
             opaque->texture_states.erase(node);
             auto animation_state_it = opaque->animation_layer_states.find(node);
             if (animation_state_it != opaque->animation_layer_states.end()) {
@@ -3229,14 +3256,11 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // loop regardless of destruction order.
         if (const auto* destroyed_object = opaque->scene->FindSceneObject(layer_id)) {
             if (const auto effect_layer = destroyed_object->ImageEffectLayer()) {
+                if (auto* updater = GetShaderUpdater(opaque)) {
+                    updater->RemoveDrawData(effect_layer->FinalCompositeDraw());
+                }
                 for (const auto& render_target : effect_layer->RuntimeRenderTargetNames()) {
-                    // Named effect targets can be shared by any number of authored layers. The
-                    // retained-resource set was collected with every pending deletion excluded,
-                    // so a name present there has a concrete surviving owner and must stay in the
-                    // scene table when this layer disappears.
-                    if (! retained_resources.render_targets.contains(render_target)) {
-                        opaque->scene->renderTargets.erase(render_target);
-                    }
+                    retired_render_targets.insert(render_target);
                 }
                 for (const auto& camera_name : effect_layer->RuntimeCameraNames()) {
                     for (auto& [linked_name, linked_cameras] : opaque->scene->linkedCameras) {
@@ -3278,10 +3302,9 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
                                }),
                 subsystems.end());
         }
-        // Deleting a layer removes its authored SceneObject entirely: parent binding, local
-        // visibility, identity, image runtime state, sound handle, and the light/particle records
-        // all live there now. Children keep their dangling parent id, exactly like the previous
-        // per-concern maps did.
+        // Base hierarchy cleanup clears surviving children's parent/attachment ids without
+        // running live setup on this dying owner, then notifies its own still-live parent.
+        // That notification can reselect shared render targets, so it precedes final retention.
         opaque->scene->DestroySceneObject(layer_id);
         // The layer-node slot and text runtime state live on the SceneObject, so
         // DestroySceneObject above already dropped them together with the rest of the identity; a
@@ -3329,6 +3352,18 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             }
         }
         opaque->scene->MarkRenderGraphTopologyDirty();
+        LOG_INFO("SceneLayerDestroy: layer=%d retired-nodes=%zu removed-scripts=%zu",
+                 layer_id, destroyed_nodes.size(), removed_instance_ids.size());
+    }
+
+    const auto retained_resources = CollectRetainedResidencyResources(*opaque->scene, {});
+    for (const auto& [layer_id, resources] : retired_resources) {
+        QueueLayerResourceRelease(*opaque->scene, layer_id, resources, retained_resources, "destroy");
+    }
+    for (const auto& render_target : retired_render_targets) {
+        if (!retained_resources.render_targets.contains(render_target)) {
+            opaque->scene->renderTargets.erase(render_target);
+        }
     }
 
     ResortLayerTree(opaque->scene->sceneGraph.get(), opaque);
@@ -3377,18 +3412,6 @@ void ApplySceneCameraParallax(WPSceneScriptHost::Opaque* opaque) {
         .delay          = opaque->scene->cameraParallaxDelay,
         .mouseinfluence = opaque->scene->cameraParallaxMouseInfluence,
     });
-}
-
-const SceneCamera* GetPerspectiveSceneCamera(const WPSceneScriptHost::Opaque* opaque) {
-    if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->cameras.find("global_perspective");
-    return it == opaque->scene->cameras.end() ? nullptr : it->second.get();
-}
-
-SceneCamera* GetPerspectiveSceneCamera(WPSceneScriptHost::Opaque* opaque) {
-    if (opaque == nullptr || opaque->scene == nullptr) return nullptr;
-    auto it = opaque->scene->cameras.find("global_perspective");
-    return it == opaque->scene->cameras.end() ? nullptr : it->second.get();
 }
 
 const Scene::ImageLayerRuntimeState* FindImageLayerById(const WPSceneScriptHost::Opaque* opaque,
@@ -3557,19 +3580,7 @@ void DecomposeAffine(const Eigen::Affine3f& affine, Eigen::Vector3f& translation
     rotation       = Eigen::Vector3f(zyx[2], zyx[1], zyx[0]);
 }
 
-NodeScaleSnapshot CaptureNodeScale(SceneNode* node) {
-    NodeScaleSnapshot snapshot;
-    if (node == nullptr) return snapshot;
 
-    node->UpdateTrans();
-    snapshot.local = node->Scale();
-
-    Eigen::Vector3f translation;
-    Eigen::Vector3f rotation;
-    DecomposeAffine(
-        Eigen::Affine3f(node->ModelTrans().cast<float>()), translation, rotation, snapshot.world);
-    return snapshot;
-}
 
 std::optional<Eigen::Matrix4d> ReadMatrix4FromJS(JSContext* context, JSValueConst value) {
     if (JS_IsException(value) || JS_IsUndefined(value) || JS_IsNull(value)) return std::nullopt;
@@ -3618,8 +3629,8 @@ std::optional<Eigen::Matrix4d> GetAttachmentWorldTransform(const WPSceneScriptHo
     const auto bone_model = GetBoneModelTransform(opaque, node, attachment.bone_index);
     if (! bone_model.has_value()) return std::nullopt;
 
-    node->UpdateTrans();
-    return node->ModelTrans() *
+    return RemoveImageAlignmentOffsetFromModel(
+               ResolveLayerModelTransform(opaque, node), node->AlignmentOffset()) *
         ((*bone_model) * attachment.bind_transform).matrix().cast<double>();
 }
 
@@ -3782,51 +3793,9 @@ WPDynamicValue EvaluateRegistrationSetting(const WPSceneScriptRegistration& regi
     return registration.setting.evaluate(user_properties, nullptr, base_context);
 }
 
-void SyncEffectLayerTransforms(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
-                               SceneNode* node) {
-    if (opaque == nullptr || opaque->scene == nullptr || node == nullptr) return;
-
-    auto& scene        = *opaque->scene;
-    auto* effect_layer = scene.FindImageEffectLayer(layer_id);
-    if (effect_layer == nullptr) return;
-
-    auto* world_node = effect_layer->WorldNode();
-    if (world_node == nullptr) {
-        effect_layer->SyncResolvedNodeToMatrix(
-            Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
-        return;
-    }
-
-    if (scene.shaderValueUpdater == nullptr) return;
-
-    /*
-     * Effect output nodes are detached render-graph publishers. A compose route can therefore
-     * keep its authored child root-owned in the physical SceneNode tree while assigning a virtual
-     * parent through WPNodeData. Script writes happen after graph construction, so copying
-     * WorldNode::ModelTrans here would replace the correctly routed publisher matrix with the
-     * child's local transform. Resolve the current logical route after every script transform
-     * update. Private final composites publish that raw routed world matrix; ordinary effect
-     * layers use the display camera's parallax in the same way as their shader uniforms.
-     */
-    const bool apply_parallax = !effect_layer->PublishesPrivateFinalComposite();
-    const auto resolved_model = scene.shaderValueUpdater->ResolveModelTransformForProjection(
-        world_node, scene.activeCamera, apply_parallax);
-    effect_layer->SyncResolvedNodeToMatrix(Eigen::Affine3f(resolved_model.cast<float>()));
-}
-
 const ShaderValue* FindMaterialUniformValue(const SceneMaterial& material,
                                             std::string_view     uniform_name) {
-    const auto uniform_key = std::string(uniform_name);
-    auto       const_it    = material.customShader.constValues.find(uniform_key);
-    if (const_it != material.customShader.constValues.end())
-        return std::addressof(const_it->second);
-
-    if (material.customShader.shader == nullptr) return nullptr;
-    auto default_it = material.customShader.shader->default_uniforms.find(uniform_key);
-    if (default_it != material.customShader.shader->default_uniforms.end()) {
-        return std::addressof(default_it->second);
-    }
-    return nullptr;
+    return material.FindUniformValue(uniform_name);
 }
 
 bool MaterialHasUniform(const SceneMaterial& material, std::string_view uniform_name) {
@@ -3937,19 +3906,9 @@ std::optional<ShaderValue> ShaderValueFromDynamicValue(const WPDynamicValue& val
     return std::nullopt;
 }
 
-SceneMaterial* RegistrationMaterial(const WPSceneScriptRegistration& registration) {
-    if (registration.node == nullptr || registration.node->Mesh() == nullptr) return nullptr;
-    return registration.node->Mesh()->Material();
-}
-
-const SceneMaterial* RegistrationMaterialConst(const WPSceneScriptRegistration& registration) {
-    if (registration.node == nullptr || registration.node->Mesh() == nullptr) return nullptr;
-    return registration.node->Mesh()->Material();
-}
-
 std::optional<WPDynamicValue>
 ReadMaterialUniformPropertyValue(const WPSceneScriptRegistration& registration) {
-    const auto* material = RegistrationMaterialConst(registration);
+    const auto* material = registration.material;
     if (material == nullptr) return std::nullopt;
 
     const auto* uniform = FindMaterialUniformValue(*material, registration.property_name);
@@ -3961,7 +3920,7 @@ ReadMaterialUniformPropertyValue(const WPSceneScriptRegistration& registration) 
 bool ApplyMaterialUniformPropertyValue(WPSceneScriptHost::Opaque*       opaque,
                                        const WPSceneScriptRegistration& registration,
                                        const WPDynamicValue&            value) {
-    auto* material = RegistrationMaterial(registration);
+    auto* material = registration.material;
     if (material == nullptr) return false;
 
     const auto shader_value = ShaderValueFromDynamicValue(value);
@@ -3989,9 +3948,7 @@ bool IsFinalEffectCompositeNode(const SceneMaterial& material, const SceneNode* 
     const auto* shader = material.customShader.shader.get();
     if (shader == nullptr || shader->name != "genericimage3") return false;
 
-    return std::find(material.textures.begin(),
-                     material.textures.end(),
-                     std::string(SpecTex_Default)) != material.textures.end();
+    return material.SamplesTexture(SpecTex_Default);
 }
 
 bool IsCameraLinkedFromScene(const Scene& scene, std::string_view camera_name) {
@@ -4031,54 +3988,7 @@ bool UpdateQuadMeshSize(SceneMesh* mesh, const std::array<float, 2>& size) {
     return true;
 }
 
-Eigen::Matrix4d ResolveCursorHitModelTransform(const WPSceneScriptHost::Opaque* opaque,
-                                               SceneNode*                       node,
-                                               std::unordered_set<SceneNode*>&  resolving) {
-    if (node == nullptr) return Eigen::Matrix4d::Identity();
 
-    if (! resolving.insert(node).second) {
-        // Cursor hit testing follows renderer-only transform bindings, which can reference
-        // virtual parents that are not present in the SceneNode parent chain. A cycle would make
-        // that virtual chain ambiguous, so log the exact node and fall back to the concrete scene
-        // graph transform instead of guessing a partial parent order.
-        LOG_ERROR("CursorHitTransform: recursive transform binding for layer=%d name='%s'",
-                  node->ID(),
-                  node->Name().c_str());
-        node->UpdateTrans();
-        return node->ModelTrans();
-    }
-
-    const auto*     node_data = GetNodeData(opaque, node);
-    Eigen::Matrix4d resolved  = Eigen::Matrix4d::Identity();
-    SceneNode*      transform_parent =
-        node_data != nullptr ? node_data->TransformParent() : nullptr;
-    if (node_data != nullptr && node_data->InheritsSceneParentTransform() &&
-        transform_parent != nullptr && GetNodeData(opaque, transform_parent) != nullptr) {
-        // Effect-backed image layers often keep the script-facing authored node outside the real
-        // SceneNode parent chain and express the render-time parent through WPShaderValueData.
-        // Cursor hit bounds must use the same virtual parent transform as the renderer; otherwise
-        // meshless authored layers are tested near their local origin while the visible composite
-        // is drawn under its parent group. The renderer inherits the parent's authored pivot, not
-        // its alignment-adjusted mesh placement, so strip the parent's image-alignment translate
-        // exactly like the render-side transform resolver does.
-        const Eigen::Matrix4d parent_model = RemoveImageAlignmentOffsetFromModel(
-            ResolveCursorHitModelTransform(opaque, transform_parent, resolving),
-            transform_parent->AlignmentOffset());
-        resolved = parent_model * node->GetLocalTrans();
-    } else {
-        node->UpdateTrans();
-        resolved = node->ModelTrans();
-    }
-
-    resolving.erase(node);
-    return resolved;
-}
-
-Eigen::Matrix4d ResolveCursorHitModelTransform(const WPSceneScriptHost::Opaque* opaque,
-                                               SceneNode*                       node) {
-    std::unordered_set<SceneNode*> resolving;
-    return ResolveCursorHitModelTransform(opaque, node, resolving);
-}
 
 std::optional<std::array<double, 4>> ComputeQuadBounds2D(const Eigen::Matrix4d&      model,
                                                          const std::array<float, 2>& size,
@@ -4152,7 +4062,7 @@ ComputeLayerQuadBounds2D(const WPSceneScriptHost::Opaque* opaque, SceneNode* nod
     // difference from a renderable mesh is that their visible geometry lives in text primitives or
     // effect composite nodes, so this fallback reconstructs only the cursor bounds and leaves the
     // render graph untouched.
-    const Eigen::Matrix4d model = ResolveCursorHitModelTransform(opaque, node);
+    const Eigen::Matrix4d model = ResolveLayerModelTransform(opaque, node);
     return ComputeQuadBounds2D(model, size, clip);
 }
 
@@ -4177,7 +4087,7 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
     // projecting vertices; cursor bounds must follow the same contract or hit regions drift away
     // from the drawn quad for meshes with a non-identity geometry transform.
     const Eigen::Matrix4d model =
-        ResolveCursorHitModelTransform(opaque, node) *
+        ResolveLayerModelTransform(opaque, node) *
         node->Mesh()->GeometryTransform().matrix().cast<double>();
 
     double min_x = std::numeric_limits<double>::max();
@@ -4231,9 +4141,11 @@ std::optional<std::array<double, 4>>
 ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
                             const WPSceneScriptRegistration& registration,
                             const Eigen::Matrix4d*           clip) {
-    if (registration.node == nullptr) return std::nullopt;
+    const auto* object = opaque->scene->FindSceneObject(registration.object_id);
+    auto* node = object != nullptr ? object->LayerNode() : nullptr;
+    if (node == nullptr) return std::nullopt;
 
-    if (auto mesh_bounds = ComputeNodeBounds2D(opaque, registration.node, clip);
+    if (auto mesh_bounds = ComputeNodeBounds2D(opaque, node, clip);
         mesh_bounds.has_value()) {
         return mesh_bounds;
     }
@@ -4243,10 +4155,10 @@ ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
     const int32_t layer_id = registration.object_id;
     if (const auto* image_layer = FindImageLayerById(opaque, layer_id); image_layer != nullptr) {
         // Effect-backed images can register scripts on a transform-only authored layer while the
-        // visible pixels are rendered by source/final composite nodes. The image registry retains
-        // the authored quad size, so combining it with ResolveCursorHitModelTransform recreates
+        // visible pixels are rendered by source and publication phases. The image registry retains
+        // the authored quad size, so combining it with ResolveLayerModelTransform recreates
         // the event target without adding any dummy mesh that could be picked up by rendering.
-        return ComputeLayerQuadBounds2D(opaque, registration.node, image_layer->size, clip);
+        return ComputeLayerQuadBounds2D(opaque, node, image_layer->size, clip);
     }
 
     if (const auto* text_layer = FindTextLayerById(opaque, layer_id); text_layer != nullptr) {
@@ -4256,7 +4168,7 @@ ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
         const std::array<float, 2> text_size = text_layer->primitive != nullptr
                                                    ? text_layer->primitive->VisibleDisplaySize()
                                                    : text_layer->object.size;
-        return ComputeLayerQuadBounds2D(opaque, registration.node, text_size, clip);
+        return ComputeLayerQuadBounds2D(opaque, node, text_size, clip);
     }
 
     return std::nullopt;
@@ -4264,7 +4176,7 @@ ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
 
 bool InstanceReceivesCursor(const WPSceneScriptHost::Opaque* opaque, const ScriptInstance& instance,
                             const CursorPositionState& cursor) {
-    if (! instance.initialized || instance.registration.node == nullptr) return false;
+    if (! instance.initialized) return false;
     if (instance.registration.target_kind != WPSceneScriptTargetKind::Layer) return false;
 
     const auto layer_id                    = instance.registration.object_id;
@@ -4322,23 +4234,23 @@ bool CallScriptEvent(JSContext* context, JSValueConst callback, JSValueConst arg
     return true;
 }
 
-std::shared_ptr<Image> BuildMediaThumbnailImage(std::string_view key, int32_t width, int32_t height,
-                                                std::span<const uint8_t> rgba) {
-    if (width <= 0 || height <= 0 || rgba.empty()) {
-        return CreateSceneScriptSolidImage(key, { 0, 0, 0, 0 });
-    }
-
-    return CreateSceneScriptRgbaImage(key, width, height, rgba);
-}
-
-void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key, int32_t width,
-                        int32_t height, std::span<const uint8_t> rgba) {
+void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, const std::string& property,
+                        std::string_view key, int32_t width, int32_t height,
+                        std::span<const uint8_t> rgba) {
     if (opaque == nullptr || opaque->scene == nullptr) return;
+
+    // Removing an image clears the property value; materials then select their authored inputs.
+    // Do not replace those inputs with a transparent pixel: a visible blend effect may write its
+    // alpha over the whole layer.
+    if (width <= 0 || height <= 0 || rgba.empty()) {
+        opaque->scene->SetSystemTextureBinding(property, "");
+        return;
+    }
 
     auto* synthetic_parser = AsSyntheticImageParser(opaque->scene->imageParser.get());
     if (synthetic_parser == nullptr) return;
 
-    const auto image = BuildMediaThumbnailImage(key, width, height, rgba);
+    const auto image = CreateSceneScriptRgbaImage(key, width, height, rgba);
     if (image == nullptr) return;
 
     const std::string texture_key(key);
@@ -4357,16 +4269,19 @@ void UpdateMediaTexture(WPSceneScriptHost::Opaque* opaque, std::string_view key,
     };
     opaque->scene->dirtyImportedTextureKeys.insert(texture_key);
     opaque->scene->MarkImportedTextureResourcesDirty(texture_key);
+    opaque->scene->SetSystemTextureBinding(property, texture_key);
 }
 
 void UpdateMediaThumbnailTexture(WPSceneScriptHost::Opaque*     opaque,
                                  const WPSceneScriptMediaState& media_state) {
     UpdateMediaTexture(opaque,
+                       "$mediaThumbnail",
                        WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE,
                        media_state.thumbnail_width,
                        media_state.thumbnail_height,
                        media_state.thumbnail_rgba);
     UpdateMediaTexture(opaque,
+                       "$mediaPreviousThumbnail",
                        WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE,
                        media_state.previous_thumbnail_width,
                        media_state.previous_thumbnail_height,
@@ -4517,7 +4432,7 @@ WPDynamicValue FromScriptFacingRegistrationValue(const WPSceneScriptRegistration
     if (! RegistrationUsesScriptAngleDegrees(registration)) return value;
 
     // Convert script-returned degrees back to the renderer's radian storage exactly at the
-    // registration boundary. This keeps SceneNode, property animation, and JSON parsing code
+    // registration boundary. This keeps object transforms, property animation, and JSON parsing code
     // single-purpose: they continue to deal only in renderer-native radians.
     return ConvertFloat3Scale(value, kSceneScriptDegreesToRadians);
 }
@@ -4527,7 +4442,7 @@ WPDynamicValue ToScriptFacingLayerPropertyValue(std::string_view property_name,
     if (! IsAngleProperty(property_name)) return value;
 
     // Direct script property access through thisLayer.angles follows the same degree-based
-    // Wallpaper Engine contract as property update scripts, while SceneNode still stores radians.
+    // Wallpaper Engine contract as property update scripts; object transforms store radians.
     return ConvertFloat3Scale(value, kSceneScriptRadiansToDegrees);
 }
 
@@ -4536,28 +4451,34 @@ WPDynamicValue FromScriptFacingLayerPropertyValue(std::string_view property_name
     if (! IsAngleProperty(property_name)) return value;
 
     // Direct assignments like thisLayer.angles = new Vec3(...) arrive in degrees from scripts and
-    // must be converted before they are compared with, or written into, the renderer node state.
+    // must be converted before comparison with, or writes to, the live object transform.
     return ConvertFloat3Scale(value, kSceneScriptDegreesToRadians);
 }
 
-std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Opaque* opaque,
-                                                     SceneNode*                       node,
-                                                     std::string_view property_name) {
-    if (node == nullptr) return std::nullopt;
+SceneTransform& LayerRuntimeTransform(const WPSceneScriptHost::Opaque& opaque, int32_t layer_id) {
+    // Layer property evaluation runs after scene-object registration. The identity owns the live
+    // placement record; querying or writing a script property must not depend on a draw handle's
+    // storage or lifetime. Private source and final phases never enter this script-facing path.
+    return *opaque.scene->FindSceneObject(layer_id)->RuntimeTransform();
+}
 
-    if (property_name == "name") return WPDynamicValue(node->Name());
-    if (property_name == "visible") {
-        if (opaque != nullptr && opaque->scene != nullptr) {
-            const auto layer_id = FindNodeId(opaque, node);
-            if (layer_id != 0) {
-                return WPDynamicValue(opaque->scene->GetLayerLocalVisibility(layer_id));
-            }
-        }
-        return WPDynamicValue(node->Visible());
+std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Opaque* opaque,
+                                                     int32_t                          layer_id,
+                                                     std::string_view property_name) {
+    const auto* object = opaque->scene->FindSceneObject(layer_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return std::nullopt;
+
+    if (property_name == "name") return WPDynamicValue(object->Name());
+    if (property_name == "visible") return WPDynamicValue(object->LocalVisible());
+    if (const auto* modulation = object->ModulationState()) {
+        // A property's value is retained on the owner; neither an empty effect list nor a private
+        // draw's camera changes this read.
+        if (property_name == "color") return WPDynamicValue(modulation->color);
+        if (property_name == "alpha") return WPDynamicValue(modulation->alpha);
+        if (property_name == "brightness") return WPDynamicValue(modulation->brightness);
     }
-    const auto text_layer_id = opaque != nullptr ? FindNodeId(opaque, node) : 0;
-    const auto* text_layer =
-        text_layer_id != 0 ? FindTextLayerById(opaque, text_layer_id) : nullptr;
+    auto* node = object->LayerNode();
+    const auto* text_layer = FindTextLayerById(opaque, layer_id);
     if (text_layer != nullptr && property_name == "origin") {
         // Text nodes keep their authored origin as the scene translation. Returning the registry value
         // rather than the node transform still matters for screen-anchored text, where the renderer may
@@ -4565,15 +4486,15 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
         return WPDynamicValue(text_layer->object.origin);
     }
     if (property_name == "origin") {
-        const auto& value = node->Translate();
+        const auto& value = LayerRuntimeTransform(*opaque, layer_id).Translate();
         return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
     }
     if (property_name == "angles") {
-        const auto& value = node->Rotation();
+        const auto& value = LayerRuntimeTransform(*opaque, layer_id).Rotation();
         return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
     }
     if (property_name == "scale") {
-        const auto& value = node->Scale();
+        const auto& value = LayerRuntimeTransform(*opaque, layer_id).Scale();
         return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
     }
     if (property_name == "parallaxDepth") {
@@ -4582,10 +4503,12 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
         }
     }
     if (opaque != nullptr) {
-        const auto layer_id = FindNodeId(opaque, node);
         if (const auto* image_layer = FindImageLayerById(opaque, layer_id);
-            image_layer != nullptr && property_name == "size") {
-            return WPDynamicValue(image_layer->size);
+            image_layer != nullptr) {
+            if (property_name == "size") return WPDynamicValue(image_layer->size);
+            if (property_name == "copybackground") {
+                return WPDynamicValue(image_layer->copy_background);
+            }
         }
         if (opaque->scene != nullptr && layer_id != 0) {
             if (const auto& layer_lights = opaque->scene->GetLayerRuntimeLights(layer_id);
@@ -4601,7 +4524,6 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
     }
 
     if (opaque != nullptr) {
-        const auto layer_id = FindNodeId(opaque, node);
         if (layer_id != 0) {
             if (auto particle_value = ReadParticlePropertyValue(opaque, layer_id, property_name);
                 particle_value.has_value()) {
@@ -4677,41 +4599,96 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
     return std::nullopt;
 }
 
-bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
+bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                              std::string_view property_name, const WPDynamicValue& value) {
-    if (node == nullptr) return false;
+    auto* object = opaque->scene->FindSceneObject(layer_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return false;
+    auto* node = object->LayerNode();
 
     if (property_name == "name") {
         std::string name;
         if (! value.tryGet(&name)) return false;
-        node->SetName(name);
-        if (opaque != nullptr && opaque->scene != nullptr) {
-            opaque->scene->layerNameToId[name] = node->ID();
-        }
+        object->SetName(name);
+        if (node != nullptr) node->SetName(name);
+        opaque->scene->layerNameToId[name] = layer_id;
         return true;
     }
 
     if (property_name == "visible") {
         bool visible = false;
         if (! value.tryGet(&visible)) return false;
-        if (opaque != nullptr && opaque->scene != nullptr) {
-            const auto layer_id = FindNodeId(opaque, node);
-            if (layer_id != 0) {
-                opaque->scene->SetLayerLocalVisibility(layer_id, visible);
-                opaque->scene->ApplyLayerVisibility(layer_id);
-                return true;
-            }
+        opaque->scene->SetLayerLocalVisibility(layer_id, visible);
+        opaque->scene->ApplyLayerVisibility(layer_id);
+        return true;
+    }
+
+    if (auto* modulation = object->ModulationState(); modulation != nullptr &&
+        (property_name == "color" || property_name == "alpha" || property_name == "brightness")) {
+        // Vector/scalar setters write only their owner field and these descriptors have no update
+        // callback. In particular, a shape's final-draw material is not a proxy for this storage:
+        // getMaterial(n) controls keep their own values, even when they happen to use
+        // alpha/color/brightness aliases.
+        const bool applied = property_name == "color" ? value.tryGet(&modulation->color)
+            : property_name == "alpha" ? value.tryGet(&modulation->alpha)
+                                       : value.tryGet(&modulation->brightness);
+        if (applied && std::getenv("WESCENE_TRACE_SHAPE_STATE") != nullptr) {
+            LOG_INFO("SceneShapeOwnerProperty: layer=%d property='%.*s' value=%s "
+                     "material-controls=unchanged",
+                     layer_id, static_cast<int>(property_name.size()), property_name.data(),
+                     value.describe().c_str());
         }
-        node->SetVisible(visible);
+        return applied;
+    }
+
+    if (property_name == "copybackground") {
+        auto* image_layer = object->ImageRuntimeState();
+        bool copy_background;
+        if (image_layer == nullptr || !value.tryGet(&copy_background)) return false;
+        if (image_layer->copy_background == copy_background) return true;
+        image_layer->copy_background = copy_background;
+        // The live copybackground property controls the source card/clear, child alpha writes and
+        // destination blend. Rebuild the composition's draw sequence from the owner value so
+        // these states change together without resizing destinations or rematerializing the
+        // layer. Empty logical owners retain only the value.
+        const bool rebuild = object->Passthrough() && object->ImageEffectLayer() != nullptr;
+        if (rebuild) opaque->scene->MarkRenderGraphTopologyDirty();
+        LOG_INFO("SceneCompositionPropertyUpdate: layer=%d name='%s' copybackground=%s "
+                 "rebuild=%s",
+                 layer_id, object->Name().c_str(), copy_background ? "true" : "false",
+                 rebuild ? "true" : "false");
+        return true;
+    }
+
+    if (property_name == "size" && object->Kind() == SceneObjectKind::Shape) {
+        // Shape's typed setter copies the two owner fields and has no resource-update callback.
+        // The write succeeds even when the owner has no effects or mesh; neither positivity
+        // clamps nor an approximate-equality filter belong to this storage operation. Resource
+        // setup consumes the live size at a separate setup boundary, so leave the retained card,
+        // alignment, cameras and render-graph dirtiness alone. Resolve this descriptor before
+        // particle dispatch: a shape's float2 is not a scalar particle override, and must not
+        // enter that unrelated conversion path.
+        std::array<float, 2> new_size {};
+        if (! value.tryGet(&new_size)) return false;
+        auto& size = object->ImageRuntimeState()->size;
+        const auto old_size = size;
+        size = new_size;
+        if (std::getenv("WESCENE_TRACE_SHAPE_STATE") != nullptr) {
+            LOG_INFO("SceneShapeOwnerSize: layer=%d old=[%.6f %.6f] "
+                     "stored=[%.6f %.6f] accepted=true materialized=%s "
+                     "geometry=retained resources-dirty=%s topology-dirty=%s",
+                     layer_id, old_size[0], old_size[1], new_size[0], new_size[1],
+                     object->ImageEffectLayer() != nullptr ? "true" : "false",
+                     opaque->scene->renderGraphResourcesDirty ? "true" : "false",
+                     opaque->scene->renderGraphTopologyDirty ? "true" : "false");
+        }
         return true;
     }
 
     if (opaque != nullptr) {
-        const auto layer_id = FindNodeId(opaque, node);
         if (property_name == "size") {
             // `size` is ambiguous: image/text layers use a 2D quad size, while particle
-            // instanceoverride.size is a scalar emitter multiplier. Try the particle override path
-            // first when this node owns a particle subsystem, then fall back to image-layer resize.
+            // instanceoverride.size is a scalar emitter multiplier. Let the particle subsystem
+            // consume its own property before resolving the drawable owner's two-component size.
             if (ApplyParticlePropertyValue(opaque, layer_id, property_name, value)) return true;
 
             auto* image_layer = FindImageLayerById(opaque, layer_id);
@@ -4731,7 +4708,16 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
             bool updated_mesh = false;
             ForEachBaseLayerMaterial(opaque, layer_id, [&](SceneMaterial&, SceneNode* mesh_node) {
                 if (mesh_node == nullptr || mesh_node->Mesh() == nullptr) return;
-                updated_mesh = UpdateQuadMeshSize(mesh_node->Mesh(), new_size) || updated_mesh;
+                const auto& effect_layer = object->ImageEffectLayer();
+                // The bridge retains its ordinary card independently of the current draw. A
+                // private source can select texture-space geometry, while a destination draw can
+                // select an imported static mesh. Resize the retained card so later visibility
+                // changes observe the new size without stretching either of those currently
+                // selected streams.
+                auto* card_mesh = effect_layer != nullptr &&
+                    mesh_node == node
+                    ? &effect_layer->SourceMesh() : mesh_node->Mesh();
+                updated_mesh = UpdateQuadMeshSize(card_mesh, new_size) || updated_mesh;
             });
 
             if (opaque->scene->HasLayerNodeSlot(layer_id)) {
@@ -4742,16 +4728,28 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
             if (const auto* resized_object = opaque->scene->FindSceneObject(layer_id);
                 const auto effect_layer_ref =
                     resized_object != nullptr ? resized_object->ImageEffectLayer() : nullptr) {
+                effect_layer_ref->SetCardSize(new_size);
                 for (const auto& camera_name : effect_layer_ref->RuntimeCameraNames()) {
                     auto camera_it = opaque->scene->cameras.find(camera_name);
                     if (camera_it == opaque->scene->cameras.end()) continue;
 
                     if (! IsCameraLinkedFromScene(*opaque->scene, camera_name)) {
-                        camera_it->second->SetWidth(
-                            std::max(1.0, static_cast<double>(new_size[0])));
-                        camera_it->second->SetHeight(
-                            std::max(1.0, static_cast<double>(new_size[1])));
-                        camera_it->second->Update();
+                        if (camera_name == effect_layer_ref->BridgeCameraName() &&
+                            effect_layer_ref->GetPrelightingSource() != nullptr) {
+                            // The active prelighting source projection follows its fixed
+                            // destination extent; only the ordinary source camera follows size.
+                            if (!effect_layer_ref->UsesPrelightingSource()) {
+                                camera_it->second->SetOrthographicViewRect(
+                                    -new_size[0] * 0.5, new_size[0] * 0.5,
+                                    -new_size[1] * 0.5, new_size[1] * 0.5);
+                            }
+                        } else {
+                            camera_it->second->SetWidth(
+                                std::max(1.0, static_cast<double>(new_size[0])));
+                            camera_it->second->SetHeight(
+                                std::max(1.0, static_cast<double>(new_size[1])));
+                            camera_it->second->Update();
+                        }
                     }
                     if (camera_name == effect_layer_ref->BridgeCameraName()) {
                         updated_mesh =
@@ -4779,7 +4777,6 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
     }
 
     if (opaque != nullptr) {
-        const auto layer_id = FindNodeId(opaque, node);
         if (layer_id != 0) {
             // Particle colors authored under instanceoverride are not material constants. Give the
             // particle runtime a chance to consume `colorn` and particle-layer `color` before the
@@ -4803,6 +4800,9 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                     opaque,
                     layer_id,
                     [&](SceneMaterial& material, SceneNode* node, const std::string& output) {
+                        // Publication is owned by the draw phase, outside this authored-effect
+                        // list, so live tint edits update source/effect materials without tinting
+                        // the resolved result twice.
                         if (IsFinalEffectCompositeNode(material, node, output)) return;
                         // Normal effect-pass materials inherit the layer color during cold parse.
                         // Keep their live constants synchronized with the source material, while
@@ -4890,7 +4890,6 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
     }
 
     if (opaque != nullptr && opaque->scene != nullptr) {
-        const auto layer_id = FindNodeId(opaque, node);
         if (layer_id != 0) {
             // An empty list means no lights are mounted for this layer (registration never stores
             // an empty entry), so the write falls through to the generic handling below exactly
@@ -4900,6 +4899,12 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                 if (property_name == "intensity") {
                     float intensity = 0.0f;
                     if (! value.tryGet(&intensity)) return false;
+                    if (std::getenv("WESCENE_TRACE_VOLUMETRICS") != nullptr) {
+                        LOG_INFO("SceneLightIntensityApply: layer=%d elapsed=%.6f "
+                                 "intensity=%.6f targets=%zu",
+                                 layer_id, opaque->scene->elapsingTime,
+                                 intensity, layer_lights.size());
+                    }
                     for (auto* light : layer_lights) {
                         if (light != nullptr) light->setIntensity(intensity);
                     }
@@ -4919,39 +4924,36 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
 
     std::array<float, 3> vector {};
     if (! value.tryGet(&vector)) return false;
-    const auto layer_id = opaque != nullptr ? FindNodeId(opaque, node) : 0;
     auto apply_text_layer_transform = [&](std::string_view transform_name) -> std::optional<bool> {
         if (opaque == nullptr || opaque->scene == nullptr || layer_id == 0) return std::nullopt;
         if (FindTextLayerById(opaque, layer_id) == nullptr) return std::nullopt;
 
-        const bool applied = ApplyTextLayerTransformValue(
+        return ApplyTextLayerTransformValue(
             *opaque->scene, layer_id, node, transform_name, vector);
-        if (applied) SyncEffectLayerTransforms(opaque, layer_id, node);
-        return applied;
     };
 
     if (property_name == "origin") {
         if (auto text_result = apply_text_layer_transform(property_name);
             text_result.has_value()) return *text_result;
 
-        node->SetTranslate(Eigen::Vector3f { vector[0], vector[1], vector[2] });
-        if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
+        LayerRuntimeTransform(*opaque, layer_id).SetTranslate(
+            Eigen::Vector3f { vector[0], vector[1], vector[2] });
         return true;
     }
     if (property_name == "angles") {
         if (auto text_result = apply_text_layer_transform(property_name);
             text_result.has_value()) return *text_result;
 
-        node->SetRotation(Eigen::Vector3f { vector[0], vector[1], vector[2] });
-        if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
+        LayerRuntimeTransform(*opaque, layer_id).SetRotation(
+            Eigen::Vector3f { vector[0], vector[1], vector[2] });
         return true;
     }
     if (property_name == "scale") {
         if (auto text_result = apply_text_layer_transform(property_name);
             text_result.has_value()) return *text_result;
 
-        node->SetScale(Eigen::Vector3f { vector[0], vector[1], vector[2] });
-        if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
+        LayerRuntimeTransform(*opaque, layer_id).SetScale(
+            Eigen::Vector3f { vector[0], vector[1], vector[2] });
         return true;
     }
     if (property_name == "parallaxDepth") {
@@ -4965,7 +4967,6 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
         }
         if (auto* data = GetNodeData(opaque, node)) {
             data->parallaxDepth = parallax;
-            data->parallaxDepthAuthored = true;
             return true;
         }
     }
@@ -5069,6 +5070,7 @@ std::optional<WPDynamicValue> ReadScenePropertyValue(const WPSceneScriptHost::Op
                                                      std::string_view property_name) {
     if (opaque == nullptr || opaque->scene == nullptr) return std::nullopt;
 
+    if (property_name == "clearenabled") return WPDynamicValue(opaque->scene->clearEnabled);
     if (property_name == "clearcolor") return WPDynamicValue(opaque->scene->clearColor);
     if (property_name == "ambientcolor") return WPDynamicValue(opaque->scene->ambientColor);
     if (property_name == "skylightcolor") return WPDynamicValue(opaque->scene->skylightColor);
@@ -5096,11 +5098,13 @@ std::optional<WPDynamicValue> ReadScenePropertyValue(const WPSceneScriptHost::Op
     if (property_name == "camerashakespeed") {
         return WPDynamicValue(opaque->scene->cameraShakeSpeed);
     }
-    if (const auto* camera = GetPerspectiveSceneCamera(opaque)) {
-        if (property_name == "fov") return WPDynamicValue(static_cast<float>(camera->Fov()));
-        if (property_name == "nearz") return WPDynamicValue(static_cast<float>(camera->NearClip()));
-        if (property_name == "farz") return WPDynamicValue(static_cast<float>(camera->FarClip()));
+    const auto& projection = opaque->scene->generalProjection;
+    if (property_name == "fov") return WPDynamicValue(projection.fov);
+    if (property_name == "perspectiveoverridefov") {
+        return WPDynamicValue(projection.perspectiveOverrideFov);
     }
+    if (property_name == "nearz") return WPDynamicValue(projection.nearClip);
+    if (property_name == "farz") return WPDynamicValue(projection.farClip);
     return std::nullopt;
 }
 
@@ -5122,6 +5126,14 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         return true;
     };
 
+    // These are frame state, not topology: each scene stage reads the current values immediately
+    // before its walk.
+    if (property_name == "clearenabled") {
+        bool enabled = false;
+        if (!value.tryGet(&enabled)) return false;
+        opaque->scene->clearEnabled = enabled;
+        return true;
+    }
     if (property_name == "clearcolor") {
         std::array<float, 3> clear_color {};
         if (! value.tryGet(&clear_color)) return false;
@@ -5254,21 +5266,24 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         return true;
     }
 
-    auto* camera = GetPerspectiveSceneCamera(opaque);
-    if (camera == nullptr) return false;
+    // General properties retain their raw values even when a camera layer selects a
+    // different FOV. The frame camera phase consumes these values after all scripts,
+    // timelines and camera-path updates, before framing and uniform upload.
+    auto& projection = opaque->scene->generalProjection;
     if (property_name == "fov") {
-        camera->SetFov(scalar);
-        camera->Update();
+        projection.fov = scalar;
+        return true;
+    }
+    if (property_name == "perspectiveoverridefov") {
+        projection.perspectiveOverrideFov = scalar;
         return true;
     }
     if (property_name == "nearz") {
-        camera->SetNearClip(scalar);
-        camera->Update();
+        projection.nearClip = scalar;
         return true;
     }
     if (property_name == "farz") {
-        camera->SetFarClip(scalar);
-        camera->Update();
+        projection.farClip = scalar;
         return true;
     }
     return false;
@@ -5464,7 +5479,9 @@ std::optional<WPDynamicValue> ReadRegistrationValue(const WPSceneScriptHost::Opa
     }
     if (registration.target_kind == WPSceneScriptTargetKind::AnimationLayer) {
         return ReadAnimationLayerPropertyValue(
-            opaque, registration.node, registration.target_index, registration.property_name);
+            opaque, FindNodeById(const_cast<WPSceneScriptHost::Opaque*>(opaque),
+                                 registration.object_id),
+            registration.target_index, registration.property_name);
     }
     if (registration.target_kind == WPSceneScriptTargetKind::Effect) {
         return ReadEffectPropertyValue(opaque, registration);
@@ -5472,7 +5489,7 @@ std::optional<WPDynamicValue> ReadRegistrationValue(const WPSceneScriptHost::Opa
     if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
         return ReadMaterialUniformPropertyValue(registration);
     }
-    return ReadLayerPropertyValue(opaque, registration.node, registration.property_name);
+    return ReadLayerPropertyValue(opaque, registration.object_id, registration.property_name);
 }
 
 bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
@@ -5501,7 +5518,7 @@ bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
     }
     if (registration.target_kind == WPSceneScriptTargetKind::AnimationLayer) {
         return ApplyAnimationLayerPropertyValue(opaque,
-                                                registration.node,
+                                                FindNodeById(opaque, registration.object_id),
                                                 registration.target_index,
                                                 registration.property_name,
                                                 runtime_value);
@@ -5523,7 +5540,7 @@ bool ApplyRegistrationValue(WPSceneScriptHost::Opaque*       opaque,
         return ApplyMaterialUniformPropertyValue(opaque, registration, runtime_value);
     }
     return ApplyLayerPropertyValue(
-        opaque, registration.node, registration.property_name, runtime_value);
+        opaque, registration.object_id, registration.property_name, runtime_value);
 }
 
 void FreeJSValue(JSContext* context, JSValue& value) {
@@ -5574,13 +5591,12 @@ JSValue NativeGetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
     if (const auto sound_handle = FindSoundHandleByLayerId(opaque, node_id);
         sound_handle.has_value()) {
         if (property_name == "name") {
-            auto it = opaque->scene->layerNameToId.begin();
-            for (; it != opaque->scene->layerNameToId.end(); ++it) {
-                if (it->second == node_id) break;
-            }
-            return it == opaque->scene->layerNameToId.end()
-                       ? JS_UNDEFINED
-                       : JS_NewStringLen(context, it->first.c_str(), it->first.size());
+            // Enumeration returns distinct owners even when sound layers share a name. The name
+            // lookup index selects one owner for getLayer(name), so reversing that index loses
+            // later same-named layers. A sound handle belongs to an existing SceneObject; read
+            // the selected object's name field directly.
+            const auto& name = opaque->scene->FindSceneObject(node_id)->Name();
+            return JS_NewStringLen(context, name.data(), name.size());
         }
         if (property_name == "volume") {
             return JS_NewFloat64(context, opaque->scene->soundManager->StreamVolume(*sound_handle));
@@ -5595,10 +5611,7 @@ JSValue NativeGetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
         return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
     }
 
-    auto* node = FindNodeById(opaque, node_id);
-    if (node == nullptr) return JS_UNDEFINED;
-
-    const auto value = ReadLayerPropertyValue(opaque, node, property_name);
+    const auto value = ReadLayerPropertyValue(opaque, node_id, property_name);
     if (! value.has_value()) return JS_UNDEFINED;
     const auto script_value = ToScriptFacingLayerPropertyValue(property_name, *value).toScriptValue();
     return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
@@ -5645,16 +5658,13 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
                               opaque, node_id, property_name, runtime_value));
     }
 
-    auto* node = FindNodeById(opaque, node_id);
-    if (node == nullptr) return JS_FALSE;
-
     const auto hint = LayerValueType(property_name);
     if (! hint.supported) return JS_FALSE;
 
     const auto value = ReadDynamicValueFromJS(context, argv[2], hint.type);
     if (! value.has_value()) return JS_FALSE;
     const auto runtime_value = FromScriptFacingLayerPropertyValue(property_name, *value);
-    if (const auto current = ReadLayerPropertyValue(opaque, node, property_name);
+    if (const auto current = ReadLayerPropertyValue(opaque, node_id, property_name);
         current.has_value() && current->equals(runtime_value)) {
         // Scene.on('update') scripts often drive layer visibility by assigning true/false every
         // frame. Returning early here preserves the Wallpaper Engine script contract while keeping
@@ -5662,7 +5672,7 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
         return JS_TRUE;
     }
 
-    return JS_NewBool(context, ApplyLayerPropertyValue(opaque, node, property_name, runtime_value));
+    return JS_NewBool(context, ApplyLayerPropertyValue(opaque, node_id, property_name, runtime_value));
 }
 
 JSValue NativeHasEffect(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -6248,7 +6258,7 @@ JSValue NativeResolveLayerAnimation(JSContext* context, JSValueConst, int argc,
     std::string property_name;
     if (! ReadJSString(context, argv[1], &property_name)) return JS_NewInt32(context, 0);
 
-    auto* animation = FindPropertyAnimation(opaque, FindNodeById(opaque, node_id), property_name);
+    auto* animation = FindPropertyAnimation(opaque, node_id, std::string_view(property_name));
     return JS_NewInt32(context,
                        animation != nullptr ? static_cast<int32_t>(animation->animation_id) : 0);
 }
@@ -6486,11 +6496,7 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
     if (node == nullptr) return JS_UNDEFINED;
 
     if (command == "getTransformMatrix") {
-        // Layer transform queries are supported for every scene node, not only puppet-backed
-        // model layers. Update the node transform and return WE's column-major .m layout so
-        // scripts that compare parent.m[13] against child.m[13] see the expected coordinates.
-        node->UpdateTrans();
-        return TransformMatrixToJS(context, node->ModelTrans());
+        return TransformMatrixToJS(context, ResolveLayerModelTransform(opaque, node));
     }
 
     const auto* puppet = AdvanceNodePuppetForScriptQuery(opaque, node);
@@ -6557,8 +6563,9 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         if (! bone_index.has_value()) return JS_UNDEFINED;
         const auto transform = GetBoneModelTransform(opaque, node, *bone_index);
         if (! transform.has_value()) return JS_UNDEFINED;
-        node->UpdateTrans();
-        return Matrix4ToJS(context, node->ModelTrans() * transform->matrix().cast<double>());
+        return Matrix4ToJS(context,
+                          ResolveLayerModelTransform(opaque, node) *
+                              transform->matrix().cast<double>());
     }
     if (command == "getLocalBoneTransform") {
         if (argc < 3) return JS_UNDEFINED;
@@ -6603,8 +6610,7 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         const auto world_matrix = ReadMatrix4FromJS(context, argv[3]);
         if (! bone_index.has_value() || ! world_matrix.has_value()) return JS_FALSE;
 
-        node->UpdateTrans();
-        const Eigen::Matrix4d layer_inverse = node->ModelTrans().inverse();
+        const Eigen::Matrix4d layer_inverse = ResolveLayerModelTransform(opaque, node).inverse();
         const Eigen::Affine3f desired_model((layer_inverse * *world_matrix).cast<float>());
 
         Eigen::Affine3f local_transform = desired_model;
@@ -7812,7 +7818,7 @@ bool ShouldKeepScriptAuthoredInitialValue(const WPSceneScriptRegistration& regis
     };
 
     // Wallpaper Engine gives property scripts their authored/user-resolved base value during
-    // init(), even when a parser-time probe has already produced a derived live layer value.
+    // init(), before script updates derive the live layer value from that base.
     // Transform scripts commonly keep this init() input as their base for applyUserProperties()
     // formulas, so replacing origin/scale with renderer-resolved values makes later user-property
     // deltas accumulate from the wrong coordinate space.
@@ -7991,6 +7997,8 @@ bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& in
             result = JS_Call(context, instance.init_fn, JS_UNDEFINED, 0, nullptr);
         }
         if (JS_IsException(result)) {
+            LOG_ERROR("QuickJS init context: %s",
+                      DescribeScriptInstance(opaque, instance.instance_id).c_str());
             LogQuickJSException(context, "init");
             // A failed init leaves authored module-scope state only partially assigned. Keep the
             // instance disabled after logging the real init exception so FrameBegin() does not run
@@ -8424,14 +8432,23 @@ bool WPSceneScriptHost::Ready() const noexcept {
            m_impl->runtime.context != nullptr;
 }
 
+namespace
+{
+bool RegistrationTargetExists(const Scene& scene, const WPSceneScriptRegistration& registration) {
+    if (registration.target_kind == WPSceneScriptTargetKind::Scene) return true;
+    if (registration.target_kind == WPSceneScriptTargetKind::Sound) {
+        return scene.GetLayerSoundHandle(registration.object_id).has_value();
+    }
+    if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
+        return registration.material != nullptr;
+    }
+    const auto* object = scene.FindSceneObject(registration.object_id);
+    return object != nullptr && object->RuntimeTransform() != nullptr;
+}
+} // namespace
+
 bool WPSceneScriptHost::RegisterPropertyBinding(WPSceneScriptRegistration registration) {
-    const bool scene_registration = registration.target_kind == WPSceneScriptTargetKind::Scene;
-    const bool sound_registration = registration.target_kind == WPSceneScriptTargetKind::Sound;
-    // Scene-level bindings do not have a SceneNode owner. Keep the node requirement for layer-like
-    // targets, but allow `general` properties and mounted sound streams to enter the same
-    // user-property dispatch table through their target-specific apply functions.
-    if (! Ready() ||
-        (! scene_registration && ! sound_registration && registration.node == nullptr) ||
+    if (! Ready() || ! RegistrationTargetExists(*m_scene, registration) ||
         ! registration.setting.hasUserBinding()) {
         return false;
     }
@@ -8452,7 +8469,8 @@ bool WPSceneScriptHost::RegisterPropertyBinding(WPSceneScriptRegistration regist
 }
 
 bool WPSceneScriptHost::RegisterPropertyScript(WPSceneScriptRegistration registration) {
-    if (! Ready() || registration.node == nullptr || ! registration.setting.hasScript())
+    if (! Ready() || ! RegistrationTargetExists(*m_scene, registration) ||
+        ! registration.setting.hasScript())
         return false;
 
     auto instance           = std::make_unique<ScriptInstance>();
@@ -8461,8 +8479,23 @@ bool WPSceneScriptHost::RegisterPropertyScript(WPSceneScriptRegistration registr
     instance->current_value = instance->registration.setting.value;
     m_impl->instances.push_back(std::move(instance));
 
-    auto* node = m_impl->instances.back()->registration.node;
-    EnsureTextureAnimationStatesForNode(m_impl, node);
+    // Sprite timelines still begin when their script is registered. Resolve the current resource
+    // here without retaining its drawing node in the script descriptor; material scripts can target
+    // an authored effect pass or a model chunk rather than the owner's base source material.
+    const auto& target = m_impl->instances.back()->registration;
+    if (target.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
+        auto prepare = [&](SceneMaterial& material, SceneNode* node) {
+            if (&material == target.material) EnsureTextureAnimationStatesForNode(m_impl, node);
+        };
+        ForEachBaseLayerMaterial(m_impl, target.object_id, prepare);
+        ForEachEffectLayerMaterial(m_impl, target.object_id,
+                                   [&](SceneMaterial& material, SceneNode* node,
+                                       const std::string&) {
+                                       prepare(material, node);
+                                   });
+    } else if (target.target_kind != WPSceneScriptTargetKind::Scene) {
+        EnsureTextureAnimationStatesForNode(m_impl, FindNodeById(m_impl, target.object_id));
+    }
 
     if (m_impl->initialized) {
         InitializeScriptInstance(m_impl, *m_impl->instances.back());
@@ -8473,7 +8506,8 @@ bool WPSceneScriptHost::RegisterPropertyScript(WPSceneScriptRegistration registr
 }
 
 bool WPSceneScriptHost::RegisterPropertyAnimation(WPSceneScriptRegistration registration) {
-    if (! Ready() || registration.node == nullptr || registration.animation == nullptr ||
+    if (! Ready() || ! RegistrationTargetExists(*m_scene, registration) ||
+        registration.animation == nullptr ||
         ! registration.animation->valid()) {
         return false;
     }
@@ -8717,6 +8751,8 @@ void WPSceneScriptHost::ApplyUserProperties(const UserPropertyMap& user_properti
         JSValue result = JS_Call(context, instance.apply_user_properties_fn, JS_UNDEFINED, 1, &arg);
         JS_FreeValue(context, arg);
         if (JS_IsException(result)) {
+            LOG_ERROR("QuickJS applyUserProperties context: %s",
+                      DescribeScriptInstance(m_impl, instance.instance_id).c_str());
             LogQuickJSException(context, "applyUserProperties");
         }
         JS_FreeValue(context, result);
@@ -8785,38 +8821,64 @@ void WPSceneScriptHost::ApplyMediaState(const WPSceneScriptMediaState& media_sta
     }
 
     JSContext* context = m_impl->runtime.context;
-    const bool thumbnail_changed =
-        initial_dispatch ||
-        m_impl->dispatched_media_state.has_thumbnail != media_state.has_thumbnail ||
-        m_impl->dispatched_media_state.primary_color != media_state.primary_color ||
-        m_impl->dispatched_media_state.secondary_color != media_state.secondary_color ||
-        m_impl->dispatched_media_state.tertiary_color != media_state.tertiary_color ||
-        m_impl->dispatched_media_state.text_color != media_state.text_color ||
-        m_impl->dispatched_media_state.high_contrast_color != media_state.high_contrast_color ||
-        m_impl->dispatched_media_state.thumbnail_width != media_state.thumbnail_width ||
-        m_impl->dispatched_media_state.thumbnail_height != media_state.thumbnail_height ||
-        m_impl->dispatched_media_state.thumbnail_rgba != media_state.thumbnail_rgba ||
-        m_impl->dispatched_media_state.previous_thumbnail_width !=
-            media_state.previous_thumbnail_width ||
-        m_impl->dispatched_media_state.previous_thumbnail_height !=
-            media_state.previous_thumbnail_height ||
-        m_impl->dispatched_media_state.previous_thumbnail_rgba !=
-            media_state.previous_thumbnail_rgba;
-    const bool properties_changed = initial_dispatch ||
-                                    m_impl->dispatched_media_state.title != media_state.title ||
-                                    m_impl->dispatched_media_state.artist != media_state.artist ||
-                                    m_impl->dispatched_media_state.album_title !=
-                                        media_state.album_title ||
-                                    m_impl->dispatched_media_state.album_artist !=
-                                        media_state.album_artist ||
-                                    m_impl->dispatched_media_state.sub_title !=
-                                        media_state.sub_title ||
-                                    m_impl->dispatched_media_state.genres != media_state.genres ||
-                                    m_impl->dispatched_media_state.content_type !=
-                                        media_state.content_type;
-    const bool playback_changed =
-        initial_dispatch ||
-        m_impl->dispatched_media_state.playback_state != media_state.playback_state;
+    const auto& previous = m_impl->dispatched_media_state;
+    /*
+     * Initialization replays populated cached media fields, rather than inventing changes for the
+     * empty initial state. Sending an empty thumbnail here would overwrite authored script colors
+     * before any media source exists. These presence predicates belong only to initial replay: a
+     * later thumbnail removal, empty title or zero playback state is a real change that must
+     * still reach listeners.
+     */
+    const bool thumbnail_changed = initial_dispatch
+        ? media_state.has_thumbnail
+        : previous.has_thumbnail != media_state.has_thumbnail ||
+          previous.primary_color != media_state.primary_color ||
+          previous.secondary_color != media_state.secondary_color ||
+          previous.tertiary_color != media_state.tertiary_color ||
+          previous.text_color != media_state.text_color ||
+          previous.high_contrast_color != media_state.high_contrast_color ||
+          previous.thumbnail_width != media_state.thumbnail_width ||
+          previous.thumbnail_height != media_state.thumbnail_height ||
+          previous.thumbnail_rgba != media_state.thumbnail_rgba ||
+          previous.previous_thumbnail_width != media_state.previous_thumbnail_width ||
+          previous.previous_thumbnail_height != media_state.previous_thumbnail_height ||
+          previous.previous_thumbnail_rgba != media_state.previous_thumbnail_rgba;
+    const bool properties_changed = initial_dispatch
+        ? ! media_state.title.empty()
+        : previous.title != media_state.title || previous.artist != media_state.artist ||
+          previous.album_title != media_state.album_title ||
+          previous.album_artist != media_state.album_artist ||
+          previous.sub_title != media_state.sub_title || previous.genres != media_state.genres ||
+          previous.content_type != media_state.content_type;
+    const bool playback_changed = initial_dispatch
+        ? media_state.playback_state != 0
+        : previous.playback_state != media_state.playback_state;
+
+    const bool trace_media = std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr;
+    if (trace_media &&
+        (initial_dispatch || thumbnail_changed || properties_changed || playback_changed)) {
+        // Correlate received media snapshots with the scene clock and the actual draw trace.
+        // A thumbnail-removal event and a valid replacement whose GPU pass is skipped have
+        // the same visible symptom, so retain both image extents and byte counts here.
+        LOG_INFO("SceneMediaDispatch: time=%.6f initial=%s thumbnail_changed=%s properties_changed=%s "
+                 "playback_changed=%s has_thumbnail=%s primary=(%.6g,%.6g,%.6g) "
+                 "playback=%d thumbnail=%dx%d bytes=%zu previous_thumbnail=%dx%d "
+                 "previous_bytes=%zu texture_pixels_changed=%s title='%s'",
+                 m_scene != nullptr ? m_scene->elapsingTime : 0.0,
+                 initial_dispatch ? "true" : "false",
+                 thumbnail_changed ? "true" : "false",
+                 properties_changed ? "true" : "false",
+                 playback_changed ? "true" : "false",
+                 media_state.has_thumbnail ? "true" : "false",
+                 media_state.primary_color[0], media_state.primary_color[1],
+                 media_state.primary_color[2], media_state.playback_state,
+                 media_state.thumbnail_width, media_state.thumbnail_height,
+                 media_state.thumbnail_rgba.size(),
+                 media_state.previous_thumbnail_width, media_state.previous_thumbnail_height,
+                 media_state.previous_thumbnail_rgba.size(),
+                 texture_pixels_changed ? "true" : "false",
+                 media_state.title.c_str());
+    }
 
     JSValue thumbnail_event  = JS_UNDEFINED;
     JSValue properties_event = JS_UNDEFINED;
@@ -8830,6 +8892,10 @@ void WPSceneScriptHost::ApplyMediaState(const WPSceneScriptMediaState& media_sta
         if (! instance.initialized) continue;
 
         if (thumbnail_changed && ! JS_IsUndefined(instance.media_thumbnail_changed_fn)) {
+            if (trace_media) {
+                LOG_INFO("SceneMediaThumbnailReceiver: %s",
+                         DescribeScriptInstance(m_impl, instance.instance_id).c_str());
+            }
             JSValue arg = JS_DupValue(context, thumbnail_event);
             CallScriptEvent(
                 context, instance.media_thumbnail_changed_fn, arg, "mediaThumbnailChanged");

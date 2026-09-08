@@ -2,7 +2,10 @@
 
 #include "PassCommon.hpp"
 #include "Resource.hpp"
+#include "RenderTargetOps.hpp"
 #include "Utils/Logging.h"
+
+#include <cstdlib>
 
 using namespace wallpaper::vulkan;
 
@@ -61,54 +64,33 @@ void ClearPass::execute(const Device&, RenderingResources& rr) {
         return;
     }
 
-    VkImageSubresourceRange range {
-        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-        .baseMipLevel   = 0,
-        .levelCount     = VK_REMAINING_MIP_LEVELS,
-        .baseArrayLayer = 0,
-        .layerCount     = VK_REMAINING_ARRAY_LAYERS,
-    };
+    VkClearValue clear_value = m_desc.clear_value;
+    if (m_desc.use_scene_clear_color) {
+        const auto& color = rr.scene->clearColor;
+        clear_value.color = { color[0], color[1], color[2], 1.0f };
+    }
+    const bool clear_color = !m_desc.should_clear_color || m_desc.should_clear_color();
+    if (clear_color) {
+        ClearRenderTargetColor(rr.command, img, clear_value.color,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
 
-    VkImageMemoryBarrier to_transfer {
-        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext            = nullptr,
-        .srcAccessMask    = 0,
-        .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .image            = img.handle,
-        .subresourceRange = range,
-    };
-
-    auto& cmd = rr.command;
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        to_transfer);
-
-    cmd.ClearColorImage(img.handle,
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        &m_desc.clear_value.color,
-                        range);
-
-    VkImageMemoryBarrier to_shader_read {
-        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext            = nullptr,
-        .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask    = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
-                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .image            = img.handle,
-        .subresourceRange = range,
-    };
-
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        to_shader_read);
+    // A live disabled clear preserves both attachments. A freshly allocated model depth
+    // still needs an attachment layout before LOAD, even when no content clear is requested.
+    const auto depth_action = m_desc.should_clear_model_depth
+        ? PrepareSceneModelDepth(rr, m_desc.target, m_desc.should_clear_model_depth())
+        : SceneDepthAction::Unused;
+    if (m_desc.use_scene_clear_color &&
+        (std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr ||
+         std::getenv("WESCENE_TRACE_REFLECTION") != nullptr)) {
+        LOG_INFO("SceneStageClear: target='%s' clear-enabled=%s color-action=%s "
+                 "color=[%.6f %.6f %.6f %.6f] model-depth=%s",
+                 m_desc.target.c_str(), rr.scene->clearEnabled ? "true" : "false",
+                 clear_color ? "cleared" : "preserved",
+                 clear_value.color.float32[0], clear_value.color.float32[1],
+                 clear_value.color.float32[2], clear_value.color.float32[3],
+                 SceneDepthActionName(depth_action).data());
+    }
 }
 
 void ClearPass::destory(const Device&, RenderingResources&) {

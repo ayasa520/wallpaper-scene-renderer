@@ -77,6 +77,7 @@ bool Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBindVertexBuffers);
     X(vkCmdBlitImage);
     X(vkCmdClearColorImage);
+    X(vkCmdClearDepthStencilImage);
     X(vkCmdClearAttachments);
     X(vkCmdCopyBuffer);
     X(vkCmdCopyBufferToImage);

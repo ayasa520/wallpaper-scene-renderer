@@ -15,6 +15,7 @@ namespace wallpaper
 
 class Scene;
 class SceneNode;
+class SceneMaterial;
 struct WPSceneScriptMediaState;
 
 enum class WPSceneScriptTargetKind
@@ -46,7 +47,11 @@ struct WPSceneScriptRegistration {
     int32_t                                     object_id { 0 };
     std::string                                 object_name;
     std::string                                 property_name;
-    SceneNode*                                  node { nullptr };
+    // A script belongs to the authored object, independent of its drawing handles. Only a
+    // material-uniform target carries a resource pointer: it selects the actual material rather
+    // than a node that happens to contain it. Owner destruction removes the registrations before
+    // releasing that owner's resources; resolved effect meshes share the authored material.
+    SceneMaterial*                              material { nullptr };
     WPSceneScriptTargetKind                     target_kind { WPSceneScriptTargetKind::Layer };
     uint32_t                                    target_index { 0 };
     int32_t                                     target_id { 0 };

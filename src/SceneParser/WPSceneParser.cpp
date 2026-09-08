@@ -35,6 +35,7 @@
 
 #include "WPShaderValueUpdater.hpp"
 #include "Scene/SceneDestinationTarget.h"
+#include "Scene/SceneShapeGeometry.h"
 #include "wpscene/WPImageObject.h"
 #include "wpscene/WPParallaxDepth.hpp"
 #include "wpscene/WPParticleObject.h"
@@ -94,6 +95,7 @@ struct ImageDestinationExtent {
     // 'n' when the layer's source texture is point-sampled, otherwise 'b'.
     char                   suffix { 'b' };
     const char*            policy { "" };
+    bool                   uses_card_size { false };
 };
 
 // The pixel extent of an effect-backed image layer's destination targets and effect FBOs.
@@ -110,17 +112,11 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
                                                      const std::array<float, 2>&   card_size) {
     ImageDestinationExtent result;
     const auto use_card = [&](const char* policy) {
-        result.extent = { static_cast<int32_t>(std::ceil(card_size[0])),
-                          static_cast<int32_t>(std::ceil(card_size[1])) };
+        result.extent = ResolveCardDestinationExtent(card_size);
         result.policy = policy;
+        result.uses_card_size = true;
         return result;
     };
-    if (image.effectSourceSizeIsPixelExtent) {
-        result.extent = { static_cast<int32_t>(std::lround(card_size[0])),
-                          static_cast<int32_t>(std::lround(card_size[1])) };
-        result.policy = "pixel-extent";
-        return result;
-    }
     if (image.fullscreen) {
         const auto output = OutputFramebufferEffectTargetSize(context);
         result.extent     = { static_cast<int32_t>(std::lround(output[0])),
@@ -128,18 +124,11 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
         result.policy     = "output-framebuffer";
         return result;
     }
-    if (material.textures.empty() || material.textures.front().empty() ||
+    if (material.textures.empty() || material.Texture(0).empty() ||
         context.scene == nullptr) {
         return use_card("card-no-texture");
     }
-    const auto& texture_name = material.textures.front();
-    // Media-integration system textures are bound to a 1x1 placeholder until a thumbnail arrives
-    // at runtime. At load the slot holds no real texture, so the destination is the card; the
-    // destination is not re-derived when the thumbnail is swapped in later.
-    if (texture_name == WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE ||
-        texture_name == WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE) {
-        return use_card("card-media-placeholder");
-    }
+    const auto& texture_name = material.Texture(0);
     const bool  card_sized_helper =
         (image.config.passthrough || image.solidlayer) && ! image.instanced;
 
@@ -179,6 +168,32 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
 std::string EffectFboRenderTargetName(const wpscene::WPEffectFbo& fbo, int32_t effect_id) {
     if (! fbo.unique) return fbo.name;
     return fbo.name + "_" + std::to_string(effect_id);
+}
+
+void LoadEffectCommands(const wpscene::WPImageEffect& source, SceneImageEffect& effect,
+                        const std::unordered_map<std::string, std::string>& declared_fbos) {
+    // Command indices are looked up exclusively in the effect's declared FBO array. The
+    // material-only `previous` alias is inserted by callers after this step; an undeclared
+    // command name must retain the -1 value.
+    const auto resolve_fbo = [&](const std::string& name) -> std::optional<std::string> {
+        const auto found = declared_fbos.find(name);
+        if (found == declared_fbos.end()) return std::nullopt;
+        return found->second;
+    };
+    for (const auto& [_, target] : declared_fbos) effect.RegisterFbo(target);
+    for (const auto& command : source.commands) {
+        if (command.command != "copy" && command.command != "swap") {
+            LOG_ERROR("Unknown effect command: %s", command.command.c_str());
+            continue;
+        }
+        effect.commands.push_back({ .cmd = command.command == "swap"
+                                        ? SceneImageEffect::CmdType::Swap
+                                        : SceneImageEffect::CmdType::Copy,
+                                    .authored_dst = resolve_fbo(command.target),
+                                    .authored_src = resolve_fbo(command.source),
+                                    .afterpos = command.afterpos,
+                                    .advances_composition = command.compose });
+    }
 }
 
 uint32_t HashParticleFrameU32(uint32_t seed, uint32_t bits) {
@@ -316,18 +331,7 @@ void LogTextLayerRegistration(const char* event_name, int32_t object_id,
                               WPDynamicValue::Type hint, const WPUserSetting& setting,
                               const std::optional<WPDynamicValue>& base_value) {}
 
-bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
-    return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
-}
 
-std::string NormalizeParallaxPeerName(std::string_view name) {
-    std::string normalized;
-    normalized.reserve(name.size());
-    for (unsigned char ch : name) {
-        if (std::isalnum(ch)) normalized.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return normalized;
-}
 
 std::array<float, 2> ImageObjectParallaxDepth(const wpscene::WPImageObject& object) {
     return { object.parallaxDepth[0], object.parallaxDepth[1] };
@@ -509,7 +513,11 @@ bool WPModelObject::FromJson(const nlohmann::json& json, fs::VFS&) {
         GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
         GET_JSON_NAME_VALUE_NOWARN(json, "model", model);
         GET_JSON_NAME_VALUE_NOWARN(json, "skin", skin);
-        GET_JSON_NAME_VALUE_NOWARN(json, "reflected", reflected);
+        // This field is a literal boolean, not a script/user property. Missing and non-boolean
+        // values both retain the default inclusion in the reflected-owner list.
+        const auto reflected_value = json.find("reflected");
+        reflected = reflected_value == json.end() || !reflected_value->is_boolean() ||
+            reflected_value->get<bool>();
         GET_JSON_NAME_VALUE_NOWARN(json, "castshadow", castshadow);
         if (json.contains("animationlayers") && json.at("animationlayers").is_array()) {
             for (const auto& animation_json : json.at("animationlayers")) {
@@ -532,196 +540,17 @@ using WPObjectVar =
                  WPEmptyObject>;
 
 
-void ApplyNodeOwnerParallaxFallback(ParseContext& context, int32_t owner_id,
-                                    const std::array<float, 2>& depth, SceneNode* anchor,
-                                    bool suppress_model_parallax = false) {
-    if (context.scene == nullptr || context.shader_updater == nullptr) return;
 
-    auto apply_to_node = [&context, &depth, anchor, suppress_model_parallax](SceneNode* node) {
-        if (node == nullptr) return;
-        if (! node->Camera().empty()) return;
-        auto* node_data = context.shader_updater->GetNodeData(node);
-        if (node_data == nullptr) return;
-
-        // Only camera-facing/world-facing nodes should receive this repaired parallax contract.
-        // Effect source nodes render inside private effect cameras, so moving them here would bake
-        // the same mouse offset into the offscreen texture and then apply it again at composition.
-        node_data->SetParallaxContract(depth, anchor, suppress_model_parallax);
-    };
-
-    // The layer's registered draw handles live on its identity object. The list also contains
-    // detached effect-source nodes, which the former nodeOwners scan never held; they own the
-    // private effect camera and stay excluded by apply_to_node's camera check either way.
-    for (auto* node : context.scene->GetLayerRuntimeNodes(owner_id)) {
-        apply_to_node(node);
-    }
-
-    // The layer's effect passes and final composite are drawing phases rather than registered
-    // node identities, so they are reached through the owning effect layer instead of nodeOwners.
-    // Effect pass nodes carry no SceneNode camera (their camera is a pass override), so they keep
-    // receiving the repaired contract exactly like they did through the former registration;
-    // detached source nodes own the private effect camera and stay excluded by the camera check.
-    if (auto* effect_layer = context.scene->FindImageEffectLayer(owner_id);
-        effect_layer != nullptr) {
-        for (std::size_t i = 0; i < effect_layer->EffectCount(); i++) {
-            const auto& effect = effect_layer->GetEffect(i);
-            if (! effect) continue;
-            for (const auto& effect_node : effect->nodes) {
-                apply_to_node(effect_node.sceneNode.get());
-            }
-        }
-        if (effect_layer->HasFinalComposite()) {
-            apply_to_node(&effect_layer->FinalNode());
-        }
-    }
-}
-
-void ApplyMissingImageParallaxFallbacks(ParseContext&                   context,
-                                        const std::vector<WPObjectVar>& objects) {
-    std::unordered_map<std::string, int32_t> explicit_parallax_peer_by_name;
-
-    for (const auto& object : objects) {
-        std::visit(visitor::overload {
-                       [&explicit_parallax_peer_by_name](const wpscene::WPImageObject& image) {
-                           if (! image.parallaxDepthAuthored ||
-                               IsZeroParallaxDepth(ImageObjectParallaxDepth(image))) {
-                               return;
-                           }
-                           const auto key = NormalizeParallaxPeerName(image.name);
-                           if (! key.empty()) explicit_parallax_peer_by_name.emplace(key, image.id);
-                       },
-                       [&explicit_parallax_peer_by_name](const WPEmptyObject& empty) {
-                           if (! empty.parallaxDepthAuthored ||
-                               IsZeroParallaxDepth(empty.parallaxDepth)) {
-                               return;
-                           }
-                           const auto key = NormalizeParallaxPeerName(empty.name);
-                           if (! key.empty()) explicit_parallax_peer_by_name.emplace(key, empty.id);
-                       },
-                       [](const auto&) {
-                       },
-                   },
-                   object);
-    }
-
-    for (const auto& object : objects) {
-        const auto* image = std::get_if<wpscene::WPImageObject>(&object);
-        if (image == nullptr || image->parallaxDepthAuthored || image->parent != 0) continue;
-
-        const auto key     = NormalizeParallaxPeerName(image->name);
-        auto       peer_it = explicit_parallax_peer_by_name.find(key);
-        if (peer_it != explicit_parallax_peer_by_name.end() && peer_it->second != image->id) {
-            auto peer_node_it = context.object_nodes.find(peer_it->second);
-            if (peer_node_it != context.object_nodes.end() && peer_node_it->second) {
-                // Some WE projects split a character into a static-looking root image plus an
-                // explicitly-parallaxed detail/effect group with the same normalized name. The root
-                // layer has no authored parent, but visually it must inherit the detail group's
-                // parallax offset so the pieces stay locked together.
-                ApplyNodeOwnerParallaxFallback(
-                    context, image->id, { 0.0f, 0.0f }, peer_node_it->second.get());
-                continue;
-            }
-        }
-
-        const bool is_compose_layer         = image->image == "models/util/composelayer.json";
-        const bool has_authored_descendants = context.dependent_parent_ids.count(image->id) != 0;
-        const bool is_compose_container =
-            is_compose_layer && (! image->effects.empty() || has_authored_descendants);
-        if (is_compose_container) {
-            // A composition source subtracts its parallax while rendering routed children into a
-            // private target. Its final writer must restore the resolved default in scene space;
-            // suppressing that offset makes an omitted root and child cancel to a static result.
-            ApplyNodeOwnerParallaxFallback(
-                context, image->id, wpscene::kDefaultParallaxDepth, nullptr, false);
-        }
-    }
-}
 
 namespace
 {
-
-constexpr std::string_view kSyntheticDirectDrawShapeTextureName {
-    "__hanabi_shape_directdraw_transparent_source"
-};
 
 bool UsesShaderColorBlendMode(int32_t color_blend_mode) {
     return color_blend_mode >= 1 && color_blend_mode <= 30;
 }
 
-struct FinalShaderCapabilityEntry {
-    std::string_view shader;
-    FinalOutputCapability capability;
-};
-
-constexpr std::array<FinalShaderCapabilityEntry, 5> kFinalShaderCapabilities {{
-    // Scroll evaluates UV/time in the authored layer projection. Running its visible raster in a
-    // source-sized private target quantizes repeated pixel art before the layer is scaled to the
-    // display. The capability is attached to the shader contract itself, never to a wallpaper,
-    // texture name, or nearest-sampler heuristic.
-    { "effects/scroll", FinalOutputCapability::SceneAuthoredWriter },
-    // X-Ray unprojects the normalized desktop cursor through the inverse authored layer MVP and
-    // divides the resulting local position by the source texture extent. A private effect-camera
-    // pass uses a 2x2 clip-space helper mesh whose XY MVP is identity, collapsing cursor movement
-    // to roughly one source texel before the neutral publication pass. Keep the authored final
-    // shader in scene space so its matrix, pointer coordinates, and visible layer geometry remain
-    // one coherent projection contract.
-    { "effects/xray", FinalOutputCapability::SceneAuthoredWriter },
-    // Vertex-mode distortions displace `a_Position` before multiplying by g_MVP, and the
-    // displacement is authored in layer pixels: skew adds `g_Texture0Resolution.zw * g_Left` (and
-    // friends), foliagesway adds `g_Strength * 100`, transform rotates/offsets the raw position.
-    // That arithmetic is correct on the authored final pass: a +/-(W/2, H/2) pixel card with the
-    // unscaled layer MVP. The private effect-camera pass instead draws the 2x2 clip-space helper
-    // card, where a 0.27 skew on a 244 px box moves the left edge ~66 clip units off-target and
-    // the whole layer vanishes. Keep these shaders in scene space.
-    { "effects/skew", FinalOutputCapability::SceneAuthoredWriter },
-    { "effects/foliagesway", FinalOutputCapability::SceneAuthoredWriter },
-    { "effects/transform", FinalOutputCapability::SceneAuthoredWriter },
-}};
-
-FinalOutputCapability ResolveFinalShaderCapability(std::string_view shader) {
-    const auto it = std::find_if(kFinalShaderCapabilities.begin(),
-                                 kFinalShaderCapabilities.end(),
-                                 [shader](const auto& entry) { return entry.shader == shader; });
-    return it == kFinalShaderCapabilities.end()
-        ? FinalOutputCapability::PrivateThenPublish
-        : it->capability;
-}
-
-bool IsCurrentEffectWriterTarget(std::string_view target) {
-    return target == SpecTex_Default || sstart_with(target, WE_EFFECT_PPONG_PREFIX_B);
-}
-
 BlendMode ResolveObjectFinalBlend(BlendMode authored_blend, int32_t color_blend_mode) {
     return color_blend_mode == 31 ? BlendMode::Additive : authored_blend;
-}
-
-void EnsureSystemTextureRegistered(Scene& scene, std::string_view texture_key) {
-    auto* synthetic_parser = AsSyntheticImageParser(scene.imageParser.get());
-    if (synthetic_parser == nullptr) return;
-
-    const std::string key(texture_key);
-    if (scene.textures.count(key) != 0) return;
-
-    synthetic_parser->RegisterImage(key, CreateSceneScriptSolidImage(texture_key, { 0, 0, 0, 0 }));
-    scene.textures[key] = SceneTexture {
-        .url = key,
-        .sample =
-            TextureSample {
-                .wrapS     = TextureWrap::CLAMP_TO_EDGE,
-                .wrapT     = TextureWrap::CLAMP_TO_EDGE,
-                .magFilter = TextureFilter::LINEAR,
-                .minFilter = TextureFilter::LINEAR,
-            },
-        .format    = TextureFormat::RGBA8,
-        .isVideo   = false,
-        .isSprite  = false,
-        .width     = 1,
-        .height    = 1,
-        .mapWidth     = 1,
-        .mapHeight    = 1,
-        .mipmapCount  = 1,
-    };
-    scene.dirtyImportedTextureKeys.insert(key);
 }
 
 bool ResolveObjectVisibility(bool raw_visible, const VisibleBinding& binding,
@@ -855,50 +684,6 @@ void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
     mesh.AddVertexArray(std::move(vertex));
 }
 
-void GenCardMeshWithTexCoordBounds(SceneMesh& mesh, const std::array<float, 2>& size,
-                                   const std::array<float, 4>& texcoord_bounds) {
-    const float width  = std::max(1.0f, size[0]);
-    const float height = std::max(1.0f, size[1]);
-    const float min_u  = texcoord_bounds[0];
-    const float min_v  = texcoord_bounds[1];
-    const float max_u  = texcoord_bounds[2];
-    const float max_v  = texcoord_bounds[3];
-    const float z      = 0.0f;
-
-    auto local_x = [width](float u) {
-        return (u - 0.5f) * width;
-    };
-    auto local_y = [height](float v) {
-        return (0.5f - v) * height;
-    };
-
-    // The final writer may need to cover UVs outside [0, 1], but the effect shader still expects
-    // its authored domain to be the original layer size. Expanding positions from UV bounds keeps
-    // those two contracts independent: shader math stays stable, while the final quad no longer
-    // clips generated DIRECTDRAW pixels at the canonical card edge.
-    const std::array pos = {
-        local_x(min_u), local_y(max_v), z,
-        local_x(min_u), local_y(min_v), z,
-        local_x(max_u), local_y(max_v), z,
-        local_x(max_u), local_y(min_v), z,
-    };
-    const std::array texCoord = {
-        min_u, max_v,
-        min_u, min_v,
-        max_u, max_v,
-        max_u, min_v,
-    };
-
-    SceneVertexArray vertex(
-        {
-            { WE_IN_POSITION.data(), VertexType::FLOAT3 },
-            { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 },
-        },
-        4);
-    vertex.SetVertex(WE_IN_POSITION, pos);
-    vertex.SetVertex(WE_IN_TEXCOORD, texCoord);
-    mesh.AddVertexArray(std::move(vertex));
-}
 
 void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const Scene* scene,
                       const WPShaderInfo& sinfo) {
@@ -911,15 +696,11 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const
                 name = "_rt_ParticleRefract";
             }
             */
-        } else if (sstart_with(name, WE_IMAGE_LAYER_COMPOSITE_PREFIX)) {
-            LOG_INFO("link tex \"%s\"", name.c_str());
-            int         wpid { -1 };
-            std::regex  reImgId { R"(_rt_imageLayerComposite_([0-9]+))" };
-            std::smatch match;
-            if (std::regex_search(name, match, reImgId)) {
-                STRTONUM(std::string(match[1]), wpid);
-            }
-            name = GenLinkTex((u32)wpid);
+        } else if (IsImageLayerCompositeTex(name)) {
+            // The private slot is registered under its complete authored name and sampled through
+            // ordinary named texture lookup. Rewriting it to a layer id loses the physical slot
+            // and can make the consumer sample a later screen publication instead of the private
+            // result.
         } else if (name == SpecTex_DefaultPingPong) {
         } else if (sstart_with(name, WE_MIP_MAPPED_FRAME_BUFFER)) {
         } else if (sstart_with(name, WE_EFFECT_PPONG_PREFIX)) {
@@ -928,10 +709,9 @@ void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const
         } else if (sstart_with(name, WE_FULL_COMPO_BUFFER_PREFIX)) {
         } else if (name == "_rt_shadowAtlas") {
         } else if (name == kModelReflectionTargetName) {
-            // 3D model reflection targets are registered lazily by model materialization, but
-            // first-party grid materials may reference the sampler while their own model is not
-            // reflected. Accept the name here as a model/runtime target instead of treating it as a
-            // missing 2D texture.
+            // The name can come from a shader's default texture, before model setup has
+            // classified its active samplers. Only that classification allocates the target; an
+            // unused authored slot does not.
         } else if (scene != nullptr && scene->renderTargets.count(name) != 0) {
             // Effect-local feedback buffers such as `_rt_EightBuffer1_<effect-layer-address>` are
             // registered dynamically from the authored FBO table. They still use Wallpaper Engine's
@@ -1007,7 +787,7 @@ void RegisterSceneTextureFromHeader(Scene& scene, const std::string& name,
 } // namespace
 
 std::optional<MaterialLoadResult>
-LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, SceneNode* pNode,
+LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
              SceneMaterial* pMaterial, WPShaderValueData* pSvData,
              const UserPropertyMap* user_properties,
              WPShaderInfo*          pWPShaderInfo,
@@ -1105,13 +885,16 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
         const auto& binding = wpmat.usertextures[i];
         if (binding.empty()) continue;
         if (binding.type == "system") {
-            if (binding.name == "$mediaThumbnail") {
-                textures[i] = std::string(WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE);
-                EnsureSystemTextureRegistered(*pScene, WP_SCENE_SCRIPT_MEDIA_THUMBNAIL_TEXTURE);
-            } else if (binding.name == "$mediaPreviousThumbnail") {
-                textures[i] = std::string(WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
-                EnsureSystemTextureRegistered(*pScene,
-                                              WP_SCENE_SCRIPT_MEDIA_PREVIOUS_THUMBNAIL_TEXTURE);
+            // Keep the authored input intact when the system property has no value. The live
+            // handle is resolved by every texture consumer, after effect aliases have selected
+            // their current targets.
+            material.systemTextureBindings.emplace(
+                i, pScene->GetSystemTextureBinding(binding.name));
+            if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
+                LOG_INFO("SceneMaterialSystemTexture: shader='%s' slot=%zu property='%s' "
+                         "authored='%s' override='%s'",
+                         wpmat.shader.c_str(), i, binding.name.c_str(), textures[i].c_str(),
+                         material.systemTextureBindings.at(i)->c_str());
             }
             continue;
         }
@@ -1218,18 +1001,21 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
 
         std::array<i32, 4> resolution {};
         if (IsSpecTex(name) || IsMaterialRuntimeRenderTarget(pScene, name)) {
-            if (IsSpecLinkTex(name)) {
-                svData.renderTargets.push_back({ i, name });
-            } else if (pScene->renderTargets.count(name) == 0) {
-                LOG_ERROR("%s not found in render targes", name.c_str());
-            } else {
-                svData.renderTargets.push_back({ i, name });
+            if (pScene->renderTargets.count(name) != 0) {
                 const auto& rt = pScene->renderTargets.at(name);
                 // Runtime render targets may keep a larger physical allocation than the logical
                 // content they currently store. Forwarding the authored content extent through
                 // `.zw` preserves Wallpaper Engine's original "sample area" contract for effects
                 // that distinguish between allocated size and meaningful image size.
                 resolution = rt.ResolutionVector();
+            } else if (name == kModelReflectionTargetName) {
+                // Receiver detection follows compilation. Seed its screen-sized resolution
+                // without allocating a target for every material mentioning the name. The
+                // live updater reads the registered receiver target after model setup.
+                resolution = pScene->renderTargets.at(std::string(SpecTex_Default))
+                                 .ResolutionVector();
+            } else if (!IsImageLayerCompositeTex(name)) {
+                LOG_ERROR("%s not found in render targets", name.c_str());
             }
         } else {
             const ImageHeader& texh = texHeaders.count(name) == 0
@@ -1288,6 +1074,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
     for (uint i = 0; i < material.textures.size(); i++) {
         if (! exists(fragment_unit.preprocess_info.active_tex_slots, i)) {
             material.textures[i].clear();
+            material.systemTextureBindings.erase(i);
         }
     }
 
@@ -1308,73 +1095,73 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene, Scen
 namespace
 {
 
+const char* EffectPublicationMaterialPath(uint32_t scene_version) {
+    // The scene's top-level JSON version selects the utility program for private publication,
+    // using the unsigned version >= 3 boundary. This decision is independent of the authored
+    // source shader, its lighting combos and the renderer's graphics capabilities.
+    return scene_version >= 3 ? "/assets/materials/util/effectpassthrough_4.json"
+                              : "/assets/materials/util/effectpassthrough.json";
+}
+
+bool LoadEffectPublicationSource(ParseContext& context, wpscene::WPMaterial& material) {
+    nlohmann::json json;
+    return PARSE_JSON(fs::GetFileContent(*context.vfs,
+                                        EffectPublicationMaterialPath(context.scene->authoredVersion)),
+                      json) && material.FromJson(json);
+}
+
+void SetNeutralPublicationModulation(ShaderValueMap& values) {
+    // Publication uses neutral color and alpha when sampling the resolved slot. It preserves
+    // those pixels without applying the authored source's tint, opacity or brightness again.
+    values["g_Color4"] = std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
+    values["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
+    values["g_Alpha"] = 1.0f;
+    values["g_UserAlpha"] = 1.0f;
+    values["g_Brightness"] = 1.0f;
+}
+
 bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer& effect_layer,
                                    std::string_view initial_source, int32_t owner_layer_id,
                                    std::string_view         owner_name,
                                    int32_t                  color_blend_mode,
                                    const WPShaderValueData* final_transform_data = nullptr,
-                                   const wpscene::WPMaterial* direct_material    = nullptr,
-                                   int32_t                    direct_effect_id   = 0) {
+                                   const WPMdl* puppet = nullptr) {
     auto& vfs = *context.vfs;
 
     wpscene::WPMaterial composite_source;
-    if (direct_material != nullptr) {
-        // A single authored effect pass with no private buffers is the layer's on-screen
-        // writer: the pass material draws the final quad at output resolution while sampling
-        // the private source. Routing it through a second ping-pong target instead would cap
-        // procedural detail (orbit lines, atmosphere rims) at that target's resolution.
-        composite_source = *direct_material;
-    } else {
-        nlohmann::json composite_json;
-        if (! PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
-                         composite_json) ||
-            ! composite_source.FromJson(composite_json)) {
-            LOG_ERROR(
-                "SceneEffectFinalComposite: layer=%d name='%.*s' failed to load passthrough material",
-                owner_layer_id,
-                static_cast<int>(owner_name.size()),
-                owner_name.data());
-            return false;
-        }
+    if (!LoadEffectPublicationSource(context, composite_source)) {
+        LOG_ERROR(
+            "SceneEffectFinalComposite: layer=%d name='%.*s' failed to load passthrough material",
+            owner_layer_id,
+            static_cast<int>(owner_name.size()),
+            owner_name.data());
+        return false;
     }
 
     if (composite_source.textures.empty()) composite_source.textures.resize(1);
-    if (direct_material == nullptr || composite_source.textures[0].empty()) {
-        composite_source.textures[0] = std::string(initial_source);
-    }
-    if (direct_material == nullptr) {
-        // Modes 1..30 are framebuffer-aware shader blend equations. Modes 0 and 31 use the neutral
-        // shader variant; mode 31 is expressed by the final fixed-function additive state instead.
-        composite_source.combos["BLENDMODE"] =
-            UsesShaderColorBlendMode(color_blend_mode) ? color_blend_mode : 0;
+    composite_source.textures[0] = std::string(initial_source);
+    // Modes 1..30 are framebuffer-aware shader blend equations. Modes 0 and 31 use the neutral
+    // shader variant; mode 31 is expressed by the final fixed-function additive state instead.
+    composite_source.combos["BLENDMODE"] =
+        UsesShaderColorBlendMode(color_blend_mode) ? color_blend_mode : 0;
+    if (puppet != nullptr) {
+        // The restored destination receives the imported mesh with this utility program. Skinning
+        // samples the owner's current pose at uniform upload; it does not require another local
+        // render target or a second animation runtime on this drawing phase.
+        WPMdlParser::AddPuppetMatInfo(composite_source, *puppet);
+        composite_source.combos["LIGHTING"] = 0;
+        composite_source.combos["REFLECTION"] = 0;
     }
 
     WPShaderInfo composite_shader_info;
     composite_shader_info.baseConstSvs = context.global_base_uniforms;
-    if (direct_material != nullptr) {
-        composite_shader_info.baseConstSvs["g_EffectTextureProjectionMatrix"] =
-            ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
-        composite_shader_info.baseConstSvs["g_EffectTextureProjectionMatrixInverse"] =
-            ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
-    } else {
-        // The source object/effect chain has already baked authored color, alpha, brightness, and
-        // effect output into the ping-pong texture. The final composite must therefore be a neutral
-        // sampler: it applies the layer's final mesh and blend state, but it must not tint or fade
-        // the resolved texture a second time.
-        composite_shader_info.baseConstSvs["g_Color4"] =
-            std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
-        composite_shader_info.baseConstSvs["g_Color"] = std::array<float, 3> { 1.0f, 1.0f, 1.0f };
-        composite_shader_info.baseConstSvs["g_Alpha"]      = 1.0f;
-        composite_shader_info.baseConstSvs["g_UserAlpha"]  = 1.0f;
-        composite_shader_info.baseConstSvs["g_Brightness"] = 1.0f;
-    }
+    SetNeutralPublicationModulation(composite_shader_info.baseConstSvs);
 
     SceneMaterial     composite_material;
     WPShaderValueData composite_data;
     if (! LoadMaterial(vfs,
                        composite_source,
                        context.scene.get(),
-                       &effect_layer.FinalNode(),
                        &composite_material,
                        &composite_data,
                        context.user_properties,
@@ -1385,92 +1172,30 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
                   owner_name.data());
         return false;
     }
-    if (direct_material != nullptr) {
-        LoadConstvalue(composite_material, composite_source, composite_shader_info);
-        LoadUserShaderValue(
-            composite_material, composite_source, composite_shader_info, context.user_properties);
-    }
     if (final_transform_data != nullptr) {
-        // The fallback final composite is the screen-space writer used when the last authored
-        // effect in a layer is hidden. It is not an authored child node, so copying the full parent
-        // transform binding would multiply route matrices twice; only the parallax contract is
-        // mirrored from the visible world node so hidden-effect fallbacks keep moving with their
-        // compose/text layer.
+        // Publication evaluates the owner's raw transform through the layer binding below.
+        // Its destination displacement remains phase-specific: inheriting the owner's parent
+        // binding here would apply the hierarchy twice when resolving this draw handle.
         composite_data.CopyParallaxContractFrom(*final_transform_data);
     }
+    composite_data.SetEffectLayerProjection(&effect_layer);
 
     auto composite_mesh = std::make_shared<SceneMesh>();
     composite_mesh->AddMaterial(std::move(composite_material));
 
-    auto& final_node = effect_layer.FinalNode();
-    final_node.SetName(owner_name.empty()
-                           ? std::string("__hanabi_effect_final_composite")
-                           : std::string(owner_name) + "::__hanabi_effect_final_composite");
-    final_node.ID() = owner_layer_id;
-    final_node.SetCamera(std::string());
-    final_node.AddMesh(composite_mesh);
-
-    context.shader_updater->SetNodeData(&final_node, composite_data);
-    if (direct_material != nullptr) {
-        RegisterUserShaderValueBindings(context,
-                                        composite_source,
-                                        composite_shader_info,
-                                        &final_node,
-                                        owner_layer_id,
-                                        owner_name);
-        RegisterConstantShaderValueBindings(context,
-                                            composite_source,
-                                            composite_shader_info,
-                                            &final_node,
-                                            owner_layer_id,
-                                            owner_name,
-                                            direct_effect_id,
-                                            0,
-                                            0);
-        LOG_INFO("SceneEffectDirectFinalDraw: layer=%d name='%.*s' effect-id=%d shader='%s' "
-                 "source='%.*s'",
-                 owner_layer_id,
-                 static_cast<int>(owner_name.size()),
-                 owner_name.data(),
-                 direct_effect_id,
-                 composite_source.shader.c_str(),
-                 static_cast<int>(initial_source.size()),
-                 initial_source.data());
-    }
-    // The final composite is a drawing phase of the owning layer, not a second layer identity:
-    // it stays out of sceneGraph/nodeOwners. Its node id (set above) is the back-reference the
-    // render graph uses to resolve the owning layer for visibility and residency decisions.
+    auto& publication = effect_layer.FinalCompositeDraw();
+    publication.SetName(std::string(owner_name) + "::publication");
+    publication.SetMesh(std::move(composite_mesh));
+    context.shader_updater->SetNodeData(&publication, composite_data);
+    // Publication stores only its raster resources and projection selection. Its owner reference
+    // supplies identity, visibility and placement; no SceneNode is created or registered here.
     effect_layer.SetFinalCompositeSource(std::string(initial_source));
     return true;
 }
 
-SceneImageEffectLayer::HiddenFinalCompositePolicy
-ResolveHiddenFinalCompositePolicy(const Scene& scene, const wpscene::WPImageObject& image) {
-    // This is a source-contract decision rather than a shader or layer-name decision. Normal image
-    // layers have a meaningful pre-effect source, so disabling the final effect should reveal that
-    // source. Layers the editor marks with a scene-object `config.passthrough` publish nothing
-    // instead of preserving a helper render target that may only contain previous framebuffer
-    // contents. The model passthrough marker (SceneObject::Passthrough) is a different flag and
-    // does not drive this policy.
-    (void)scene;
-    return image.config.suppressHiddenFinalComposite
-        ? SceneImageEffectLayer::HiddenFinalCompositePolicy::SuppressOutput
-        : SceneImageEffectLayer::HiddenFinalCompositePolicy::PreserveSource;
-}
-
-SceneImageEffectLayer::SourcePolicy ResolveImageEffectSourcePolicy(
-    bool is_compose_layer, const wpscene::WPImageObject& image) {
-    if (!is_compose_layer) return SceneImageEffectLayer::SourcePolicy::OwnerNode;
-    // copybackground composition layers seed their private source from the owner framebuffer
-    // material before routed children are accumulated. Ordinary composition layers instead author
-    // their source exclusively through routed children; drawing the owner framebuffer again would
-    // composite the already-rendered scene a second time and brighten the complete wallpaper.
-    return image.copybackground ? SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren
-                                : SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly;
-}
-
 std::string_view ImageEffectSourcePolicyName(SceneImageEffectLayer::SourcePolicy policy) {
     switch (policy) {
+    case SceneImageEffectLayer::SourcePolicy::None: return "none";
     case SceneImageEffectLayer::SourcePolicy::OwnerNode: return "owner-node";
     case SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren:
         return "owner-node-and-proxy-children";
@@ -1502,47 +1227,9 @@ PuppetBounds3D TransformPuppetBounds(const PuppetBounds3D& bounds,
     return result;
 }
 
-PuppetSurfaceProjection BuildPuppetSurfaceProjection(
-    const wpscene::WPImageObject& image,
-    const WPMdl& mdl,
-    const SceneMesh& puppet_mesh,
-    std::string camera_name,
-    std::string target_name,
-    const std::array<float, 2>& effect_source_size) {
-    PuppetSurfaceProjection projection;
-    projection.authored_layer_size = { image.size[0], image.size[1] };
-    projection.geometry_transform = puppet_mesh.GeometryTransform();
-    projection.camera_name = std::move(camera_name);
-    projection.target_name = std::move(target_name);
-    projection.render_density = std::max(
-        effect_source_size[0] / std::max(image.size[0], 1.0f),
-        effect_source_size[1] / std::max(image.size[1], 1.0f));
-    projection.asset_bounds = mdl.asset_bounds;
-    projection.authored_pose_bounds = mdl.authored_pose_bounds.IsFiniteAndOrdered()
-                                          ? mdl.authored_pose_bounds
-                                          : mdl.asset_bounds;
-
-    PuppetBounds3D authored_surface = TransformPuppetBounds(
-        projection.authored_pose_bounds, projection.geometry_transform);
-    authored_surface.Include(Eigen::Vector3f {
-        -image.size[0] * 0.5f, -image.size[1] * 0.5f, 0.0f
-    });
-    authored_surface.Include(Eigen::Vector3f {
-        image.size[0] * 0.5f, image.size[1] * 0.5f, 0.0f
-    });
-    // One physical target pixel protects raster-edge precision while keeping the guard tied to the
-    // actual render density. The resulting surface remains immutable for authored animation.
-    const float guard = 1.0f / std::max(projection.render_density,
-                                        std::numeric_limits<float>::epsilon());
-    projection.surface_bounds = authored_surface;
-    projection.surface_bounds.min -= Eigen::Vector3f::Constant(guard);
-    projection.surface_bounds.max += Eigen::Vector3f::Constant(guard);
-    return projection;
-}
-
 TextureSample ResolvePrimaryMaterialSampler(const Scene& scene, const SceneMaterial& material) {
-    if (material.textures.empty() || material.textures.front().empty()) return {};
-    const auto& texture_name = material.textures.front();
+    if (material.textures.empty() || material.Texture(0).empty()) return {};
+    const auto& texture_name = material.Texture(0);
     if (const auto texture_it = scene.textures.find(texture_name);
         texture_it != scene.textures.end()) {
         return texture_it->second.sample;
@@ -1555,9 +1242,145 @@ TextureSample ResolvePrimaryMaterialSampler(const Scene& scene, const SceneMater
 }
 
 bool PrimaryMaterialTextureIsSprite(const Scene& scene, const SceneMaterial& material) {
-    if (material.textures.empty() || material.textures.front().empty()) return false;
-    const auto texture_it = scene.textures.find(material.textures.front());
+    if (material.textures.empty() || material.Texture(0).empty()) return false;
+    const auto texture_it = scene.textures.find(material.Texture(0));
     return texture_it != scene.textures.end() && texture_it->second.isSprite;
+}
+
+void MergeImageSourceProgramBindings(SceneMaterial& material, const SceneMaterial& variant) {
+    // Both executables address the same authored bindings. Install additional reflected
+    // slots once, before script registration, then leave their live values untouched during
+    // program switches. Per-program default uniforms remain owned by each compiled shader.
+    material.customShader.constValues.insert(variant.customShader.constValues.begin(),
+                                             variant.customShader.constValues.end());
+    material.uniformAliases.insert(variant.uniformAliases.begin(), variant.uniformAliases.end());
+    material.systemTextureBindings.insert(variant.systemTextureBindings.begin(),
+                                           variant.systemTextureBindings.end());
+    for (size_t slot = 0; slot < variant.textures.size(); ++slot) {
+        if (slot >= material.textures.size()) {
+            material.textures.push_back(variant.textures[slot]);
+            material.defines.push_back(variant.defines[slot]);
+        } else if (material.textures[slot].empty()) {
+            material.textures[slot] = variant.textures[slot];
+        }
+    }
+}
+
+bool LoadImageDirectPuppetSource(
+    ParseContext& context, const wpscene::WPImageObject& image, const WPMdl& puppet,
+    const WPShaderInfo& source_info, SceneMaterial& material,
+    SceneImageEffectLayer::DirectPuppetSource& result) {
+    // Direct skinning uses the original image material, including authored lighting and
+    // reflection. The parser supplies only owners eligible for this branch; live visible-effect
+    // state decides whether it executes before private publication has been selected for the
+    // owner.
+    WPShaderInfo skinned_info = source_info;
+    WPMdlParser::AddPuppetShaderInfo(skinned_info, puppet);
+    SceneMaterial skinned_material;
+    WPShaderValueData skinned_values;
+    if (!LoadMaterial(*context.vfs, image.material, context.scene.get(), &skinned_material,
+                      &skinned_values, context.user_properties, &skinned_info)) {
+        LOG_ERROR("SceneImageDirectPuppetMaterial: layer=%d name='%s' shader='%s' load failed",
+                  image.id, image.name.c_str(), image.material.shader.c_str());
+        return false;
+    }
+    result.ordinary_shader = material.customShader.shader;
+    result.skinned_shader = skinned_material.customShader.shader;
+    MergeImageSourceProgramBindings(material, skinned_material);
+    LOG_INFO("SceneImageDirectPuppetMaterial: layer=%d name='%s' shader='%s' chunk-info=0x%x",
+             image.id, image.name.c_str(), image.material.shader.c_str(), puppet.chunk_info);
+    return true;
+}
+
+bool LoadImagePrelightingSource(
+    ParseContext& context, const wpscene::WPImageObject& image, const WPMdl* puppet,
+    const WPShaderInfo& source_info, SceneMaterial& material,
+    std::optional<SceneImageEffectLayer::PrelightingSource>& result) {
+    const auto combo_enabled = [&](std::string_view name) {
+        const auto it = source_info.combos.find(std::string(name));
+        return it != source_info.combos.end() && it->second != "0";
+    };
+    const bool lighting = combo_enabled("LIGHTING");
+    const bool reflection = combo_enabled("REFLECTION");
+    if ((!lighting && !reflection) || material.textures.empty() ||
+        material.Texture(0).empty()) return true;
+
+    // Derive the source variant from the complete authored material, preserving its feature
+    // combos and property inputs. This prepares an executable; visible-effect/private/sprite
+    // state selects it at graph construction, so a runtime visibility change never reloads a
+    // material over script edits.
+    auto authored = image.material;
+    authored.combos["LIGHTING"] = lighting ? 1 : 0;
+    authored.combos["REFLECTION"] = reflection ? 1 : 0;
+    authored.combos["PRELIGHTING"] = 1;
+    const bool skinned = puppet != nullptr && puppet->HasImageSkinning();
+    if (skinned) {
+        WPMdlParser::AddPuppetMatInfo(authored, *puppet);
+        authored.combos["PRELIGHTINGDUALVERTEX"] = 1;
+    }
+    WPShaderInfo prelighting_info;
+    prelighting_info.baseConstSvs = source_info.baseConstSvs;
+    SceneMaterial prelighting_material;
+    WPShaderValueData prelighting_values;
+    if (!LoadMaterial(*context.vfs, authored, context.scene.get(), &prelighting_material,
+                       &prelighting_values, context.user_properties, &prelighting_info)) {
+        LOG_ERROR("SceneImagePrelightingMaterial: layer=%d name='%s' shader='%s' load failed",
+                  image.id, image.name.c_str(), authored.shader.c_str());
+        return false;
+    }
+
+    const auto& scene = *context.scene;
+    const auto& texture_name = material.Texture(0);
+    std::array<int32_t, 2> allocation;
+    std::array<float, 2> content;
+    bool sprite = false;
+    if (const auto it = scene.textures.find(texture_name); it != scene.textures.end()) {
+        const auto& texture = it->second;
+        allocation = {texture.width, texture.height};
+        sprite = texture.isSprite;
+        if (sprite) {
+            const auto& frame = texture.spriteAnim.Frames().front();
+            content = {frame.width, frame.height};
+        } else {
+            content = {static_cast<float>(texture.mapWidth),
+                       static_cast<float>(texture.mapHeight)};
+        }
+    } else {
+        const auto& texture = scene.renderTargets.at(texture_name);
+        allocation = {texture.width, texture.height};
+        content = {static_cast<float>(texture.ContentWidth()),
+                   static_cast<float>(texture.ContentHeight())};
+    }
+
+    auto source_mesh = std::make_shared<SceneMesh>();
+    if (skinned) {
+        // The primary position and tangent basis are skinned for lighting; the unskinned
+        // auxiliary position rasterizes into the source texture. Do not apply the display-card
+        // calibration or the animated publication envelope here.
+        WPMdlParser::GenPuppetMesh(*source_mesh, *puppet);
+    } else {
+        // Private source geometry uses the physical texture extent and full UVs. Logical content
+        // determines its half-size I translation; target extent independently determines
+        // projection.
+        GenCardMesh(*source_mesh, {static_cast<uint16_t>(allocation[0]),
+                                   static_cast<uint16_t>(allocation[1])});
+    }
+    result = SceneImageEffectLayer::PrelightingSource {
+        .ordinary_shader = material.customShader.shader,
+        .prelighting_shader = prelighting_material.customShader.shader,
+        .mesh = std::move(source_mesh),
+        .content_size = content,
+        .sprite = sprite,
+        .instanced = image.instanced,
+    };
+
+    MergeImageSourceProgramBindings(material, prelighting_material);
+    LOG_INFO("SceneImagePrelightingMaterial: layer=%d name='%s' shader='%s' lighting=%s "
+             "reflection=%s dual-position=%s allocation=[%d %d] content=[%.3f %.3f]",
+             image.id, image.name.c_str(), authored.shader.c_str(), lighting ? "true" : "false",
+             reflection ? "true" : "false", skinned ? "true" : "false",
+             allocation[0], allocation[1], content[0], content[1]);
+    return true;
 }
 
 ImageEffectCameraClipRange ResolveImageEffectCameraClipRange(bool has_animated_puppet_mesh) {
@@ -1617,7 +1440,7 @@ std::optional<AttachmentBinding> ResolveAttachmentBinding(const ParseContext& co
 } // namespace
 
 bool ConfigureBoneAttachment(ParseContext& context, int32_t parent_id, std::string_view attachment,
-                             const Eigen::Affine3f& local_transform, std::string_view object_kind,
+                             std::string_view object_kind,
                              std::string_view object_name, WPShaderValueData& node_data) {
     if (parent_id == 0 || attachment.empty()) return false;
 
@@ -1642,14 +1465,12 @@ bool ConfigureBoneAttachment(ParseContext& context, int32_t parent_id, std::stri
 
     node_data.AttachToBone(parent_node.get(),
                            attachment_binding->bone_index,
-                           attachment_binding->transform,
-                           local_transform);
+                           attachment_binding->transform);
     return true;
 }
 
 void AttachNodeToScene(ParseContext& context, const std::shared_ptr<SceneNode>& node,
-                       int32_t parent_id, const std::string& object_name,
-                       WPShaderValueData* node_data) {
+                       int32_t parent_id, const std::string& object_name) {
     if (parent_id == 0) {
         context.scene->sceneGraph->AppendChild(node);
         return;
@@ -1665,160 +1486,34 @@ void AttachNodeToScene(ParseContext& context, const std::shared_ptr<SceneNode>& 
     }
 
     parent->AppendChild(node);
-    if (node_data != nullptr) {
-        node_data->SetParallaxAnchor(parent.get());
-    }
+
 }
-
-namespace
-{
-
-bool ShouldInheritParentParallax(ParseContext& context, const SceneNode& parent,
-                                 const WPShaderValueData& node_data) {
-    if (context.shader_updater == nullptr) return true;
-    if (! node_data.parallaxDepthAuthored) {
-        // Wallpaper Engine stores its numeric default as an omitted field. A root layer with that
-        // field still resolves to the scene default depth, but a child layer uses the parent
-        // parallax contract instead of becoming a separate depth-1 camera source. This check must
-        // precede the numeric comparison because both omitted and explicitly authored `1 1` carry
-        // the same resolved float values.
-        return true;
-    }
-    if (IsZeroParallaxDepth(node_data.parallaxDepth)) return true;
-
-    const auto* parent_data = context.shader_updater->GetNodeData(&parent);
-    if (parent_data == nullptr) return true;
-
-    // Inherited transform and inherited camera-parallax are separate contracts in Wallpaper
-    // Engine. Authored relay layers can be positioned relative to a parent while still carrying
-    // their own parallaxDepth. Keep the old parent-anchor behavior for repaired/suppressed
-    // containers and zero-depth parents, but let explicit child depth survive when both sides
-    // authored their own non-zero parallax values.
-    if (parent_data->suppress_model_parallax || parent_data->IsBoneAttached()) return true;
-    if (parent_data->parallax_anchor != nullptr) return true;
-    if (IsZeroParallaxDepth(parent_data->parallaxDepth)) return true;
-
-    return false;
-}
-
-enum class ParentTransformBindingContract
-{
-    None,
-    InheritAuthoredParent,
-};
-
-enum class ParentParallaxAnchorContract
-{
-    None,
-    InheritWhenCompatible,
-    ForceAuthoredParent,
-};
-
-struct ParentTransformContract {
-    int32_t                         parent_id { 0 };
-    ParentTransformBindingContract  transform_binding {
-        ParentTransformBindingContract::None
-    };
-    ParentParallaxAnchorContract    parallax_anchor {
-        ParentParallaxAnchorContract::None
-    };
-
-    static ParentTransformContract InheritAuthoredParentTransform(int32_t parent_id) {
-        return { .parent_id         = parent_id,
-                 .transform_binding = ParentTransformBindingContract::InheritAuthoredParent,
-                 .parallax_anchor   = ParentParallaxAnchorContract::InheritWhenCompatible };
-    }
-
-    static ParentTransformContract RoutedEffectWorldTransform(int32_t parent_id) {
-        return { .parent_id         = parent_id,
-                 .transform_binding = ParentTransformBindingContract::InheritAuthoredParent,
-                 .parallax_anchor   = ParentParallaxAnchorContract::ForceAuthoredParent };
-    }
-
-    static ParentTransformContract ParallaxAnchorWhenCompatible(int32_t parent_id) {
-        return { .parent_id       = parent_id,
-                 .parallax_anchor = ParentParallaxAnchorContract::InheritWhenCompatible };
-    }
-
-    static ParentTransformContract ForceParallaxAnchor(int32_t parent_id) {
-        return { .parent_id       = parent_id,
-                 .parallax_anchor = ParentParallaxAnchorContract::ForceAuthoredParent };
-    }
-};
-
-void ApplyParentTransformContract(ParseContext& context, const ParentTransformContract& contract,
-                                  WPShaderValueData& node_data) {
-    if (contract.parent_id == 0) return;
-    auto parent = FindParentNode(context, contract.parent_id);
-    if (! parent) return;
-
-    const bool inherit_parent_parallax =
-        contract.parallax_anchor == ParentParallaxAnchorContract::ForceAuthoredParent ||
-        (contract.parallax_anchor == ParentParallaxAnchorContract::InheritWhenCompatible &&
-         ShouldInheritParentParallax(context, *parent, node_data));
-
-    if (contract.transform_binding ==
-        ParentTransformBindingContract::InheritAuthoredParent) {
-        node_data.InheritParentTransform(parent.get(), inherit_parent_parallax);
-        return;
-    }
-
-    if (inherit_parent_parallax) {
-        node_data.SetParallaxAnchor(parent.get());
-    }
-}
-
-// Shared with WPSceneParserParticle.cpp (declared in WPSceneParserShared.hpp).
-} // namespace
 
 void ConfigureInheritedParentBinding(ParseContext& context, int32_t parent_id,
                                      WPShaderValueData& node_data) {
-    ApplyParentTransformContract(
-        context, ParentTransformContract::InheritAuthoredParentTransform(parent_id), node_data);
+    if (auto parent = FindParentNode(context, parent_id)) {
+        node_data.InheritParentTransform(parent.get());
+    }
 }
 
 namespace
 {
 
-void ConfigureRoutedEffectWorldParentBinding(ParseContext& context, int32_t parent_id,
-                                             WPShaderValueData& node_data) {
-    // Effect-backed image layers split into a routed world node and private effect nodes. The world
-    // node is the scene-space writer that ResolveEffect()/UpdateUniforms use to synchronize the
-    // final output, so it must keep the authored parent as its camera-parallax anchor even when both
-    // parent and child authored non-zero parallaxDepth. Authored effect materials still keep their
-    // own child parallax contract; this binding only preserves the parent component that would
-    // otherwise be lost before the final writer is synchronized.
-    ApplyParentTransformContract(
-        context, ParentTransformContract::RoutedEffectWorldTransform(parent_id), node_data);
-}
-
 struct EffectWriterTransformContract {
     std::array<float, 2>       parallax_depth { 0.0f, 0.0f };
-    bool                       parallax_depth_authored { true };
     SceneImageEffectLayer*     projection_layer { nullptr };
-    bool                       binds_puppet_surface { false };
-    ParentTransformContract    parent_transform {};
     bool suppress_own_model_parallax { false };
 };
 
 void ApplyEffectWriterTransformContract(ParseContext& context,
                                         const EffectWriterTransformContract& contract,
                                         WPShaderValueData& data) {
-    data.SetParallaxContract(contract.parallax_depth,
-                             nullptr,
-                             false,
-                             contract.parallax_depth_authored);
+    data.SetParallaxContract(contract.parallax_depth);
 
     if (contract.projection_layer != nullptr) {
-        data.SetEffectTextureProjection(&contract.projection_layer->FinalNode(),
-                                        &contract.projection_layer->FinalMesh());
-        if (contract.binds_puppet_surface) {
-            data.SetPuppetSurface(contract.projection_layer,
-                                  &contract.projection_layer->FinalMesh());
-        }
+        data.SetEffectLayerProjection(contract.projection_layer);
     }
 
-    ApplyParentTransformContract(context, contract.parent_transform, data);
 
     if (contract.suppress_own_model_parallax) {
         data.SuppressOwnModelParallax();
@@ -1833,125 +1528,36 @@ WPShaderValueData BuildEffectWriterTransformData(ParseContext& context,
 }
 
 EffectWriterTransformContract BuildImageEffectFinalCompositeContract(
-    const wpscene::WPImageObject& image, bool uses_routed_parent) {
+    const wpscene::WPImageObject& image) {
     EffectWriterTransformContract contract;
-    contract.parallax_depth          = ImageObjectParallaxDepth(image);
-    contract.parallax_depth_authored = image.parallaxDepthAuthored;
-
-    if (image.parent != 0 && ! image.attachment.empty()) {
-        // A bone-attached image is positioned by the parent puppet before this neutral final
-        // composite is drawn. SyncResolvedNodeToWorld() copies that already-parallaxed world
-        // matrix into the detached final node, while final-composite data deliberately does not
-        // retain the bone binding itself. Applying the child's parsed parallaxDepth again here
-        // therefore adds an independent camera translation after the parent translation. Missing
-        // parallaxDepth now resolves to the normal scene default, so without this explicit
-        // attachment contract a head, eye, or other attached artwork drifts away from its bone.
-        // Match the direct-image path: attachments get exactly the parent puppet's parallax.
-        contract.suppress_own_model_parallax = true;
-    }
-
-    if (uses_routed_parent) {
-        // Effect-backed image world nodes deliberately force the authored parent as their parallax
-        // anchor because their physical SceneNode is detached and routed only for render order. The
-        // private final composite is the actual visible writer, so it must mirror that same anchor
-        // rather than re-running compatibility selection against its own synthetic node data. This
-        // keeps parented media covers and other routed effect layers moving with their authored
-        // parent while the route matrix continues to supply only the raw transform hierarchy.
-        contract.parent_transform = ParentTransformContract::ForceParallaxAnchor(image.parent);
-    }
+    contract.parallax_depth = ImageObjectParallaxDepth(image);
     return contract;
-}
-
-enum class ImageEffectWriterRole
-{
-    AuthoredEffectProjection,
-    LayerSurfaceProxy,
-};
-
-struct ImageEffectMaterialTopology {
-    bool                  uses_routed_parent { false };
-    ImageEffectWriterRole writer_role { ImageEffectWriterRole::AuthoredEffectProjection };
-
-    bool NeedsLayerSurfaceParentParallax() const {
-        return uses_routed_parent && writer_role == ImageEffectWriterRole::LayerSurfaceProxy;
-    }
-};
-
-ImageEffectWriterRole ResolveImageEffectWriterRole(bool is_compose_layer) {
-    if (is_compose_layer) return ImageEffectWriterRole::LayerSurfaceProxy;
-    return ImageEffectWriterRole::AuthoredEffectProjection;
 }
 
 EffectWriterTransformContract BuildTextEffectFinalCompositeContract(
     const wpscene::WPTextObject& text) {
     EffectWriterTransformContract contract;
-    contract.parallax_depth          = TextObjectParallaxDepth(text);
-    contract.parallax_depth_authored = text.parallaxDepthAuthored;
-    if (LayerUsesRoutedParent(text.parent, text.attachment)) {
-        // The route matrix contains the authored parent transform but never shader-time mouse
-        // parallax. Match the normal text-node contract here: zero-depth text inherits the closest
-        // compatible parent parallax anchor, while text with an independent authored depth keeps its
-        // own offset. The final composite then applies exactly one parallax contract instead of
-        // suppressing the only offset available to effect-backed weekday/date labels.
-        contract.parent_transform =
-            ParentTransformContract::ParallaxAnchorWhenCompatible(text.parent);
-    }
+    contract.parallax_depth = TextObjectParallaxDepth(text);
     return contract;
 }
 
 EffectWriterTransformContract BuildImageEffectMaterialContract(
-    const wpscene::WPImageObject& image, SceneImageEffectLayer& effect_layer,
-    const ImageEffectMaterialTopology& topology, bool private_layer_surface_writer) {
-    EffectWriterTransformContract contract;
-    contract.parallax_depth          = ImageObjectParallaxDepth(image);
-    contract.parallax_depth_authored = image.parallaxDepthAuthored;
+    const wpscene::WPImageObject& image, SceneImageEffectLayer& effect_layer) {
+    // The authored last material and a layer blend stage publish the same object. Both must
+    // use the same parent/attachment parallax contract on the raw object transform. Intermediate
+    // effect draws select local projection separately and do not apply scene parallax.
+    auto contract = BuildImageEffectFinalCompositeContract(image);
     contract.projection_layer        = &effect_layer;
-    contract.binds_puppet_surface    = private_layer_surface_writer;
-
-    if (private_layer_surface_writer) {
-        // An animated puppet surface writer rasterizes the skinned mesh through the layer-local
-        // source camera, then the neutral final composite places that resolved texture in scene
-        // space. Camera parallax belongs exclusively to that final scene-space placement. Applying
-        // it during the private puppet draw as well shifts the body inside its texture, while a
-        // bone-attached child receives the parent's parallax only through its attachment transform;
-        // the two pieces therefore separate as the pointer moves. Keep the private rasterization
-        // local so the final composite and every attachment observe one shared parallax transform.
-        contract.suppress_own_model_parallax = true;
-    }
-
-    if (topology.NeedsLayerSurfaceParentParallax()) {
-        // This decision is based on render topology, not on authored parallax values. Compose
-        // layers have no authored effect projection that should own a separate child-space parallax
-        // result; their resolved screen writer is the layer image itself, merely routed through the
-        // image-effect path. Match the no-effect
-        // image-layer contract by inheriting the authored parent's parallax anchor, so virtual
-        // render-order parents keep routed visual layers locked together.
-        //
-        // Detached chains with real authored effects intentionally do not enter this branch. Their
-        // final writer belongs to the effect pipeline, and the world route matrix already supplies
-        // the parent transform. Re-anchoring that authored final writer to the parent changes the
-        // effect-chain projection contract and moves layers such as the lantern media cover and
-        // audio rings away from their authored local center.
-        contract.parent_transform = ParentTransformContract::ForceParallaxAnchor(image.parent);
-    }
     return contract;
 }
 
 EffectWriterTransformContract BuildTextEffectMaterialContract(
     const wpscene::WPTextObject& text, SceneImageEffectLayer& effect_layer) {
-    EffectWriterTransformContract contract;
-    contract.parallax_depth          = TextObjectParallaxDepth(text);
-    contract.parallax_depth_authored = text.parallaxDepthAuthored;
+    // Text re-layout synchronizes an unmodified object transform. The material that publishes
+    // the shaped card therefore owns the same single parallax application as direct text or
+    // the layer blend stage, including the authored parent anchor.
+    auto contract = BuildTextEffectFinalCompositeContract(text);
     contract.projection_layer        = &effect_layer;
-    if (LayerUsesRoutedParent(text.parent, text.attachment)) {
-        // Text effect nodes start as private bridge passes, but ResolveEffect() may turn the last
-        // authored effect node into the visible scene-space writer. Parent-routed text already
-        // receives the visual parent chain, including parent camera parallax, through the render
-        // graph route matrix. Suppressing this node's own model parallax prevents two failure modes:
-        // non-zero child text depths drifting inside zero-parallax HUD groups, and zero-depth
-        // effect-backed date labels receiving an extra copy of their moving parent's parallax.
-        contract.suppress_own_model_parallax = true;
-    }
     return contract;
 }
 
@@ -1965,64 +1571,6 @@ void RegisterLayerSceneState(ParseContext& context, int32_t layer_id, int32_t pa
     context.scene->SetLayerLocalVisibility(layer_id, visible);
 }
 
-namespace
-{
-
-void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObject& wpimgobj) {
-    auto node = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
-                                            Vector3f(wpimgobj.scale.data()),
-                                            Vector3f(wpimgobj.angles.data()),
-                                            wpimgobj.name);
-    LoadAlignment(*node, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
-    node->ID() = wpimgobj.id;
-
-    WPShaderValueData node_data;
-    node_data.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-    node_data.parallaxDepthAuthored = wpimgobj.parallaxDepthAuthored;
-    ConfigureBoneAttachment(context,
-                            wpimgobj.parent,
-                            wpimgobj.attachment,
-                            Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
-                            "image layer",
-                            wpimgobj.name,
-                            node_data);
-
-    if (LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment)) {
-        ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
-        context.scene->sceneGraph->AppendChild(node);
-    } else {
-        AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
-    }
-
-    context.object_nodes[wpimgobj.id] = node;
-    context.scene->EnsureSceneObject(wpimgobj.id)
-        .SetImageRuntimeState(Scene::ImageLayerRuntimeState {
-            .size      = wpimgobj.size,
-            .alignment = wpimgobj.alignment,
-        });
-    context.scene->AddLayerRuntimeNode(wpimgobj.id, node.get());
-    context.shader_updater->SetNodeData(node.get(), node_data);
-    RegisterLayerSceneState(
-        context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
-    context.scene->ApplyLayerVisibility(wpimgobj.id);
-
-    LOG_INFO("SceneObjectMaterialize: mode=image-logical-only id=%d name='%s' image='%s' "
-             "fullscreen=%s autosize=%s projectlayer=%s effects=%zu dependency-source=%s",
-             wpimgobj.id,
-             wpimgobj.name.c_str(),
-             wpimgobj.image.c_str(),
-             wpimgobj.fullscreen ? "true" : "false",
-             wpimgobj.autosize ? "true" : "false",
-             wpimgobj.projectlayer ? "true" : "false",
-             wpimgobj.effects.size(),
-             context.scene != nullptr &&
-                     context.scene->IsLayerOffscreenDependencySource(wpimgobj.id)
-                 ? "true"
-                 : "false");
-}
-
-// Shared with WPSceneParserParticle.cpp (declared in WPSceneParserShared.hpp).
-} // namespace
 
 namespace
 {
@@ -2351,13 +1899,13 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
         // `usershadervalues` bindings are not layer properties: they write directly into the
         // material uniform map. Registering them after the material has been attached makes 2D
         // layers and 3D model chunks share the same live-update contract: the dispatcher resolves
-        // node->Mesh()->Material() immediately and writes the same GLSL uniform that the cold parse
+        // the material resource directly and writes the same GLSL uniform that the cold parse
         // resolved from shader metadata.
         context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
             .object_id     = object_id,
             .object_name   = std::string(object_name),
             .property_name = binding.gl_uniform_name,
-            .node          = node,
+            .material      = node->Mesh()->Material(),
             .target_kind   = WPSceneScriptTargetKind::MaterialUniform,
             .target_index  = 0,
             .value_type    = value_type,
@@ -2412,14 +1960,14 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         }
 
         // Effect pass constants are parsed into SceneMaterial::constValues for cold start, but
-        // dynamic constants also need a live target on the concrete pass node. User bindings and
+        // dynamic constants also need a live target on the concrete material. User bindings and
         // scripts both reuse the MaterialUniform dispatcher so album-art color scripts can update
         // Gradient Color uniforms without rebuilding the post-process chain.
         WPSceneScriptRegistration registration {
             .object_id     = object_id,
             .object_name   = std::string(object_name),
             .property_name = gl_uniform_name,
-            .node          = node,
+            .material      = node->Mesh()->Material(),
             .target_kind   = WPSceneScriptTargetKind::MaterialUniform,
             .target_index  = static_cast<uint32_t>(material_index),
             .target_id     = effect_id,
@@ -2612,8 +2160,9 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
         std::make_shared<SceneCamera>((float)context.ortho_w / (float)context.ortho_h,
                                       general.nearz,
                                       general.farz,
-                                      algorism::ResolvePerspectiveFov(scene.perspectiveOverrideFov,
-                                                                      context.ortho_h));
+                                      algorism::ResolvePerspectiveFov(
+                                          scene.generalProjection.perspectiveOverrideFov,
+                                          context.ortho_h));
 
     Vector3f cperori                       = cori;
     cperori[2]                             = 1000.0f;
@@ -2621,13 +2170,15 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
     scene.cameras["global_perspective"]->AttatchNode(context.global_perspective_camera_node);
     scene.sceneGraph->AppendChild(context.global_perspective_camera_node);
 
-    const Vector3d eye(
-        scene_config.camera.eye[0], scene_config.camera.eye[1], scene_config.camera.eye[2]);
-    const Vector3d center(scene_config.camera.center[0],
-                          scene_config.camera.center[1],
-                          scene_config.camera.center[2]);
-    const Vector3d up(
-        scene_config.camera.up[0], scene_config.camera.up[1], scene_config.camera.up[2]);
+    scene.authoredCameraPose = {
+        .eye = scene_config.camera.eye,
+        .center = scene_config.camera.center,
+        .up = scene_config.camera.up,
+    };
+    const auto& pose = scene.authoredCameraPose;
+    const Vector3d eye(pose.eye[0], pose.eye[1], pose.eye[2]);
+    const Vector3d center(pose.center[0], pose.center[1], pose.center[2]);
+    const Vector3d up(pose.up[0], pose.up[1], pose.up[2]);
     scene.cameras[std::string(kSceneModelPerspectiveCameraName)] = std::make_shared<SceneCamera>(
         (float)context.ortho_w / (float)context.ortho_h, general.nearz, general.farz, general.fov);
     auto model_camera_node = std::make_shared<SceneNode>();
@@ -2674,6 +2225,11 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
     GenCardMesh(scene.default_effect_mesh, { 2, 2 });
     context.shader_updater = static_cast<WPShaderValueUpdater*>(scene.shaderValueUpdater.get());
 
+    scene.authoredVersion              = sc.version;
+    LOG_INFO("SceneEffectPublicationMaterial: scene-version=%u path='%s'",
+             scene.authoredVersion,
+             EffectPublicationMaterialPath(scene.authoredVersion));
+    scene.clearEnabled                 = sc.general.clearenabled;
     scene.clearColor                   = sc.general.clearcolor;
     scene.ambientColor                 = sc.general.ambientcolor;
     scene.skylightColor                = sc.general.skylightcolor;
@@ -2692,7 +2248,12 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
     scene.cameraParallaxDelay          = sc.general.cameraparallaxdelay;
     scene.cameraParallaxMouseInfluence = sc.general.cameraparallaxmouseinfluence;
     scene.cameraOrthographic           = sc.general.isOrtho;
-    scene.perspectiveOverrideFov       = sc.general.perspectiveoverridefov;
+    scene.generalProjection = {
+        .fov = sc.general.fov,
+        .perspectiveOverrideFov = sc.general.perspectiveoverridefov,
+        .nearClip = sc.general.nearz,
+        .farClip = sc.general.farz,
+    };
     scene.cameraShake                  = sc.general.camerashake;
     scene.cameraShakeAmplitude         = sc.general.camerashakeamplitude;
     scene.cameraShakeRoughness         = sc.general.camerashakeroughness;
@@ -2723,61 +2284,217 @@ void InitContext(ParseContext& context, fs::VFS& vfs, wpscene::WPScene& sc,
     }
 }
 
+namespace
+{
+// Effect retention, FBO allocation, material loading and script registration are shared resource
+// responsibilities. The optional source target belongs to the owner's draw contract: images
+// supply a ping-pong source, while shape's source-slot -1 leaves authored material inputs intact.
+void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
+                      const std::vector<wpscene::WPImageEffect>& effects,
+                      const std::array<float, 2>& target_resolution,
+                      const ShaderValueMap& base_uniforms,
+                      const EffectWriterTransformContract& transform_contract,
+                      std::optional<std::string_view> source_target,
+                      const WPPuppetLayer* puppet_pose = nullptr) {
+    auto& scene = *context.scene;
+    const auto layer_id = layer.Owner().Id();
+    const auto& layer_name = layer.Owner().Name();
+    const auto visibility_policy = layer.UsesShapeDraw()
+        ? SceneImageEffect::VisibilityPolicy::OwnerOnly
+        : SceneImageEffect::VisibilityPolicy::Instance;
+    for (usize effect_index = 0; effect_index < effects.size(); ++effect_index) {
+        const auto& authored_effect = effects[effect_index];
+        auto effect = std::make_shared<SceneImageEffect>(visibility_policy);
+        effect->SetIdentity(layer_id, authored_effect.id, static_cast<uint32_t>(effect_index),
+                            authored_effect.name);
+        const auto feedback_fbos = authored_effect.FeedbackFboNames();
+        std::unordered_map<std::string, std::string> fbo_map;
+        for (const auto& authored_fbo : authored_effect.fbos) {
+            const auto name = EffectFboRenderTargetName(authored_fbo, authored_effect.id);
+            const auto size = authored_fbo.ResolveSize(target_resolution);
+            const bool feedback = feedback_fbos.contains(authored_fbo.name);
+            const SceneRenderTarget target {
+                .width = size[0],
+                .height = size[1],
+                .mapWidth = size[0],
+                .mapHeight = size[1],
+                .allowReuse = !feedback,
+            };
+            InternNamedRenderTarget(scene, name, target);
+            if (authored_fbo.fit > 0 || feedback) {
+                LOG_INFO("SceneEffectFboResolve: layer=%d effect-id=%d effect='%s' "
+                         "fbo='%s' target='%s' size=%dx%d scale=%u fit=%u persistent-feedback=%s",
+                         layer_id, authored_effect.id, authored_effect.name.c_str(),
+                         authored_fbo.name.c_str(), name.c_str(), size[0], size[1],
+                         authored_fbo.scale, authored_fbo.fit, feedback ? "true" : "false");
+            }
+            layer.AddEffectRenderTarget(name, authored_fbo.scale, authored_fbo.fit);
+            fbo_map[authored_fbo.name] = name;
+        }
+
+        LoadEffectCommands(authored_effect, *effect, fbo_map);
+        if (source_target) fbo_map.try_emplace("previous", *source_target);
+
+        bool materials_loaded = true;
+        for (usize material_index = 0; material_index < authored_effect.materials.size();
+             ++material_index) {
+            auto material_source = authored_effect.materials[material_index];
+            std::string output(source_target ? WE_EFFECT_PPONG_PREFIX_B : SpecTex_Default);
+            std::vector<usize> fbo_texture_slots;
+            bool output_is_fbo = false;
+            if (material_index < authored_effect.passes.size()) {
+                const auto& pass = authored_effect.passes[material_index];
+                material_source.MergePass(pass);
+                for (const auto& binding : pass.bind) {
+                    const auto target = fbo_map.find(binding.name);
+                    if (target == fbo_map.end()) {
+                        // A negative binding index is ignored for source-slot -1; in particular,
+                        // "previous" must not overwrite an authored texture with a shape target.
+                        if (source_target) LOG_ERROR("fbo %s not found", binding.name.c_str());
+                        continue;
+                    }
+                    const auto slot = static_cast<usize>(binding.index);
+                    if (material_source.textures.size() <= slot) {
+                        material_source.textures.resize(slot + 1);
+                    }
+                    material_source.textures[slot] = target->second;
+                    if (effect->IsDeclaredFbo(target->second)) fbo_texture_slots.push_back(slot);
+                }
+                if (!pass.target.empty()) {
+                    const auto target = fbo_map.find(pass.target);
+                    if (target != fbo_map.end()) {
+                        output = target->second;
+                        output_is_fbo = effect->IsDeclaredFbo(output);
+                    } else if (source_target) {
+                        LOG_ERROR("fbo %s not found", pass.target.c_str());
+                    }
+                }
+            }
+            if (source_target) {
+                if (material_source.textures.empty()) material_source.textures.resize(1);
+                if (material_source.textures[0].empty()) {
+                    material_source.textures[0] = *source_target;
+                }
+            }
+
+            auto node = std::make_shared<SceneNode>();
+            // Material nodes are private draw handles. Their id refers to the canonical owner,
+            // but they do not enter the authored hierarchy or allocate another script identity.
+            node->ID() = layer_id;
+            node->SetName(layer_name + "::__hanabi_effect_pass_" +
+                          std::to_string(effect_index) + "_" + std::to_string(material_index));
+            WPShaderInfo shader_info;
+            shader_info.baseConstSvs = base_uniforms;
+            shader_info.baseConstSvs["g_EffectTextureProjectionMatrix"] =
+                ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
+            shader_info.baseConstSvs["g_EffectTextureProjectionMatrixInverse"] =
+                ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
+            SceneMaterial material;
+            WPShaderValueData node_data;
+            if (!LoadMaterial(*context.vfs, material_source, &scene, &material, &node_data,
+                              context.user_properties, &shader_info)) {
+                LOG_ERROR("SceneEffectLoad: layer=%d effect='%s' material-index=%zu load failed",
+                          layer_id, authored_effect.name.c_str(), material_index);
+                materials_loaded = false;
+                break;
+            }
+            LoadConstvalue(material, material_source, shader_info);
+            LoadUserShaderValue(material, material_source, shader_info, context.user_properties);
+            ApplyEffectWriterTransformContract(context, transform_contract, node_data);
+            if (puppet_pose != nullptr && material_source.use_puppet) {
+                node_data.puppet_layer = *puppet_pose;
+            }
+
+            const auto authored_textures = material.textures;
+            const auto authored_blend = material.blenmode;
+            auto mesh = std::make_shared<SceneMesh>();
+            mesh->AddMaterial(std::move(material));
+            node->AddMesh(mesh);
+            RegisterUserShaderValueBindings(
+                context, material_source, shader_info, node.get(), layer_id, layer_name);
+            RegisterConstantShaderValueBindings(
+                context, material_source, shader_info, node.get(), layer_id, layer_name,
+                authored_effect.id, static_cast<int32_t>(effect_index), material_index);
+            context.shader_updater->SetNodeData(node.get(), node_data);
+            const bool final_material = material_index + 1 == authored_effect.materials.size();
+            effect->nodes.push_back({
+                .authored_output = output,
+                .output = output,
+                .authored_textures = authored_textures,
+                .fbo_texture_slots = std::move(fbo_texture_slots),
+                .output_is_fbo = output_is_fbo,
+                .sceneNode = node,
+                .advances_composition = material_index < authored_effect.passes.size() &&
+                    authored_effect.passes[material_index].compose,
+                .is_final_material = final_material,
+                .authored_blend = authored_blend,
+            });
+            if (layer.UsesShapeDraw()) {
+                LOG_INFO("SceneShapeMaterialRetained: layer=%d effect=%d effect-index=%zu "
+                         "material=%zu final-material=%s input='%s' explicit-fbo=%s output='%s'",
+                         layer_id, authored_effect.id, effect_index, material_index,
+                         final_material ? "true" : "false",
+                         authored_textures.empty() ? "" : authored_textures[0].c_str(),
+                         output_is_fbo ? "true" : "false", output.c_str());
+            }
+        }
+        if (!materials_loaded) {
+            LOG_ERROR("effect '%s' failed to load", authored_effect.name.c_str());
+            continue;
+        }
+        const bool visible = ResolveEffectVisibility(authored_effect, context.user_properties);
+        effect->SetLocalVisible(visible);
+        if (!authored_effect.visible_json.is_null()) {
+            LOG_INFO("SceneEffectVisibilityResolve: layer=%d effect-id=%d effect-index=%zu "
+                     "name='%s' authored=%s initial=%s runtime=%s",
+                     layer_id, authored_effect.id, effect_index, authored_effect.name.c_str(),
+                     authored_effect.visible ? "true" : "false", visible ? "true" : "false",
+                     EffectVisibilityCanChangeAtRuntime(authored_effect) ? "true" : "false");
+        }
+        layer.AddEffect(effect);
+    }
+}
+} // namespace
+
 void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     auto& wpimgobj = img_obj;
 
     auto& vfs = *context.vfs;
 
-    const auto register_logical_only_layer = [&]() {
-        RegisterLogicalImageLayer(context, wpimgobj);
-    };
+    // Runtime image properties exist before materialization, including empty compositions.
+    // Composition resources read this owner record throughout parsing and after script updates,
+    // so both paths retain one value for the copybackground property.
+    context.scene->EnsureSceneObject(wpimgobj.id)
+        .SetImageRuntimeState(Scene::ImageLayerRuntimeState {
+            .size = wpimgobj.size,
+            .alignment = wpimgobj.alignment,
+            .copy_background = wpimgobj.copybackground,
+        });
 
     const int32_t count_eff = static_cast<int32_t>(wpimgobj.effects.size());
     const bool hasAuthoredEffect = count_eff > 0;
-    bool       isCompose         = (wpimgobj.image == "models/util/composelayer.json");
-    const bool isProjectLayer =
-        wpimgobj.projectlayer || wpimgobj.image == "models/util/projectlayer.json";
+    const bool isCompose = wpimgobj.config.passthrough && !wpimgobj.fullscreen;
     const bool is_offscreen_dependency_source =
         context.scene != nullptr &&
         context.scene->IsLayerOffscreenDependencySource(wpimgobj.id);
     const bool has_shader_color_blend = UsesShaderColorBlendMode(wpimgobj.colorBlendMode);
-    // Wallpaper Engine `dependencies` expose a layer through `_rt_imageLayerComposite_<id>`
+    // Wallpaper Engine `dependencies` expose a layer through `_rt_imageLayerComposite_<id>_a`
     // even when the source layer has no authored effects. Such layers still need a private source
-    // render target because the visible consumer samples that source while the layer itself remains
-    // hidden in the main scene. Treating dependency-only image layers as effect-backed sources lets
-    // the existing effect camera/ping-pong path materialize the raw image or mask without drawing
-    // it directly into `_rt_default`.
-    bool hasEffect =
-        hasAuthoredEffect || has_shader_color_blend || is_offscreen_dependency_source;
-    // Detached effect world nodes still need to inherit the parent transform even though they
-    // cannot become real scene-graph children of that parent. SceneScript/property-animation
-    // also needs a dedicated logical/world node for image layers with effects, otherwise runtime
-    // transform updates move the offscreen source quad out of its effect camera and the final
-    // output turns blank.
+    // render target because a consumer samples that source independently of the owner's
+    // visibility. Treating dependency-only image layers as effect-backed sources lets the
+    // existing effect camera/ping-pong path materialize the raw image or mask. Publication
+    // separately follows the owner's current visibility, whether its enclosing destination is the
+    // scene or a composition. A composition can gain its first child after parsing. Retain its
+    // material, mesh and bridge descriptors even while empty, so that transition does not reparse
+    // the owner or reset script-written properties. An empty non-private zero-step owner still
+    // emits no graph passes. The scene target table only declares resources; GPU images are
+    // queried by the emitted draw passes.
+    bool hasEffect = hasAuthoredEffect || has_shader_color_blend ||
+        is_offscreen_dependency_source || wpimgobj.config.passthrough;
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
-    bool use_detached_effect_world_node = hasEffect && ! isCompose;
-    // The card / compose-camera size: the authored size, or the pixel extent a shape already
-    // resolved. The destination extent itself is derived from the source texture once the material
-    // is loaded (ResolveImageDestinationExtent).
-    const std::array<float, 2> effect_source_size =
-        wpimgobj.effectSourceSize[0] > 0.0f && wpimgobj.effectSourceSize[1] > 0.0f
-            ? wpimgobj.effectSourceSize
-            : wpimgobj.size;
-    // skip no effect fullscreen layer
-    if (! hasEffect && wpimgobj.fullscreen) {
-        register_logical_only_layer();
-        return;
-    }
-
+    // Card/compose-camera size is independent of the source texture's destination extent.
+    const std::array<float, 2> effect_source_size = wpimgobj.size;
     const bool hasAuthoredPuppet = ! wpimgobj.puppet.empty();
-    // No-effect compose/project layers are logical framebuffer helpers. Drawing them as regular
-    // image meshes can sample `_rt_default` and write it back through the scene camera, which
-    // applies a second projection to the already-composited frame on non-authored output aspects.
-    if (! hasEffect && (isCompose || isProjectLayer) && ! is_offscreen_dependency_source) {
-        register_logical_only_layer();
-        return;
-    }
-
     std::unique_ptr<WPMdl> puppet;
     if (hasAuthoredPuppet) {
         puppet = std::make_unique<WPMdl>();
@@ -2806,25 +2523,17 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     const bool hasStaticImageMesh =
         puppet != nullptr && puppet->kind == WPMdl::MeshKind::StaticImage;
 
-    // wpimgobj.origin[1] = context.ortho_h - wpimgobj.origin[1];
-    auto spWorldNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
-                                                   Vector3f(wpimgobj.scale.data()),
-                                                   Vector3f(wpimgobj.angles.data()),
-                                                   wpimgobj.name);
-    LoadAlignment(*spWorldNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
-    spWorldNode->ID() = wpimgobj.id;
-    auto spImgNode = use_detached_effect_world_node ? std::make_shared<SceneNode>() : spWorldNode;
-    if (use_detached_effect_world_node) {
-        // The detached node is this layer's private-camera source phase, not a second layer
-        // identity. Name it like the other phase nodes so the authored name stays unique to the
-        // world node and graph logs distinguish the two.
-        spImgNode->SetName(wpimgobj.name + "::__hanabi_effect_source");
-    }
+    // One object retains the authored transform, mesh, pose and script identity. The source
+    // pass selects its local raster matrix without allocating or mutating another SceneNode.
+    auto spImgNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
+                                                Vector3f(wpimgobj.scale.data()),
+                                                Vector3f(wpimgobj.angles.data()),
+                                                wpimgobj.name);
+    LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
     spImgNode->ID() = wpimgobj.id;
 
     SceneMaterial     material;
     WPShaderValueData svData;
-    WPShaderValueData worldNodeData;
     TextureSample     source_sampler;
     std::string       primary_source_texture;
     WPPuppetLayer     shared_puppet_pose;
@@ -2839,7 +2548,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     {
         if (! hasEffect) {
             svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-            svData.parallaxDepthAuthored = wpimgobj.parallaxDepthAuthored;
+
             if (hasAnimatedPuppetMesh) {
                 WPMdlParser::AddPuppetShaderInfo(shaderInfo, *puppet);
             }
@@ -2859,7 +2568,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         if (! LoadMaterial(vfs,
                            wpimgobj.material,
                            context.scene.get(),
-                           spImgNode.get(),
                            &material,
                            &svData,
                            context.user_properties,
@@ -2870,15 +2578,35 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         LoadConstvalue(material, wpimgobj.material, shaderInfo);
         LoadUserShaderValue(material, wpimgobj.material, shaderInfo, context.user_properties);
         source_sampler = ResolvePrimaryMaterialSampler(*context.scene, material);
-        if (!material.textures.empty()) primary_source_texture = material.textures.front();
+        if (!material.textures.empty()) primary_source_texture = material.Texture(0);
     }
+    std::optional<SceneImageEffectLayer::DirectPuppetSource> direct_puppet_source;
+    if (hasEffect && puppet && puppet->HasImageSkinning() &&
+        !puppet->HasImagePrivateChunk() &&
+        !PrimaryMaterialTextureIsSprite(*context.scene, material) &&
+        !is_offscreen_dependency_source && !has_shader_color_blend &&
+        !wpimgobj.config.passthrough) {
+        direct_puppet_source.emplace();
+        if (!LoadImageDirectPuppetSource(context, wpimgobj, *puppet, shaderInfo,
+                                         material, *direct_puppet_source)) return;
+    }
+    std::optional<SceneImageEffectLayer::PrelightingSource> prelighting_source;
+    if (hasEffect && !LoadImagePrelightingSource(context, wpimgobj, puppet.get(), shaderInfo,
+                                                 material, prelighting_source)) return;
     // Destination targets and effect FBOs are fixed-size images sized from the source texture
     // content (or the card for texture-less / passthrough helpers), never from the scene camera.
     const ImageDestinationExtent destination_extent =
         ResolveImageDestinationExtent(context, wpimgobj, material, effect_source_size);
+    // Destination filtering follows the source unless the layer explicitly disables
+    // interpolation. Addressing belongs to the destination itself, not to the source file;
+    // include both settings in the intern key and use the same sampler for both slots.
+    const TextureSample destination_sampler = DestinationRenderTargetSampler(
+        wpimgobj.nointerpolation || destination_extent.suffix == 'n', wpimgobj.clampuvs);
+    // Destination setup clamps the selected source extent before either the destination pair or
+    // the authored effect FBOs use it.
     const std::array<float, 2> effect_target_resolution {
-        static_cast<float>(destination_extent.extent[0]),
-        static_cast<float>(destination_extent.extent[1]),
+        static_cast<float>(ClampDestinationRenderTargetExtent(destination_extent.extent[0])),
+        static_cast<float>(ClampDestinationRenderTargetExtent(destination_extent.extent[1])),
     };
 
     // mesh
@@ -2926,22 +2654,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 
         if (hasAnimatedPuppetMesh) {
             if (hasEffect) {
-                // Effects operate on a rectangular layer-local source, then the original image
-                // material is appended as the authoritative puppet surface writer. Reusing that
-                // material is required because puppet images may carry extra textures and shader
-                // semantics such as iris movement and blink masks that a neutral passthrough cannot
-                // reconstruct from the resolved color texture alone.
+                // The source material already evaluates authored image behavior before the effect
+                // sequence. Publication samples that resolved result with a utility material and
+                // the original skinned mesh; repeating the source shader would process iris
+                // controls, lighting and tint twice. Keep source and publication programs
+                // separate while sharing the same owner and immutable puppet pose.
                 GenCardMesh(
                     mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
                 WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
-
-                wpscene::WPImageEffect puppet_effect;
-                wpscene::WPMaterial    puppet_mat;
-                puppet_mat             = wpimgobj.material;
-                puppet_mat.textures[0] = "";
-                WPMdlParser::AddPuppetMatInfo(puppet_mat, *puppet);
-                puppet_effect.materials.push_back(std::move(puppet_mat));
-                wpimgobj.effects.push_back(std::move(puppet_effect));
             } else {
                 svData.puppet_layer = shared_puppet_pose;
                 WPMdlParser::GenPuppetMesh(mesh, *puppet);
@@ -2976,17 +2696,19 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             const auto source_mesh_size = wpimgobj.size;
             GenCardMesh(
                 mesh, { (uint16_t)source_mesh_size[0], (uint16_t)source_mesh_size[1] }, mapRate);
-            if (wpimgobj.effectFinalTexCoordBoundsEnabled) {
-                GenCardMeshWithTexCoordBounds(
-                    effct_final_mesh, wpimgobj.size, wpimgobj.effectFinalTexCoordBounds);
-            } else {
-                GenCardMesh(effct_final_mesh,
-                            { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
-            }
+            GenCardMesh(effct_final_mesh,
+                        { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
         }
     }
-    // material blendmode for last step to use
-    auto imgBlendMode = ResolveObjectFinalBlend(material.blenmode, wpimgobj.colorBlendMode);
+    // A passthrough source cleared to transparent publishes with translucent blending.
+    // colorBlendMode 31 takes precedence over that rule; other images retain their authored
+    // destination blend independently of the source-pass override below.
+    const auto authored_destination_blend =
+        ResolveObjectFinalBlend(material.blenmode, wpimgobj.colorBlendMode);
+    const auto transparent_destination_blend =
+        ResolveObjectFinalBlend(BlendMode::Translucent, wpimgobj.colorBlendMode);
+    const auto imgBlendMode = wpimgobj.config.passthrough && !wpimgobj.copybackground
+        ? transparent_destination_blend : authored_destination_blend;
     // disable img material blend, as it's the first effect node now
     if (hasEffect) {
         material.blenmode = BlendMode::Normal;
@@ -3005,19 +2727,15 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     ConfigureBoneAttachment(context,
                             wpimgobj.parent,
                             wpimgobj.attachment,
-                            Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>()),
                             "object",
                             wpimgobj.name,
                             svData);
 
-    worldNodeData               = svData;
-    worldNodeData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
-    worldNodeData.parallaxDepthAuthored = wpimgobj.parallaxDepthAuthored;
+    svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+
 
     if (hasEffect) {
         auto& scene = *context.scene;
-        FinalOutputCapability final_shader_capability =
-            wpimgobj.config.finalOutputCapability;
         std::string effect_camera_name = EffectCameraName(wpimgobj.id);
         const auto  effect_camera_clip = ResolveImageEffectCameraClipRange(hasAnimatedPuppetMesh);
         // set camera to attatch effect
@@ -3031,7 +2749,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                 source_camera_height,
                 effect_camera_clip.near_clip,
                 effect_camera_clip.far_clip);
-            scene.cameras.at(effect_camera_name)->AttatchNode(spWorldNode);
+            scene.cameras.at(effect_camera_name)->AttatchNode(spImgNode);
             LOG_INFO("SceneCompositionLayerSourceCamera: layer=%d name='%s' camera='%s' "
                      "size=[%d, %d] source-target=[%.3f, %.3f] near=%.3f far=%.3f "
                      "animated-puppet=%s",
@@ -3064,36 +2782,44 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                      effect_camera_clip.far_clip,
                      hasAnimatedPuppetMesh ? "true" : "false");
         }
-        spImgNode->SetCamera(effect_camera_name);
         const int32_t effect_target_width = ClampDestinationRenderTargetExtent(
             static_cast<int32_t>(std::lround(effect_target_resolution[0])));
         const int32_t effect_target_height = ClampDestinationRenderTargetExtent(
             static_cast<int32_t>(std::lround(effect_target_resolution[1])));
-        const auto effect_destination_names = SceneDestinationRenderTargetNames(
-            scene, wpimgobj.parent, effect_target_width, effect_target_height,
-            destination_extent.suffix);
+        // Allocate the puppet's potential private branch before its materials are bound. Direct
+        // drawing can omit every source/publication draw for initially hidden effects; resident
+        // resources allow a later visibility change to promote the owner. Composition membership
+        // and the separate hidden-output policy do not set this flag.
+        const bool private_destination_output = is_offscreen_dependency_source ||
+            hasAnimatedPuppetMesh || has_shader_color_blend;
+        const SceneRenderTarget destination_target {
+            .width = effect_target_width,
+            .height = effect_target_height,
+            .mapWidth = effect_target_width,
+            .mapHeight = effect_target_height,
+            .allowReuse = true,
+            .sample = destination_sampler,
+        };
+        const auto effect_destination_names = ResolveSceneDestinationRenderTargets(
+            scene, wpimgobj.id, wpimgobj.parent, private_destination_output, destination_target);
         const std::string& effect_ppong_a = effect_destination_names[0];
         const std::string& effect_ppong_b = effect_destination_names[1];
-        // set image effect
-        // Compose layers keep their source node in the normal scene tree, but their final authored
-        // effect pass is still a detached render-graph node. Give the effect layer a world node
-        // even when the source node is not detached so final output can inherit virtual parent
-        // transforms from render-order proxy groups instead of drawing at the compose layer's local
-        // coordinates.
-        auto* effect_world_node =
-            (use_detached_effect_world_node || isCompose) ? spWorldNode.get() : nullptr;
+        // Source and destination are drawing phases of the same authored object. Keep its
+        // identity here; the parser registers the canonical LayerNode after parent resolution,
+        // and uniform evaluation reads its current transform through that owner at draw time.
         auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(
-            effect_world_node, wpimgobj.size[0], wpimgobj.size[1], effect_ppong_a, effect_ppong_b);
+            scene.EnsureSceneObject(wpimgobj.id), wpimgobj.size[0], wpimgobj.size[1],
+            effect_ppong_a, effect_ppong_b);
+        imgEffectLayer->SetDestinationUsesCardSize(destination_extent.uses_card_size);
         {
             // Fullscreen image-effect layers are postprocess-style framebuffer passes. Remember
             // that authored shape here so ResolveEffect() can keep their final shader on the
             // effect-camera fullscreen quad instead of projecting the 2x2 utility mesh through the
             // active scene camera.
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
-            imgEffectLayer->SetFinalBlend(imgBlendMode);
-            imgEffectLayer->SetCopyBackground(wpimgobj.copybackground);
-            const auto source_policy = ResolveImageEffectSourcePolicy(isCompose, wpimgobj);
-            imgEffectLayer->SetSourceContributionPolicy(source_policy);
+            imgEffectLayer->SetFinalBlend(authored_destination_blend);
+            imgEffectLayer->SetTransparentCompositionBlend(transparent_destination_blend);
+            const auto source_policy = imgEffectLayer->SourceContributionPolicy();
             if (isCompose) {
                 LOG_INFO("SceneCompositionLayerSourcePolicy: layer=%d name='%s' "
                          "copybackground=%s policy=%.*s",
@@ -3103,89 +2829,40 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                          static_cast<int>(ImageEffectSourcePolicyName(source_policy).size()),
                          ImageEffectSourcePolicyName(source_policy).data());
             }
-            imgEffectLayer->SetHiddenFinalCompositePolicy(
-                ResolveHiddenFinalCompositePolicy(*context.scene, wpimgobj));
             imgEffectLayer->SourceMesh().ChangeMeshDataFrom(mesh);
-            imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
-            imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
-                                                                                 : *spImgNode);
-            if (! use_detached_effect_world_node && ! isCompose) {
-                spImgNode->CopyTrans(SceneNode());
+            if (direct_puppet_source) {
+                imgEffectLayer->SetDirectPuppetSource(std::move(*direct_puppet_source));
             }
+            if (prelighting_source) {
+                imgEffectLayer->SetPrelightingSource(std::move(*prelighting_source));
+                svData.SetEffectLayerProjection(imgEffectLayer.get());
+            }
+            imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
+            // Draw the authored image mesh when all effects are hidden. Imported meshes retain
+            // their crop geometry and bone attributes; ordinary cards retain source-file UVs
+            // instead of a resolved effect texture's full UVs.
+            imgEffectLayer->SetDirectDrawMesh(hasStaticImageMesh || hasAnimatedPuppetMesh
+                ? imgEffectLayer->FinalMesh() : imgEffectLayer->SourceMesh());
             // The owning SceneObject owns the effect bridge; the private effect camera is a pure
             // projection resource with no back-reference. The bridge records that camera's name so
-            // draw-time consumers can match SceneNode::Camera() against it and geometry updates
-            // and destroy reach the camera through the layer.
+            // source passes select it explicitly. It never becomes an inherited object camera;
+            // geometry updates and destruction reach the projection resource through its owner.
             scene.EnsureSceneObject(wpimgobj.id).SetImageEffectLayer(imgEffectLayer);
+            scene.EnsureSceneObject(wpimgobj.id).SetResourceSetupCallback(
+                [](Scene& setup_scene, SceneObject& owner) {
+                    owner.ImageEffectLayer()->RefreshDestinationTargets(setup_scene);
+                });
             imgEffectLayer->SetBridgeCameraName(effect_camera_name);
             imgEffectLayer->AddRuntimeCameraName(effect_camera_name);
         }
-        if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
-            const std::string puppet_surface_camera = effect_camera_name + "__puppet_surface_camera";
-            const std::string puppet_surface_target =
-                "_rt_puppet_surface_" + effect_camera_name;
-            imgEffectLayer->SetPuppetSurfaceProjection(BuildPuppetSurfaceProjection(
-                wpimgobj,
-                *puppet,
-                effct_final_mesh,
-                puppet_surface_camera,
-                puppet_surface_target,
-                effect_source_size));
-            imgEffectLayer->SetLayerSurfaceCamera(puppet_surface_camera);
-
-            const auto* projection = imgEffectLayer->GetPuppetSurfaceProjection();
-            if (projection != nullptr) {
-                scene.cameras[puppet_surface_camera] = std::make_shared<SceneCamera>(
-                    1, 1, effect_camera_clip.near_clip, effect_camera_clip.far_clip);
-                scene.cameras.at(puppet_surface_camera)->AttatchNode(context.effect_camera_node);
-                scene.cameras.at(puppet_surface_camera)->SetOrthographicViewRect(
-                    projection->surface_bounds.min.x(),
-                    projection->surface_bounds.max.x(),
-                    projection->surface_bounds.min.y(),
-                    projection->surface_bounds.max.y());
-                imgEffectLayer->AddRuntimeCameraName(puppet_surface_camera);
-
-                scene.renderTargets[puppet_surface_target] = SceneRenderTarget {
-                    .width = projection->target_extent[0],
-                    .height = projection->target_extent[1],
-                    .mapWidth = projection->target_extent[0],
-                    .mapHeight = projection->target_extent[1],
-                    .allowReuse = true,
-                    .sample = source_sampler,
-                };
-                imgEffectLayer->AddRuntimeRenderTargetName(puppet_surface_target);
-            }
-        }
-        // set renderTarget for ping-pong operate. Destination targets are fixed-size images even
-        // for fullscreen layers: they keep the output framebuffer size resolved at load instead of
-        // following later output resizes, so the interned name always describes the backing image.
+        // Destination targets keep the output size resolved at load for fullscreen layers.
+        // Only a new layer layout selects another shared extent or recreates its private slot.
         {
-            SceneRenderTarget pingpong_a_target {
-                .width      = effect_target_width,
-                .height     = effect_target_height,
-                .mapWidth   = effect_target_width,
-                .mapHeight  = effect_target_height,
-                .allowReuse = true,
-                .sample     = source_sampler,
-            };
-            InternNamedRenderTarget(scene, effect_ppong_a, pingpong_a_target);
-
-            SceneRenderTarget pingpong_b_target = pingpong_a_target;
-            // Intermediate effect output is a separate sampling contract. Point-preserving source
-            // passes read ping-pong A with the authored source sampler; generic downstream filters
-            // read ping-pong B linearly unless their own FBO contract says otherwise.
-            pingpong_b_target.sample = TextureSample {
-                .wrapS = TextureWrap::CLAMP_TO_EDGE,
-                .wrapT = TextureWrap::CLAMP_TO_EDGE,
-                .magFilter = TextureFilter::LINEAR,
-                .minFilter = TextureFilter::LINEAR,
-            };
-            InternNamedRenderTarget(scene, effect_ppong_b, pingpong_b_target);
             imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_a);
             imgEffectLayer->AddRuntimeRenderTargetName(effect_ppong_b);
             LOG_INFO("SceneEffectPingPongTargetResolve: layer=%d name='%s' "
                      "pingpong-a='%s' pingpong-b='%s' authored-size=[%.3f, %.3f] "
-                     "target=%dx%d policy=%s suffix=%c texture='%s' fullscreen=%s",
+                     "target=%dx%d policy=%s filter=%s wrap=%s texture='%s' fullscreen=%s",
                      wpimgobj.id,
                      wpimgobj.name.c_str(),
                      effect_ppong_a.c_str(),
@@ -3195,65 +2872,19 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                      effect_target_width,
                      effect_target_height,
                      destination_extent.policy,
-                     destination_extent.suffix,
+                     wpimgobj.nointerpolation || destination_extent.suffix == 'n' ? "point" : "linear",
+                     wpimgobj.clampuvs ? "clamp" : "repeat",
                      primary_source_texture.c_str(),
                      wpimgobj.fullscreen ? "true" : "false");
         }
-        // A single static-visible effect pass with no private buffers or commands is the layer's
-        // own on-screen writer: its material draws the final quad at output resolution while
-        // sampling the private source target. Multi-pass chains, dependency sources, puppets,
-        // compose helpers, and runtime-toggled effects keep the private ping-pong route.
-        const wpscene::WPImageEffect* direct_final_effect = nullptr;
-        wpscene::WPMaterial           direct_final_material;
-        if (hasAuthoredEffect && ! has_shader_color_blend && ! is_offscreen_dependency_source &&
-            ! isCompose && ! hasAnimatedPuppetMesh && wpimgobj.effects.size() == 1) {
-            const auto& candidate = wpimgobj.effects.front();
-            const bool candidate_initial_visible =
-                ResolveEffectVisibility(candidate, context.user_properties);
-            bool eligible = candidate_initial_visible &&
-                            ! EffectVisibilityCanChangeAtRuntime(candidate) &&
-                            candidate.materials.size() == 1 && candidate.fbos.empty() &&
-                            candidate.commands.empty() && candidate.passes.size() <= 1;
-            if (eligible) {
-                direct_final_material = candidate.materials.front();
-                if (! candidate.passes.empty()) {
-                    const auto& direct_pass = candidate.passes.front();
-                    if (! direct_pass.target.empty()) {
-                        eligible = false;
-                    } else {
-                        for (const auto& bind : direct_pass.bind) {
-                            if (bind.name != "previous") {
-                                eligible = false;
-                                break;
-                            }
-                        }
-                    }
-                    if (eligible) {
-                        direct_final_material.MergePass(direct_pass);
-                        for (const auto& bind : direct_pass.bind) {
-                            if (direct_final_material.textures.size() <=
-                                static_cast<usize>(bind.index)) {
-                                direct_final_material.textures.resize(
-                                    static_cast<usize>(bind.index) + 1);
-                            }
-                            direct_final_material.textures[static_cast<usize>(bind.index)] =
-                                effect_ppong_a;
-                        }
-                    }
-                }
-            }
-            if (eligible) direct_final_effect = &candidate;
-        }
-
-        if (hasAuthoredEffect || has_shader_color_blend) {
-            // Dependency-only sources intentionally stop at the first ping-pong target so
-            // `_rt_imageLayerComposite_<id>` samples the raw source texture. Every real authored
-            // chain and every framebuffer-aware color blend instead uses Wallpaper Engine's
-            // independent final passthrough publisher.
+        {
+            // A zero-effect composition still publishes its child source, and a dependency source
+            // can also be visible in the enclosing destination. Materialize this draw for every
+            // bridge; the graph's live visibility/phase gate decides whether it runs. Sampling
+            // slot zero here does not replace the private texture used by readers.
             const auto finalCompositeTransformData = BuildEffectWriterTransformData(
                 context,
-                BuildImageEffectFinalCompositeContract(wpimgobj,
-                                                       uses_routed_parent));
+                BuildImageEffectFinalCompositeContract(wpimgobj));
             ConfigureEffectFinalComposite(context,
                                           *imgEffectLayer,
                                           effect_ppong_a,
@@ -3261,253 +2892,30 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                                           wpimgobj.name,
                                           wpimgobj.colorBlendMode,
                                           &finalCompositeTransformData,
-                                          direct_final_effect != nullptr ? &direct_final_material
-                                                                         : nullptr,
-                                          direct_final_effect != nullptr ? direct_final_effect->id
-                                                                         : 0);
+                                          hasAnimatedPuppetMesh ? puppet.get() : nullptr);
         }
-        int32_t i_eff = -1;
-        for (const auto& wpeffobj : wpimgobj.effects) {
-            i_eff++;
-            if (&wpeffobj == direct_final_effect) {
-                // The single authored pass already draws as the layer's final on-screen writer;
-                // no private pass nodes exist for this effect.
-                continue;
-            }
-            std::shared_ptr<SceneImageEffect> imgEffect = std::make_shared<SceneImageEffect>();
-            imgEffect->SetIdentity(
-                wpimgobj.id, wpeffobj.id, static_cast<uint32_t>(i_eff), wpeffobj.name);
-            const bool effect_initial_visible =
-                ResolveEffectVisibility(wpeffobj, context.user_properties);
-            const bool effect_runtime_visibility =
-                EffectVisibilityCanChangeAtRuntime(wpeffobj);
-            imgEffect->SetRuntimeVisibilityContract(effect_runtime_visibility);
-            const ImageEffectMaterialTopology effect_material_topology {
-                .uses_routed_parent = uses_routed_parent,
-                .writer_role        = ResolveImageEffectWriterRole(isCompose),
-            };
+        LoadLayerEffects(context, *imgEffectLayer, wpimgobj.effects, effect_target_resolution,
+                         baseConstSvs, BuildImageEffectMaterialContract(wpimgobj, *imgEffectLayer),
+                         effect_ppong_a, hasAnimatedPuppetMesh ? &shared_puppet_pose : nullptr);
 
-            // this will be replace when resolve, use here to get rt info
-            const std::string inRT { effect_ppong_a };
-
-            // FBO name map and effect command. `unique` is scoped to the authored effect id;
-            // non-unique FBOs retain their JSON name and therefore intern across layers.
-            const auto  feedback_fbos = wpeffobj.FeedbackFboNames();
-
-            std::unordered_map<std::string, std::string> fboMap;
-            {
-                fboMap["previous"] = inRT;
-                for (usize i = 0; i < wpeffobj.fbos.size(); i++) {
-                    const auto& wpfbo  = wpeffobj.fbos.at(i);
-                    const std::string rtname =
-                        EffectFboRenderTargetName(wpfbo, wpeffobj.id);
-                    // Effect FBOs are fixed images derived from the layer's effect target size
-                    // (divided by the authored scale, or fitted). A fullscreen layer therefore gets
-                    // framebuffer-sized FBOs at load without a screen binding, matching its
-                    // fixed destination targets above.
-                    const auto  fbo_size = wpfbo.ResolveSize(effect_target_resolution);
-                    const bool  persistent_feedback_fbo =
-                        feedback_fbos.count(wpfbo.name) != 0;
-                    SceneRenderTarget fbo_target {
-                        .width      = fbo_size[0],
-                        .height     = fbo_size[1],
-                        .mapWidth   = fbo_size[0],
-                        .mapHeight  = fbo_size[1],
-                        .allowReuse = ! persistent_feedback_fbo,
-                    };
-                    // `fit`-sized feedback buffers are authored simulation textures, not
-                    // display-space framebuffers. Their resolved descriptor enters the same global
-                    // name table and the first registration owns the size.
-                    InternNamedRenderTarget(scene, rtname, fbo_target);
-                    if (wpfbo.fit > 0 || persistent_feedback_fbo) {
-                        LOG_INFO("SceneEffectFboResolve: layer=%d effect-id=%d effect='%s' "
-                                 "fbo='%s' target='%s' size=%dx%d scale=%u fit=%u "
-                                 "persistent-feedback=%s",
-                                 wpimgobj.id,
-                                 wpeffobj.id,
-                                 wpeffobj.name.c_str(),
-                                 wpfbo.name.c_str(),
-                                 rtname.c_str(),
-                                 fbo_size[0],
-                                 fbo_size[1],
-                                 wpfbo.scale,
-                                 wpfbo.fit,
-                                 persistent_feedback_fbo ? "true" : "false");
-                    }
-                    imgEffectLayer->AddRuntimeRenderTargetName(rtname);
-                    fboMap[wpfbo.name] = rtname;
-                }
-            }
-            // load! effect commands
-            {
-                for (const auto& el : wpeffobj.commands) {
-                    if (el.command != "copy") {
-                        LOG_ERROR("Unknown effect command: %s", el.command.c_str());
-                        continue;
-                    }
-                    if (fboMap.count(el.target) + fboMap.count(el.source) < 2) {
-                        LOG_ERROR("Unknown effect command dst or src: %s %s",
-                                  el.target.c_str(),
-                                  el.source.c_str());
-                        continue;
-                    }
-                    const auto resolved_dst = fboMap[el.target];
-                    const auto resolved_src = fboMap[el.source];
-                    imgEffect->commands.push_back({ .cmd          = SceneImageEffect::CmdType::Copy,
-                                                    .authored_dst = resolved_dst,
-                                                    .authored_src = resolved_src,
-                                                    .dst          = resolved_dst,
-                                                    .src          = resolved_src,
-                                                    .afterpos     = el.afterpos });
-                }
-            }
-
-            bool eff_mat_ok { true };
-
-            for (usize i_mat = 0; i_mat < wpeffobj.materials.size(); i_mat++) {
-                wpscene::WPMaterial wpmat = wpeffobj.materials.at(i_mat);
-                std::string         matOutRT { WE_EFFECT_PPONG_PREFIX_B };
-                if (wpeffobj.passes.size() > i_mat) {
-                    const auto& wppass = wpeffobj.passes.at(i_mat);
-                    wpmat.MergePass(wppass);
-                    // Set rendertarget, in and out
-                    for (const auto& el : wppass.bind) {
-                        if (fboMap.count(el.name) == 0) {
-                            LOG_ERROR("fbo %s not found", el.name.c_str());
-                            continue;
-                        }
-                        if (wpmat.textures.size() <= (usize)el.index)
-                            wpmat.textures.resize((usize)el.index + 1);
-                        wpmat.textures[(usize)el.index] = fboMap[el.name];
-                    }
-                    if (! wppass.target.empty()) {
-                        if (fboMap.count(wppass.target) == 0) {
-                            LOG_ERROR("fbo %s not found", wppass.target.c_str());
-                        } else {
-                            matOutRT = fboMap.at(wppass.target);
-                        }
-                    }
-                }
-                if (wpmat.textures.size() == 0) wpmat.textures.resize(1);
-                if (wpmat.textures.at(0).empty()) {
-                    wpmat.textures[0] = inRT;
-                }
-                auto spEffNode = std::make_shared<SceneNode>();
-                // Effect passes are drawing phases of the authored layer, not second layer
-                // identities: they stay out of nodeOwners, the node id is the back-reference the
-                // layer resolvers use (NodeLayerId and friends), and the phase name keeps the
-                // authored name unique to the world node.
-                spEffNode->ID() = wpimgobj.id;
-                spEffNode->SetName(wpimgobj.name + "::__hanabi_effect_pass_" +
-                                   std::to_string(i_eff) + "_" + std::to_string(i_mat));
-                ShaderValueMap effectBaseConstSvs = baseConstSvs;
-                WPShaderInfo wpEffShaderInfo;
-                wpEffShaderInfo.baseConstSvs = std::move(effectBaseConstSvs);
-                wpEffShaderInfo.baseConstSvs["g_EffectTextureProjectionMatrix"] =
-                    ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
-                wpEffShaderInfo.baseConstSvs["g_EffectTextureProjectionMatrixInverse"] =
-                    ShaderValue::fromMatrix(Eigen::Matrix4f::Identity());
-                SceneMaterial     material;
-                WPShaderValueData svData;
-                if (! LoadMaterial(vfs,
-                                   wpmat,
-                                   context.scene.get(),
-                                   spEffNode.get(),
-                                   &material,
-                                   &svData,
-                                   context.user_properties,
-                                   &wpEffShaderInfo)) {
-                    LOG_ERROR(
-                        "SceneEffectLoad: layer=%d effect='%s' material-index=%zu load failed",
-                        wpimgobj.id,
-                        wpeffobj.name.c_str(),
-                        i_mat);
-                    eff_mat_ok = false;
-                    break;
-                }
-
-                if (IsCurrentEffectWriterTarget(matOutRT)) {
-                    final_shader_capability = ResolveFinalShaderCapability(wpmat.shader);
-                }
-
-                // load glname from alias and load to constvalue
-                LoadConstvalue(material, wpmat, wpEffShaderInfo);
-                LoadUserShaderValue(material, wpmat, wpEffShaderInfo, context.user_properties);
-                auto spMesh = std::make_shared<SceneMesh>();
-                {
-                    ApplyEffectWriterTransformContract(
-                        context,
-                        BuildImageEffectMaterialContract(wpimgobj,
-                                                         *imgEffectLayer,
-                                                         effect_material_topology,
-                                                         hasAnimatedPuppetMesh && wpmat.use_puppet),
-                        svData);
-                    if (hasAnimatedPuppetMesh && wpmat.use_puppet) {
-                        svData.puppet_layer = shared_puppet_pose;
-                    }
-                }
-                const auto authored_textures = material.textures;
-                spMesh->AddMaterial(std::move(material));
-                spEffNode->AddMesh(spMesh);
-                RegisterUserShaderValueBindings(
-                    context, wpmat, wpEffShaderInfo, spEffNode.get(), wpimgobj.id, wpimgobj.name);
-                RegisterConstantShaderValueBindings(context,
-                                                    wpmat,
-                                                    wpEffShaderInfo,
-                                                    spEffNode.get(),
-                                                    wpimgobj.id,
-                                                    wpimgobj.name,
-                                                    wpeffobj.id,
-                                                    i_eff,
-                                                    i_mat);
-
-                context.shader_updater->SetNodeData(spEffNode.get(), svData);
-                imgEffect->nodes.push_back({ .authored_output = matOutRT,
-                                             .output = matOutRT,
-                                             .authored_textures = authored_textures,
-                                             .sceneNode = spEffNode,
-                                             .private_final_output_uses_layer_surface =
-                                                 hasAnimatedPuppetMesh && wpmat.use_puppet });
-            }
-
-            if (eff_mat_ok) {
-                // Set the resolved instance bit only after every pass node exists so all nodes
-                // receive the same initial gate. This changes execution state only; the effect and
-                // every render target above remain resident exactly as they were materialized.
-                imgEffect->SetLocalVisible(effect_initial_visible);
-                if (! wpeffobj.visible_json.is_null()) {
-                    LOG_INFO("SceneEffectVisibilityResolve: layer=%d effect-id=%d effect-index=%d "
-                             "name='%s' authored=%s initial=%s runtime=%s",
-                             wpimgobj.id,
-                             wpeffobj.id,
-                             i_eff,
-                             wpeffobj.name.c_str(),
-                             wpeffobj.visible ? "true" : "false",
-                             effect_initial_visible ? "true" : "false",
-                             effect_runtime_visibility ? "true" : "false");
-                }
-                imgEffectLayer->AddEffect(imgEffect);
-            } else {
-                LOG_ERROR("effect \'%s\' failed to load", wpeffobj.name.c_str());
-            }
-        }
-
-        // Capability priority is structural. Dependency sources must remain private, animated
-        // puppets must keep their private skinned surface, and only then may the last authored
-        // shader publish directly in scene space.
+        // The final authored material draws the layer card into the restored destination. Its
+        // shader name does not change that rule: custom vertex effects and cursor unprojection
+        // need the same layer geometry and object-inclusive MVP as stock effects. Dependencies,
+        // skinned surfaces and framebuffer color blending have an additional publication stage
+        // and retain their corresponding resource contract.
         if (is_offscreen_dependency_source) {
             imgEffectLayer->SetFinalOutputCapability(
                 FinalOutputCapability::PrivateDependency);
         } else if (hasAnimatedPuppetMesh) {
             imgEffectLayer->SetFinalOutputCapability(
-                FinalOutputCapability::PrivatePuppetSurface);
-        } else if (wpimgobj.config.finalOutputCapability ==
-                   FinalOutputCapability::SceneAuthoredWriter) {
+                FinalOutputCapability::PrivatePuppetPublication);
+        } else if (has_shader_color_blend) {
             imgEffectLayer->SetFinalOutputCapability(
-                FinalOutputCapability::SceneAuthoredWriter);
+                FinalOutputCapability::PrivateThenPublish);
         } else {
-            imgEffectLayer->SetFinalOutputCapability(final_shader_capability);
+            imgEffectLayer->SetFinalOutputCapability(FinalOutputCapability::SceneAuthoredWriter);
         }
+        imgEffectLayer->RefreshPuppetPublicationState();
         LOG_INFO("SceneEffectOutputCapability: layer=%d name='%s' capability=%.*s "
                  "dependency=%s puppet=%s source-policy=%.*s",
                  wpimgobj.id,
@@ -3592,46 +3000,17 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                      imgEffectLayer->DeclaredFinalOutputCapability()).data());
     }
     if (uses_routed_parent) {
-        if (hasEffect) {
-            ConfigureRoutedEffectWorldParentBinding(context, wpimgobj.parent, worldNodeData);
-        } else {
-            ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
-        }
-        context.scene->sceneGraph->AppendChild(spWorldNode);
+        ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
+        context.scene->sceneGraph->AppendChild(spImgNode);
     } else {
-        AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
+        AttachNodeToScene(context, spImgNode, wpimgobj.parent, wpimgobj.name);
     }
-    context.object_nodes[wpimgobj.id] = spWorldNode;
-    context.scene->EnsureSceneObject(wpimgobj.id)
-        .SetImageRuntimeState(Scene::ImageLayerRuntimeState {
-            .size      = wpimgobj.size,
-            .alignment = wpimgobj.alignment,
-        });
-    context.scene->AddLayerRuntimeNode(wpimgobj.id, spWorldNode.get());
+    context.object_nodes[wpimgobj.id] = spImgNode;
+    context.scene->AddLayerRuntimeNode(wpimgobj.id, spImgNode.get());
     if (hasAnimatedPuppetMesh) {
         context.object_puppets[wpimgobj.id] = puppet->puppet.get();
     }
-    // Effect-backed image layers usually use a detached source node plus a separate world node:
-    // the source node keeps `svData` so it can render into the private effect camera, while the
-    // world node keeps `worldNodeData` so authored parent transforms and parent-anchored parallax
-    // match Wallpaper Engine's scene hierarchy. Compose layers are the exception because their
-    // image node and world node are the same object. In that case, register the inherited
-    // world-node data on the shared node; otherwise a child compose layer with its own
-    // `parallaxDepth` would ignore a zero-parallax parent and incorrectly drift with the cursor.
-    context.shader_updater->SetNodeData(
-        spImgNode.get(),
-        spImgNode.get() == spWorldNode.get() && hasEffect ? worldNodeData : svData);
-    if (spImgNode.get() != spWorldNode.get()) {
-        context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
-        // The detached source node is a drawing phase owned by the effect bridge, not a second
-        // layer identity: it never enters sceneGraph, stays out of nodeOwners, and its node id
-        // (set above) is the back-reference layer resolvers use. The render graph emits its draw
-        // when the world node is visited at the authored order position.
-        if (auto* source_bridge = context.scene->FindImageEffectLayer(wpimgobj.id)) {
-            source_bridge->AddDetachedSourceNode(spImgNode);
-        }
-        context.scene->AddLayerRuntimeNode(wpimgobj.id, spImgNode.get());
-    }
+    context.shader_updater->SetNodeData(spImgNode.get(), svData);
     RegisterLayerSceneState(
         context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
     context.scene->ApplyLayerVisibility(wpimgobj.id);
@@ -3640,13 +3019,18 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
 void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     TextLayerRenderContract render_contract;
     render_contract.has_materialized_authored_effects = ! text_obj.effects.empty();
+    render_contract.has_visible_authored_effects = std::any_of(
+        text_obj.effects.begin(), text_obj.effects.end(), [&](const auto& effect) {
+            return ResolveEffectVisibility(effect, context.user_properties);
+        });
+    render_contract.uses_private_dependency_bridge =
+        context.scene->IsLayerOffscreenDependencySource(text_obj.id);
     render_contract.uses_shader_color_blend_bridge =
         UsesShaderColorBlendMode(text_obj.colorBlendMode);
 
-    // This immutable contract is resolved before materialization. Text rasterization, logical-box
-    // preservation, camera/target sizing, glyph placement, and final publication must all agree on
-    // the same bridge decision; consulting effects or blend mode again downstream recreates the
-    // crop/offset mismatch this contract exists to prevent.
+    // Bridge ownership is resolved before materialization and remains stable. The visible-effect
+    // part of the contract can later change padding and destination extent without discarding the
+    // authored effect materials or creating a second text representation.
 
     std::shared_ptr<SceneTextPrimitive> primitive;
     std::string                         error;
@@ -3663,52 +3047,56 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     }
 
     const bool has_effect = render_contract.RequiresBridge();
-    auto       spWorldNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
+    auto       spTextNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
                                                          Vector3f(text_obj.scale.data()),
                                                          Vector3f(text_obj.angles.data()),
                                                          text_obj.name);
-    spWorldNode->ID()      = text_obj.id;
-    auto spTextNode        = has_effect ? std::make_shared<SceneNode>() : spWorldNode;
-    if (has_effect) {
-        // Same phase-naming contract as image layers: the bridged text node is the layer's
-        // private-camera source phase, so the authored name stays unique to the world node.
-        spTextNode->SetName(text_obj.name + "::__hanabi_effect_source");
-    }
     spTextNode->ID() = text_obj.id;
     spTextNode->AddText(primitive);
 
-    WPShaderValueData worldNodeData;
-    worldNodeData.parallaxDepth = { text_obj.parallaxDepth[0], text_obj.parallaxDepth[1] };
-    worldNodeData.parallaxDepthAuthored = text_obj.parallaxDepthAuthored;
+    WPShaderValueData svData;
+    svData.parallaxDepth = { text_obj.parallaxDepth[0], text_obj.parallaxDepth[1] };
+
     ConfigureBoneAttachment(context,
                             text_obj.parent,
                             text_obj.attachment,
-                            Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>()),
                             "text object",
                             text_obj.name,
-                            worldNodeData);
+                            svData);
 
     if (has_effect) {
         auto&             scene       = *context.scene;
         const std::string camera_name = EffectCameraName(text_obj.id);
         primitive->bridge.camera_name = camera_name;
+        const auto destination_extent = ResolveTextDestinationExtent(primitive->VisibleDisplaySize());
         primitive->bridge.bridge_backing_extent = {
-            static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
-                static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[0])))),
-            static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
-                static_cast<int32_t>(std::lround(primitive->VisibleDisplaySize()[1])))),
+            static_cast<uint32_t>(destination_extent[0]),
+            static_cast<uint32_t>(destination_extent[1]),
         };
-        const auto bridge_destination_names = SceneDestinationRenderTargetNames(
+        const auto destination_sampler = DestinationRenderTargetSampler(
+            text_obj.nointerpolation, text_obj.clampuvs);
+        const SceneRenderTarget text_pingpong_target {
+            .width = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
+            .height = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
+            .mapWidth = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
+            .mapHeight = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
+            .allowReuse = false,
+            .sample = destination_sampler,
+        };
+        const auto bridge_destination_names = ResolveSceneDestinationRenderTargets(
             scene,
+            text_obj.id,
             text_obj.parent,
-            static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
-            static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]));
+            render_contract.uses_private_dependency_bridge ||
+                render_contract.uses_shader_color_blend_bridge,
+            text_pingpong_target);
         primitive->bridge.pingpong_a = bridge_destination_names[0];
         primitive->bridge.pingpong_b = bridge_destination_names[1];
-        primitive->bridge.render_targets.push_back(
-            TextBridgeRenderTarget { .name = primitive->bridge.pingpong_a, .scale = 1 });
-        primitive->bridge.render_targets.push_back(
-            TextBridgeRenderTarget { .name = primitive->bridge.pingpong_b, .scale = 1 });
+
+        const std::array<float, 2> effect_target_resolution {
+            static_cast<float>(text_pingpong_target.width),
+            static_cast<float>(text_pingpong_target.height),
+        };
 
         const auto display_size = primitive->VisibleDisplaySize();
         SceneMesh  effect_final_mesh {};
@@ -3720,16 +3108,8 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             -1.0f,
             1.0f);
         scene.cameras.at(camera_name)->AttatchNode(context.effect_camera_node);
-        // Effect-backed text draws the canonical glyph primitive into an isolated source target
-        // before authored image effects sample it. Keep that source node on an explicit identity
-        // shader-data contract instead of relying on the visible world node's parallax/attachment
-        // data: the world node is only the final composited output transform, while this node must
-        // fill the bridge camera exactly in local text space.
-        WPShaderValueData text_source_node_data;
-        context.shader_updater->SetNodeData(spTextNode.get(), text_source_node_data);
-        spTextNode->SetCamera(camera_name);
 
-        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(spWorldNode.get(),
+        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(scene.EnsureSceneObject(text_obj.id),
                                                                       display_size[0],
                                                                       display_size[1],
                                                                       primitive->bridge.pingpong_a,
@@ -3737,24 +3117,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         imgEffectLayer->SetFinalBlend(
             ResolveObjectFinalBlend(BlendMode::Translucent, text_obj.colorBlendMode));
         imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
-        imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
         // Same contract as image layers: the object owns the bridge, and the bridge records the
         // camera it materialized; the camera itself carries no back-reference.
         scene.EnsureSceneObject(text_obj.id).SetImageEffectLayer(imgEffectLayer);
         imgEffectLayer->SetBridgeCameraName(camera_name);
         imgEffectLayer->AddRuntimeCameraName(camera_name);
 
-        SceneRenderTarget text_pingpong_target {
-            .width = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
-            .height = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
-            .mapWidth = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[0]),
-            .mapHeight = static_cast<int32_t>(primitive->bridge.bridge_backing_extent[1]),
-            // Text targets keep the authored letter box for both the physical backing and the
-            // logical effect grid. Persisting the cache entry replaces the old image in place.
-            .allowReuse = false,
-        };
-        InternNamedRenderTarget(scene, primitive->bridge.pingpong_a, text_pingpong_target);
-        InternNamedRenderTarget(scene, primitive->bridge.pingpong_b, text_pingpong_target);
         imgEffectLayer->AddRuntimeRenderTargetName(primitive->bridge.pingpong_a);
         imgEffectLayer->AddRuntimeRenderTargetName(primitive->bridge.pingpong_b);
         const auto source_size = primitive->VisibleSourceSize();
@@ -3807,9 +3175,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
 
         const std::string in_rt        = primitive->bridge.pingpong_a;
         int32_t           effect_index = -1;
-        // Same final-writer contract as image layers: the shader of the last pass that writes the
-        // chain output decides whether that pass may draw in scene space or must stay private.
-        FinalOutputCapability final_shader_capability = FinalOutputCapability::PrivateThenPublish;
         for (const auto& wp_effect : text_obj.effects) {
             effect_index++;
             std::shared_ptr<SceneImageEffect> img_effect = std::make_shared<SceneImageEffect>();
@@ -3819,15 +3184,13 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 ResolveEffectVisibility(wp_effect, context.user_properties);
             const bool effect_runtime_visibility =
                 EffectVisibilityCanChangeAtRuntime(wp_effect);
-            img_effect->SetRuntimeVisibilityContract(effect_runtime_visibility);
             std::unordered_map<std::string, std::string> fbo_map;
-            fbo_map["previous"] = in_rt;
             const auto feedback_fbos = wp_effect.FeedbackFboNames();
 
             for (const auto& wp_fbo : wp_effect.fbos) {
                 const std::string rt_name =
                     EffectFboRenderTargetName(wp_fbo, wp_effect.id);
-                const auto fbo_size = wp_fbo.ResolveSize(primitive->VisibleDisplaySize());
+                const auto fbo_size = wp_fbo.ResolveSize(effect_target_resolution);
                 const bool        persistent_feedback_fbo =
                     feedback_fbos.count(wp_fbo.name) != 0;
                 SceneRenderTarget fbo_target {
@@ -3856,35 +3219,20 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                              wp_fbo.fit,
                              persistent_feedback_fbo ? "true" : "false");
                 }
-                imgEffectLayer->AddRuntimeRenderTargetName(rt_name);
-                primitive->bridge.render_targets.push_back(TextBridgeRenderTarget {
-                    .name = rt_name,
-                    .scale = std::max<uint32_t>(1u, wp_fbo.scale),
-                    .fit = wp_fbo.fit,
-                    .persistent_feedback = persistent_feedback_fbo,
-                });
+                imgEffectLayer->AddEffectRenderTarget(rt_name, wp_fbo.scale, wp_fbo.fit);
                 fbo_map[wp_fbo.name] = rt_name;
             }
 
-            for (const auto& command : wp_effect.commands) {
-                if (command.command != "copy") continue;
-                if (fbo_map.count(command.target) == 0 || fbo_map.count(command.source) == 0)
-                    continue;
-                const auto resolved_dst = fbo_map.at(command.target);
-                const auto resolved_src = fbo_map.at(command.source);
-                img_effect->commands.push_back({ .cmd          = SceneImageEffect::CmdType::Copy,
-                                                 .authored_dst = resolved_dst,
-                                                 .authored_src = resolved_src,
-                                                 .dst          = resolved_dst,
-                                                 .src          = resolved_src,
-                                                 .afterpos     = command.afterpos });
-            }
+            LoadEffectCommands(wp_effect, *img_effect, fbo_map);
+            fbo_map.try_emplace("previous", in_rt);
 
             bool effect_materials_ok = true;
             for (usize material_index = 0; material_index < wp_effect.materials.size();
                  material_index++) {
                 wpscene::WPMaterial material_source = wp_effect.materials.at(material_index);
                 std::string         material_output { WE_EFFECT_PPONG_PREFIX_B };
+                std::vector<usize>   fbo_texture_slots;
+                bool                output_is_fbo = false;
                 if (wp_effect.passes.size() > material_index) {
                     const auto& wp_pass = wp_effect.passes.at(material_index);
                     material_source.MergePass(wp_pass);
@@ -3895,9 +3243,13 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                         }
                         material_source.textures[static_cast<usize>(bind.index)] =
                             fbo_map.at(bind.name);
+                        if (img_effect->IsDeclaredFbo(fbo_map.at(bind.name))) {
+                            fbo_texture_slots.push_back(static_cast<usize>(bind.index));
+                        }
                     }
                     if (! wp_pass.target.empty() && fbo_map.count(wp_pass.target) != 0) {
                         material_output = fbo_map.at(wp_pass.target);
+                        output_is_fbo = img_effect->IsDeclaredFbo(material_output);
                     }
                 }
                 if (material_source.textures.empty()) material_source.textures.resize(1);
@@ -3922,16 +3274,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 if (! LoadMaterial(*context.vfs,
                                    material_source,
                                    context.scene.get(),
-                                   spEffectNode.get(),
                                    &effect_material,
                                    &effect_node_data,
                                    context.user_properties,
                                    &effect_shader_info)) {
                     effect_materials_ok = false;
                     break;
-                }
-                if (IsCurrentEffectWriterTarget(material_output)) {
-                    final_shader_capability = ResolveFinalShaderCapability(material_source.shader);
                 }
                 LoadConstvalue(effect_material, material_source, effect_shader_info);
                 LoadUserShaderValue(
@@ -3974,7 +3322,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 img_effect->nodes.push_back({ .authored_output = material_output,
                                               .output = material_output,
                                               .authored_textures = authored_textures,
-                                              .sceneNode = spEffectNode });
+                                              .fbo_texture_slots = std::move(fbo_texture_slots),
+                                              .output_is_fbo = output_is_fbo,
+                                              .sceneNode = spEffectNode,
+                                              .advances_composition =
+                                                  material_index < wp_effect.passes.size() &&
+                                                  wp_effect.passes[material_index].compose });
             }
 
             if (effect_materials_ok) {
@@ -3994,13 +3347,15 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             }
         }
 
-        // Mirror the image-layer priority: a dependency source must stay sampleable, otherwise the
-        // final writer shader decides. ResolveFinalOutputCapability() still forces the private
-        // route for chains with runtime-toggled effects and for composition-source routing.
+        // Text uses the same final-pass selection as images. A normal effect publishes the
+        // shaped card with its object transform; framebuffer color blending retains the separate
+        // blend stage, and dependency sources remain sampleable by their consuming layers.
         if (scene.IsLayerOffscreenDependencySource(text_obj.id)) {
             imgEffectLayer->SetFinalOutputCapability(FinalOutputCapability::PrivateDependency);
+        } else if (render_contract.uses_shader_color_blend_bridge) {
+            imgEffectLayer->SetFinalOutputCapability(FinalOutputCapability::PrivateThenPublish);
         } else {
-            imgEffectLayer->SetFinalOutputCapability(final_shader_capability);
+            imgEffectLayer->SetFinalOutputCapability(FinalOutputCapability::SceneAuthoredWriter);
         }
         LOG_INFO("SceneTextEffectOutputCapability: layer=%d name='%s' capability=%.*s "
                  "dependency=%s",
@@ -4014,24 +3369,15 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     }
 
     if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
-        ConfigureInheritedParentBinding(context, text_obj.parent, worldNodeData);
-        context.scene->sceneGraph->AppendChild(spWorldNode);
+        ConfigureInheritedParentBinding(context, text_obj.parent, svData);
+        context.scene->sceneGraph->AppendChild(spTextNode);
     } else {
-        AttachNodeToScene(context, spWorldNode, text_obj.parent, text_obj.name, &worldNodeData);
+        AttachNodeToScene(context, spTextNode, text_obj.parent, text_obj.name);
     }
 
-    context.object_nodes[text_obj.id] = spWorldNode;
-    context.scene->AddLayerRuntimeNode(text_obj.id, spWorldNode.get());
-    context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
-
-    if (spTextNode.get() != spWorldNode.get()) {
-        // Same phase contract as the image source node: bridge-owned, never in sceneGraph, no
-        // nodeOwners registration, and the node id (set above) back-references the owning layer.
-        if (auto* source_bridge = context.scene->FindImageEffectLayer(text_obj.id)) {
-            source_bridge->AddDetachedSourceNode(spTextNode);
-        }
-        context.scene->AddLayerRuntimeNode(text_obj.id, spTextNode.get());
-    }
+    context.object_nodes[text_obj.id] = spTextNode;
+    context.scene->AddLayerRuntimeNode(text_obj.id, spTextNode.get());
+    context.shader_updater->SetNodeData(spTextNode.get(), svData);
 
     context.scene->SetTextLayerState(text_obj.id,
                                      TextLayerRuntimeState {
@@ -4040,8 +3386,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                          .render_contract   = render_contract,
                                          .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
                                      });
+    if (has_effect) {
+        context.scene->EnsureSceneObject(text_obj.id).SetResourceSetupCallback(
+            RefreshTextLayerResources);
+    }
 
-    ApplyTextLayerNodePlacement(spWorldNode.get(),
+    ApplyTextLayerNodePlacement(spTextNode.get(),
                                 *context.scene->FindTextLayerState(text_obj.id),
                                 text_obj.origin);
 
@@ -4130,11 +3480,10 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
 
     WPShaderValueData svData;
     svData.parallaxDepth = empty_obj.parallaxDepth;
-    svData.parallaxDepthAuthored = empty_obj.parallaxDepthAuthored;
+
     ConfigureBoneAttachment(context,
                             empty_obj.parent,
                             empty_obj.attachment,
-                            Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
                             "object",
                             empty_obj.name,
                             svData);
@@ -4143,7 +3492,7 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
         ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
         context.scene->sceneGraph->AppendChild(node);
     } else {
-        AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name, &svData);
+        AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name);
     }
     context.object_nodes[empty_obj.id] = node;
     context.scene->AddLayerRuntimeNode(empty_obj.id, node.get());
@@ -4198,109 +3547,41 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     }
 }
 
-bool ShapeEffectRequestsDirectDraw(const WPShapeObject& shape_obj) {
-    // Wallpaper Engine marks shader-authored shape output with the DIRECTDRAW combo on the effect
-    // chain. Ask the parsed effect model for that shader contract instead of inferring it from the
-    // outer shape geometry string; the geometry name only says what primitive the editor displayed,
-    // while DIRECTDRAW is the actual render-path switch that means no image/model source exists.
-    return std::any_of(shape_obj.effects.begin(), shape_obj.effects.end(), [](const auto& effect) {
-        return effect.HasEnabledCombo("DIRECTDRAW");
-    });
-}
-
-std::string ToLowerAscii(std::string_view text) {
-    std::string lower;
-    lower.reserve(text.size());
-    for (unsigned char ch : text) {
-        lower.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return lower;
-}
-
-bool EffectLooksLikeLightshafts(const wpscene::WPImageEffect& effect) {
-    auto matches = [](std::string_view text) {
-        const std::string lower = ToLowerAscii(text);
-        return lower.find("lightshafts") != std::string::npos ||
-               lower.find("light shafts") != std::string::npos;
-    };
-
-    if (matches(effect.name)) return true;
-    for (const auto& material : effect.materials) {
-        if (matches(material.shader)) return true;
-    }
-    return false;
-}
-
-void MergeLightshaftPointValues(
-    const std::unordered_map<std::string, std::vector<float>>& values,
-    std::array<std::optional<std::array<float, 2>>, 4>&        points) {
-    for (const auto& [name, value] : values) {
-        if (value.size() < 2 || ! std::isfinite(value[0]) || ! std::isfinite(value[1])) continue;
-
-        const std::string lower = ToLowerAscii(name);
-        for (usize i = 0; i < points.size(); i++) {
-            const std::string point_name = "point" + std::to_string(i);
-            if (lower == point_name || lower == "g_" + point_name) {
-                points[i] = std::array<float, 2> { value[0], value[1] };
-                break;
-            }
+void PrepareShapeEffectMaterials(WPShapeObject& shape_obj) {
+    // Shape output is selected by the owning layer type. Each material-bearing effect pass gets
+    // DIRECTDRAW=1 after its authored override is read, even when the file omits the combo or
+    // explicitly writes zero. Keep this in the shape parser: the common material merge then
+    // applies this pass override over material defaults without changing image or text effects.
+    // The parsed pass list contains only material entries, so command markers are unaffected.
+    for (auto& effect : shape_obj.effects) {
+        for (usize pass_index = 0; pass_index < effect.passes.size(); ++pass_index) {
+            auto& combos = effect.passes[pass_index].combos;
+            const auto authored = combos.find("DIRECTDRAW");
+            LOG_INFO("SceneShapeMaterialPreparation: layer=%d effect-id=%d pass=%zu "
+                     "authored-directdraw=%s authored-value=%d final-directdraw=1",
+                     shape_obj.id,
+                     effect.id,
+                     pass_index,
+                     authored != combos.end() ? "present" : "absent",
+                     authored != combos.end() ? authored->second : 0);
+            combos["DIRECTDRAW"] = 1;
         }
     }
 }
 
-std::optional<std::array<float, 4>>
-ResolveLightshaftsDirectDrawFinalTexCoordBounds(const WPShapeObject& shape_obj) {
-    for (const auto& effect : shape_obj.effects) {
-        if (! EffectLooksLikeLightshafts(effect)) continue;
-
-        std::array<std::optional<std::array<float, 2>>, 4> points;
-        for (usize material_index = 0; material_index < effect.materials.size(); material_index++) {
-            MergeLightshaftPointValues(effect.materials[material_index].constantshadervalues,
-                                       points);
-            if (material_index < effect.passes.size()) {
-                MergeLightshaftPointValues(effect.passes[material_index].constantshadervalues,
-                                           points);
-            }
-        }
-
-        if (! std::all_of(points.begin(), points.end(), [](const auto& point) {
-                return point.has_value();
-            })) {
-            continue;
-        }
-
-        std::array<float, 4> bounds { 0.0f, 0.0f, 1.0f, 1.0f };
-        for (const auto& point : points) {
-            bounds[0] = std::min(bounds[0], point->at(0));
-            bounds[1] = std::min(bounds[1], point->at(1));
-            bounds[2] = std::max(bounds[2], point->at(0));
-            bounds[3] = std::max(bounds[3], point->at(1));
-        }
-
-        const bool expands_default_quad = bounds[0] < 0.0f || bounds[1] < 0.0f ||
-                                          bounds[2] > 1.0f || bounds[3] > 1.0f;
-        if (expands_default_quad) return bounds;
-    }
-
-    return std::nullopt;
-}
 
 std::array<float, 2> ResolveImplicitDirectDrawShapeVisualSize(const ParseContext& context) {
-    const float scene_width  = static_cast<float>(std::max(1, context.ortho_w));
-    const float scene_height = static_cast<float>(std::max(1, context.ortho_h));
-    const float short_edge   = std::min(scene_width, scene_height);
-    return { short_edge, short_edge };
+    // The default card uses scene ortho height for both axes, including portrait canvases;
+    // choosing the shorter edge changes the shape's visible extent.
+    const float scene_height = static_cast<float>(context.ortho_h);
+    return { scene_height, scene_height };
 }
 
 struct DirectDrawShapeMetrics {
     std::array<float, 2> visual_size { 1.0f, 1.0f };
     std::array<float, 2> effect_source_size { 0.0f, 0.0f };
-    bool                 effect_source_size_is_pixel_extent { false };
-    bool                 final_texcoord_bounds_enabled { false };
-    std::array<float, 4> final_texcoord_bounds { 0.0f, 0.0f, 1.0f, 1.0f };
     const char*          visual_policy { "authored-size" };
     const char*          effect_source_policy { "layer-size" };
-    const char*          final_uv_policy { "default" };
 };
 
 // Shape effect chains run in a destination target that is half the canvas in each dimension
@@ -4308,7 +3589,8 @@ struct DirectDrawShapeMetrics {
 // extent, so it bypasses perspective density scaling; the destination intern applies the common
 // minimum-extent clamp.
 std::array<float, 2> ResolveDirectDrawShapeEffectTargetSize(const ParseContext& context) {
-    return { static_cast<float>(context.ortho_w / 2), static_cast<float>(context.ortho_h / 2) };
+    const auto extent = ResolveShapeDestinationExtent({ context.ortho_w, context.ortho_h });
+    return { static_cast<float>(extent[0]), static_cast<float>(extent[1]) };
 }
 
 DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context,
@@ -4316,147 +3598,109 @@ DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context
     DirectDrawShapeMetrics metrics;
     // Shapes keep two separate size contracts. The intermediate effect buffers are always the
     // fixed half-canvas shape destination, whether or not the shape carries an authored size;
-    // the authored size (or the implicit short-edge square) only shapes the visible card. This
+    // the authored size (or the implicit canvas-height square) only shapes the visible card. This
     // preserves world transforms without forcing the layer through the fullscreen postprocess
     // path.
     metrics.effect_source_size                 = ResolveDirectDrawShapeEffectTargetSize(context);
-    metrics.effect_source_size_is_pixel_extent = true;
     metrics.effect_source_policy               = "half-canvas";
     if (shape_obj.has_size) {
         metrics.visual_size = shape_obj.size;
     } else {
         metrics.visual_size   = ResolveImplicitDirectDrawShapeVisualSize(context);
-        metrics.visual_policy = "implicit-short-edge-square";
-    }
-
-    if (auto bounds = ResolveLightshaftsDirectDrawFinalTexCoordBounds(shape_obj);
-        bounds.has_value()) {
-        metrics.final_texcoord_bounds_enabled = true;
-        metrics.final_texcoord_bounds         = *bounds;
-        metrics.final_uv_policy               = "lightshafts-control-points";
+        metrics.visual_policy = "implicit-canvas-height";
     }
 
     return metrics;
 }
 
 void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj) {
+    // The owner is a transform/script identity, not an image source. Materialize it once for
+    // both empty and drawable shapes; the effect resource layer below owns the actual draws.
+    WPEmptyObject transform;
+    transform.id = shape_obj.id;
+    transform.name = shape_obj.name;
+    transform.origin = shape_obj.origin;
+    transform.scale = shape_obj.scale;
+    transform.angles = shape_obj.angles;
+    transform.parallaxDepth = shape_obj.parallaxDepth;
+    transform.parallaxDepthAuthored = shape_obj.parallaxDepthAuthored;
+    transform.visible = shape_obj.visible;
+    transform.visible_binding = shape_obj.visible_binding;
+    transform.parent = shape_obj.parent;
+    transform.attachment = shape_obj.attachment;
+    ParseEmptyObj(context, transform);
 
-    const bool direct_draw_shape = ShapeEffectRequestsDirectDraw(shape_obj);
-    if (! direct_draw_shape) {
-        // Unsupported or effect-less shape layers still need to behave like transform containers.
-        // Registering a normal empty object preserves parent bindings, scripts, and child ordering
-        // while making the missing drawable path explicit in the log instead of silently dropping
-        // the authored layer.
-        LOG_INFO("SceneShapeObjectFallback: id=%d name='%s' shape='%s' effects=%zu",
-                 shape_obj.id,
-                 shape_obj.name.c_str(),
-                 shape_obj.shape.c_str(),
-                 shape_obj.effects.size());
+    auto& scene = *context.scene;
+    auto& owner = scene.EnsureSceneObject(shape_obj.id);
+    const auto metrics = ResolveDirectDrawShapeMetrics(context, shape_obj);
+    owner.SetImageRuntimeState(Scene::ImageLayerRuntimeState { .size = metrics.visual_size });
+    // Construction/property decoding owns these values even when there is no drawable effect. Do
+    // not clamp the stored scalar or manufacture a source material to make the script getter
+    // work; property setters copy the owner fields and have no material-update callback. Authored
+    // effect controls remain independent below.
+    owner.SetModulationState({ shape_obj.color, shape_obj.alpha, shape_obj.brightness });
+    LOG_INFO("SceneShapeOwnerState: layer=%d color=[%.6f %.6f %.6f] alpha=%.6f "
+             "brightness=%.6f size=[%.3f %.3f] material-controls=independent",
+             shape_obj.id, shape_obj.color[0], shape_obj.color[1], shape_obj.color[2],
+             shape_obj.alpha, shape_obj.brightness, metrics.visual_size[0], metrics.visual_size[1]);
 
-        WPEmptyObject empty_obj;
-        empty_obj.id              = shape_obj.id;
-        empty_obj.name            = shape_obj.name;
-        empty_obj.origin          = shape_obj.origin;
-        empty_obj.scale           = shape_obj.scale;
-        empty_obj.angles          = shape_obj.angles;
-        empty_obj.parallaxDepth   = shape_obj.parallaxDepth;
-        empty_obj.parallaxDepthAuthored = shape_obj.parallaxDepthAuthored;
-        empty_obj.visible         = shape_obj.visible;
-        empty_obj.visible_binding = shape_obj.visible_binding;
-        empty_obj.parent          = shape_obj.parent;
-        empty_obj.attachment      = shape_obj.attachment;
-        ParseEmptyObj(context, empty_obj);
+    if (shape_obj.effects.empty()) {
+        LOG_INFO("SceneShapeEmpty: id=%d name='%s' shape='%s' effects=0",
+                 shape_obj.id, shape_obj.name.c_str(), shape_obj.shape.c_str());
         return;
     }
 
-    auto& vfs = *context.vfs;
+    PrepareShapeEffectMaterials(shape_obj);
+    const auto target_width =
+        ClampDestinationRenderTargetExtent(static_cast<int32_t>(metrics.effect_source_size[0]));
+    const auto target_height =
+        ClampDestinationRenderTargetExtent(static_cast<int32_t>(metrics.effect_source_size[1]));
+    const bool private_destination = scene.IsLayerOffscreenDependencySource(shape_obj.id);
+    const SceneRenderTarget destination {
+        .width = target_width,
+        .height = target_height,
+        .mapWidth = target_width,
+        .mapHeight = target_height,
+        .allowReuse = true,
+        .sample = DestinationRenderTargetSampler(false, true),
+    };
+    const auto targets = ResolveSceneDestinationRenderTargets(
+        scene, shape_obj.id, shape_obj.parent, private_destination, destination);
+    auto layer = std::make_shared<SceneImageEffectLayer>(
+        owner, metrics.visual_size[0], metrics.visual_size[1], targets[0], targets[1]);
+    owner.SetImageEffectLayer(layer);
+    layer->AddRuntimeRenderTargetName(targets[0]);
+    layer->AddRuntimeRenderTargetName(targets[1]);
+    layer->SetFinalOutputCapability(private_destination ? FinalOutputCapability::PrivateDependency
+                                                       : FinalOutputCapability::SceneAuthoredWriter);
+    // The common record dispatcher applies shape's additive state only to the retained final
+    // material. There is no source image shader or utility-publication material to stand in for
+    // this draw.
+    layer->SetFinalBlend(BlendMode::Additive);
+    owner.SetResourceSetupCallback(RefreshShapeLayerResources);
 
-    wpscene::WPMaterial transparent_source_material;
-    nlohmann::json      transparent_source_json;
-    if (! PARSE_JSON(fs::GetFileContent(vfs, "/assets/materials/util/effectpassthrough.json"),
-                     transparent_source_json) ||
-        ! transparent_source_material.FromJson(transparent_source_json)) {
-        LOG_ERROR(
-            "SceneShapeDirectDraw: layer=%d name='%s' failed to load transparent source material",
-            shape_obj.id,
-            shape_obj.name.c_str());
-        return;
-    }
+    // Shape's material loader receives the material resource and its instance override, not an
+    // image source's modulation constants. Preserve shader defaults and authored material values
+    // instead of baking unrelated owner fields into every effect. This does not introduce a new
+    // engine-global color staging operation.
+    const EffectWriterTransformContract transform_contract {
+        .parallax_depth = shape_obj.parallaxDepth,
+        .projection_layer = layer.get(),
+    };
+    LoadLayerEffects(context, *layer, shape_obj.effects,
+                     { static_cast<float>(target_width), static_cast<float>(target_height) },
+                     context.global_base_uniforms, transform_contract, std::nullopt);
 
-    EnsureSystemTextureRegistered(*context.scene, kSyntheticDirectDrawShapeTextureName);
-    if (transparent_source_material.textures.empty()) {
-        transparent_source_material.textures.resize(1);
-    }
-    transparent_source_material.textures[0] = std::string(kSyntheticDirectDrawShapeTextureName);
-    // Direct-draw shape effects author their visible pixels inside the effect shader and leave
-    // untouched areas with alpha zero. Treat the final synthetic source as additive for every
-    // shape direct-draw layer: the shader output is authored as generated contribution over the
-    // existing scene, and translucent alpha compositing would multiply the destination by
-    // `1 - alpha`, causing rays and other generated highlights to darken the wallpaper instead of
-    // adding energy. The source texture itself is transparent, so additive blending keeps empty
-    // regions neutral while preserving the intended brightening behavior.
-    const std::string_view direct_draw_final_blend = "additive";
-    transparent_source_material.blending           = std::string(direct_draw_final_blend);
-
-    const DirectDrawShapeMetrics metrics = ResolveDirectDrawShapeMetrics(context, shape_obj);
-
-    // Shape direct-draw layers have no image asset because the effect shader owns the visible
-    // pixels (`DIRECTDRAW=1`). Synthesize a fully transparent image source only to reuse the
-    // established image-effect camera, ping-pong render targets, visibility contracts, and final
-    // composite path; the authored shape string stays metadata, not a render-path discriminator.
-    wpscene::WPImageObject image_obj;
-    image_obj.id               = shape_obj.id;
-    image_obj.name             = shape_obj.name;
-    image_obj.origin           = shape_obj.origin;
-    image_obj.scale            = shape_obj.scale;
-    image_obj.angles           = shape_obj.angles;
-    image_obj.size             = metrics.visual_size;
-    image_obj.parallaxDepth    = shape_obj.parallaxDepth;
-    image_obj.parallaxDepthAuthored = shape_obj.parallaxDepthAuthored;
-    image_obj.color            = shape_obj.color;
-    image_obj.alpha            = shape_obj.alpha;
-    image_obj.brightness       = shape_obj.brightness;
-    image_obj.visible          = shape_obj.visible;
-    image_obj.visible_binding  = shape_obj.visible_binding;
-    image_obj.image            = "__hanabi_shape_directdraw";
-    image_obj.parent           = shape_obj.parent;
-    image_obj.attachment       = shape_obj.attachment;
-    image_obj.effectSourceSize              = metrics.effect_source_size;
-    image_obj.effectSourceSizeIsPixelExtent = metrics.effect_source_size_is_pixel_extent;
-    image_obj.effectFinalTexCoordBoundsEnabled = metrics.final_texcoord_bounds_enabled;
-    image_obj.effectFinalTexCoordBounds        = metrics.final_texcoord_bounds;
-    image_obj.material         = std::move(transparent_source_material);
-    image_obj.effects          = std::move(shape_obj.effects);
-    image_obj.nopadding        = true;
-    image_obj.config.finalOutputCapability = FinalOutputCapability::SceneAuthoredWriter;
-
+    // Geometry uses the first retained effect's first material. Selecting the physical last
+    // effect for execution must never truncate that list or change this independent setup.
+    RebuildShapeLayerGeometry(owner);
     LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
-             "visual-size=[%.3f, %.3f] visual-policy=%s effect-source-policy=%s "
-             "effect-source-size=[%.3f, %.3f] authored-size=%s final-uv-policy=%s "
-             "final-uv-bounds=[%.3f, %.3f, %.3f, %.3f] transparent-texture='%.*s' "
-             "final-blend='%.*s'",
-             image_obj.id,
-             image_obj.name.c_str(),
-             shape_obj.shape.c_str(),
-             image_obj.effects.size(),
-             image_obj.size[0],
-             image_obj.size[1],
-             metrics.visual_policy,
-             metrics.effect_source_policy,
-             image_obj.effectSourceSize[0],
-             image_obj.effectSourceSize[1],
-             shape_obj.has_size ? "true" : "false",
-             metrics.final_uv_policy,
-             metrics.final_texcoord_bounds[0],
-             metrics.final_texcoord_bounds[1],
-             metrics.final_texcoord_bounds[2],
-             metrics.final_texcoord_bounds[3],
-             static_cast<int>(kSyntheticDirectDrawShapeTextureName.size()),
-             kSyntheticDirectDrawShapeTextureName.data(),
-             static_cast<int>(direct_draw_final_blend.size()),
-             direct_draw_final_blend.data());
-
-    ParseImageObj(context, image_obj);
+             "retained-effects=%zu visual-size=[%.3f %.3f] visual-policy=%s "
+             "effect-source-policy=%s target=%dx%d source-slot=-1 publication=false",
+             shape_obj.id, shape_obj.name.c_str(), shape_obj.shape.c_str(),
+             shape_obj.effects.size(), layer->EffectCount(), metrics.visual_size[0],
+             metrics.visual_size[1], metrics.visual_policy, metrics.effect_source_policy,
+             target_width, target_height);
 }
 
 template<typename T>
@@ -4541,10 +3785,10 @@ std::string GetObjectName(const WPObjectVar& obj) {
         obj);
 }
 
-// Registers one scene.json object as the authored SceneObject identity: id, kind, name, authored
-// transform, effect count, and the passthrough flag. Behavior-facing fields (local visibility,
-// parent binding, image runtime state) are intentionally not written here; those keep flowing
-// through the existing registration points so runtime semantics stay exactly as before.
+// Registers authored identity and ancestry before materialization. A composition's resource
+// requirements include its authored children, including children appearing later in scene order.
+// Parent ids therefore belong to this prepass; runtime node/material handles and resolved
+// visibility remain in their respective registrars.
 template <typename ValueT>
 void FillSceneObjectIdentityFor(Scene& scene, const ValueT& value) {
     if (value.id == 0) return;
@@ -4555,6 +3799,11 @@ void FillSceneObjectIdentityFor(Scene& scene, const ValueT& value) {
         return;
     } else {
         object.SetAuthoredTransform(value.origin, value.scale, value.angles);
+        if constexpr (std::is_same_v<ValueT, wpscene::WPLightObject>) {
+            scene.SetLayerParentBinding(value.id, value.parent, {});
+        } else {
+            scene.SetLayerParentBinding(value.id, value.parent, value.attachment);
+        }
         if constexpr (std::is_same_v<ValueT, wpscene::WPImageObject>) {
             object.SetKind(SceneObjectKind::Image);
             object.SetEffectCount(static_cast<int32_t>(value.effects.size()));
@@ -4568,6 +3817,7 @@ void FillSceneObjectIdentityFor(Scene& scene, const ValueT& value) {
             object.SetKind(SceneObjectKind::Light);
         } else if constexpr (std::is_same_v<ValueT, WPModelObject>) {
             object.SetKind(SceneObjectKind::Model);
+            object.SetReflected(value.reflected);
         } else if constexpr (std::is_same_v<ValueT, WPShapeObject>) {
             object.SetKind(SceneObjectKind::Shape);
             object.SetEffectCount(static_cast<int32_t>(value.effects.size()));
@@ -4761,11 +4011,10 @@ bool wallpaper::CreateDynamicSceneLayer(
     const auto binding_start            = scene.bindingRegistrations.size();
     const auto property_animation_start = scene.propertyAnimationRegistrations.size();
     const auto script_start             = scene.scriptRegistrations.size();
-    RegisterSceneScriptsForObject(context, normalized_object_json);
-
     scene.layerOrder.push_back(layer_id);
     scene.SetLayerNode(layer_id, layer_node);
     scene.SetLayerInitialConfigJson(layer_id, normalized_object_json.dump());
+    RegisterSceneScriptsForObject(context, normalized_object_json);
     std::string layer_name = layer_node != nullptr
                                  ? layer_node->Name()
                                  : normalized_object_json.value("name", std::string {});
@@ -4804,7 +4053,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     nlohmann::json json;
     if (! PARSE_JSON(buf, json)) return nullptr;
 
-    ScopedJsonUserProperties json_user_scope(user_properties, &json);
+    ScopedJsonUserProperties json_user_scope(user_properties);
 
     wpscene::WPScene sc;
     sc.FromJson(json);
@@ -5045,9 +4294,6 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                    obj);
     }
 
-    ApplyMissingImageParallaxFallbacks(context, wp_objs);
-
-    RegisterSceneScripts(context, json);
 
     context.scene->layerOrder.clear();
     context.scene->ClearAllLayerNodeSlots();
@@ -5080,6 +4326,9 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         }
     }
 
+    // Script registrations resolve the completed authored-object table, including live transforms
+    // and initial JSON, rather than retaining parser-owned drawing-node addresses.
+    RegisterSceneScripts(context, json);
     context.scene->ApplyAllLayerVisibility();
 
     ConfigureSceneVolumetricsImpl(*context.scene, *context.vfs);

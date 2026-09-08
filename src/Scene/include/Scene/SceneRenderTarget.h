@@ -2,9 +2,15 @@
 #include "SceneTexture.h"
 #include "Core/Literals.hpp"
 #include <array>
+#include <cstdint>
 
 namespace wallpaper
 {
+
+// Authored effect FBO sizing is shared by initial materialization and later resource setup.
+// Keep the calculation independent of parser objects and of the image/text geometry owner.
+std::array<int32_t, 2> ResolveEffectRenderTargetExtent(
+    std::array<float, 2> source_extent, uint32_t scale, uint32_t fit);
 
 struct SceneRenderTarget {
     struct Bind {

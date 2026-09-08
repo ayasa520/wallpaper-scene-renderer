@@ -327,9 +327,9 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
         resolved->second.view) {
         depth_image = &resolved->second;
     } else if (auto raw = rr.model_depth_images.find(m_desc.scene_output);
-               raw != rr.model_depth_images.end() && raw->second.handle && raw->second.view &&
-               raw->second.samples <= 1) {
-        depth_image = &raw->second;
+               raw != rr.model_depth_images.end() && raw->second.image.handle &&
+               raw->second.image.view && raw->second.image.samples <= 1) {
+        depth_image = &raw->second.image;
     }
     if (depth_image == nullptr) {
         // No model wrote scene depth this frame: expose an all-far (0) limit depth.

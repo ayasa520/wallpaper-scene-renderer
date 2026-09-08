@@ -61,5 +61,9 @@ public:
     static bool CompileToSpv(std::string_view         scene_id, std::span<WPShaderUnit>,
                              std::vector<ShaderCode>& spvs, fs::VFS&, WPShaderInfo*,
                              std::span<const WPShaderTexInfo>);
+
+    // Inspect compiled descriptor usage, including slots introduced by shader defaults.
+    // Preprocessor declarations alone do not establish that a texture survives optimization.
+    static bool ReflectTextureSlots(std::span<const ShaderCode>, Set<uint>& slots);
 };
 } // namespace wallpaper

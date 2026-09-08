@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace wallpaper::vulkan;
 
@@ -133,12 +134,12 @@ std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, Vk
 } // namespace
 
 ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
-    : m_node_identity(desc.node != nullptr ? desc.node->RenderIdentity() : 0) {
+    : m_draw_identity(desc.draw.Valid() ? desc.draw.RenderIdentity() : 0) {
     // The render graph builder already classifies hidden offscreen dependencies and gives passes
     // a live scene pointer for diagnostics. Preserve that prepared intent here; dropping these
     // fields forced text/effect passes back through generic visibility and null-scene behavior.
     m_desc.scene               = desc.scene;
-    m_desc.node                = desc.node;
+    m_desc.draw                = desc.draw;
     m_desc.layer_id            = desc.layer_id;
     m_desc.execute_when_hidden = desc.execute_when_hidden;
     m_desc.should_execute      = desc.should_execute;
@@ -150,6 +151,8 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.camera_override     = desc.camera_override;
     m_desc.use_active_camera_for_uniforms = desc.use_active_camera_for_uniforms;
     m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
+    m_desc.model_space = desc.model_space;
+    m_desc.reflection_pass = desc.reflection_pass;
     m_desc.sprites_map         = desc.sprites_map;
     m_desc.model_pass          = desc.model_pass;
     m_desc.depth_test          = desc.depth_test;
@@ -160,22 +163,23 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
 
 std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
     return std::string(pass_kind) + "|layer=" + std::to_string(m_desc.layer_id) +
-           "|node=" + std::to_string(m_node_identity) +
-           "|output=" + m_desc.output;
+           "|node=" + std::to_string(m_draw_identity) +
+           "|output=" + m_desc.output +
+           "|reflection=" + (m_desc.reflection_pass ? "1" : "0");
 }
 
 std::string ShaderDrawCore::profileName(std::string_view pass_kind) const {
     // Frame-profiling identity: the residency key plus the authored node name, so aggregated GPU
     // timings can be attributed to scene content without cross-referencing node pointers.
     std::string name = residencyKey(pass_kind);
-    if (m_desc.node != nullptr && ! m_desc.node->Name().empty()) {
-        name += "|name=" + m_desc.node->Name();
+    if (m_desc.draw.Valid() && ! m_desc.draw.Name().empty()) {
+        name += "|name=" + m_desc.draw.Name();
     }
     return name;
 }
 
 static int IntendedShaderDrawSampleCount(const ShaderDrawData& desc) {
-    if (desc.scene != nullptr && ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.node)) {
+    if (desc.scene != nullptr && ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.draw)) {
         return std::max(1, desc.scene->MsaaSampleCount());
     }
     return 1;
@@ -188,7 +192,7 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
     const int this_samples = static_cast<int>(m_desc.sample_count);
     const int next_samples = IntendedShaderDrawSampleCount(next.m_desc);
     return m_desc.layer_id == next.m_desc.layer_id &&
-           m_node_identity == next.m_node_identity &&
+           m_draw_identity == next.m_draw_identity &&
            m_desc.output == next.m_desc.output &&
            m_desc.execute_when_hidden == next.m_desc.execute_when_hidden &&
            m_desc.model_pass == next.m_desc.model_pass &&
@@ -210,6 +214,8 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
                next.m_desc.use_active_camera_for_uniforms &&
            m_desc.use_active_camera_for_parallax ==
                next.m_desc.use_active_camera_for_parallax &&
+           m_desc.model_space == next.m_desc.model_space &&
+           m_desc.reflection_pass == next.m_desc.reflection_pass &&
            this_samples == next_samples &&
            ! m_desc.resolve_msaa &&
            m_desc.textures.size() == next.m_desc.textures.size();
@@ -221,8 +227,8 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     // Texture handles are rebound by refreshResources()/prepare(), and the runtime gate must follow
     // the newly built graph so effect bypass/final-composite branches stay correct.
     m_desc.scene          = next.m_desc.scene;
-    m_desc.node           = next.m_desc.node;
-    m_node_identity       = next.m_node_identity;
+    m_desc.draw           = next.m_desc.draw;
+    m_draw_identity       = next.m_draw_identity;
     m_desc.layer_id       = next.m_desc.layer_id;
     m_desc.should_execute = next.m_desc.should_execute;
     m_desc.textures       = next.m_desc.textures;
@@ -233,6 +239,8 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.camera_override = next.m_desc.camera_override;
     m_desc.use_active_camera_for_uniforms = next.m_desc.use_active_camera_for_uniforms;
     m_desc.use_active_camera_for_parallax = next.m_desc.use_active_camera_for_parallax;
+    m_desc.model_space = next.m_desc.model_space;
+    m_desc.reflection_pass = next.m_desc.reflection_pass;
     m_desc.sprites_map    = next.m_desc.sprites_map;
 }
 
@@ -248,8 +256,8 @@ bool ShaderDrawCore::referencesImportedTexture(std::string_view texture_key) con
     for (const auto& texture : m_desc.textures) {
         if (texture == texture_key) return true;
     }
-    if (m_extension != nullptr && m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
-        for (const auto texture : m_extension->resourceTextures(*m_desc.node->Mesh())) {
+    if (m_extension != nullptr && m_desc.draw.Valid() && m_desc.draw.Mesh() != nullptr) {
+        for (const auto texture : m_extension->resourceTextures(*m_desc.draw.Mesh())) {
             if (texture == texture_key) return true;
         }
     }
@@ -331,14 +339,22 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
         .pDepthStencilAttachment = extra_attachment.enabled() ? &depth_attachment_ref : nullptr,
     };
 
+    // Rebound attachments can still contain writes from a preceding pass, even
+    // when this pass discards their contents with UNDEFINED/CLEAR. In particular,
+    // the per-light Back depth is stored in late fragment tests. Make those writes
+    // available before the next automatic layout transition, not just before reads.
     VkSubpassDependency dependency {
         .srcSubpass = VK_SUBPASS_EXTERNAL,
         .dstSubpass = 0,
-        .srcStageMask =
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        .srcAccessMask = {},
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
@@ -485,22 +501,6 @@ VkCullModeFlags ToVkCullMode(wallpaper::SceneCullMode mode) {
     return VK_CULL_MODE_NONE;
 }
 
-wallpaper::SceneCullMode ResolveModelCullMode(wallpaper::SceneCullMode mode,
-                                              bool                     mirrored_handedness) {
-    if (! mirrored_handedness) return mode;
-
-    // A floor reflection uses a negative scale, so the model transform changes handedness and the
-    // authored triangle winding is observed backwards by Vulkan. Flip only front/back model culling
-    // here; `None` stays double-sided for receiver materials such as reflection grids, and
-    // non-model custom shader passes never carry SceneModelRenderState at all.
-    switch (mode) {
-    case wallpaper::SceneCullMode::Back: return wallpaper::SceneCullMode::Front;
-    case wallpaper::SceneCullMode::Front: return wallpaper::SceneCullMode::Back;
-    case wallpaper::SceneCullMode::None: return wallpaper::SceneCullMode::None;
-    }
-    return mode;
-}
-
 bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
                                   std::string_view                camera_name,
                                   wallpaper::AlphaWritePolicy      alpha_write_policy,
@@ -531,7 +531,7 @@ bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
 std::string_view EffectiveCustomShaderCamera(
     const wallpaper::vulkan::ShaderDrawData& desc) {
     if (! desc.camera_override.empty()) return desc.camera_override;
-    return desc.node != nullptr ? std::string_view(desc.node->Camera()) : std::string_view {};
+    return desc.draw.Valid() ? std::string_view(desc.draw.Camera()) : std::string_view {};
 }
 
 void ApplyAlphaWritePolicy(wallpaper::AlphaWritePolicy                policy,
@@ -595,6 +595,10 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     case wallpaper::SceneModelColorLoadMode::Load: load_op = VK_ATTACHMENT_LOAD_OP_LOAD; break;
     case wallpaper::SceneModelColorLoadMode::Clear: load_op = VK_ATTACHMENT_LOAD_OP_CLEAR; break;
     }
+    // Stage initialization is independent of the first visible chunk. Every reflected draw loads
+    // the color/depth already cleared by that stage, even when this shared material is the first
+    // model in the ordinary scene walk.
+    if (desc.reflection_pass) load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 }
 
 std::string_view ModelColorLoadModeName(wallpaper::SceneModelColorLoadMode mode) {
@@ -643,7 +647,7 @@ void ApplyExplicitClearPolicy(const wallpaper::vulkan::ShaderDrawData& desc,
     LOG_INFO("CustomShaderExplicitClearPolicy: layer=%d node='%s' material='%s' "
              "output='%s'",
              desc.layer_id,
-             desc.node != nullptr ? desc.node->Name().c_str() : "",
+             desc.draw.Valid() ? desc.draw.Name().c_str() : "",
              material.name.c_str(),
              desc.output.c_str());
 }
@@ -669,10 +673,12 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
     SetAttachmentLoadOp(blend_mode, state.color_load_op);
     ApplyModelPassDesc(material, desc, state.color_load_op);
     ApplyExplicitClearPolicy(desc, material, state.color_load_op);
-    if (desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
+    if ((desc.sample_count > VK_SAMPLE_COUNT_1_BIT ||
+         desc.output == wallpaper::SpecTex_Default || desc.output == wallpaper::SpecTex_Reflection) &&
         state.color_load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
-        // Compose shaders usually omit alpha. DONT_CARE would drop the opaque
-        // MSAA clear and leave uncovered samples at A=0.
+        // Blending disabled does not mean a draw covers every target pixel. Scene destinations
+        // must LOAD the stage clear or retained history, including alpha and uncovered MSAA
+        // samples; only the stage may clear.
         state.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
     }
     return state;
@@ -693,18 +699,19 @@ void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  ma
     pipeline.depth.depthCompareOp        = VK_COMPARE_OP_GREATER;
     pipeline.depth.depthBoundsTestEnable = false;
     pipeline.depth.stencilTestEnable     = false;
-    const auto effective_cull_mode =
-        ResolveModelCullMode(model_state->cullMode, model_state->mirroredHandedness);
-    pipeline.raster.cullMode = ToVkCullMode(effective_cull_mode);
+    // The reflected destination and the projection-Y inversion each reverse handedness. With our
+    // top-down viewport their product keeps ordinary winding, so reflection does not mutate this
+    // shared material's cull policy.
+    pipeline.raster.cullMode = ToVkCullMode(model_state->cullMode);
     LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' color-load=%s "
-             "mirrored-handedness=%s depth-test=%s depth-write=%s depth-clear=%s "
+             "reflection-pass=%s depth-test=%s depth-write=%s depth-clear=%s "
              "depth-compare=%s depth-clear-z=%.3f cull=%u",
-             desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+             desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
              material.customShader.shader != nullptr ? material.customShader.shader->name.c_str()
                                                      : "<null>",
              desc.output.c_str(),
              ModelColorLoadModeName(model_state->colorLoadMode).data(),
-             model_state->mirroredHandedness ? "true" : "false",
+             desc.reflection_pass ? "true" : "false",
              desc.depth_test ? "true" : "false",
              desc.depth_write ? "true" : "false",
              desc.clear_depth ? "true" : "false",
@@ -759,7 +766,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
             if (! opt.has_value()) {
                 LOG_ERROR("CustomShaderPassRefresh: query input failed node='%s' output='%s' "
                           "slot=%zu texture='%s'",
-                          desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                          desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                           desc.output.c_str(),
                           static_cast<size_t>(i),
                           tex_name.c_str());
@@ -771,7 +778,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
         } else if (wallpaper::IsSpecTex(tex_name)) {
             LOG_ERROR("CustomShaderPassRefresh: missing input render target node='%s' "
                       "output='%s' slot=%zu texture='%s'",
-                      desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                      desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                       desc.output.c_str(),
                       static_cast<size_t>(i),
                       tex_name.c_str());
@@ -808,7 +815,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                     const bool initially_paused =
                         paused_it != scene.videoTexturePaused.end()
                             ? paused_it->second
-                            : (desc.node != nullptr && ! desc.node->Visible());
+                            : (desc.draw.Valid() && ! desc.draw.Visible(scene));
                     const auto initial_state =
                         stopped
                             ? wallpaper::VideoTexturePlaybackState::Stopped
@@ -838,7 +845,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
         // effect-local FBOs are uniquified from their authored names and are still valid Vulkan
         // framebuffer destinations once WPSceneParser has inserted them into scene.renderTargets.
         LOG_ERROR("CustomShaderPassRefresh: missing output render target node='%s' output='%s'",
-                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                   tex_name.c_str());
         return false;
     }
@@ -847,7 +854,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
     desc.resolve_msaa      = false;
     desc.alpha_to_coverage = false;
     desc.vk_resolve        = {};
-    if (ShaderDrawCanUseMsaa(scene, tex_name, desc.node)) {
+    if (ShaderDrawCanUseMsaa(scene, tex_name, desc.draw)) {
         const auto ms_name = std::string(wallpaper::SpecTex_DefaultMS);
         const auto ms_it   = scene.renderTargets.find(ms_name);
         if (ms_it != scene.renderTargets.end()) {
@@ -859,15 +866,15 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                     std::max(1u, ms_it->second.sample_count > 0
                                      ? static_cast<uint>(ms_it->second.sample_count)
                                      : 1u));
-                if (desc.node != nullptr && desc.node->Mesh() != nullptr &&
-                    desc.node->Mesh()->Material() != nullptr) {
-                    desc.alpha_to_coverage = desc.node->Mesh()->Material()->alpha_to_coverage;
+                if (desc.draw.Valid() && desc.draw.Mesh() != nullptr &&
+                    desc.draw.Mesh()->Material() != nullptr) {
+                    desc.alpha_to_coverage = desc.draw.Mesh()->Material()->alpha_to_coverage;
                 }
                 return true;
             }
         }
         LOG_ERROR("CustomShaderPassRefresh: MSAA compose target missing node='%s' output='%s'",
-                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                   tex_name.c_str());
     }
     if (auto opt =
@@ -877,62 +884,15 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
         return true;
     }
     LOG_ERROR("CustomShaderPassRefresh: query output failed node='%s' output='%s'",
-              desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+              desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
               tex_name.c_str());
-    return false;
-}
-
-bool StaticSceneTexturesResidentForDeferredPrepare(wallpaper::Scene& scene, const Device& device,
-                                                   const ShaderDrawData& desc,
-                                                   const ShaderDrawExtension* extension) {
-    std::vector<std::string_view> missing_textures;
-    for (const auto& tex_name : desc.textures) {
-        if (tex_name.empty()) continue;
-        if (scene.renderTargets.count(tex_name) != 0 || wallpaper::IsSpecTex(tex_name)) continue;
-        if (scene.dirtyImportedTextureKeys.count(tex_name) != 0) continue;
-
-        const auto texture_it = scene.textures.find(tex_name);
-        if (texture_it == scene.textures.end() || texture_it->second.isVideo) continue;
-        if (! device.tex_cache().FindTex(tex_name).has_value()) {
-            missing_textures.push_back(tex_name);
-        }
-    }
-    if (extension != nullptr && desc.node != nullptr && desc.node->Mesh() != nullptr) {
-        for (const auto texture : extension->resourceTextures(*desc.node->Mesh())) {
-            const std::string tex_name(texture);
-            if (tex_name.empty()) continue;
-            if (scene.dirtyImportedTextureKeys.count(tex_name) != 0) continue;
-
-            const auto texture_it = scene.textures.find(tex_name);
-            if (texture_it == scene.textures.end() || texture_it->second.isVideo) continue;
-            if (! device.tex_cache().FindTex(tex_name).has_value()) {
-                missing_textures.push_back(tex_name);
-            }
-        }
-    }
-
-    if (missing_textures.empty()) return true;
-
-    // This is the guardrail that makes runtime visibility behave like a game-engine streaming
-    // system: a deferred pass is not allowed to fall back to the blocking texture creation path
-    // inside RefreshCustomShaderPassTextures(). It will stay off the render graph's executable set
-    // until requestDeferredPrepareResources() has finished the background parse and the budgeted
-    // GPU residency work.
-    std::string missing;
-    for (const auto texture : missing_textures) {
-        if (! missing.empty()) missing += ",";
-        missing += texture;
-    }
-    LOG_INFO("CustomShaderPassDeferredPrepareWaitTextures: node='%s' output='%s' missing='%s'",
-             desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
-             desc.output.c_str(),
-             missing.c_str());
     return false;
 }
 
 VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingResources& rr,
                                                ShaderDrawData& desc) {
-    auto&      depth      = rr.model_depth_images[desc.output];
+    auto&      attachment = rr.model_depth_images[desc.output];
+    auto&      depth      = attachment.image;
     const bool missing    = ! depth.view || ! depth.handle;
     const bool wrong_size = depth.extent.width != desc.vk_output.extent.width ||
                             depth.extent.height != desc.vk_output.extent.height ||
@@ -946,7 +906,7 @@ VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingRe
         if (! replacement.has_value()) {
             LOG_ERROR("CustomShaderPassRefresh: cannot create shared model depth image node='%s' "
                       "output='%s' extent=[%u,%u] samples=%u",
-                      desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                      desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                       desc.output.c_str(),
                       desc.vk_output.extent.width,
                       desc.vk_output.extent.height,
@@ -954,7 +914,9 @@ VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingRe
             return nullptr;
         }
         depth = std::move(replacement.value());
+        attachment.layout = VK_IMAGE_LAYOUT_UNDEFINED;
         rr.model_depth_resolved.erase(desc.output);
+        rr.model_depth_dirty.erase(desc.output);
     }
     if (desc.sample_count > VK_SAMPLE_COUNT_1_BIT) {
         auto&      resolved      = rr.model_depth_resolved[desc.output];
@@ -1002,7 +964,7 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
         desc.vk_output.extent.width == 0 || desc.vk_output.extent.height == 0) {
         LOG_ERROR("CustomShaderPassRefresh: cannot recreate framebuffer node='%s' output='%s' "
                   "hasRenderPass=%s hasView=%s extent=[%u,%u]",
-                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                   desc.output.c_str(),
                   desc.pipeline.pass ? "true" : "false",
                   desc.vk_output.view != VK_NULL_HANDLE ? "true" : "false",
@@ -1029,7 +991,7 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
     };
     if (desc.resolve_msaa && desc.vk_resolve.view == VK_NULL_HANDLE) {
         LOG_ERROR("CustomShaderPassRefresh: missing MSAA resolve view node='%s' output='%s'",
-                  desc.node != nullptr ? desc.node->Name().c_str() : "<null>",
+                  desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
                   desc.output.c_str());
         return false;
     }
@@ -1064,15 +1026,15 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
     // text bridge updates.
     m_desc.fb.reset();
     m_desc.vk_tex_binding.clear();
-    if (m_desc.node == nullptr || m_desc.node->Mesh() == nullptr ||
-        m_desc.node->Mesh()->Material() == nullptr ||
-        m_desc.node->Mesh()->Material()->customShader.shader == nullptr) {
+    if (!m_desc.draw.Valid() || m_desc.draw.Mesh() == nullptr ||
+        m_desc.draw.Mesh()->Material() == nullptr ||
+        m_desc.draw.Mesh()->Material()->customShader.shader == nullptr) {
         LOG_ERROR("ShaderDrawPrepare: incomplete scene contract node='%s' output='%s'",
-                  m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+                  m_desc.draw.Valid() ? m_desc.draw.Name().c_str() : "<null>",
                   m_desc.output.c_str());
         return false;
     }
-    SceneMesh& mesh = *(m_desc.node->Mesh());
+    SceneMesh& mesh = *(m_desc.draw.Mesh());
     if (m_extension != nullptr && ! m_extension->configure(device, m_desc, mesh)) return false;
     if (! RefreshCustomShaderPassTextures(scene, device, m_desc)) return false;
     if (m_extension != nullptr && ! m_extension->refreshTextures(scene, device, m_desc)) {
@@ -1188,6 +1150,36 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         }
     }
     const auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
+    if (const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+        trace_layer != nullptr && std::to_string(m_desc.layer_id) == trace_layer) {
+        const auto& blend = render_state.color_blend;
+        LOG_INFO("SceneShaderDrawPrepare: layer=%d node='%s' output='%s' count=%u "
+                 "load=%u blend=%u rgb=[%u %u %u] alpha=[%u %u %u] mask=%u",
+                 m_desc.layer_id, m_desc.draw.Name().c_str(), m_desc.output.c_str(),
+                 m_desc.draw_count, render_state.color_load_op, blend.blendEnable,
+                 blend.srcColorBlendFactor, blend.dstColorBlendFactor, blend.colorBlendOp,
+                 blend.srcAlphaBlendFactor, blend.dstAlphaBlendFactor, blend.alphaBlendOp,
+                 blend.colorWriteMask);
+        // Record small generated cards before upload so their actual UV/position bytes can be
+        // compared with the submitted transforms. Imported immutable payloads may already be
+        // released; diagnostics must not recreate or retain them just to print this information.
+        for (size_t binding = 0; binding < mesh.VertexCount(); ++binding) {
+            const auto& vertices = mesh.GetVertexArray(binding);
+            if (vertices.Data() == nullptr || vertices.VertexCount() > 4) continue;
+            for (size_t vertex = 0; vertex < vertices.VertexCount(); ++vertex) {
+                std::string values;
+                for (size_t component = 0; component < vertices.OneSize(); ++component) {
+                    if (component != 0) values += ' ';
+                    values += std::to_string(
+                        vertices.Data()[vertex * vertices.OneSize() + component]);
+                }
+                LOG_INFO("SceneShaderDrawVertex: layer=%d node='%s' binding=%zu "
+                         "vertex=%zu values=[%s]",
+                         m_desc.layer_id, m_desc.draw.Name().c_str(), binding, vertex,
+                         values.c_str());
+            }
+        }
+    }
     {
         const auto attachment = ResolveShaderDrawAttachment(m_desc, m_extension);
         auto opt = CreateShaderDrawRenderPass(device.handle(),
@@ -1209,7 +1201,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
         m_desc.pipeline.debug_name =
             "CustomShaderPass[node=" +
-            (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
+            (m_desc.draw.Valid() ? m_desc.draw.Name() : std::string("(null)")) +
             ",output=" + m_desc.output + "]";
         pipeline.addDescriptorSetInfo(spanone { descriptor_info })
             .setColorBlendStates(spanone { render_state.color_blend })
@@ -1262,7 +1254,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
     if (! ref.blocks.empty()) {
         std::function<void()> update_dyn_buf_op;
         if (m_desc.dyn_vertex) {
-            auto&       mesh             = *m_desc.node->Mesh();
+            auto&       mesh             = *m_desc.draw.Mesh();
             auto*       dyn_buf          = rr.dyn_buf;
             auto&       vertex_bufs      = m_desc.vertex_bufs;
             auto&       draw_count       = m_desc.draw_count;
@@ -1417,7 +1409,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         auto  block  = ref.blocks.front();
         auto* buf    = rr.dyn_buf;
         auto* bufref = &m_desc.ubo_buf;
-        auto* node           = m_desc.node;
+        const auto draw      = m_desc.draw;
         auto* shader_updater = scene.shaderValueUpdater.get();
         auto* extension      = m_extension;
         auto& sprites        = m_desc.sprites_map;
@@ -1433,10 +1425,12 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         m_desc.update_dynamic_mesh_op = update_dyn_buf_op;
         m_desc.update_op =
             [shader_updater, block, buf, bufref, extension,
-             node, material, &sprites, &vk_textures,
+             draw, material, &sprites, &vk_textures,
              camera_override = m_desc.camera_override,
              use_active_camera_for_uniforms = m_desc.use_active_camera_for_uniforms,
-             use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax]() {
+             use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax,
+             model_space = m_desc.model_space,
+             reflection_pass = m_desc.reflection_pass]() {
                 auto update_unf_op = [block, buf, bufref, extension](
                                          std::string_view name, wallpaper::ShaderValue value) {
                     UpdateShaderDrawUniform(buf, *bufref, block, name, value);
@@ -1450,13 +1444,17 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     .use_camera_override = !camera_override.empty(),
                     .use_active_camera_for_uniforms = use_active_camera_for_uniforms,
                     .use_active_camera_for_parallax = use_active_camera_for_parallax,
+                    .model_space = model_space,
+                    .reflection_pass = reflection_pass,
                 };
                 shader_updater->UpdateUniforms(
-                    node,
+                    draw,
                     sprites,
                     update_unf_op,
                     (overrides.use_camera_override ||
-                     overrides.use_active_camera_for_uniforms)
+                     overrides.use_active_camera_for_uniforms ||
+                     overrides.model_space != ShaderModelSpace::Object ||
+                     overrides.reflection_pass)
                         ? &overrides
                         : nullptr);
                 // update image slot for sprites
@@ -1471,7 +1469,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         auto exists_unf_op = [&block](std::string_view name) {
             return exists(block.member_map, name);
         };
-        shader_updater->InitUniforms(node, exists_unf_op);
+        shader_updater->InitUniforms(draw, exists_unf_op);
 
         // memset uniform buf
         buf->fillBuf(*bufref, 0, bufref->size, 0);
@@ -1488,99 +1486,14 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
     return true;
 }
 
-bool ShaderDrawCore::prepareDeferred(Scene& scene, const Device& device, RenderingResources& rr) {
-    if (requestDeferredPrepareResources(scene, device) == DeferredPrepareResourcesState::Waiting) {
-        return false;
-    }
-    if (! StaticSceneTexturesResidentForDeferredPrepare(scene, device, m_desc, m_extension)) {
-        return false;
-    }
-    return prepare(scene, device, rr);
-}
-
-DeferredPrepareResourcesState
-ShaderDrawCore::requestDeferredPrepareResources(Scene& scene, const Device& device) {
-    constexpr std::size_t kDeferredStaticTextureStageBudgetBytes = 64u * 1024u * 1024u;
-    bool                  waiting                                = false;
-
-    const auto request_texture = [&](std::string_view tex_name_view,
-                                     std::optional<usize> priority_slot) {
-        const std::string tex_name(tex_name_view);
-        if (tex_name.empty()) return;
-        if (scene.renderTargets.count(tex_name) != 0 || wallpaper::IsSpecTex(tex_name)) return;
-        if (scene.dirtyImportedTextureKeys.count(tex_name) != 0) return;
-        if (device.tex_cache().FindTex(tex_name).has_value()) return;
-
-        const auto pending_streaming_state = device.tex_cache().StagePendingTexUploads(
-            tex_name, kDeferredStaticTextureStageBudgetBytes);
-        if (pending_streaming_state == TextureCacheStreamingState::Waiting) {
-            waiting = true;
-            return;
-        }
-        if (pending_streaming_state == TextureCacheStreamingState::Ready &&
-            device.tex_cache().FindTex(tex_name).has_value()) {
-            return;
-        }
-
-        const auto texture_it = scene.textures.find(tex_name);
-        if (texture_it == scene.textures.end() || texture_it->second.isVideo) return;
-
-        // Deferred structural preparation follows the same split as modern streaming renderers:
-        // expensive disk/decompression work is requested from the scene asset cache first, and the
-        // render thread only builds Vulkan residency after those CPU bytes are ready. This keeps a
-        // newly created dynamic layer from blocking the whole frame on WPTexImageParser::Parse().
-        const auto request = scene.RequestParsedImageAsync(tex_name);
-        switch (request.state) {
-        case Scene::ParsedImageRequestState::Ready:
-            if (request.image != nullptr) {
-                const auto streaming_state = device.tex_cache().StageTexUploads(
-                    request.image, priority_slot, kDeferredStaticTextureStageBudgetBytes);
-                scene.DropParsedImageCache(tex_name);
-                if (streaming_state == TextureCacheStreamingState::Waiting) {
-                    waiting = true;
-                } else if (streaming_state == TextureCacheStreamingState::Failed) {
-                    LOG_ERROR("CustomShaderPassDeferredResources: staging failed node='%s' "
-                              "texture='%s'",
-                              m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
-                              tex_name.c_str());
-                }
-            }
-            break;
-        case Scene::ParsedImageRequestState::Pending: waiting = true; break;
-        case Scene::ParsedImageRequestState::Failed:
-            LOG_ERROR("CustomShaderPassDeferredResources: parse failed node='%s' texture='%s'",
-                      m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
-                      tex_name.c_str());
-            break;
-        }
-    };
-
-    for (usize texture_index = 0; texture_index < m_desc.textures.size(); texture_index++) {
-        std::optional<usize> priority_slot;
-        if (const auto sprite_it = m_desc.sprites_map.find(texture_index);
-            sprite_it != m_desc.sprites_map.end()) {
-            const auto image_id = sprite_it->second.GetCurFrame().imageId;
-            if (image_id >= 0) priority_slot = static_cast<usize>(image_id);
-        }
-        request_texture(m_desc.textures[texture_index], priority_slot);
-    }
-    if (m_extension != nullptr && m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
-        for (const auto texture : m_extension->resourceTextures(*m_desc.node->Mesh())) {
-            request_texture(texture, std::nullopt);
-        }
-    }
-
-    return waiting ? DeferredPrepareResourcesState::Waiting : DeferredPrepareResourcesState::Ready;
-}
-
 bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, RenderingResources& rr) {
     m_desc.scene = &scene;
-    if (m_desc.node == nullptr || m_desc.node->Mesh() == nullptr ||
-        m_desc.node->Mesh()->Material() == nullptr) {
+    if (!m_desc.draw.Valid() || m_desc.draw.Mesh() == nullptr ||
+        m_desc.draw.Mesh()->Material() == nullptr) {
         return false;
     }
 
-    SceneMesh& mesh = *(m_desc.node->Mesh());
+    SceneMesh& mesh = *(m_desc.draw.Mesh());
     if (m_extension != nullptr && ! m_extension->configure(device, m_desc, mesh)) return false;
 
     std::vector<Uni_ShaderSpv> spvs;
@@ -1627,7 +1540,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
             });
         }
     }
-    if (ShaderDrawCanUseMsaa(scene, m_desc.output, m_desc.node)) {
+    if (ShaderDrawCanUseMsaa(scene, m_desc.output, m_desc.draw)) {
         m_desc.sample_count = static_cast<VkSampleCountFlagBits>(
             std::max(1, scene.MsaaSampleCount()));
         m_desc.resolve_msaa = false;
@@ -1656,7 +1569,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
     ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
     m_desc.pipeline.debug_name =
         "CustomShaderPassWarmup[node=" +
-        (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
+        (m_desc.draw.Valid() ? m_desc.draw.Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
     m_desc.pipeline.cache_key = ShaderDrawPipelineCompatibilityKey(
         render_state.color_load_op,
@@ -1685,8 +1598,8 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     // minute updates is the texture-cache-backed image handle set and the framebuffer that wraps
     // the resized render target. Rebinding only those pieces avoids recompiling every shader pass
     // in the scene when the clock/date text changes shape.
-    if (m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
-        auto& mesh = *m_desc.node->Mesh();
+    if (m_desc.draw.Valid() && m_desc.draw.Mesh() != nullptr) {
+        auto& mesh = *m_desc.draw.Mesh();
         if (! mesh.Dynamic() && mesh.Dirty().load()) {
             // Resource-only refreshes were originally written for effects whose geometry never
             // changes after graph build. Refactored text effects break that assumption: runtime
@@ -1705,7 +1618,7 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     if (output_target_it == scene.renderTargets.end()) {
         LOG_ERROR(
             "CustomShaderPassRefresh: output target not found before refresh node='%s' output='%s'",
-            m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+            m_desc.draw.Valid() ? m_desc.draw.Name().c_str() : "<null>",
             m_desc.output.c_str());
         return false;
     }
@@ -1726,7 +1639,7 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     }
     if (! RefreshCustomShaderPassTextures(scene, device, m_desc)) {
         LOG_ERROR("CustomShaderPassRefresh: texture refresh failed node='%s' output='%s'",
-                  m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+                  m_desc.draw.Valid() ? m_desc.draw.Name().c_str() : "<null>",
                   m_desc.output.c_str());
         return false;
     }
@@ -1744,9 +1657,9 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
             return false;
         }
     }
-    if (m_desc.dyn_vertex && m_desc.update_dynamic_mesh_op != nullptr && m_desc.node != nullptr &&
-        m_desc.node->Mesh() != nullptr &&
-        (m_desc.force_dyn_upload || m_desc.node->Mesh()->Dirty().load())) {
+    if (m_desc.dyn_vertex && m_desc.update_dynamic_mesh_op != nullptr && m_desc.draw.Valid() &&
+        m_desc.draw.Mesh() != nullptr &&
+        (m_desc.force_dyn_upload || m_desc.draw.Mesh()->Dirty().load())) {
         // Text-backed effect passes keep their render-graph topology stable while the final
         // source quad changes size. Uploading the dirty dynamic mesh during the resource-refresh
         // phase lets the compile-time dynamic-buffer copy include the new quad before the first
@@ -1768,7 +1681,7 @@ bool ShaderDrawCore::refreshImportedTextureBindings(Scene& scene, const Device& 
             LOG_ERROR("ImportedTexturePassRebind: cached texture missing layer=%d node='%s' "
                       "output='%s' slot=%zu key='%s'",
                       m_desc.layer_id,
-                      m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>",
+                      m_desc.draw.Valid() ? m_desc.draw.Name().c_str() : "<null>",
                       m_desc.output.c_str(),
                       static_cast<size_t>(texture_index),
                       texture_key.c_str());
@@ -1782,8 +1695,8 @@ bool ShaderDrawCore::refreshImportedTextureBindings(Scene& scene, const Device& 
     }
 
     bool extension_affected = false;
-    if (m_extension != nullptr && m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
-        for (const auto texture_key : m_extension->resourceTextures(*m_desc.node->Mesh())) {
+    if (m_extension != nullptr && m_desc.draw.Valid() && m_desc.draw.Mesh() != nullptr) {
+        for (const auto texture_key : m_extension->resourceTextures(*m_desc.draw.Mesh())) {
             if (scene.dirtyImportedTextureResourceKeys.count(std::string(texture_key)) == 0) {
                 continue;
             }
@@ -1804,12 +1717,12 @@ void ShaderDrawCore::updateBeforeUpload() {
         return;
     }
 
-    if (m_desc.node != nullptr && ! m_desc.node->LocalVisible()) {
+    if (m_desc.draw.Valid() && ! m_desc.draw.LocalVisible()) {
         return;
     }
 
-    const bool node_visible = m_desc.node == nullptr ? true : m_desc.node->Visible();
-    if (m_desc.node != nullptr && ! node_visible && ! m_desc.execute_when_hidden) {
+    const bool node_visible = !m_desc.draw.Valid() ? true : m_desc.draw.Visible(*m_desc.scene);
+    if (m_desc.draw.Valid() && ! node_visible && ! m_desc.execute_when_hidden) {
         return;
     }
 
@@ -1824,14 +1737,77 @@ void ShaderDrawCore::updateBeforeUpload() {
 }
 
 void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
+    const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+    const char* trace_target = std::getenv("WESCENE_TRACE_RENDER_TARGET");
+    // A named target can connect otherwise unrelated owners. Select both its producer and
+    // consumers in the same process so the trace can compare actual GPU image identities,
+    // execution gates and ordering without changing the render graph or reading pixels.
+    const bool trace_draw = (trace_layer != nullptr &&
+        std::to_string(m_desc.layer_id) == trace_layer) ||
+        (trace_target != nullptr && (m_desc.output == trace_target ||
+            std::find(m_desc.textures.begin(), m_desc.textures.end(), trace_target) !=
+                m_desc.textures.end()));
+    if (trace_draw) ++m_trace_draw_sequence;
+    const auto trace_result = [&](const char* result) {
+        // Pass-begin profiling also includes skipped draws. Log the execution decision and exact
+        // bound images at sparse checkpoints so an absent element can be traced without guessing
+        // from visibility flags or flooding every frame with descriptor and geometry metadata.
+        // A one-frame media transition needs consecutive decisions rather than sparse
+        // checkpoints. This opt-in keeps the existing layer/target filter and adds the
+        // scene clock so resource generations can be matched to SceneMediaDispatch.
+        const bool trace_every_frame = std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr;
+        if (!trace_draw || (!trace_every_frame && m_trace_draw_sequence != 1 &&
+                            m_trace_draw_sequence != 121 && m_trace_draw_sequence != 601)) return;
+        LOG_INFO("SceneShaderDrawExecute: sequence=%llu time=%.6f layer=%d node='%s' result=%s "
+                 "count=%u output='%s' image=%p extent=%ux%u",
+                 static_cast<unsigned long long>(m_trace_draw_sequence),
+                 m_desc.scene != nullptr ? m_desc.scene->elapsingTime : 0.0, m_desc.layer_id,
+                 m_desc.draw.Name().c_str(), result, m_desc.draw_count, m_desc.output.c_str(),
+                 reinterpret_cast<void*>(m_desc.vk_output.handle),
+                 m_desc.vk_output.extent.width, m_desc.vk_output.extent.height);
+        for (size_t index = 0; index < m_desc.vk_textures.size(); ++index) {
+            const auto& slots = m_desc.vk_textures[index];
+            if (slots.slots.empty()) continue;
+            const auto& input = slots.getActive();
+            LOG_INFO("SceneShaderDrawInput: sequence=%llu layer=%d node='%s' index=%zu "
+                     "key='%s' binding=%d slot=%u image=%p extent=%ux%u",
+                     static_cast<unsigned long long>(m_trace_draw_sequence), m_desc.layer_id,
+                     m_desc.draw.Name().c_str(), index, m_desc.textures[index].c_str(),
+                     m_desc.vk_tex_binding[index], static_cast<unsigned>(slots.active),
+                     reinterpret_cast<void*>(input.handle), input.extent.width, input.extent.height);
+        }
+        if (const char* trace_uniform = std::getenv("WESCENE_TRACE_MATERIAL_UNIFORM");
+            trace_uniform != nullptr && m_desc.draw.Mesh() != nullptr) {
+            const auto& material = *m_desc.draw.Mesh()->Material();
+            const auto log_value = [&](const auto& values, const char* source) {
+                const auto it = values.find(trace_uniform);
+                if (it == values.end()) return;
+                std::string value;
+                for (size_t component = 0; component < it->second.size(); ++component) {
+                    if (!value.empty()) value += ' ';
+                    value += std::to_string(it->second[component]);
+                }
+                LOG_INFO("SceneShaderDrawMaterialValue: sequence=%llu layer=%d node='%s' "
+                         "uniform='%s' source=%s value=[%s]",
+                         static_cast<unsigned long long>(m_trace_draw_sequence), m_desc.layer_id,
+                         m_desc.draw.Name().c_str(), trace_uniform, source, value.c_str());
+            };
+            // Preserve upload precedence in the report: authored/live values override the
+            // executable's defaults in WriteMaterialUniforms before this submit is recorded.
+            log_value(material.customShader.shader->default_uniforms, "program-default");
+            log_value(material.customShader.constValues, "material");
+        }
+    };
     if (m_desc.should_execute && ! m_desc.should_execute()) {
+        trace_result("execution-gate");
         // Runtime-gated helper passes stay in the render graph so visibility flips do not rebuild
         // framebuffer topology. Returning before uniform updates and draw submission makes the pass
         // a true no-op on frames where its fallback branch is not active.
         return;
     }
 
-    if (m_desc.node != nullptr && ! m_desc.node->LocalVisible()) {
+    if (m_desc.draw.Valid() && ! m_desc.draw.LocalVisible()) {
+        trace_result("local-hidden");
         // execute_when_hidden is only for layer-level invisibility, such as offscreen dependency
         // sources that must keep rendering while their authored layer is hidden in the main scene.
         // Effect-local visibility is a stricter contract: a hidden effect must not run its shader
@@ -1840,13 +1816,16 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         return;
     }
 
-    const bool node_visible = m_desc.node == nullptr ? true : m_desc.node->Visible();
-    if (m_desc.node != nullptr && ! node_visible && ! m_desc.execute_when_hidden) {
+    const bool node_visible = !m_desc.draw.Valid() ? true : m_desc.draw.Visible(*m_desc.scene);
+    if (m_desc.draw.Valid() && ! node_visible && ! m_desc.execute_when_hidden) {
+        trace_result("owner-hidden");
         // The render graph has still reached this pass's ordering point even when authored
         // visibility turns the shader into a no-op for the frame. Releasing final-read keys here
         // prevents temporary render targets from staying pinned only because no draw was recorded.
         return;
     }
+
+    trace_result("draw");
 
     if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;
         scene != nullptr && ShaderDrawSamplesResolvedDefault(m_desc.textures)) {
@@ -2027,6 +2006,11 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     }
 
     cmd.EndRenderPass();
+
+    if (m_desc.model_pass) {
+        rr.model_depth_images.at(m_desc.output).layout =
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    }
 
     if (m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
         m_desc.output == wallpaper::SpecTex_Default) {

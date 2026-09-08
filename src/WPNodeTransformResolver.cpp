@@ -1,6 +1,7 @@
 #include "WPNodeTransformResolver.hpp"
 
 #include "Scene/Scene.h"
+#include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SceneNode.h"
 #include "WPImageAlignment.hpp"
 
@@ -14,207 +15,159 @@ WPNodeTransformResolver::WPNodeTransformResolver(
     Map<void*, WPShaderValueData>& node_data_map,
     Map<void*, Matrix4d>& model_transform_cache,
     Map<void*, Vector3f>& parallax_offset_cache,
-    Map<void*, Affine3f>& attachment_transform_cache,
-    const SceneCamera* parallax_camera,
     const std::array<float, 2>& mouse_pos, uint64_t puppet_frame_serial)
     : m_scene(scene),
       m_parallax(parallax),
       m_node_data_map(node_data_map),
       m_model_transform_cache(model_transform_cache),
       m_parallax_offset_cache(parallax_offset_cache),
-      m_attachment_transform_cache(attachment_transform_cache),
-      m_parallax_camera(parallax_camera),
       m_mouse_pos(mouse_pos),
       m_puppet_frame_serial(puppet_frame_serial) {}
 
-Matrix4d WPNodeTransformResolver::ResolveParallaxedModelTransform(SceneNode* node,
-                                                                  const SceneCamera* camera,
-                                                                  bool apply_parallax) {
-    const auto* node_data = FindNodeData(node);
-    Matrix4d    model_trans = ResolveModelTransform(node, node_data);
-    if (node_data != nullptr && apply_parallax && node_data->AppliesModelParallax()) {
-        const auto parallax_offset = ComputeParallaxOffset(node, *node_data, camera);
-        model_trans =
-            Affine3d(Eigen::Translation3d(parallax_offset.cast<double>())).matrix() * model_trans;
+Matrix4d WPNodeTransformResolver::ResolveParallaxedModelTransform(const SceneDraw& draw,
+                                                                const SceneCamera* camera,
+                                                                bool apply_parallax) {
+    const auto* data = FindNodeData(draw);
+    Matrix4d model = ResolveModelTransform(draw, data);
+    if (data != nullptr && apply_parallax && data->AppliesModelParallax()) {
+        const auto offset = ComputeParallaxOffset(draw, *data, camera);
+        model = Affine3d(Translation3d(offset.cast<double>())).matrix() * model;
     }
-    return model_trans;
+    return model;
 }
 
-Matrix4d WPNodeTransformResolver::ResolveRawModelTransform(SceneNode* node) {
-    const auto* node_data = FindNodeData(node);
-    return ResolveModelTransform(node, node_data);
+Matrix4d WPNodeTransformResolver::ResolveRawModelTransform(const SceneDraw& draw) {
+    return ResolveModelTransform(draw, FindNodeData(draw));
 }
 
-Vector3f WPNodeTransformResolver::ResolveParallaxOffset(SceneNode* node, const SceneCamera* camera) {
-    const auto* node_data = FindNodeData(node);
-    if (node_data == nullptr) return Vector3f::Zero();
-    return ComputeParallaxOffset(node, *node_data, camera);
+Vector3f WPNodeTransformResolver::ResolveParallaxOffset(const SceneDraw& draw,
+                                                       const SceneCamera* camera) {
+    const auto* data = FindNodeData(draw);
+    return data != nullptr ? ComputeParallaxOffset(draw, *data, camera) : Vector3f::Zero();
 }
 
-std::optional<Affine3f> WPNodeTransformResolver::ResolveAttachmentLocalTransform(SceneNode* node) {
-    const auto* node_data = FindNodeData(node);
-    if (node_data == nullptr) return std::nullopt;
-    return ResolveAttachmentLocalTransform(node, *node_data);
+const WPShaderValueData* WPNodeTransformResolver::FindNodeData(const SceneDraw& draw) const {
+    const auto it = m_node_data_map.find(draw.DataKey());
+    return it == m_node_data_map.end() ? nullptr : std::addressof(it->second);
 }
 
-bool WPNodeTransformResolver::ApplyAttachment(SceneNode* node) {
-    auto local_transform = ResolveAttachmentLocalTransform(node);
-    if (! local_transform.has_value()) return false;
-    node->SetLocalAffine(*local_transform);
-    return true;
-}
-
-void WPNodeTransformResolver::UpdateAttachmentParentIfNeeded(const WPShaderValueData& node_data) {
-    if (node_data.TransformParent() == nullptr ||
-        ! exists(m_node_data_map, node_data.TransformParent())) {
-        return;
+Matrix4d WPNodeTransformResolver::ResolveObjectTransform(const SceneObject& object) {
+    // Authored TRS is input to matrix evaluation, never its output. In particular, a live bone
+    // must not decompose its result back into the owner's origin/angles/scale or freeze a copy of
+    // those properties at attachment time. Repeated script/projection/draw queries read the same
+    // authored record.
+    auto* key = const_cast<SceneObject*>(&object);
+    if (const auto it = m_model_transform_cache.find(key); it != m_model_transform_cache.end()) {
+        return it->second;
     }
-
-    auto& parent_data = m_node_data_map.at(node_data.TransformParent());
-    if (! parent_data.IsBoneAttached()) return;
-
-    ApplyAttachment(node_data.TransformParent());
+    const auto& transform = object.RuntimeTransform();
+    if (transform == nullptr) return Matrix4d::Identity();
+    Matrix4d local = transform->LocalMatrix();
+    const auto* parent = m_scene.FindSceneObject(object.ParentId());
+    Matrix4d model = local;
+    if (parent != nullptr && parent->RuntimeTransform() != nullptr) {
+        const auto* data = FindNodeData(object.LayerNode());
+        if (data != nullptr && data->IsBoneAttached()) {
+            auto* parent_data = m_node_data_map.contains(parent->LayerNode())
+                ? &m_node_data_map.at(parent->LayerNode()) : nullptr;
+            if (parent_data != nullptr && parent_data->puppet_layer.hasPuppet()) {
+                parent_data->puppet_layer.AdvanceIfNeeded(m_scene.frameTime, m_puppet_frame_serial);
+                const auto* puppet = parent_data->puppet_layer.Puppet();
+                const auto attachment =
+                    puppet->BoneModelTransform(data->transform_binding.bone_index) *
+                    data->transform_binding.bind_transform;
+                local = attachment.matrix().cast<double>() * local;
+            }
+        }
+        // Card alignment is a local drawing offset, not the pivot inherited by another object.
+        // The parent relation is authored identity data; physical render-order proxies and
+        // detached source resources cannot change this multiplication chain.
+        const Matrix4d parent_model = RemoveImageAlignmentOffsetFromModel(
+            ResolveObjectTransform(*parent), parent->RuntimeTransform()->AlignmentOffset());
+        model = parent_model * local;
+    }
+    m_model_transform_cache[key] = model;
+    return model;
 }
 
-const WPShaderValueData* WPNodeTransformResolver::FindNodeData(SceneNode* node) const {
-    if (node == nullptr || ! exists(m_node_data_map, node)) return nullptr;
-    return std::addressof(m_node_data_map.at(node));
-}
-
-Matrix4d WPNodeTransformResolver::ResolveModelTransform(SceneNode* node,
-                                                        const WPShaderValueData* node_data) {
+Matrix4d WPNodeTransformResolver::ResolveModelTransform(const SceneDraw& draw,
+                                                       const WPShaderValueData* data) {
+    if (const auto* phase = draw.Phase(); phase != nullptr) {
+        return phase->PlacementSpace() == SceneDrawPhase::Space::Camera
+            ? Matrix4d(Matrix4d::Identity()) : ResolveObjectTransform(phase->Owner());
+    }
+    auto* node = draw.Node();
     if (node == nullptr) return Matrix4d::Identity();
-    if (exists(m_model_transform_cache, node)) return m_model_transform_cache.at(node);
-
-    Matrix4d resolved = Matrix4d::Identity();
-    if (node_data != nullptr && node_data->InheritsSceneParentTransform() &&
-        node_data->TransformParent() != nullptr &&
-        exists(m_node_data_map, node_data->TransformParent())) {
-        const auto& parent_data = m_node_data_map.at(node_data->TransformParent());
-        auto*       parent_node  = node_data->TransformParent();
-        const auto  parent_model =
-            RemoveImageAlignmentOffsetFromModel(ResolveModelTransform(parent_node, &parent_data),
-                                                parent_node->AlignmentOffset());
-        resolved = parent_model * node->GetLocalTrans();
-    } else {
-        node->UpdateTrans();
-        resolved = node->ModelTrans();
+    if (auto* layer = data != nullptr ? data->effect_layer_projection.layer : nullptr;
+        layer != nullptr && layer->UsesOwnerTransform(node)) {
+        return ResolveObjectTransform(layer->Owner());
+    }
+    if (const auto* owner = m_scene.FindSceneObject(draw.LayerId(m_scene));
+        owner != nullptr && owner->LayerNode() == node) {
+        return ResolveObjectTransform(*owner);
+    }
+    if (const auto it = m_model_transform_cache.find(node); it != m_model_transform_cache.end()) {
+        return it->second;
     }
 
-    m_model_transform_cache[node] = resolved;
-    return resolved;
+    // Internal model/particle resources still carry local geometry transforms. Their parent can
+    // be an authored object, so resolve it through the same query instead of depending on a
+    // SceneNode cache that a previous attachment draw happened to mutate.
+    Matrix4d model = node->GetLocalTrans();
+    if (data != nullptr && data->InheritsSceneParentTransform() &&
+        data->TransformParent() != nullptr) {
+        auto* parent = data->TransformParent();
+        model = RemoveImageAlignmentOffsetFromModel(
+                    ResolveRawModelTransform(parent), parent->AlignmentOffset()) * model;
+    } else if (auto* parent = node->Parent(); parent != nullptr) {
+        model = ResolveRawModelTransform(parent) * model;
+    }
+    m_model_transform_cache[node] = model;
+    return model;
 }
 
-Vector3f WPNodeTransformResolver::ComputeParallaxOffset(SceneNode* node,
-                                                        const WPShaderValueData& node_data,
-                                                        const SceneCamera* camera) {
-    if (node == nullptr || camera == nullptr || ! m_parallax.enable) return Vector3f::Zero();
-    if (exists(m_parallax_offset_cache, node)) return m_parallax_offset_cache.at(node);
+const SceneObject* WPNodeTransformResolver::ParallaxRoot(const SceneDraw& draw) const {
+    const auto* root = m_scene.FindSceneObject(draw.LayerId(m_scene));
+    if (root == nullptr) return nullptr;
+    while (const auto* parent = m_scene.FindSceneObject(root->ParentId())) {
+        root = parent;
+    }
+    return root;
+}
 
-    Vector3f offset = Vector3f::Zero();
-    if (node_data.parallax_anchor != nullptr &&
-        exists(m_node_data_map, node_data.parallax_anchor)) {
-        const auto& parent_data = m_node_data_map.at(node_data.parallax_anchor);
-        if (! parent_data.IsBoneAttached()) {
-            offset = ComputeParallaxOffset(node_data.parallax_anchor, parent_data, camera);
+Vector3f WPNodeTransformResolver::ComputeParallaxOffset(const SceneDraw& draw,
+                                                       const WPShaderValueData& data,
+                                                       const SceneCamera* camera) {
+    if (!draw.Valid() || camera == nullptr || !m_parallax.enable) return Vector3f::Zero();
+    const auto key = draw.DataKey();
+    if (const auto it = m_parallax_offset_cache.find(key); it != m_parallax_offset_cache.end()) {
+        return it->second;
+    }
+
+    // Destination displacement uses the authored origin and depth of the object's root. Every
+    // descendant receives the same displacement, including nested bone attachments. Neither a
+    // transformed child position nor a name-matched peer supplies this input, and it never enters
+    // raw M.
+    Vector2f position;
+    Vector2f depth(data.parallaxDepth.data());
+    if (const auto* root = ParallaxRoot(draw);
+        root != nullptr && root->RuntimeTransform() != nullptr) {
+        position = root->RuntimeTransform()->Translate().head<2>();
+        if (const auto* root_data = FindNodeData(root->LayerNode()); root_data != nullptr) {
+            depth = Vector2f(root_data->parallaxDepth.data());
         }
     } else {
-        const auto model_trans = ResolveModelTransform(node, &node_data);
-        Vector3f   node_pos((float)model_trans(0, 3),
-                          (float)model_trans(1, 3),
-                          (float)model_trans(2, 3));
-        Vector2f depth(node_data.parallaxDepth[0], node_data.parallaxDepth[1]);
-
-        Vector2f ortho { (float)m_scene.ortho[0], (float)m_scene.ortho[1] };
-        Vector2f mouse_vec =
-            Scaling(1.0f, -1.0f) * (Vector2f { 0.5f, 0.5f } - Vector2f(&m_mouse_pos[0]));
-        mouse_vec = mouse_vec.cwiseProduct(ortho) * m_parallax.mouseinfluence;
-
-        Vector3f cam_pos = camera->GetPosition().cast<float>();
-        Vector2f para_vec =
-            (node_pos.head<2>() - cam_pos.head<2>() + mouse_vec).cwiseProduct(depth) *
-            m_parallax.amount;
-        offset = Vector3f(para_vec.x(), para_vec.y(), 0.0f);
+        position = ResolveModelTransform(draw, &data).block<2, 1>(0, 3).cast<float>();
     }
 
-    m_parallax_offset_cache[node] = offset;
-    return offset;
-}
-
-void WPNodeTransformResolver::ApplyResolvedParentDelta(SceneNode* target_parent,
-                                                       const WPShaderValueData& parent_data,
-                                                       Affine3f& local_transform) {
-    if (target_parent == nullptr) return;
-
-    target_parent->UpdateTrans();
-    const auto parent_actual_model   = target_parent->ModelTrans();
-    const auto parent_resolved_model = ResolveModelTransform(target_parent, &parent_data);
-    const auto parent_actual_linear  = parent_actual_model.block<3, 3>(0, 0);
-    if (std::abs(parent_actual_linear.determinant()) <= 1e-12) return;
-
-    const auto resolved_delta = parent_actual_model.inverse() * parent_resolved_model;
-    local_transform           = Affine3f(resolved_delta.cast<float>()) * local_transform;
-}
-
-void WPNodeTransformResolver::ApplyParentParallaxToAttachment(SceneNode* parent_node,
-                                                              const WPShaderValueData& parent_data,
-                                                              Affine3f& local_transform) {
-    if (parent_node == nullptr || m_parallax_camera == nullptr || ! m_parallax.enable) return;
-    if (parent_data.IsBoneAttached()) {
-        // Nested attachments resolve their parent SceneNode local transform before the child is
-        // evaluated. That resolved parent local transform already carries the inherited camera
-        // parallax needed to keep the attached artwork locked to the parent puppet. Injecting the
-        // same parent parallax again here makes the offset accumulate once per attachment depth
-        // (body -> leg -> shoe), which pulls shoe overlays away from the base foot artwork. Direct
-        // attachments to normal puppet layers still fall through because their parent parallax is
-        // shader-only and must be converted into the attachment's local space.
-        return;
-    }
-
-    const auto parent_parallax = ComputeParallaxOffset(parent_node, parent_data, m_parallax_camera);
-    const auto parent_model    = ResolveModelTransform(parent_node, &parent_data);
-    Matrix3f   parent_linear   = parent_model.block<3, 3>(0, 0).cast<float>();
-    Vector3f   parent_parallax_local = parent_parallax;
-    if (std::abs(parent_linear.determinant()) > 1e-6f) {
-        parent_parallax_local = parent_linear.inverse() * parent_parallax;
-    }
-    local_transform.translation() += parent_parallax_local;
-}
-
-std::optional<Affine3f> WPNodeTransformResolver::ResolveAttachmentLocalTransform(
-    SceneNode* node, const WPShaderValueData& node_data) {
-    if (node == nullptr || ! node_data.IsBoneAttached() || node_data.TransformParent() == nullptr ||
-        ! exists(m_node_data_map, node_data.TransformParent())) {
-        return std::nullopt;
-    }
-
-    if (exists(m_attachment_transform_cache, node)) {
-        return m_attachment_transform_cache.at(node);
-    }
-
-    auto* parent_node = node_data.TransformParent();
-    auto& parent_data = m_node_data_map.at(parent_node);
-    if (parent_data.IsBoneAttached()) {
-        auto parent_transform = ResolveAttachmentLocalTransform(parent_node, parent_data);
-        if (! parent_transform.has_value()) return std::nullopt;
-        parent_node->SetLocalAffine(*parent_transform);
-    }
-
-    if (! parent_data.puppet_layer.hasPuppet()) return std::nullopt;
-
-    parent_data.puppet_layer.AdvanceIfNeeded(m_scene.frameTime, m_puppet_frame_serial);
-    const auto* parent_puppet = parent_data.puppet_layer.Puppet();
-    if (parent_puppet == nullptr) return std::nullopt;
-
-    // MDAT attachment locators are bone-local. The multiplication order below is the coordinate
-    // contract: the current animated bone frame moves the authored locator, then the child keeps
-    // its own local origin/rotation/scale. Treating bind_transform as model space, or premultiplying
-    // it by inverse(bindBoneModel), double-converts the locator and breaks non-root attachment points.
-    Affine3f local_transform =
-        parent_puppet->BoneModelTransform(node_data.transform_binding.bone_index) *
-        node_data.transform_binding.bind_transform * node_data.transform_binding.local_transform;
-    ApplyResolvedParentDelta(parent_node, parent_data, local_transform);
-    ApplyParentParallaxToAttachment(parent_node, parent_data, local_transform);
-    m_attachment_transform_cache[node] = local_transform;
-    return local_transform;
+    const Vector2f ortho((float)m_scene.ortho[0], (float)m_scene.ortho[1]);
+    Vector2f mouse = Scaling(1.0f, -1.0f) *
+        (Vector2f(0.5f, 0.5f) - Vector2f(m_mouse_pos.data()));
+    mouse = mouse.cwiseProduct(ortho) * m_parallax.mouseinfluence;
+    const Vector2f offset =
+        (position - camera->GetPosition().head<2>().cast<float>() + mouse)
+            .cwiseProduct(depth) * m_parallax.amount;
+    const Vector3f result(offset.x(), offset.y(), 0.0f);
+    m_parallax_offset_cache[key] = result;
+    return result;
 }

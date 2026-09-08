@@ -16,6 +16,7 @@
 #include <Eigen/Geometry>
 #include <iostream>
 #include <ctime>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -63,6 +64,21 @@ struct MeshBounds2D {
 Matrix4d ApplyMeshGeometryTransform(const Matrix4d& model, const SceneMesh* mesh) {
     if (mesh == nullptr) return model;
     return model * mesh->GeometryTransform().matrix().cast<double>();
+}
+
+std::array<float, 12> NormalizedModelBasis(const Matrix4d& model) {
+    // Both normal uploads remove the length of each basis column directly, retaining shear and
+    // reflection. A mat3 occupies three padded float4 columns in the DXC constant-buffer layout.
+    Eigen::Matrix3d basis = model.topLeftCorner<3, 3>();
+    std::array<float, 12> packed {};
+    for (int column = 0; column < 3; ++column) {
+        basis.col(column).normalize();
+        for (int row = 0; row < 3; ++row) {
+            packed[static_cast<size_t>(column) * 4 + row] =
+                static_cast<float>(basis(row, column));
+        }
+    }
+    return packed;
 }
 
 float SanitizeMouseCoord(double value) {
@@ -118,12 +134,9 @@ MeshBounds2D ComputeMeshBounds2D(const SceneMesh* mesh) {
     return MeshBounds2D { .valid = true, .center = center, .halfExtent = halfExtent };
 }
 
-bool IsModelRenderNode(SceneNode* node) {
-    auto* mesh = node != nullptr ? node->Mesh() : nullptr;
+bool IsModelMaterial(const SceneDraw& draw) {
+    auto* mesh = draw.Mesh();
     const auto* material = mesh != nullptr ? mesh->Material() : nullptr;
-    // `g_EyePosition` updates are scoped to materials explicitly marked by WPModelObject
-    // materialization. This prevents the new 3D camera uniform support from changing any legacy 2D
-    // image, effect, text, or particle shader that happens to declare the same uniform name.
     return material != nullptr && material->modelRenderState.has_value();
 }
 
@@ -139,11 +152,10 @@ ShaderValue ToDxcRowVectorSkinningUniform(std::span<const Affine3f> matrices) {
     return ShaderValue(PackDxcRowVectorSkinningUniform(matrices));
 }
 
-Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
-                                        const SceneMesh* projectionMesh,
+Matrix4d ComputeEffectTextureProjection(const SceneMesh* projectionMesh,
                                         const Matrix4d&  projectionModelTrans,
                                         const Matrix4d&  viewProjectionTrans) {
-    if (projectionNode == nullptr || projectionMesh == nullptr) return Matrix4d::Identity();
+    if (projectionMesh == nullptr) return Matrix4d::Identity();
 
     const auto bounds = ComputeMeshBounds2D(projectionMesh);
     if (!bounds.valid) return viewProjectionTrans * projectionModelTrans;
@@ -155,12 +167,12 @@ Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
     return viewProjectionTrans * projectionModelTrans * localFromNormalized;
 }
 
-std::string_view ResolveEffectiveNodeCameraName(const SceneNode* node) {
-    // Effect-backed text still contributes intermediate bridge-source quads to the generic image
-    // path while the logical text owner carries the camera binding. Walking ancestors here lets
-    // those bridge-source quads inherit the same offscreen camera contract as the owning text
-    // primitive, so text effects stay synchronized without any text-specific fallback camera path.
-    for (auto* current = node; current != nullptr; current = current->Parent()) {
+std::string_view ResolveEffectiveDrawCameraName(const SceneDraw& draw) {
+    // Publication has an explicit projection selection and no parent hierarchy. Node-based
+    // source draws still inherit their camera from the traversal parent, including glyph quads
+    // whose logical text owner supplies the private source camera.
+    if (draw.Phase() != nullptr) return draw.Camera();
+    for (auto* current = draw.Node(); current != nullptr; current = current->Parent()) {
         if (!current->Camera().empty()) return current->Camera();
     }
     return {};
@@ -172,7 +184,6 @@ void WPShaderValueUpdater::PrepareFrame() {
     m_puppet_frame_serial++;
     m_modelTransformCache.clear();
     m_parallaxOffsetCache.clear();
-    m_attachmentTransformCache.clear();
     // 3D model camera paths are sampled before uniforms so the model-only camera projection,
     // g_EyePosition, and view-basis uniforms all describe the same frame. Scenes without model
     // camera paths return immediately inside Scene and keep the legacy 2D path untouched.
@@ -189,8 +200,6 @@ void WPShaderValueUpdater::PrepareFrame() {
                                                m_nodeDataMap,
                                                m_modelTransformCache,
                                                m_parallaxOffsetCache,
-                                               m_attachmentTransformCache,
-                                               nullptr,
                                                m_parallaxPointerPos,
                                                m_puppet_frame_serial);
         for (auto& light : m_scene->lights) {
@@ -258,22 +267,6 @@ void WPShaderValueUpdater::AdvanceAllPuppets() {
         notification_nodes.push_back(static_cast<SceneNode*>(addr));
     }
 
-    // Surface synchronization is a frame-preparation transaction. Every binding reads the pose
-    // snapshot cached above, while SceneImageEffectLayer deduplicates multiple consumers of the
-    // same private surface and owns all camera, target and publication-mesh changes.
-    for (auto& [addr, nodeData] : m_nodeDataMap) {
-        (void)addr;
-        if (!nodeData.puppet_layer.hasPuppet() || nodeData.puppet_surface.layer == nullptr ||
-            nodeData.puppet_surface.skinned_mesh == nullptr) {
-            continue;
-        }
-        nodeData.puppet_surface.layer->PreparePuppetSurface(
-            *m_scene,
-            *nodeData.puppet_surface.skinned_mesh,
-            nodeData.puppet_layer.PoseSnapshot(),
-            m_puppet_frame_serial);
-    }
-
     if (m_scene->scriptHost != nullptr) {
         for (auto* node : notification_nodes) {
             m_scene->scriptHost->NotifyAnimationLayersAdvanced(node);
@@ -284,35 +277,72 @@ void WPShaderValueUpdater::AdvanceAllPuppets() {
 void WPShaderValueUpdater::FrameEnd() {}
 
 Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
-    SceneNode* node, const SceneCamera* camera, bool apply_parallax) {
-    if (m_scene == nullptr || node == nullptr) return Matrix4d::Identity();
+    const SceneDraw& draw, const SceneCamera* camera, bool apply_parallax) {
+    if (m_scene == nullptr || !draw.Valid()) return Matrix4d::Identity();
 
     // Projection can run before render-graph refresh while ordinary uniform updates happen during
     // draw. Isolated caches make this query observe the current node graph without consuming a
     // matrix cached before a script changed an origin, scale, parent, or attachment in this frame.
     Map<void*, Matrix4d> local_model_cache;
     Map<void*, Vector3f> local_parallax_cache;
-    Map<void*, Affine3f> local_attachment_cache;
     WPNodeTransformResolver transform_resolver(*m_scene,
                                                m_parallax,
                                                m_nodeDataMap,
                                                local_model_cache,
                                                local_parallax_cache,
-                                               local_attachment_cache,
-                                               camera,
                                                m_parallaxPointerPos,
                                                m_puppet_frame_serial);
 
-    if (const auto* node_data = GetNodeData(node); node_data != nullptr) {
-        transform_resolver.UpdateAttachmentParentIfNeeded(*node_data);
-        if (const auto local_transform =
-                transform_resolver.ResolveAttachmentLocalTransform(node);
-            local_transform.has_value()) {
-            node->SetLocalAffine(*local_transform);
-        }
-    }
 
-    return transform_resolver.ResolveParallaxedModelTransform(node, camera, apply_parallax);
+    return transform_resolver.ResolveParallaxedModelTransform(draw, camera, apply_parallax);
+}
+
+WPShaderValueUpdater::EffectProjectionSnapshot
+WPShaderValueUpdater::ResolveEffectProjectionSnapshot(const SceneImageEffectLayer& layer) {
+    if (layer.UsesShapeDraw()) {
+        // Shape's direct callback never enters the image destination operation that captures
+        // owner I and placement MVP. Its stored effect matrices therefore retain the
+        // constructor's identity on this draw path. Live owner/camera matrices still drive
+        // rasterization; substituting them here would invent an image snapshot boundary merely
+        // because a shader requests it.
+        return { Matrix4d::Identity(), Matrix4d::Identity(),
+                 Matrix4d::Identity(), Matrix4d::Identity() };
+    }
+    const auto& camera_name = layer.EffectSnapshotCamera();
+    const bool composition = !camera_name.empty();
+    const auto* camera = composition ? m_scene->cameras.at(camera_name).get()
+                                     : m_scene->activeCamera;
+
+    // Snapshot I is replaced by the raw owner matrix before private raster state is installed.
+    // Resolve the authored owner even when the final draw uses an identity fullscreen quad. Use
+    // separate query caches because a preceding source draw or diagnostic may have evaluated
+    // parallax with a private camera.
+    Map<void*, Matrix4d> model_cache;
+    Map<void*, Vector3f> parallax_cache;
+    WPNodeTransformResolver resolver(*m_scene, m_parallax, m_nodeDataMap, model_cache,
+                                      parallax_cache, m_parallaxPointerPos, m_puppet_frame_serial);
+    const SceneDraw owner_draw(layer.Owner().LayerNode());
+    EffectProjectionSnapshot snapshot;
+    snapshot.layer_model = resolver.ResolveRawModelTransform(owner_draw);
+    snapshot.placed_model = snapshot.layer_model;
+
+    // The composition child walk uses a centered camera and identity destination throughout. Its
+    // inverse-owner I participates in child rasterization, but is overwritten for this snapshot.
+    // Outside that walk, root displacement remains in the destination. Source suppression and the
+    // final material's camera describe later draw phases and cannot change either of these saved
+    // factors.
+    if (composition) {
+        snapshot.view_projection = camera->GetProjectionMatrix();
+        snapshot.incoming_view_projection = snapshot.view_projection;
+    } else {
+        snapshot.view_projection = camera->GetViewProjectionMatrix();
+        const Vector3d offset = resolver.ResolveParallaxOffset(owner_draw, camera).cast<double>();
+        snapshot.incoming_view_projection = snapshot.view_projection *
+            Affine3d(Translation3d(offset)).matrix();
+        snapshot.placed_model =
+            Affine3d(Translation3d(offset)).matrix() * snapshot.layer_model;
+    }
+    return snapshot;
 }
 
 void WPShaderValueUpdater::MouseInput(double x, double y) {
@@ -320,12 +350,13 @@ void WPShaderValueUpdater::MouseInput(double x, double y) {
     m_pointerPosInput[1] = SanitizeMouseCoord(y);
 }
 
-void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp& existsOp) {
-    m_nodeUniformInfoMap[pNode] = WPUniformInfo();
-    auto& info                  = m_nodeUniformInfoMap[pNode];
+void WPShaderValueUpdater::InitUniforms(const SceneDraw& draw, const ExistsUniformOp& existsOp) {
+    m_nodeUniformInfoMap[draw.DataKey()] = WPUniformInfo();
+    auto& info                  = m_nodeUniformInfoMap[draw.DataKey()];
     info.has_MI                 = existsOp(G_MI);
     info.has_M                  = existsOp(G_M);
     info.has_AM                 = existsOp(G_AM);
+    info.has_ANM                = existsOp(G_ANM);
     info.has_AVP                = existsOp(G_AVP);
     info.has_EM                 = existsOp(G_EM);
     info.has_RV0                = existsOp(G_RV0);
@@ -336,6 +367,7 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_MVP                = existsOp(G_MVP);
     info.has_LMM                = existsOp(G_LMM);
     info.has_EMVP               = existsOp(G_EMVP);
+    info.has_EMVPI              = existsOp(G_EMVPI);
     info.has_MVPI               = existsOp(G_MVPI);
     info.has_ETVP               = existsOp(G_ETVP);
     info.has_ETVPI              = existsOp(G_ETVPI);
@@ -354,8 +386,8 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
     info.has_SCREEN           = existsOp(G_SCREEN);
     info.has_LP               = existsOp(G_LP);
-    info.has_model_LCP        = IsModelRenderNode(pNode) && existsOp(G_LCP);
-    info.has_LCR              = IsModelRenderNode(pNode) && existsOp(G_LCR);
+    info.has_model_LCP        = IsModelMaterial(draw) && existsOp(G_LCP);
+    info.has_LCR              = IsModelMaterial(draw) && existsOp(G_LCR);
     info.has_LPOINT_ORIGIN    = existsOp(G_LPOINT_ORIGIN);
     info.has_LPOINT_COLOR     = existsOp(G_LPOINT_COLOR);
     info.has_LSPOT_ORIGIN     = existsOp(G_LSPOT_ORIGIN);
@@ -371,15 +403,15 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     info.has_LFEAT_SHADOW_POINT_XFORM = existsOp(G_LFEAT_SHADOW_POINT_XFORM);
     info.has_LFEAT_SHADOW_PROJ        = existsOp(G_LFEAT_SHADOW_PROJ);
     info.has_LFEAT_SHADOW_PROJ_XFORM  = existsOp(G_LFEAT_SHADOW_PROJ_XFORM);
-    // Particle shaders in a 3D scene are fed by the same camera/destination chain as model
-    // shaders. Their eye and view basis must therefore follow the named model camera as it
-    // moves; leaving the parse-time orthographic constants in place rotates trail ribbons and
-    // view-dependent particle quads against a different camera than their projection matrix.
+    // Particle shaders in a 3D scene share the model camera's view basis. Eye position has
+    // its own frame-level binding below and does not depend on this draw-camera selection.
     const bool follows_scene_camera =
-        IsModelRenderNode(pNode) ||
-        (m_scene != nullptr && ! m_scene->modelPerspectiveCameraName.empty() && pNode != nullptr &&
-         pNode->Camera() == m_scene->modelPerspectiveCameraName);
-    info.has_EYE_POSITION     = follows_scene_camera && existsOp(G_EYE_POSITION);
+        IsModelMaterial(draw) ||
+        (m_scene != nullptr && ! m_scene->modelPerspectiveCameraName.empty() &&
+         draw.Camera() == m_scene->modelPerspectiveCameraName);
+    // Every material requesting g_EyePosition receives the scene frame eye, including
+    // lit/reflected image sources and private effect passes.
+    info.has_EYE_POSITION     = existsOp(G_EYE_POSITION);
     info.has_NORMAL_MODEL_MATRIX = existsOp(G_NORMAL_MODEL_MATRIX);
     info.has_VIEWUP           = follows_scene_camera && existsOp(G_VIEWUP);
     info.has_VIEWRIGHT        = follows_scene_camera && existsOp(G_VIEWRIGHT);
@@ -397,10 +429,11 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
     });
 }
 
-void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprites,
+void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& sprites,
                                           const UpdateUniformOp& updateOp,
                                           const ShaderUniformOverrides* overrides) {
-    const auto node_cam_name = ResolveEffectiveNodeCameraName(pNode);
+    auto* pNode = draw.Node();
+    const auto node_cam_name = ResolveEffectiveDrawCameraName(draw);
     const bool use_active_camera_for_uniforms =
         overrides != nullptr && overrides->use_active_camera_for_uniforms;
     const bool has_named_camera_override =
@@ -420,7 +453,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             LOG_ERROR("ShaderUniformCameraOverride: camera '%.*s' not found for node '%s'",
                       static_cast<int>(uniform_cam_name.size()),
                       uniform_cam_name.data(),
-                      pNode != nullptr ? pNode->Name().c_str() : "<null>");
+                      draw.Name().c_str());
             camera = m_scene->activeCamera;
         }
     } else {
@@ -439,143 +472,65 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
     Map<void*, Matrix4d> localModelTransformCache;
     Map<void*, Vector3f> localParallaxOffsetCache;
-    Map<void*, Affine3f> localAttachmentTransformCache;
     auto& modelTransformCache =
         use_camera_local_transform_caches ? localModelTransformCache : m_modelTransformCache;
     auto& parallaxOffsetCache =
         use_camera_local_transform_caches ? localParallaxOffsetCache : m_parallaxOffsetCache;
-    auto& attachmentTransformCache =
-        use_camera_local_transform_caches ? localAttachmentTransformCache
-                                          : m_attachmentTransformCache;
 
     WPNodeTransformResolver transformResolver(*m_scene,
                                               m_parallax,
                                               m_nodeDataMap,
                                               modelTransformCache,
                                               parallaxOffsetCache,
-                                              attachmentTransformCache,
-                                              use_camera_local_transform_caches
-                                                  ? model_parallax_camera
-                                                  : m_scene->activeCamera,
                                               m_parallaxPointerPos,
                                               m_puppet_frame_serial);
 
-    if (exists(m_nodeDataMap, pNode)) {
-        auto& nodeData = m_nodeDataMap.at(pNode);
-        transformResolver.UpdateAttachmentParentIfNeeded(nodeData);
-        auto localTransform = transformResolver.ResolveAttachmentLocalTransform(pNode);
-        if (localTransform.has_value()) {
-            SceneImageEffectLayer* effectLayer { nullptr };
-            if (!node_cam_name.empty()) {
-                // pNode renders through its layer's private bridge camera exactly when it is the
-                // effect-source route; resolve the bridge through the owning layer instead of a
-                // camera back-reference.
-                auto* candidate = m_scene->FindImageEffectLayer(m_scene->LayerIdForNode(pNode));
-                if (candidate != nullptr &&
-                    std::string_view(candidate->BridgeCameraName()) == node_cam_name) {
-                    effectLayer = candidate;
-                }
-            }
-
-            if (effectLayer != nullptr) {
-                if (auto* worldNode = effectLayer->WorldNode()) {
-                    worldNode->SetLocalAffine(*localTransform);
-                    worldNode->UpdateTrans();
-                    effectLayer->SyncResolvedNodeToWorld();
-                }
-            } else {
-                pNode->SetLocalAffine(*localTransform);
-            }
-        }
-    }
-
-    pNode->UpdateTrans();
-
-    if (! node_cam_name.empty()) {
-        auto* effectLayer = m_scene->FindImageEffectLayer(m_scene->LayerIdForNode(pNode));
-        if (effectLayer != nullptr &&
-            std::string_view(effectLayer->BridgeCameraName()) == node_cam_name) {
-            auto* worldNode   = effectLayer->WorldNode();
-            if (worldNode != nullptr && exists(m_nodeDataMap, worldNode)) {
-                auto& worldNodeData = m_nodeDataMap.at(worldNode);
-                transformResolver.UpdateAttachmentParentIfNeeded(worldNodeData);
-                if (worldNodeData.IsBoneAttached()) {
-                    // Effect-backed layers draw their source into a private camera, then composite a
-                    // detached final node back into the visible scene. That world node does not get a
-                    // normal SceneNode tree update carrying the puppet bone and inherited parallax
-                    // into the detached writer. Resolve the attachment here before synchronizing the
-                    // effect output matrix so visibility changes preserve the same camera parallax.
-                    auto localTransform = transformResolver.ResolveAttachmentLocalTransform(worldNode);
-                    if (localTransform.has_value()) {
-                        worldNode->SetLocalAffine(*localTransform);
-                        worldNode->UpdateTrans();
-                    }
-                }
-                if (worldNodeData.InheritsSceneParentTransform() || worldNodeData.IsBoneAttached()) {
-                    const SceneCamera* displayCamera =
-                        m_scene->activeCamera != nullptr ? m_scene->activeCamera : camera;
-                    // Composition source routes publish a child layer's private authored effect
-                    // through the neutral final composite. Keep that publisher on the raw routed
-                    // world transform here; the actual compose-source pass applies the chosen
-                    // source camera and camera-parallax exactly once. Syncing it to the active
-                    // screen camera here would bake one parallax offset into the node transform,
-                    // then the compose pass would add another one, which pulls effect-backed body
-                    // parts away from direct siblings such as faces and eyes.
-                    const auto worldModel =
-                        effectLayer->PublishesPrivateFinalComposite()
-                            ? transformResolver.ResolveRawModelTransform(worldNode)
-                            : transformResolver.ResolveParallaxedModelTransform(
-                                  worldNode, displayCamera, displayCamera != nullptr);
-                    effectLayer->SyncResolvedNodeToMatrix(Affine3f(worldModel.cast<float>()));
-                }
-            }
-        }
-    }
 
     // Text is now allowed to be a first-class renderable without a backing SceneMesh material.
     // The old updater returned early here, which made transform uniforms unavailable to any
     // render path that was not disguised as a mesh/custom-shader node. Keeping material access
     // optional lets the dedicated text pass reuse the same attachment/parallax/camera transform
     // logic while still skipping mesh-only material uniform work when no mesh exists.
-    auto* material = pNode->Mesh() != nullptr ? pNode->Mesh()->Material() : nullptr;
+    auto* material = draw.Mesh() != nullptr ? draw.Mesh()->Material() : nullptr;
     // auto& shadervs = material->customShader.updateValueList;
     // const auto& valueSet = material->customShader.valueSet;
 
-    assert(exists(m_nodeUniformInfoMap, pNode));
-    const auto& info = m_nodeUniformInfoMap[pNode];
+    assert(exists(m_nodeUniformInfoMap, draw.DataKey()));
+    const auto& info = m_nodeUniformInfoMap[draw.DataKey()];
 
-    bool hasNodeData = exists(m_nodeDataMap, pNode);
-    if (hasNodeData) {
-        auto& nodeData = m_nodeDataMap.at(pNode);
-        for (const auto& el : nodeData.renderTargets) {
-            if (m_scene->renderTargets.count(el.second) == 0) continue;
-            const auto& rt = m_scene->renderTargets[el.second];
-
-            const auto& unifrom_tex = info.texs[el.first];
-            const auto  resolution  = rt.ResolutionVector();
-
-            if (unifrom_tex.has_resolution) {
-                // Runtime render targets expose one canonical resolution contract through
-                // `ResolutionVector()`: physical size in `.xy`, logical content size in `.zw`.
-                // Uniform updates should always forward that authoritative scene-side contract
-                // directly instead of layering text-specific interpretation on top of it.
-                updateOp(WE_GLTEX_RESOLUTION_NAMES[el.first],
-                         ShaderValue(array_cast<float>(resolution)));
-            }
-            if (unifrom_tex.has_texel) {
-                updateOp(WE_GLTEX_TEXEL_NAMES[el.first], TextureTexelUniform(resolution));
-            }
-            if (unifrom_tex.has_mipmap) {
-                updateOp(WE_GLTEX_MIPMAPINFO_NAMES[el.first], (float)rt.mipmap_level);
-            }
-        }
-        if (nodeData.puppet_layer.hasPuppet() && info.has_BONES) {
-            const auto pose = nodeData.puppet_layer.PoseSnapshot();
+    bool hasNodeData = exists(m_nodeDataMap, draw.DataKey());
+    const auto* layer = hasNodeData
+        ? m_nodeDataMap.at(draw.DataKey()).effect_layer_projection.layer : nullptr;
+    const bool image_prelighting_source = layer != nullptr &&
+        layer->Owner().LayerNode() == pNode && layer->UsesPrelightingSource();
+    if (info.has_BONES) {
+        // Publication is a drawing phase of its authored owner. Read skinning from that
+        // owner's canonical node, while keeping the phase's projection/material data separate.
+        // Registering a second pose consumer in the animation-advance map would allow a phase
+        // address to enter SceneNode notification paths and duplicate animation ownership.
+        const void* pose_key = draw.Phase() != nullptr
+            ? draw.Phase()->Owner().LayerNode() : draw.DataKey();
+        const auto* pose_data = GetNodeData(pose_key);
+        if (pose_data != nullptr && pose_data->puppet_layer.hasPuppet()) {
+            const auto pose = pose_data->puppet_layer.PoseSnapshot();
             // PrepareFrame() is the sole pose-advance boundary. Uniform consumers only publish the
             // immutable snapshot selected for this frame, so mask pre-passes, clipped main passes
             // and effect writers cannot independently advance animation or mutate render topology.
             assert(pose.frame_serial == m_puppet_frame_serial);
             updateOp(G_BONES, ToDxcRowVectorSkinningUniform(pose.skinning));
+            const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+            if (draw.Phase() != nullptr && trace_layer != nullptr &&
+                std::to_string(draw.LayerId(*m_scene)) == trace_layer &&
+                (m_puppet_frame_serial == 1 || m_puppet_frame_serial == 121 ||
+                 m_puppet_frame_serial == 601)) {
+                LOG_INFO("ScenePuppetPublicationPose: layer=%d node='%s' owner='%s' "
+                         "frame=%llu pose-frame=%llu revision=%llu bones=%zu",
+                         draw.LayerId(*m_scene), draw.Name().c_str(),
+                         draw.Phase()->Owner().LayerNode()->Name().c_str(),
+                         static_cast<unsigned long long>(m_puppet_frame_serial),
+                         static_cast<unsigned long long>(pose.frame_serial),
+                         static_cast<unsigned long long>(pose.revision), pose.skinning.size());
+            }
         }
     }
 
@@ -583,9 +538,30 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         const auto tex_count = std::min(material->textures.size(), info.texs.size());
         for (size_t i = 0; i < tex_count; i++) {
             const auto& texture_uniforms = info.texs[i];
-            if (! texture_uniforms.has_resolution && ! texture_uniforms.has_texel) continue;
-            const auto& name = material->textures[i];
-            if (name.empty() || m_scene->renderTargets.count(name) != 0) continue;
+            if (!texture_uniforms.has_resolution && !texture_uniforms.has_texel &&
+                !texture_uniforms.has_mipmap) continue;
+            const auto& name = material->Texture(i);
+            if (name.empty()) continue;
+            // Effect chains can select a new destination after text re-layout or a pass swap.
+            // Resolve dimensions from the material's current texture slot, just as descriptor
+            // binding does. A separate parse-time list retains the previous interned image and
+            // makes blur offsets and sampling bounds disagree with the image actually sampled.
+            const auto target_it = m_scene->renderTargets.find(name);
+            if (target_it != m_scene->renderTargets.end()) {
+                const auto& target = target_it->second;
+                const auto resolution = target.ResolutionVector();
+                if (texture_uniforms.has_resolution) {
+                    updateOp(WE_GLTEX_RESOLUTION_NAMES[i],
+                             ShaderValue(array_cast<float>(resolution)));
+                }
+                if (texture_uniforms.has_texel) {
+                    updateOp(WE_GLTEX_TEXEL_NAMES[i], TextureTexelUniform(resolution));
+                }
+                if (texture_uniforms.has_mipmap) {
+                    updateOp(WE_GLTEX_MIPMAPINFO_NAMES[i], (float)target.mipmap_level);
+                }
+                continue;
+            }
             const auto texture_it = m_scene->textures.find(name);
             if (texture_it == m_scene->textures.end()) continue;
             const auto resolution =
@@ -605,128 +581,250 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     bool reqAM    = info.has_AM;
     bool reqMVP   = info.has_MVP;
     bool reqLMM   = info.has_LMM;
+    bool reqEM    = info.has_EM;
     bool reqEMVP  = info.has_EMVP;
+    bool reqEMVPI = info.has_EMVPI;
     bool reqMVPI  = info.has_MVPI;
     bool reqETVP  = info.has_ETVP;
     bool reqETVPI = info.has_ETVPI;
 
     Matrix4d viewProTrans = camera->GetViewProjectionMatrix();
     const auto camera_node = camera->GetAttachedNode();
-
-    if (info.has_VP) {
-        updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
+    const bool reflection_pass = overrides != nullptr && overrides->reflection_pass;
+    if (reflection_pass) {
+        // The compositor's destination stack is separate from the owner's I matrix. Insert the
+        // Y=0 reflection after the incoming view, before the authored model, and apply the
+        // top-down projection convention. In particular, reflecting a local chunk scale leaves
+        // the owner's translation on the wrong side of the floor and changes M/normal/lighting
+        // uniforms incorrectly.
+        Matrix4d projection = camera->GetProjectionMatrix();
+        projection(1, 1) = -projection(1, 1);
+        const Matrix4d reflection = Affine3d(Eigen::Scaling(1.0, -1.0, 1.0)).matrix();
+        viewProTrans = projection * camera->GetViewMatrix() * reflection;
     }
-    if (reqM || reqAM || reqMVP || reqLMM || reqEMVP || reqMI || reqMVPI || reqETVP ||
-        reqETVPI) {
-        Matrix4d modelTrans =
-            transformResolver.ResolveParallaxedModelTransform(
-                pNode, model_parallax_camera, uniform_cam_name != "effect");
-        if (use_active_parallax_camera) {
-            const auto source_camera_node = camera->GetAttachedNode();
-            const auto source_camera_data =
-                source_camera_node != nullptr && exists(m_nodeDataMap, source_camera_node.get())
-                    ? &m_nodeDataMap.at(source_camera_node.get())
-                    : nullptr;
-            if (source_camera_data != nullptr && source_camera_data->AppliesModelParallax()) {
-                // Composition-source routes project a child through the source camera, then the
-                // parent composition layer publishes that source texture through its own final
-                // scene-space writer. The child model therefore needs active-camera parallax minus
-                // the parallax already represented by the source camera's attached layer; otherwise
-                // parent depth is added twice for authored parallax groups, while source-camera
-                // relative parallax drops the root fallback movement for groups whose final writer
-                // deliberately suppresses its own model parallax.
-                const auto source_parallax =
-                    transformResolver.ResolveParallaxOffset(source_camera_node.get(),
-                                                            model_parallax_camera);
-                modelTrans =
-                    Affine3d(Eigen::Translation3d((-source_parallax).cast<double>())).matrix() *
-                    modelTrans;
-            }
-        }
 
-        if (has_named_camera_override && overrides->use_active_camera_for_parallax &&
-            camera_node != nullptr) {
-            // A composition source is rasterized in the owning layer's local coordinate system and
-            // its neutral final composite applies the owning layer's world transform afterwards.
-            // Routed children, however, resolve directly to world space because their physical
-            // SceneNode parent is only an ordering proxy. Rebase those world matrices through the
-            // exact source-camera view used by the pass: VP * inverse(V) cancels the camera pose,
-            // while inverse(cameraWorld) removes the composition root and every routed ancestor.
-            // The resulting source texture therefore contains child-local geometry, leaving the
-            // final publisher as the sole owner of parent translation, rotation, and scale.
-            const auto source_camera_world =
-                transformResolver.ResolveRawModelTransform(camera_node.get());
-            modelTrans = camera->GetViewMatrix().inverse() * source_camera_world.inverse() *
+    if (reqM || reqAM || reqMVP || reqLMM || reqEM || reqEMVP || reqEMVPI || reqMI ||
+        reqMVPI || reqETVP || reqETVPI || info.has_VP || info.has_NORMAL_MODEL_MATRIX) {
+        // The model uniform is the object's I transform. Camera parallax belongs to the
+        // destination state used for this draw, so VP includes that translation while M does not.
+        // Keeping the factors separate also makes shaders that multiply VP and M agree with
+        // shaders that consume the combined MVP, without storing a camera-dependent transform on
+        // any authored object or detached publication node. Ordinary offscreen source
+        // rasterization selects an identity I matrix. Its geometry and skinning still belong to
+        // the authored object; scripts and child queries always resolve that object's live
+        // transform independently of this submitted draw state.
+        const bool geometry_space =
+            overrides != nullptr && overrides->model_space == ShaderModelSpace::Geometry;
+        Matrix4d modelTrans = geometry_space
+            ? Matrix4d::Identity()
+            : transformResolver.ResolveRawModelTransform(draw);
+        Vector3d destinationOffset = Vector3d::Zero();
+        const bool composition_draw = !geometry_space && !use_active_camera_for_uniforms &&
+            has_named_camera_override && overrides->use_active_camera_for_parallax &&
+            camera_node != nullptr;
+        // Private material rasterization uses identity destination state; root displacement
+        // belongs to the restored scene destination. Composition children also retain identity
+        // destination state for the entire child walk. A source's nonzero owner depth must never
+        // move its pixels inside a private target.
+        if (!geometry_space && !composition_draw && hasNodeData &&
+            (camera == m_scene->activeCamera || use_active_parallax_camera) &&
+            m_nodeDataMap.at(draw.DataKey()).AppliesModelParallax()) {
+            destinationOffset =
+                transformResolver.ResolveParallaxOffset(draw, model_parallax_camera).cast<double>();
+        }
+        if (composition_draw) {
+            // The composition child walk replaces I with the inverse raw owner matrix,
+            // destination with identity, and camera with a centered orthographic projection. Each
+            // child's draw then multiplies that I by its own raw object matrix. Keep those exact
+            // uniform factors: cancelling an attached view matrix only in MVP leaves M/MI and
+            // normal-model uniforms in the wrong coordinate system. The enclosing draw restores
+            // its saved state after this walk, so no parent/child parallax subtraction or owner
+            // transform mutation is needed here.
+            modelTrans = transformResolver.ResolveRawModelTransform(camera_node.get()).inverse() *
                 modelTrans;
+            viewProTrans = camera->GetProjectionMatrix();
         }
 
-        modelTrans = ApplyMeshGeometryTransform(modelTrans, pNode->Mesh());
+        if (image_prelighting_source) {
+            // The prelighting source appends this local translation to incoming I. Its
+            // independent AM upload below retains the raw owner transform. In particular, the
+            // private source's texture-space placement must never reach scripts or bones.
+            const auto& size = layer->GetPrelightingSource()->content_size;
+            modelTrans = (modelTrans * Affine3d(Translation3d(
+                size[0] * 0.5, size[1] * 0.5, 0.0)).matrix()).eval();
+        }
+        modelTrans = ApplyMeshGeometryTransform(modelTrans, draw.Mesh());
+        const Matrix4d destinationTrans =
+            Affine3d(Eigen::Translation3d(destinationOffset)).matrix();
+        viewProTrans = viewProTrans * destinationTrans;
 
-        if (info.has_NORMAL_MODEL_MATRIX) {
-            // Wallpaper Engine's stock model vertex shaders normalize the transformed vertex
-            // normal, but pass the transformed tangent and bitangent to the fragment shader
-            // without normalizing either one. Consequently g_NormalModelMatrix is a direction
-            // basis, not an arbitrary scaled inverse-transpose: retaining a uniform model scale of
-            // 0.01 here produces tangent vectors of length 100, and a normal-map XY perturbation
-            // then inflates N.L by the same factor in the PBR helpers. Compute the mathematically
-            // correct inverse-transpose first, then remove only the per-axis magnitude while
-            // preserving rotation, reflection, and the directional effect of non-uniform scale.
-            Eigen::Matrix3d linear = modelTrans.topLeftCorner<3, 3>();
-            if (std::abs(linear.determinant()) < 1e-18) {
-                linear = Eigen::Matrix3d::Identity();
-            } else {
-                linear = linear.inverse().transpose().eval();
+        // Opt-in per-layer diagnostics follow every material phase, including private source
+        // draws and the authored last pass. Comparing the raw model with the submitted model
+        // identifies whether placement was changed by routing, parallax, or camera rebasing;
+        // the clip-space origin then separates those changes from projection differences.
+        const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+        const int32_t layer_id = draw.LayerId(*m_scene);
+        if (trace_layer != nullptr && std::to_string(layer_id) == trace_layer) {
+            const auto raw_model = transformResolver.ResolveRawModelTransform(draw);
+            const auto offset = transformResolver.ResolveParallaxOffset(draw, model_parallax_camera);
+            const Vector4d clip_origin = viewProTrans * modelTrans.col(3);
+            const auto* data = GetNodeData(draw.DataKey());
+            const auto* effect_layer = data != nullptr ? data->effect_layer_projection.layer : nullptr;
+            const Matrix4d local_model = pNode != nullptr ? pNode->GetLocalTrans() : Matrix4d::Identity();
+            const auto* owner = m_scene->FindSceneObject(layer_id);
+            const auto* owner_transform = owner != nullptr ? owner->RuntimeTransform().get() : nullptr;
+            LOG_INFO("SceneTransformDraw: frame=%llu layer=%d node='%s' material='%s' "
+                     "reflection=%s "
+                     "camera='%.*s' suppress=%s parallax-root=%d owner-transform=%s "
+                     "owner-revision=%llu stored-local=[%.6f %.6f %.6f] raw=[%.6f %.6f %.6f] "
+                     "parallax=[%.6f %.6f %.6f] model=[%.6f %.6f %.6f] "
+                     "destination=[%.6f %.6f %.6f] "
+                     "clip=[%.6f %.6f %.6f %.6f]",
+                     static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
+                     draw.Name().c_str(), material != nullptr ? material->name.c_str() : "",
+                     reflection_pass ? "true" : "false",
+                     static_cast<int>(uniform_cam_name.size()), uniform_cam_name.data(),
+                     data != nullptr && data->suppress_model_parallax ? "true" : "false",
+                     transformResolver.ParallaxRoot(draw) != nullptr
+                         ? transformResolver.ParallaxRoot(draw)->Id() : 0,
+                     ((draw.Phase() != nullptr &&
+                       draw.Phase()->PlacementSpace() == SceneDrawPhase::Space::Layer) ||
+                      (effect_layer != nullptr && effect_layer->UsesOwnerTransform(pNode)))
+                         ? "true" : "false",
+                     static_cast<unsigned long long>(
+                         owner_transform != nullptr ? owner_transform->Revision() : 0),
+                     local_model(0, 3), local_model(1, 3), local_model(2, 3),
+                     raw_model(0, 3), raw_model(1, 3), raw_model(2, 3),
+                     offset.x(), offset.y(), offset.z(),
+                     modelTrans(0, 3), modelTrans(1, 3), modelTrans(2, 3),
+                     destinationOffset.x(), destinationOffset.y(), destinationOffset.z(),
+                     clip_origin.x(), clip_origin.y(), clip_origin.z(), clip_origin.w());
+            if (m_puppet_frame_serial == 0 || m_puppet_frame_serial == 120 ||
+                m_puppet_frame_serial == 600) {
+                const Matrix4d clip_model = viewProTrans * modelTrans;
+                LOG_INFO("SceneDrawClipBasis: frame=%llu layer=%d node='%s' "
+                         "x=[%.9f %.9f %.9f %.9f] y=[%.9f %.9f %.9f %.9f]",
+                         static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
+                         draw.Name().c_str(), clip_model(0, 0), clip_model(1, 0),
+                         clip_model(2, 0), clip_model(3, 0), clip_model(0, 1), clip_model(1, 1),
+                         clip_model(2, 1), clip_model(3, 1));
             }
-            for (int column = 0; column < 3; ++column) {
-                const double magnitude = linear.col(column).norm();
-                if (magnitude > 1e-12) {
-                    linear.col(column) /= magnitude;
+            if (material != nullptr) {
+                // Keep modulation beside the selected phase's placement trace. A visible owner
+                // can still produce transparent pixels after a script alpha write; logging both
+                // material overrides and shader defaults distinguishes that from clipping or a
+                // missing publication draw without changing the submitted uniform values.
+                const auto log_modulation = [&](const ShaderValues& values, const char* source) {
+                    for (const auto& [name, value] : values) {
+                        const bool standard_modulation = name == "g_Alpha" ||
+                            name == "g_UserAlpha" || name == "g_Color4";
+                        if (!standard_modulation && m_puppet_frame_serial != 0 &&
+                            m_puppet_frame_serial != 120 && m_puppet_frame_serial != 600) continue;
+                        std::string components;
+                        for (size_t index = 0; index < value.size(); ++index) {
+                            if (index != 0) components += ' ';
+                            components += std::to_string(value[index]);
+                        }
+                        LOG_INFO("SceneDrawModulation: frame=%llu layer=%d node='%s' "
+                                 "material='%s' source=%s uniform='%s' value=[%s] texture0='%s'",
+                                 static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
+                                 draw.Name().c_str(), material->name.c_str(), source, name.c_str(),
+                                 components.c_str(),
+                                 material->textures.empty() ? "" : material->Texture(0).c_str());
+                    }
+                };
+                log_modulation(material->customShader.constValues, "material");
+                if (material->customShader.shader != nullptr) {
+                    log_modulation(material->customShader.shader->default_uniforms, "shader");
                 }
             }
-            const Eigen::Matrix3f normal_matrix = linear.cast<float>();
-            std::array<float, 12> packed {};
-            for (int column = 0; column < 3; ++column) {
-                packed[static_cast<size_t>(column) * 4 + 0] = normal_matrix(0, column);
-                packed[static_cast<size_t>(column) * 4 + 1] = normal_matrix(1, column);
-                packed[static_cast<size_t>(column) * 4 + 2] = normal_matrix(2, column);
-            }
+        }
+
+        if (info.has_NORMAL_MODEL_MATRIX) {
+            const auto packed = NormalizedModelBasis(modelTrans);
             updateOp(G_NORMAL_MODEL_MATRIX,
                      std::span<const float> { packed.data(), packed.size() });
         }
 
         if (reqM) updateOp(G_M, ToDxcCBufferMatrixUniform(modelTrans));
-        if (reqAM) updateOp(G_AM, ToDxcCBufferMatrixUniform(modelTrans));
-        if (reqLMM) updateOp(G_LMM, ToDxcCBufferMatrixUniform(modelTrans));
+        // The alternate model has a separate publication site from I and the destination stack.
+        if (reqAM && !image_prelighting_source) {
+            updateOp(G_AM, ToDxcCBufferMatrixUniform(destinationTrans * modelTrans));
+        }
         if (reqMI) updateOp(G_MI, ToDxcCBufferMatrixUniform(modelTrans.inverse()));
-        if (reqMVP || reqEMVP) {
-            Matrix4d mvpTrans = viewProTrans * modelTrans;
+        if (reqMVP || reqMVPI) {
+            const Matrix4d mvpTrans = viewProTrans * modelTrans;
             if (reqMVP) updateOp(G_MVP, ToDxcCBufferMatrixUniform(mvpTrans));
-            if (reqEMVP) updateOp(G_EMVP, ToDxcCBufferMatrixUniform(mvpTrans));
             if (reqMVPI) updateOp(G_MVPI, ToDxcCBufferMatrixUniform(mvpTrans.inverse()));
         }
-        if (reqETVP || reqETVPI) {
-            const SceneNode* projectionNode      = pNode;
-            const SceneMesh* projectionMesh      = pNode->Mesh();
-            Matrix4d         projectionModelTrans = modelTrans;
-            Matrix4d         projectionViewPro    = viewProTrans;
-
-            const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
-            if (nodeDataPtr != nullptr &&
-                nodeDataPtr->effect_texture_projection.node != nullptr &&
-                nodeDataPtr->effect_texture_projection.mesh != nullptr &&
-                m_scene->activeCamera != nullptr) {
-                projectionNode = nodeDataPtr->effect_texture_projection.node;
-                projectionMesh = nodeDataPtr->effect_texture_projection.mesh;
-                const_cast<SceneNode*>(projectionNode)->UpdateTrans();
-                projectionModelTrans = ApplyMeshGeometryTransform(
-                    projectionNode->ModelTrans(), projectionMesh);
-                projectionViewPro    = m_scene->activeCamera->GetViewProjectionMatrix();
+        if (reqLMM || reqEM || reqEMVP || reqEMVPI || reqETVP || reqETVPI) {
+            const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(draw.DataKey()) : nullptr;
+            const auto* layer = nodeDataPtr != nullptr
+                ? nodeDataPtr->effect_layer_projection.layer : nullptr;
+            Matrix4d layerModel = modelTrans;
+            Matrix4d effectModel = modelTrans;
+            Matrix4d effectMvp = viewProTrans * modelTrans;
+            Matrix4d etvpTrans;
+            if (layer != nullptr) {
+                const auto snapshot = ResolveEffectProjectionSnapshot(*layer);
+                const auto& projectionCameraName = layer->EffectSnapshotCamera();
+                // All effect matrices come from the owner's I and placement snapshots, before
+                // private passes substitute their local camera and fullscreen mesh. LayerModel
+                // always retains I. EffectModel/EffectMVP scale X/Y by the card half-size in
+                // intermediate segments and retain the raw snapshots in the final segment;
+                // EffectTextureProjection always uses the scaled placement snapshot. Mesh
+                // calibration, puppet animation bounds and render-target padding are not part
+                // of this card domain. Fullscreen rasterization also retains these owner snapshots.
+                layerModel = snapshot.layer_model;
+                const auto& placedModel = snapshot.placed_model;
+                const auto& cardSize = layer->CardSize();
+                const Matrix4d cardScale = Affine3d(Eigen::Scaling(
+                    static_cast<double>(cardSize[0]) * 0.5,
+                    static_cast<double>(cardSize[1]) * 0.5, 1.0)).matrix();
+                effectModel = layerModel;
+                effectMvp = snapshot.view_projection * placedModel;
+                etvpTrans = effectMvp * cardScale;
+                if (!layer->UsesLayerSpaceEffectMatrices(pNode)) {
+                    effectModel = (effectModel * cardScale).eval();
+                    effectMvp = etvpTrans;
+                }
+                if (std::getenv("WESCENE_TRACE_EFFECT_PROJECTION") != nullptr &&
+                    (trace_layer == nullptr || std::to_string(layer_id) == trace_layer)) {
+                    LOG_INFO("SceneEffectMatrixSnapshot: frame=%llu layer=%d node='%s' "
+                             "snapshot-source=%s "
+                             "camera='%s' composition=%s fullscreen=%s layer-space=%s "
+                             "projection-diagonal=[%.9f %.9f %.9f] "
+                             "card=[%.6f %.6f] raw=[%.6f %.6f %.6f] "
+                             "placed=[%.6f %.6f %.6f] clip=[%.6f %.6f %.6f %.6f]",
+                             static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
+                             draw.Name().c_str(),
+                             layer->UsesShapeDraw() ? "shape-constructor" : "image-destination",
+                             projectionCameraName.c_str(),
+                             !projectionCameraName.empty() ? "true" : "false",
+                             layer->IsFullscreen() ? "true" : "false",
+                             layer->UsesLayerSpaceEffectMatrices(pNode) ? "true" : "false",
+                             snapshot.view_projection(0, 0), snapshot.view_projection(1, 1),
+                             snapshot.view_projection(2, 2), cardSize[0], cardSize[1],
+                             layerModel(0, 3), layerModel(1, 3), layerModel(2, 3),
+                             placedModel(0, 3), placedModel(1, 3), placedModel(2, 3),
+                             etvpTrans(0, 3), etvpTrans(1, 3), etvpTrans(2, 3), etvpTrans(3, 3));
+                }
+            } else if (reqETVP || reqETVPI) {
+                etvpTrans = ComputeEffectTextureProjection(draw.Mesh(),
+                                                           modelTrans, viewProTrans);
             }
-
-            const auto etvpTrans = ComputeEffectTextureProjection(projectionNode,
-                                                                  projectionMesh,
-                                                                  projectionModelTrans,
-                                                                  projectionViewPro);
+            if (reqLMM) {
+                updateOp(G_LMM, ToDxcCBufferMatrixUniform(layerModel));
+                if (trace_layer != nullptr && std::to_string(layer_id) == trace_layer) {
+                    LOG_INFO("SceneLayerModelDraw: frame=%llu layer=%d node='%s' "
+                             "origin=[%.6f %.6f %.6f]",
+                             static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
+                             draw.Name().c_str(), layerModel(0, 3), layerModel(1, 3), layerModel(2, 3));
+                }
+            }
+            if (reqEM && layer != nullptr) updateOp(G_EM, ToDxcCBufferMatrixUniform(effectModel));
+            if (reqEMVP) updateOp(G_EMVP, ToDxcCBufferMatrixUniform(effectMvp));
+            if (reqEMVPI) updateOp(G_EMVPI, ToDxcCBufferMatrixUniform(effectMvp.inverse()));
             if (reqETVP) updateOp(G_ETVP, ToDxcCBufferMatrixUniform(etvpTrans));
             if (reqETVPI) {
                 if (std::abs(etvpTrans.determinant()) > 1e-12) {
@@ -738,8 +836,52 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         }
     }
 
+    if (info.has_VP) {
+        updateOp(G_VP, ToDxcCBufferMatrixUniform(viewProTrans));
+    }
+
+    if (image_prelighting_source && (info.has_AM || info.has_ANM || info.has_AVP)) {
+        // AM is raw owner I, optionally scaled by the instanced card/content ratio. AVP snapshots
+        // the incoming camera and destination before private rasterization, excluding the owner
+        // matrix. The volumetric writer below has its own contract and never enters this image
+        // branch.
+        const auto snapshot = ResolveEffectProjectionSnapshot(*layer);
+        const auto& source = *layer->GetPrelightingSource();
+        Matrix4d alternate_model = snapshot.layer_model;
+        if (source.instanced) {
+            const auto& card = layer->CardSize();
+            alternate_model.col(0) *= card[0] / source.content_size[0];
+            alternate_model.col(1) *= card[1] / source.content_size[1];
+        }
+        if (info.has_AM) updateOp(G_AM, ToDxcCBufferMatrixUniform(alternate_model));
+        if (info.has_ANM) {
+            const auto basis = NormalizedModelBasis(alternate_model);
+            updateOp(G_ANM, std::span<const float> {basis.data(), basis.size()});
+        }
+        if (info.has_AVP) {
+            updateOp(G_AVP, ToDxcCBufferMatrixUniform(snapshot.incoming_view_projection));
+        }
+        if (std::getenv("WESCENE_TRACE_PRELIGHTING") != nullptr) {
+            LOG_INFO("SceneImagePrelightingMatrices: frame=%llu layer=%d name='%s' "
+                     "am-origin=[%.6f %.6f %.6f] am-scale=[%.6f %.6f %.6f] "
+                     "avp-origin=[%.6f %.6f %.6f %.6f] incoming-camera='%s' "
+                     "uniforms=[am=%d normal=%d avp=%d]",
+                     static_cast<unsigned long long>(m_puppet_frame_serial),
+                     layer->Owner().Id(), layer->Owner().Name().c_str(),
+                     alternate_model(0, 3), alternate_model(1, 3), alternate_model(2, 3),
+                     alternate_model.col(0).head<3>().norm(),
+                     alternate_model.col(1).head<3>().norm(),
+                     alternate_model.col(2).head<3>().norm(),
+                     snapshot.incoming_view_projection(0, 3),
+                     snapshot.incoming_view_projection(1, 3),
+                     snapshot.incoming_view_projection(2, 3),
+                     snapshot.incoming_view_projection(3, 3),
+                     layer->EffectSnapshotCamera().c_str(), info.has_AM, info.has_ANM, info.has_AVP);
+        }
+    }
+
     if (hasNodeData) {
-        const auto& vol = m_nodeDataMap.at(pNode);
+        const auto& vol = m_nodeDataMap.at(draw.DataKey());
         if (vol.volumetric_pass && vol.volumetric_light != nullptr) {
             const SceneLight& light = *vol.volumetric_light;
             const Matrix4d    alt_vp = light.AltViewProjection().cast<double>();
@@ -762,6 +904,44 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             const Vector3f origin  = light.WorldOrigin();
             const Vector3f forward = light.WorldForward();
             const Vector3f color   = light.color();
+            // This opt-in trace ties the authored light animation to an executed volume
+            // pass and its actual camera projection. Sampling every ten rendered frames
+            // keeps short lightning peaks observable without flooding ordinary captures.
+            if (std::getenv("WESCENE_TRACE_VOLUMETRICS") != nullptr &&
+                m_puppet_frame_serial % 10 == 0) {
+                const Vector4d clip = viewProTrans *
+                    Vector4d(origin.x(), origin.y(), origin.z(), 1.0);
+                LOG_INFO("SceneVolumetricUniforms: frame=%llu elapsed=%.6f light-layer=%d "
+                         "pass='%s' intensity=%.6f radius=%.6f density=%.6f "
+                         "origin=[%.6f %.6f %.6f] clip=[%.6f %.6f %.6f %.6f] "
+                         "has-rv1=%d has-em=%d",
+                         static_cast<unsigned long long>(m_puppet_frame_serial),
+                         m_scene->elapsingTime, m_scene->LayerIdForNode(light.node()),
+                         draw.Name().c_str(), light.intensity(), light.radius(), light.density(),
+                         origin.x(), origin.y(), origin.z(),
+                         clip.x(), clip.y(), clip.z(), clip.w(), info.has_RV1, info.has_EM);
+                if (m_puppet_frame_serial <= 10) {
+                    const Vector3d eye = camera->GetPosition();
+                    const Vector3f frame_eye = m_scene->FrameEyePosition();
+                    const Matrix4d inverse_vp = viewProTrans.inverse();
+                    const Vector4d near_point = inverse_vp * Vector4d(0, 0, 1, 1);
+                    const Vector4d far_point = inverse_vp * Vector4d(0, 0, 0, 1);
+                    LOG_INFO("SceneVolumetricProjection: light-layer=%d pass='%s' "
+                             "has-vp=%d has-avp=%d hull-scale=[%.6f %.6f %.6f] "
+                             "hull-origin=[%.6f %.6f %.6f] "
+                             "camera=[%.6f %.6f %.6f] ray-z=[%.6f %.6f] "
+                             "frame-eye=[%.6f %.6f %.6f] volume-inside=%d",
+                             m_scene->LayerIdForNode(light.node()), draw.Name().c_str(),
+                             info.has_VP, info.has_AVP,
+                             alt_vp(0, 0), alt_vp(1, 1), alt_vp(2, 2),
+                             alt_vp(0, 3), alt_vp(1, 3), alt_vp(2, 3),
+                             eye.x(), eye.y(), eye.z(),
+                             near_point.z() / near_point.w(), far_point.z() / far_point.w(),
+                             frame_eye.x(), frame_eye.y(), frame_eye.z(),
+                             light.CameraInsideVolume(frame_eye,
+                                 m_scene->activeCamera->GetDirection().cast<float>()));
+                }
+            }
             // g_RenderVar1: radius*0.99, cos(inner), cos(outer), intensity.
             if (info.has_RV0) {
                 const auto atlas = light.ShadowAtlasUv();
@@ -833,20 +1013,50 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                  std::array<float, 3> {
                      m_screen_size[0], m_screen_size[1], m_screen_size[0] / m_screen_size[1] });
 
-    if (info.has_EYE_POSITION || info.has_VIEWUP || info.has_VIEWRIGHT || info.has_VIEWFORWARD) {
-        // InitUniforms restricts these updates to model materials and nodes explicitly routed
-        // through the scene's 3D camera. Canvas-space image/effect particles keep their authored
-        // constants while perspective particles receive one coherent projection and view basis.
-        const auto eye = camera->GetPosition().cast<float>();
+    if (info.has_EYE_POSITION) {
+        // Image prelighting and the following effect passes consume the eye selected for the
+        // scene frame. Their local raster cameras can change M/VP/MVP, but cannot replace that
+        // world-space eye. Scene's orthographic camera already includes the canvas half-size in
+        // X/Y, while perspective cameras retain the authored/path/layer position on all three
+        // axes.
+        Vector3f eye = m_scene->FrameEyePosition();
+        // The reflected walk changes this same frame eye. It is not a raster-camera replacement
+        // and must not leak into the following ordinary pass.
+        if (reflection_pass) eye.y() = -eye.y();
+        updateOp(G_EYE_POSITION, std::array<float, 3> { eye.x(), eye.y(), eye.z() });
+
+        if ((std::getenv("WESCENE_TRACE_EYE_POSITION") != nullptr ||
+             std::getenv("WESCENE_TRACE_REFLECTION") != nullptr) && m_puppet_frame_serial <= 2) {
+            const auto raster_eye = camera->GetPosition();
+            LOG_INFO("SceneEyePositionDraw: frame=%llu layer=%d node='%s' material='%s' "
+                     "raster-camera='%.*s' reflection=%s orthographic=%s eye=[%.6f %.6f %.6f] "
+                     "raster-eye=[%.6f %.6f %.6f]",
+                     static_cast<unsigned long long>(m_puppet_frame_serial),
+                     draw.LayerId(*m_scene), draw.Name().c_str(),
+                     material != nullptr ? material->name.c_str() : "",
+                     static_cast<int>(uniform_cam_name.size()), uniform_cam_name.data(),
+                     reflection_pass ? "true" : "false",
+                     m_scene->cameraOrthographic ? "true" : "false",
+                     eye.x(), eye.y(), eye.z(),
+                     raster_eye.x(), raster_eye.y(), raster_eye.z());
+        }
+    }
+
+    if (info.has_VIEWUP || info.has_VIEWRIGHT || info.has_VIEWFORWARD) {
         Vector3f forward = camera->GetDirection().cast<float>();
         if (forward.norm() > 1e-6f) forward.normalize();
         Vector3f up = camera->GetUp().cast<float>();
         if (up.norm() > 1e-6f) up.normalize();
         Vector3f right = forward.cross(up);
         if (right.norm() > 1e-6f) right.normalize();
+        // Reflection changes the stored right/up vectors independently, leaving g_ViewForward
+        // untouched. Recomputing a cross product after the mirror would silently undo that
+        // handedness choice for billboard and model shader consumers.
+        if (reflection_pass) {
+            right.y() = -right.y();
+            up.y() = -up.y();
+        }
 
-        if (info.has_EYE_POSITION)
-            updateOp(G_EYE_POSITION, std::array<float, 3> { eye.x(), eye.y(), eye.z() });
         if (info.has_VIEWUP)
             updateOp(G_VIEWUP, std::array<float, 3> { up.x(), up.y(), up.z() });
         if (info.has_VIEWRIGHT)
@@ -892,7 +1102,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
     }
 
-    if (m_scene->scriptHost) {
+    if (m_scene->scriptHost && pNode != nullptr) {
         m_scene->scriptHost->ApplyTextureAnimations(pNode, sprites, m_scene->frameTime);
     }
 
@@ -1070,6 +1280,20 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
 
 void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
     m_nodeDataMap[nodeAddr] = data;
+}
+
+void WPShaderValueUpdater::RemoveDrawData(const SceneDraw& draw) {
+    // Removing an owner ends its runtime resources. These records can own puppet runtimes and
+    // reference the owner's effect bridge even after the node has left the physical graph. Retire
+    // both node and publication-phase keys before their objects are freed, so the next puppet
+    // advance cannot notify a deleted handle.
+    const auto key = draw.DataKey();
+    m_nodeDataMap.erase(key);
+    m_nodeUniformInfoMap.erase(key);
+    // Surviving children have just lost an ancestor. Their derived placement must be evaluated
+    // from the new hierarchy even if it was queried earlier in this frame's script work.
+    m_modelTransformCache.clear();
+    m_parallaxOffsetCache.clear();
 }
 
 

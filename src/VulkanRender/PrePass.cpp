@@ -2,6 +2,10 @@
 #include "PassCommon.hpp"
 #include "Scene/Scene.h"
 #include "Resource.hpp"
+#include "RenderTargetOps.hpp"
+#include "Utils/Logging.h"
+
+#include <cstdlib>
 
 using namespace wallpaper::vulkan;
 
@@ -21,52 +25,14 @@ void BindPrePassTarget(wallpaper::Scene& scene, const Device& device, std::strin
     }
 }
 
-void ClearPrePassTarget(vvk::CommandBuffer& cmd, const ImageParameters& image,
-                        const VkClearColorValue& color, VkImageLayout final_layout,
-                        VkAccessFlags dst_access, VkPipelineStageFlags dst_stage) {
-    if (! image.handle) return;
-    VkImageSubresourceRange range {
-        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-        .baseMipLevel   = 0,
-        .levelCount     = VK_REMAINING_ARRAY_LAYERS,
-        .baseArrayLayer = 0,
-        .layerCount     = VK_REMAINING_MIP_LEVELS,
-    };
-    VkImageMemoryBarrier to_dst {
-        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext            = nullptr,
-        .srcAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
-        .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .image            = image.handle,
-        .subresourceRange = range,
-    };
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        to_dst);
-    cmd.ClearColorImage(image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, range);
-    VkImageMemoryBarrier to_final {
-        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext            = nullptr,
-        .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask    = dst_access,
-        .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .newLayout        = final_layout,
-        .image            = image.handle,
-        .subresourceRange = range,
-    };
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        dst_stage,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        to_final);
-}
-
 } // namespace
 
 PrePass::PrePass(const Desc& desc): m_desc(desc) {}
 PrePass::~PrePass() {}
+
+std::string PrePass::residencyKey() const {
+    return "PrePass|target=" + std::string(m_desc.result);
+}
 
 bool PrePass::referencesRenderTarget(std::string_view render_target) const {
     // The pre-pass only clears the graph result target. It should stay out of text bridge refreshes
@@ -79,10 +45,6 @@ void PrePass::prepare(Scene& scene, const Device& device, RenderingResources&) {
     BindPrePassTarget(scene, device, m_desc.result, m_desc.vk_result, have_result);
     if (! have_result) return;
     BindPrePassTarget(scene, device, SpecTex_DefaultMS, m_desc.vk_msaa, m_desc.has_msaa);
-    {
-        auto& sc           = scene.clearColor;
-        m_desc.clear_value = VkClearValue { sc[0], sc[1], sc[2], 1.0f };
-    }
     setPrepared();
 }
 
@@ -98,30 +60,33 @@ void PrePass::refreshResources(Scene& scene, const Device& device, RenderingReso
         return;
     }
     BindPrePassTarget(scene, device, SpecTex_DefaultMS, m_desc.vk_msaa, m_desc.has_msaa);
-
-    auto& sc = scene.clearColor;
-    m_desc.clear_value = VkClearValue { sc[0], sc[1], sc[2], 1.0f };
 }
 
 void PrePass::execute(const Device&, RenderingResources& rr) {
-    auto& cmd = rr.command;
-    ClearPrePassTarget(cmd,
-                       m_desc.vk_result,
-                       m_desc.clear_value.color,
-                       m_desc.layout,
-                       VK_ACCESS_MEMORY_READ_BIT,
-                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    if (m_desc.has_msaa) {
-        // Compose draws write this target and do not write alpha. TextureCache
-        // initializes new RTs to transparent black, so resolve would copy A=0
-        // over the opaque `_rt_default` clear and the compositor shows black.
-        ClearPrePassTarget(cmd,
-                           m_desc.vk_msaa,
-                           m_desc.clear_value.color,
-                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                           VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    // This pass is the main scene boundary after reflection, not a device-wide frame
+    // initialization. Read live scene values here so scripts/user bindings need no topology
+    // rebuild, and let every model LOAD depth regardless of which model is visible first.
+    const auto& scene = *rr.scene;
+    const auto& color = scene.clearColor;
+    const VkClearColorValue clear_color { color[0], color[1], color[2], 1.0f };
+    if (scene.clearEnabled) {
+        ClearRenderTargetColor(rr.command, m_desc.vk_result, clear_color, m_desc.layout);
+        if (m_desc.has_msaa) {
+            // Both representations must start with the same opaque scene clear. The
+            // resolve copies alpha as well, while most compose draws only write RGB.
+            ClearRenderTargetColor(rr.command, m_desc.vk_msaa, clear_color,
+                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
+    }
+    const auto depth_action = PrepareSceneModelDepth(rr, m_desc.result, scene.clearEnabled);
+    if (std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr) {
+        LOG_INFO("SceneStageClear: target='%.*s' clear-enabled=%s color-action=%s "
+                 "color=[%.6f %.6f %.6f %.6f] model-depth=%s msaa=%s",
+                 static_cast<int>(m_desc.result.size()), m_desc.result.data(),
+                 scene.clearEnabled ? "true" : "false",
+                 scene.clearEnabled ? "cleared" : "preserved",
+                 color[0], color[1], color[2], 1.0f, SceneDepthActionName(depth_action).data(),
+                 m_desc.has_msaa ? "true" : "false");
     }
 }
 void PrePass::destory(const Device&, RenderingResources&) {

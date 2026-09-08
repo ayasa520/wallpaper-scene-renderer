@@ -2,6 +2,7 @@
 #include "Core/Literals.hpp"
 #include "Scene/Scene.h"
 #include "Scene/SceneNode.h"
+#include "Interface/IShaderValueUpdater.h"
 #include "ParticleModify.h"
 #include "Scene/SceneMesh.h"
 #include "Core/Random.hpp"
@@ -293,8 +294,10 @@ void ParticleSubSystem::UpdateLinkedControlpoints() {
     Eigen::Vector3d mouse_scene = m_sys.MouseScenePosition();
     Eigen::Matrix4d scene_to_particle_local = Eigen::Matrix4d::Identity();
     if (m_node != nullptr) {
-        m_node->UpdateTrans();
-        const auto model = m_node->ModelTrans();
+        // Control points and visible particles must use the same authored parent/bone chain.
+        // Matrix evaluation no longer leaves an attachment result on the physical node.
+        const auto model = m_sys.scene.shaderValueUpdater->ResolveModelTransformForProjection(
+            m_node, nullptr, false);
         const double determinant = model.determinant();
         if (!std::isfinite(determinant) ||
             std::abs(determinant) <= kControlPointTransformDeterminantEpsilon) {

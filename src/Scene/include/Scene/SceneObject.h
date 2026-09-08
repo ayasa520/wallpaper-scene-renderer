@@ -9,10 +9,12 @@
 #include <vector>
 
 #include "Core/NoCopyMove.hpp"
+#include "SceneTransform.h"
 
 namespace wallpaper
 {
 
+class Scene;
 class SceneNode;
 class SceneImageEffectLayer;
 class SceneLight;
@@ -40,6 +42,21 @@ enum class SceneObjectKind
 struct SceneImageLayerRuntimeState {
     std::array<float, 2> size { 0.0f, 0.0f };
     std::string          alignment { "center" };
+    // The runtime property belongs to the authored image, including logical-only compositions.
+    // Source selection and destination blending read this same value after script writes; they
+    // must not retain separate parse-time copies of copybackground.
+    bool                 copy_background { true };
+};
+
+// These are owner properties, not material controls. A shape retains them even without a source
+// mesh or any effects, and its typed property setters do not visit or invalidate authored effect
+// materials. Keeping the record on the identity prevents a draw's current camera/output from
+// selecting the storage used by scripts. Other owner kinds can adopt this record at their own
+// staging boundary without changing the shape property contract.
+struct SceneLayerModulationState {
+    std::array<float, 3> color { 1.0f, 1.0f, 1.0f };
+    float               alpha { 1.0f };
+    float               brightness { 1.0f };
 };
 
 // Wallpaper Engine camera layers are represented in scene.json as transform-only objects with
@@ -83,6 +100,10 @@ public:
     const std::array<float, 3>& Origin() const { return m_origin; }
     const std::array<float, 3>& Scale() const { return m_scale; }
     const std::array<float, 3>& Angles() const { return m_angles; }
+    // Live placement is independent from the original JSON snapshots above and from the lifetime
+    // of a drawing handle. Registration adopts the canonical handle's existing record without a
+    // transform copy; scripts and attachment/layout writers subsequently share this single state.
+    const std::shared_ptr<SceneTransform>& RuntimeTransform() const { return m_runtime_transform; }
     void SetAuthoredTransform(const std::array<float, 3>& origin, const std::array<float, 3>& scale,
                               const std::array<float, 3>& angles) {
         m_origin = origin;
@@ -95,9 +116,9 @@ public:
     bool LocalVisible() const { return m_local_visible; }
     void SetLocalVisible(bool visible) { m_local_visible = visible; }
 
-    // Authored parent binding by layer id. parent_id 0 means "no parent". Ids are stored instead
-    // of object pointers so a deleted parent leaves exactly the same dangling-id semantics the
-    // former layerParentBindings map had.
+    // Authored parent binding by layer id. parent_id 0 means "no parent". Parent destruction
+    // clears this relation and its attachment while retaining this child's local transform;
+    // owning a child in the scene hierarchy does not own that child's authored lifetime.
     int32_t            ParentId() const { return m_parent_id; }
     const std::string& Attachment() const { return m_attachment; }
     void               SetParentBinding(int32_t parent_id, std::string attachment) {
@@ -113,10 +134,19 @@ public:
     int32_t EffectCount() const { return m_effect_count; }
     void    SetEffectCount(int32_t count) { m_effect_count = count; }
 
-    // Passthrough compose helpers publish nothing while their final effect is hidden. The flag is
-    // authored per object, so it belongs here instead of being re-read from parse-time JSON.
+    // The model's passthrough flag gives this owner a composition child phase. With zero visible
+    // effect steps, only an empty non-private owner skips drawing; nonempty compositions still
+    // publish their child source.
     bool Passthrough() const { return m_passthrough; }
     void SetPassthrough(bool passthrough) { m_passthrough = passthrough; }
+
+    // Reflection membership belongs to the authored owner, not to a cloned mesh or material. A
+    // model with even one active receiver material excludes all of its chunks from the producer
+    // walk. Material setup records that fact independently from the authored opt-out.
+    bool Reflected() const { return m_reflected; }
+    void SetReflected(bool reflected) { m_reflected = reflected; }
+    bool ReceivesReflection() const { return m_receives_reflection; }
+    void SetReceivesReflection(bool receives) { m_receives_reflection = receives; }
 
     // Set when another layer's authored effect samples this layer's private offscreen output
     // (`_rt_imageLayerComposite_<id>`). Derived once at parse time from the scene-wide dependency
@@ -138,13 +168,11 @@ public:
     // HasLayerNodeSlot, not the node value.
     bool       HasLayerNodeSlot() const { return m_has_layer_node_slot; }
     SceneNode* LayerNode() const { return m_layer_node; }
-    void       SetLayerNode(SceneNode* node) {
-        m_layer_node          = node;
-        m_has_layer_node_slot = true;
-    }
+    void       SetLayerNode(SceneNode* node);
     void ClearLayerNodeSlot() {
         m_layer_node          = nullptr;
         m_has_layer_node_slot = false;
+        m_runtime_transform.reset();
     }
 
     // The layer's image-effect bridge. The SceneObject owns it: the bridge is a per-layer
@@ -156,6 +184,18 @@ public:
     }
     void SetImageEffectLayer(std::shared_ptr<SceneImageEffectLayer> effect_layer) {
         m_image_effect_layer = std::move(effect_layer);
+    }
+
+    // The concrete layer registers its setup operation after materialization. Hierarchy edits
+    // dispatch through the owner, independent of passthrough and without teaching Scene about
+    // parser-side text layout or shape material controls. Identity-only prepass entries have no
+    // resources to refresh; their eventual constructor consumes the recorded ancestry.
+    using ResourceSetupCallback = void (*)(Scene&, SceneObject&);
+    void SetResourceSetupCallback(ResourceSetupCallback callback) {
+        m_resource_setup = callback;
+    }
+    void RefreshResources(Scene& scene) {
+        if (m_resource_setup != nullptr) m_resource_setup(scene, *this);
     }
 
     // Runtime resources this layer mounted into the Scene-level pools: scene lights
@@ -172,7 +212,7 @@ public:
         return m_runtime_particle_subsystems;
     }
 
-    // The layer's live draw handles: world node, detached effect-source node, model material nodes,
+    // The layer's live resource handles: its authored node, model material nodes,
     // and particle renderer nodes. Same append-only contract as the lists above. The list must be
     // cleared at the exact point the nodes are freed because readers walk these pointers for
     // visibility, resource ownership, and material updates.
@@ -229,6 +269,14 @@ public:
         m_has_image_runtime_state = false;
     }
 
+    SceneLayerModulationState* ModulationState() {
+        return m_modulation_state ? &*m_modulation_state : nullptr;
+    }
+    const SceneLayerModulationState* ModulationState() const {
+        return m_modulation_state ? &*m_modulation_state : nullptr;
+    }
+    void SetModulationState(SceneLayerModulationState state) { m_modulation_state = state; }
+
 private:
     int32_t         m_id { 0 };
     SceneObjectKind m_kind { SceneObjectKind::Empty };
@@ -237,6 +285,7 @@ private:
     std::array<float, 3> m_origin { 0.0f, 0.0f, 0.0f };
     std::array<float, 3> m_scale { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> m_angles { 0.0f, 0.0f, 0.0f };
+    std::shared_ptr<SceneTransform> m_runtime_transform;
 
     bool        m_local_visible { true };
     int32_t     m_parent_id { 0 };
@@ -245,6 +294,8 @@ private:
     int32_t m_effect_count { 0 };
     bool    m_passthrough { false };
     bool    m_offscreen_dependency_source { false };
+    bool    m_reflected { false };
+    bool    m_receives_reflection { false };
 
     std::optional<uint32_t>    m_sound_handle;
     std::optional<std::string> m_initial_config_json;
@@ -253,6 +304,7 @@ private:
     SceneNode* m_layer_node { nullptr };
 
     std::shared_ptr<SceneImageEffectLayer> m_image_effect_layer;
+    ResourceSetupCallback                m_resource_setup { nullptr };
 
     std::vector<SceneLight*>        m_runtime_lights;
     std::vector<ParticleSubSystem*> m_runtime_particle_subsystems;
@@ -265,6 +317,7 @@ private:
 
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;
+    std::optional<SceneLayerModulationState> m_modulation_state;
 };
 
 } // namespace wallpaper

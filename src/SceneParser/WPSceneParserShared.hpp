@@ -48,10 +48,9 @@ struct ParseContext {
     std::unordered_set<int32_t>                                        dependent_parent_ids;
     std::unordered_map<int32_t, std::shared_ptr<wallpaper::SceneNode>> object_nodes;
     std::unordered_map<int32_t, const wallpaper::WPPuppet*>            object_puppets;
-    // Model chunk passes share the main scene target. Tracking their parse order here lets the
-    // model-only material state preserve color after the first model pass without changing the
-    // legacy load-op behavior of 2D image/effect passes.
-    std::unordered_map<std::string, wallpaper::usize> model_pass_count_by_output;
+    // Main-scene model chunks preserve the color produced by preceding chunks. Reflection
+    // has its own graph-stage clear and uses these same materials with per-draw load state.
+    wallpaper::usize model_pass_count { 0 };
 };
 
 enum class GeometryStagePolicy {
@@ -67,7 +66,7 @@ struct MaterialLoadResult {
 // Defined in WPSceneParser.cpp; also consumed by the post-process configuration unit.
 std::optional<MaterialLoadResult>
 LoadMaterial(wallpaper::fs::VFS& vfs, const wallpaper::wpscene::WPMaterial& wpmat,
-             wallpaper::Scene* pScene, wallpaper::SceneNode* pNode,
+             wallpaper::Scene* pScene,
              wallpaper::SceneMaterial* pMaterial, wallpaper::WPShaderValueData* pSvData,
              const wallpaper::UserPropertyMap* user_properties = nullptr,
              wallpaper::WPShaderInfo*          pWPShaderInfo   = nullptr,
@@ -95,7 +94,7 @@ struct WPModelObject {
     std::string          attachment;
     std::string          model;
     int32_t              skin { 0 };
-    bool                 reflected { false };
+    bool                 reflected { true };
     std::vector<wallpaper::WPPuppetLayer::AnimationLayer> animation_layers;
     // 3D models omit this key when they should cast. Non-casters write false.
     bool                 castshadow { true };
@@ -104,19 +103,18 @@ struct WPModelObject {
 };
 
 // The isolated model camera keeps authored 3D view transforms away from `global_perspective`;
-// the reflection target is registered lazily by model materialization but referenced by the
-// material loader's render-target contract.
+// the reflection target is registered only after model materialization identifies an active
+// receiver sampler. Reflected-list membership alone does not allocate a scene target.
 inline constexpr std::string_view kSceneModelPerspectiveCameraName { "__hanabi_model_perspective" };
 inline constexpr std::string_view kModelReflectionTargetName { "_rt_Reflection" };
 
 // Defined in WPSceneParser.cpp; shared with the model unit.
 std::string DescribeIndexVec(const std::vector<wallpaper::usize>& values);
 bool ConfigureBoneAttachment(ParseContext& context, int32_t parent_id, std::string_view attachment,
-                             const Eigen::Affine3f& local_transform, std::string_view object_kind,
+                             std::string_view object_kind,
                              std::string_view object_name, wallpaper::WPShaderValueData& node_data);
 void AttachNodeToScene(ParseContext& context, const std::shared_ptr<wallpaper::SceneNode>& node,
-                       int32_t parent_id, const std::string& object_name,
-                       wallpaper::WPShaderValueData* node_data = nullptr);
+                       int32_t parent_id, const std::string& object_name);
 void RegisterLayerSceneState(ParseContext& context, int32_t layer_id, int32_t parent_id,
                              std::string_view attachment, bool visible);
 void LoadConstvalue(wallpaper::SceneMaterial& material, const wallpaper::wpscene::WPMaterial& wpmat,

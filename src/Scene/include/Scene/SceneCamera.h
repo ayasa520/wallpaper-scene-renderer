@@ -73,6 +73,7 @@ public:
     Eigen::Vector3d GetUp() const;
 
     Eigen::Matrix4d GetViewMatrix() const;
+    Eigen::Matrix4d GetProjectionMatrix() const { return m_projectionMat; }
     Eigen::Matrix4d GetViewProjectionMatrix() const;
 
     std::shared_ptr<SceneNode> GetAttachedNode() const { return m_node; }
@@ -83,6 +84,7 @@ public:
         m_aspect      = cam.m_aspect;
         m_nearClip    = cam.m_nearClip;
         m_farClip     = cam.m_farClip;
+        m_fov         = cam.m_fov;
         m_perspective = cam.m_perspective;
         m_hasExplicitView = cam.m_hasExplicitView;
         m_explicitEye = cam.m_explicitEye;
@@ -118,6 +120,7 @@ private:
     Eigen::Vector3d m_shakeOffset { Eigen::Vector3d::Zero() };
 
     Eigen::Matrix4d m_viewMat { Eigen::Matrix4d::Identity() };
+    Eigen::Matrix4d m_projectionMat { Eigen::Matrix4d::Identity() };
     Eigen::Matrix4d m_viewProjectionMat { Eigen::Matrix4d::Identity() };
 
     std::shared_ptr<SceneNode> m_node;

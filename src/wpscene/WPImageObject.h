@@ -31,13 +31,6 @@ public:
         // `fullscreenlayer.json`): the layer is a routing helper whose destination stays active
         // while its children draw. Read from the model JSON, not from the scene object.
         bool passthrough { false };
-        // Scene-object `config.passthrough` as written by the editor. It only feeds the renderer's
-        // hidden-final-composite publication policy (suppress instead of preserving the source
-        // when the final effect is hidden); it is not the model passthrough marker above.
-        bool suppressHiddenFinalComposite { false };
-        FinalOutputCapability finalOutputCapability {
-            FinalOutputCapability::PrivateThenPublish
-        };
     };
     bool                       FromJson(const nlohmann::json&, fs::VFS&);
     int32_t                    id { 0 };
@@ -74,19 +67,12 @@ public:
     int32_t                    parent { 0 };
     std::string                attachment;
     std::string                alignment { "center" };
-    std::array<float, 2>       effectSourceSize { 0.0f, 0.0f };
-    // Some source-less effect layers (direct-draw shapes) resolve their effect target size to a
-    // canvas-derived pixel extent at parse time while their visible output still follows ordinary
-    // world-space layer geometry. Such sizes are used as-is and skip perspective density scaling.
-    // This is intentionally separate from fullscreen, which also changes final projection and
-    // transform semantics.
-    bool                       effectSourceSizeIsPixelExtent { false };
-    // Optional final writer UV coverage. Effects such as DIRECTDRAW lightshafts can generate
-    // visible pixels outside the canonical [0, 1] quad; expanding only the final writer prevents
-    // clipping without changing the shader's authored domain.
-    bool                       effectFinalTexCoordBoundsEnabled { false };
-    std::array<float, 4>       effectFinalTexCoordBounds { 0.0f, 0.0f, 1.0f, 1.0f };
-    bool                       copybackground { false };
+    // The shared constructor enables copybackground before property parsing. An omitted key
+    // therefore copies the background; only an explicit false selects a transparent composition
+    // source. Child count and dependency status do not alter it.
+    bool                       copybackground { true };
+    bool                       nointerpolation { false };
+    bool                       clampuvs { true };
     WPMaterial                 material;
     std::vector<WPImageEffect> effects;
     Config                     config;

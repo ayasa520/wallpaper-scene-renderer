@@ -232,8 +232,16 @@ void FinPass::execute(const Device& device, RenderingResources& rr) {
         ResolveComposeMsaaIfNeeded(*rr.scene, device, rr);
     }
 
+    executeImage(device, rr, m_desc.vk_result);
+}
+
+void FinPass::executeImage(const Device& device, RenderingResources& rr,
+                           const ImageParameters& src) {
+    // A diagnostic frame can present a private draw output immediately after that draw. Borrow
+    // its physical image only while recording this transfer; never replace the resident graph's
+    // result binding or extend a temporary texture's lifetime through a later name lookup.
+
     auto& cmd = rr.command;
-    auto& src = m_desc.vk_result;
     auto& dst = m_desc.vk_present;
     if (!(src.handle && dst.handle) || src.extent.width == 0 || src.extent.height == 0 ||
         dst.extent.width == 0 || dst.extent.height == 0) {

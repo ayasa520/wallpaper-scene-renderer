@@ -11,6 +11,8 @@
 #include "WPCommon.hpp"
 
 #include "Vulkan/ShaderComp.hpp"
+#include "Vulkan/Shader.hpp"
+#include "SpecTexs.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2781,6 +2783,22 @@ std::string WPShaderParser::PreShaderSrc(fs::VFS& vfs, const std::string& src,
 
     MergeShaderInfo(*pWPShaderInfo, cached_info);
     return expanded.expanded_src;
+}
+
+bool WPShaderParser::ReflectTextureSlots(std::span<const ShaderCode> codes, Set<uint>& slots) {
+    // Use the same accessed-descriptor reflection as Vulkan draw preparation, not the authored
+    // texture array or preprocessor declarations. This is a read-only query of the returned
+    // SPIR-V, whether compiled now or loaded from disk; no cache record is rewritten and no
+    // persisted metadata changes interpretation.
+    vulkan::ShaderReflected reflected;
+    std::vector<vulkan::Uni_ShaderSpv> stages;
+    if (!vulkan::GenReflect(codes, stages, reflected)) return false;
+
+    slots.clear();
+    for (uint slot = 0; slot < WE_GLTEX_NAMES.size(); ++slot) {
+        if (reflected.binding_map.contains(WE_GLTEX_NAMES[slot])) slots.insert(slot);
+    }
+    return true;
 }
 
 bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderUnit> units,

@@ -43,6 +43,12 @@ class VFS;
 }
 class Scene : NoCopy, NoMove {
 public:
+    struct CameraPose {
+        std::array<float, 3> eye { 0.0f, 0.0f, 1.0f };
+        std::array<float, 3> center { 0.0f, 0.0f, 0.0f };
+        std::array<float, 3> up { 0.0f, 1.0f, 0.0f };
+    };
+
     struct CameraPathKeyframe {
         double timestamp { 0.0 };
         std::array<float, 3> eye { 0.0f, 0.0f, 1.0f };
@@ -213,6 +219,7 @@ public:
     void ApplyAllLayerVisibility();
     void UpdateModelCameraPath();
     void UpdateCameraShake();
+    Eigen::Vector3f FrameEyePosition() const;
     DirectionalShadowView ShadowCascadeView() const {
         const SceneCamera* camera = activeCamera;
         if (! modelPerspectiveCameraName.empty()) {
@@ -253,6 +260,8 @@ public:
     ParsedImageRequest      RequestParsedImageAsync(const std::string& texture_key);
     void                    DropParsedImageCache(std::string_view texture_key);
     void                    ClearParsedImageCache();
+    std::shared_ptr<const std::string> GetSystemTextureBinding(const std::string& name);
+    void SetSystemTextureBinding(const std::string& name, const std::string& texture_key);
 
     std::unordered_map<std::string, SceneTexture>      textures;
     std::unordered_map<std::string, SceneRenderTarget> renderTargets;
@@ -333,6 +342,9 @@ public:
     std::unordered_set<std::string> videoTextureRuntimeStateRequests;
 
     std::string scene_id { "unknown_id" };
+    // Utility material selection reads the containing scene's authored version, including for
+    // layers created after loading.
+    uint32_t authoredVersion { 0 };
 
     bool first_frame_ok { false };
 
@@ -348,6 +360,10 @@ public:
     double                     defaultGlobalCameraZoom { 1.0 };
     int32_t                    activeCameraLayerId { 0 };
     std::string                modelPerspectiveCameraName;
+    // The authored scene pose is independent of the mutable frame camera. Layer selection and
+    // path playback may replace the effective view, but must not overwrite the pose selected when
+    // neither applies.
+    CameraPose                     authoredCameraPose;
     std::vector<CameraPathSegment> modelCameraPathSegments;
     bool                           modelCameraPathEnabled { false };
     int32_t                        activeModelCameraPathSegment { -1 };
@@ -357,6 +373,7 @@ public:
     // projection uses the final pixel extent after fill-mode framing, while layout, cameras, and
     // effect sampling continue to use authored scene units.
     std::array<uint32_t, 2> physicalOutputExtent { 0u, 0u };
+    bool                 clearEnabled { true };
     std::array<float, 3> clearColor { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> ambientColor { 0.2f, 0.2f, 0.2f };
     std::array<float, 3> skylightColor { 0.3f, 0.3f, 0.3f };
@@ -470,8 +487,17 @@ public:
     float                cameraParallaxDelay { 0.0f };
     float                cameraParallaxMouseInfluence { 0.0f };
     bool                 cameraOrthographic { true };
-    // Particle perspective camera. Copied from scene `general.perspectiveoverridefov` (default 95).
-    float                perspectiveOverrideFov { 95.0f };
+    // Script/property access addresses the raw scene values, not a raster camera. Camera-layer
+    // selection and the per-frame FOV limit must never write back into these properties,
+    // including while a layer owns the view. Defaults match the scene-general schema; parsing
+    // supplies authored values.
+    struct GeneralProjectionSettings {
+        float fov { 50.0f };
+        float perspectiveOverrideFov { 95.0f };
+        float nearClip { 0.01f };
+        float farClip { 10000.0f };
+    };
+    GeneralProjectionSettings generalProjection;
     bool                 cameraShake { false };
     float                cameraShakeAmplitude { 0.5f };
     float                cameraShakeRoughness { 1.0f };
@@ -563,6 +589,10 @@ public:
     }
 
 private:
+    bool ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible);
+
+    std::unordered_map<std::string, std::shared_ptr<std::string>> m_system_texture_bindings;
+
     struct PendingParsedImageRequest {
         std::future<std::shared_ptr<Image>>    future;
         std::chrono::steady_clock::time_point  started_at;

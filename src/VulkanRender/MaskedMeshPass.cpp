@@ -12,11 +12,6 @@ void MaskedMeshPass::prepare(Scene& scene, const Device& device, RenderingResour
     setPrepared(m_visible_draw.prepare(scene, device, resources));
 }
 
-void MaskedMeshPass::prepareDeferred(Scene& scene, const Device& device,
-                                     RenderingResources& resources) {
-    setPrepared(m_visible_draw.prepareDeferred(scene, device, resources));
-}
-
 void MaskedMeshPass::refreshResources(Scene& scene, const Device& device,
                                       RenderingResources& resources) {
     if (! m_visible_draw.refreshResources(scene, device, resources)) setPrepared(false);
@@ -29,11 +24,6 @@ void MaskedMeshPass::refreshImportedTextureBindings(Scene& scene, const Device& 
 void MaskedMeshPass::dropOutputFramebuffers() { m_visible_draw.dropOutputFramebuffers(); }
 
 void MaskedMeshPass::updateBeforeUpload() { m_visible_draw.updateBeforeUpload(); }
-
-DeferredPrepareResourcesState
-MaskedMeshPass::requestDeferredPrepareResources(Scene& scene, const Device& device) {
-    return m_visible_draw.requestDeferredPrepareResources(scene, device);
-}
 
 void MaskedMeshPass::execute(const Device& device, RenderingResources& resources) {
     m_visible_draw.execute(device, resources);
@@ -63,14 +53,10 @@ bool MaskedMeshPass::canReuseForResidency(const VulkanPass& next_pass) const {
     if (next == nullptr || ! m_visible_draw.canReuseForResidency(next->m_visible_draw)) {
         return false;
     }
-    const auto* lhs_node = m_visible_draw.data().node;
-    const auto* rhs_node = next->m_visible_draw.data().node;
-    if (lhs_node == nullptr || rhs_node == nullptr || lhs_node->Mesh() == nullptr ||
-        rhs_node->Mesh() == nullptr) {
-        return lhs_node == rhs_node;
-    }
-    return MaskedDrawRenderer::SamePlan(lhs_node->Mesh()->MaskedDraw(),
-                                        rhs_node->Mesh()->MaskedDraw());
+    const auto* lhs_mesh = m_visible_draw.data().draw.Mesh();
+    const auto* rhs_mesh = next->m_visible_draw.data().draw.Mesh();
+    if (lhs_mesh == nullptr || rhs_mesh == nullptr) return lhs_mesh == rhs_mesh;
+    return MaskedDrawRenderer::SamePlan(lhs_mesh->MaskedDraw(), rhs_mesh->MaskedDraw());
 }
 
 void MaskedMeshPass::absorbResidencyGraphState(const VulkanPass& next_pass) {

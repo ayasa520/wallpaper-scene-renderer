@@ -36,6 +36,7 @@
 #include "SpecTexs.hpp"
 #include "Utils/Logging.h"
 #include "Utils/Sha.hpp"
+#include "WPJson.hpp"
 #include "WPSceneScriptMedia.hpp"
 
 using namespace wallpaper;
@@ -128,11 +129,6 @@ int32_t MaxTextPaddingEdge(const std::array<int32_t, 4>& padding) {
     return std::max({ padding[0], padding[1], padding[2], padding[3] });
 }
 
-std::array<int32_t, 4> ClampTextPaddingEdges(std::array<int32_t, 4> padding) {
-    for (auto& edge : padding) edge = std::max(edge, 0);
-    return padding;
-}
-
 int TextPaddingHorizontal(const std::array<int32_t, 4>& padding) {
     return padding[3] + padding[1];
 }
@@ -141,114 +137,19 @@ int TextPaddingVertical(const std::array<int32_t, 4>& padding) {
     return padding[0] + padding[2];
 }
 
-bool ParseTextPaddingComponentString(std::string_view text, std::vector<double>* out_components) {
-    if (out_components == nullptr) return false;
-
-    std::istringstream input { std::string(text) };
-    std::vector<double> components;
-    double component = 0.0;
-    while (input >> component) components.push_back(component);
-    input >> std::ws;
-    if (!input.eof() || components.empty()) return false;
-
-    *out_components = std::move(components);
-    return true;
-}
-
-bool ReadTextPaddingComponents(const nlohmann::json& value_node,
-                               std::vector<double>* out_components) {
-    if (out_components == nullptr) return false;
-
-    if (value_node.is_number()) {
-        *out_components = { value_node.get<double>() };
-        return true;
-    }
-
-    if (value_node.is_string()) {
-        return ParseTextPaddingComponentString(value_node.get_ref<const std::string&>(),
-                                               out_components);
-    }
-
-    if (value_node.is_array()) {
-        std::vector<double> components;
-        components.reserve(value_node.size());
-        for (const auto& item : value_node) {
-            if (item.is_number()) {
-                components.push_back(item.get<double>());
-                continue;
-            }
-            if (item.is_string()) {
-                std::vector<double> item_components;
-                if (!ParseTextPaddingComponentString(item.get_ref<const std::string&>(),
-                                                     &item_components)) {
-                    return false;
-                }
-                components.insert(components.end(), item_components.begin(), item_components.end());
-                continue;
-            }
-            return false;
-        }
-        if (components.empty()) return false;
-        *out_components = std::move(components);
-        return true;
-    }
-
-    return false;
-}
-
-int32_t RoundTextPaddingComponent(double value) {
-    if (!std::isfinite(value)) return 0;
-    return static_cast<int32_t>(std::lround(value));
-}
-
-std::optional<std::array<int32_t, 4>> ExpandTextPaddingComponents(
-    const std::vector<double>& components) {
-    if (components.empty() || components.size() > 4) return std::nullopt;
-
-    const auto edge = [&](size_t index) { return RoundTextPaddingComponent(components[index]); };
-
-    // Text padding is a shorthand, not a scalar. Keep the same expansion model as CSS:
-    // one value applies to every edge; two values are vertical/horizontal; three values are
-    // top/horizontal/bottom; four values are top/right/bottom/left.
-    if (components.size() == 1) return UniformTextPadding(edge(0));
-    if (components.size() == 2) return { { edge(0), edge(1), edge(0), edge(1) } };
-    if (components.size() == 3) return { { edge(0), edge(1), edge(2), edge(1) } };
-    return { { edge(0), edge(1), edge(2), edge(3) } };
-}
-
 void ReadTextPaddingValue(const nlohmann::json& json,
                           int32_t              object_id,
-                          int32_t*             out_legacy_padding,
-                          std::array<int32_t, 4>* out_padding_edges) {
-    if (out_legacy_padding == nullptr || out_padding_edges == nullptr ||
-        !json.contains("padding") || json.at("padding").is_null()) {
+                          std::array<float, 2>* out_padding) {
+    if (!json.contains("padding") || json.at("padding").is_null()) {
         return;
     }
 
     const auto* value_node = ResolveTextPropertyValueNode(json.at("padding"));
     if (value_node == nullptr) return;
 
-    std::vector<double> components;
-    if (!ReadTextPaddingComponents(*value_node, &components)) {
-        const std::string raw = value_node->dump();
-        LOG_ERROR("TextPaddingParse: layer=%d unsupported padding=%s",
-                  object_id,
-                  raw.c_str());
-        return;
-    }
-
-    const auto expanded = ExpandTextPaddingComponents(components);
-    if (!expanded.has_value()) {
-        const std::string raw = value_node->dump();
-        LOG_ERROR("TextPaddingParse: layer=%d invalid component-count=%zu padding=%s",
-                  object_id,
-                  components.size(),
-                  raw.c_str());
-        return;
-    }
-
-    *out_padding_edges  = ClampTextPaddingEdges(*expanded);
-    *out_legacy_padding = MaxTextPaddingEdge(*out_padding_edges);
+    if (ReadJsonFloat2Value(*value_node, *out_padding)) return;
+    const std::string raw = value_node->dump();
+    LOG_ERROR("TextPaddingParse: layer=%d unsupported padding=%s", object_id, raw.c_str());
 }
 
 std::string NormalizeAssetPath(fs::VFS& vfs, std::string_view path) {
@@ -576,15 +477,19 @@ constexpr int32_t kMaxTextPaddingEdge = 512;
 std::array<int32_t, 4> ResolveTextLayoutPadding(
     const wpscene::WPTextObject& object,
     const TextLayerRenderContract& render_contract) {
-    // Padding enters the text box only for effect-backed text, which needs the extra transparent
-    // source pixels that effect shaders sample around the glyphs. Text without effects, including
-    // opaque-background text, keeps the bare glyph box: its card and background quad hug the
-    // shaped glyph bounds, and carrying padding through the direct path would turn invisible
-    // padding into visible placement geometry.
-    if (! render_contract.RequiresBridge()) return UniformTextPadding(0);
-    auto edges = ClampTextPaddingEdges(object.padding_edges);
-    for (auto& edge : edges) edge = std::min(edge, kMaxTextPaddingEdge);
-    return edges;
+    // The opaque-background property sets the layout flag that preserves padding independently of
+    // visible effects or publication. Only transparent text can drop padding when its entire
+    // effect chain becomes hidden; the background quad must continue covering the padded AABB in
+    // that same transition.
+    if (!object.opaquebackground && !render_contract.UsesEffectPadding())
+        return UniformTextPadding(0);
+    const auto raster_edge = [](float value) {
+        return static_cast<int32_t>(
+            std::lround(std::min(value, static_cast<float>(kMaxTextPaddingEdge))));
+    };
+    const int32_t horizontal = raster_edge(object.padding[0]);
+    const int32_t vertical = raster_edge(object.padding[1]);
+    return { vertical, horizontal, vertical, horizontal };
 }
 
 bool TextObjectUsesImplicitSceneAlignment(const wpscene::WPTextObject& object) {
@@ -753,57 +658,6 @@ std::array<float, 2> ResolveVisibleTextSourceSize(const TextLayerRuntimeState& s
     return state.object.size;
 }
 
-std::array<int32_t, 2> RoundTextExtent(std::array<float, 2> extent) {
-    auto round_axis = [](float value) {
-        if (!std::isfinite(value)) return int32_t { 1 };
-        const double clamped = std::clamp(
-            static_cast<double>(value),
-            1.0,
-            static_cast<double>(std::numeric_limits<int32_t>::max()));
-        return static_cast<int32_t>(std::lround(clamped));
-    };
-    return { round_axis(extent[0]), round_axis(extent[1]) };
-}
-
-bool UpdateTextDependencyRenderTarget(SceneRenderTarget&  render_target,
-                                      std::array<float, 2> physical_extent,
-                                      std::array<float, 2> logical_extent) {
-    // width/height are the Vulkan backing pixels; mapWidth/mapHeight are the effect grid sampled
-    // by g_TextureNResolution. Both follow the text box plus any FBO scale or fit.
-    const auto physical = RoundTextExtent(physical_extent);
-    const auto logical = RoundTextExtent(logical_extent);
-    const bool changed = physical[0] != render_target.width ||
-                         physical[1] != render_target.height ||
-                         logical[0] != render_target.mapWidth ||
-                         logical[1] != render_target.mapHeight;
-    render_target.width     = physical[0];
-    render_target.height    = physical[1];
-    render_target.mapWidth  = logical[0];
-    render_target.mapHeight = logical[1];
-    return changed;
-}
-
-std::array<float, 2> ResolveTextBridgeRenderTargetExtent(
-    const TextBridgeRenderTarget& bridge_target, std::array<float, 2> bridge_extent) {
-    const float source_width  = std::max(1.0f, bridge_extent[0]);
-    const float source_height = std::max(1.0f, bridge_extent[1]);
-
-    if (bridge_target.fit > 0) {
-        const float longest_edge = std::max(source_width, source_height);
-        const float fit_scale    = static_cast<float>(bridge_target.fit) / longest_edge;
-        return {
-            std::max(1.0f, source_width * fit_scale),
-            std::max(1.0f, source_height * fit_scale),
-        };
-    }
-
-    const float scale = static_cast<float>(std::max<uint32_t>(1u, bridge_target.scale));
-    return {
-        std::max(1.0f, source_width / scale),
-        std::max(1.0f, source_height / scale),
-    };
-}
-
 std::array<float, 2> ResolveFullTextDisplaySize(const TextLayerRuntimeState& state) {
     if (state.primitive == nullptr) {
         return state.object.size;
@@ -855,10 +709,6 @@ std::array<float, 2> ResolveVisibleTextDisplayOffset(const TextLayerRuntimeState
         return { 0.0f, 0.0f };
     }
     return ResolveDerivedTextDisplayOffset(state, alignment);
-}
-
-int ResolvePadding(const wpscene::WPTextObject& object) {
-    return MaxTextPaddingEdge(ClampTextPaddingEdges(object.padding_edges));
 }
 
 float ResolveTextRasterDensityFactor(const wpscene::WPTextObject& object,
@@ -1868,32 +1718,13 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     const int ink_overhang_bottom = std::max((ink_rect.y + ink_rect.height) - layout_height, 0);
     const int bounds_width  = std::max(layout_width + ink_overhang_left + ink_overhang_right, 1);
     const int bounds_height = std::max(layout_height + ink_overhang_top + ink_overhang_bottom, 1);
-    int resolved_width =
-        scale_display_metric_to_layout_pixels(static_cast<double>(object.size[0]), 1);
-    int resolved_height =
-        scale_display_metric_to_layout_pixels(static_cast<double>(object.size[1]), 1);
-    if (! object.size_explicit || object.size[0] <= 0.0f || object.size[1] <= 0.0f) {
-        resolved_width =
-            requested_max_width > 0 ? requested_max_width
-                                    : std::max(bounds_width + padding_horizontal, 1);
-        resolved_height = std::max(bounds_height + padding_vertical, 1);
-        object.size     = {
-            static_cast<float>(resolved_width),
-            static_cast<float>(resolved_height),
-        };
-    } else if (! object.limitwidth) {
-        // Non-width-limited text should never be clipped just because Linux font
-        // metrics are a few pixels wider than the original authoring environment.
-        resolved_width  = std::max(resolved_width, bounds_width + padding_horizontal);
-        resolved_height = std::max(resolved_height, bounds_height + padding_vertical);
-        object.size     = {
-            static_cast<float>(resolved_width),
-            static_cast<float>(resolved_height),
-        };
-    }
-
-    const int width  = resolved_width;
-    const int height = resolved_height;
+    // The text card is derived from the completed layout bounds plus effect padding. Authored
+    // `size` is not a minimum card extent, and `maxwidth` constrains line breaking rather than
+    // allocating unused space around a short paragraph. Recompute both dimensions on every
+    // layout so shortening scripted text also shrinks its card and destination render target.
+    const int width  = std::max(bounds_width + padding_horizontal, 1);
+    const int height = std::max(bounds_height + padding_vertical, 1);
+    object.size = { static_cast<float>(width), static_cast<float>(height) };
     const int raster_width =
         std::max(1, static_cast<int>(std::lround(static_cast<double>(width) * raster_scale)));
     const int raster_height =
@@ -1914,9 +1745,9 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
     ApplyWallpaperEngineTextSize(draw_desc, effective_point_size);
     pango_layout_set_font_description(layout, draw_desc);
 
-    const int content_width      = std::max(width - padding_horizontal, 1);
-    const int draw_content_width = object.limitwidth ? content_width : -1;
-    ConfigureLayout(layout, object, draw_content_width);
+    // Reuse the shaping constraint, not the resulting card width: ink overhang and padding
+    // belong to the card and must not trigger a second, different set of line breaks.
+    ConfigureLayout(layout, object, measure_width);
     pango_layout_get_pixel_size(layout, &layout_width, &layout_height);
     pango_layout_get_pixel_extents(layout, &ink_rect, &logical_rect);
     const int            draw_overhang_left = std::max(-ink_rect.x, 0);
@@ -2188,14 +2019,13 @@ bool TextLayerNeedsBridgeResidency(const Scene& scene, int32_t layer_id) {
            scene.IsLayerOffscreenDependencySource(layer_id);
 }
 
-// `relayout` marks a call made because the text was shaped again (content or font change); the
-// per-frame and transform-only callers pass false.
+// Resource setup runs after reshaping or a first/last-child callback. Per-frame and
+// transform-only callers pass false and only enter when the shaped pixel extent changed.
 bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
                                           int32_t layer_id,
                                           TextLayerRuntimeState& state,
-                                          bool relayout) {
-    if (state.primitive == nullptr || !state.render_contract.RequiresBridge() ||
-        !TextLayerNeedsBridgeResidency(scene, layer_id)) {
+                                          bool resource_setup) {
+    if (state.primitive == nullptr || !state.render_contract.RequiresBridge()) {
         return false;
     }
 
@@ -2203,69 +2033,58 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
     const auto display_size = ResolveVisibleTextDisplaySize(state);
     if (!std::isfinite(display_size[0]) || !std::isfinite(display_size[1])) return false;
 
-    // Everything below runs on a re-layout of this layer, or when its shaped box changed. The
-    // scene camera and the output size never enter this decision.
+    // A setup callback uses the existing layout, including for a hidden owner. Visibility gates
+    // the per-frame maintenance caller, not this CPU resource operation. The scene camera and
+    // output resolution do not determine this extent.
+    const auto pixel_extent = ResolveTextDestinationExtent(display_size);
     const std::array<uint32_t, 2> next_backing_extent {
-        static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
-            static_cast<int32_t>(std::lround(display_size[0])))),
-        static_cast<uint32_t>(ClampDestinationRenderTargetExtent(
-            static_cast<int32_t>(std::lround(display_size[1])))),
+        static_cast<uint32_t>(pixel_extent[0]),
+        static_cast<uint32_t>(pixel_extent[1]),
     };
     const bool extent_changed = next_backing_extent != bridge.bridge_backing_extent;
-    if (!relayout && !extent_changed) return false;
+    if (!resource_setup && !extent_changed) return false;
     const std::array<uint32_t, 2> previous_extent = bridge.bridge_backing_extent;
     bridge.bridge_backing_extent                  = next_backing_extent;
 
-    // Named effect FBOs (`_rt_FullCompoBuffer1` and friends) are shared by name across layers:
-    // the first layer to reference a name creates it at its own extent, and every later
-    // re-layout of a layer that references it resizes that same image in place to the
-    // re-laid-out layer's extent (a no-op when the extent is unchanged). A layer whose text
-    // never changes therefore renders its effect chain through whatever extent the last
-    // re-laid-out layer left behind.
-    bool any_target_resized = false;
-    for (const auto& bridge_target : bridge.render_targets) {
-        if (bridge_target.name == bridge.pingpong_a || bridge_target.name == bridge.pingpong_b) {
-            continue;
-        }
-        auto render_target_it = scene.renderTargets.find(bridge_target.name);
-        if (render_target_it == scene.renderTargets.end()) continue;
-        if (render_target_it->second.bind.enable) continue;
-        const auto fbo_extent = ResolveTextBridgeRenderTargetExtent(bridge_target, display_size);
-        if (UpdateTextDependencyRenderTarget(render_target_it->second, fbo_extent, fbo_extent)) {
-            scene.MarkRenderTargetResourcesDirty(bridge_target.name);
-            any_target_resized = true;
-        }
-    }
-
-    // The destination pair follows the shaped text box as well. Here the registered pair is
-    // resized in place under its existing names and the passes that touch it refresh their
-    // resources. Interning a fresh pair for the new extent and re-pointing the effect chain at it
-    // (leaving the previous images untouched) was tried and left the glyphs undrawn after the
-    // graph rebuild; until that path renders, the pair keeps its names.
-    if (!extent_changed) return any_target_resized;
-    for (const auto* name : { &bridge.pingpong_a, &bridge.pingpong_b }) {
-        auto render_target_it = scene.renderTargets.find(*name);
-        if (render_target_it == scene.renderTargets.end()) continue;
-        const std::array<float, 2> extent { static_cast<float>(next_backing_extent[0]),
-                                            static_cast<float>(next_backing_extent[1]) };
-        if (UpdateTextDependencyRenderTarget(render_target_it->second, extent, extent)) {
-            scene.MarkRenderTargetResourcesDirty(*name);
-            any_target_resized = true;
-        }
-    }
-    if (any_target_resized) {
-        LOG_INFO("SceneTextBridgeBacking: layer=%d name='%s' destination='%s' partner='%s' "
-                 "previous=[%u %u] extent=[%u %u]",
+    auto& effect_layer = *scene.FindImageEffectLayer(layer_id);
+    // Setup reselects destinations even when reshaping preserves their extent. An earlier
+    // reparent may have changed the selected ancestor, so use the current owner rather than the
+    // text object's parsed parent snapshot. A private slot zero is recreated under its stable
+    // owner name at this same boundary.
+    const std::array<std::string, 2> previous_names { bridge.pingpong_a, bridge.pingpong_b };
+    auto target = scene.renderTargets.at(previous_names[0]);
+    target.width = target.mapWidth = static_cast<int32_t>(next_backing_extent[0]);
+    target.height = target.mapHeight = static_cast<int32_t>(next_backing_extent[1]);
+    const auto& render_contract = state.render_contract;
+    const auto next_names = ResolveSceneDestinationRenderTargets(
+        scene, layer_id, effect_layer.Owner().ParentId(),
+        render_contract.uses_private_dependency_bridge ||
+            render_contract.uses_shader_color_blend_bridge,
+        target);
+    effect_layer.SetDestinationTargets(next_names[0], next_names[1]);
+    bridge.pingpong_a = next_names[0];
+    bridge.pingpong_b = next_names[1];
+    // Shared named FBOs also rerun setup when this text's own extent is unchanged: another owner
+    // may have resized the same resource in between.
+    const bool any_target_resized = effect_layer.ResizeEffectRenderTargets(
+        scene, { static_cast<float>(next_backing_extent[0]),
+                 static_cast<float>(next_backing_extent[1]) });
+    const bool destination_changed = extent_changed || previous_names != next_names;
+    if (destination_changed) scene.MarkRenderGraphTopologyDirty();
+    LOG_INFO("SceneTextDestinationIntern: layer=%d name='%s' destination='%s' partner='%s' "
+                 "previous-target='%s' previous=[%u %u] extent=[%u %u] parent=%d setup=%s",
                  layer_id,
                  state.object.name.c_str(),
                  bridge.pingpong_a.c_str(),
                  bridge.pingpong_b.c_str(),
+                 previous_names[0].c_str(),
                  previous_extent[0],
                  previous_extent[1],
                  next_backing_extent[0],
-                 next_backing_extent[1]);
-    }
-    return any_target_resized;
+                 next_backing_extent[1],
+                 effect_layer.Owner().ParentId(),
+                 resource_setup ? "true" : "false");
+    return destination_changed || any_target_resized;
 }
 
 std::string ResolveTextContentAlignment(const wpscene::WPTextObject& object) {
@@ -2545,37 +2364,6 @@ bool ResolveBottomScreenAnchoredTextStack(std::vector<ScreenAnchoredTextPlacemen
     return changed_any;
 }
 
-void SyncTextEffectLayerResolvedTransform(Scene&                  scene,
-                                          SceneImageEffectLayer& effect_layer) {
-    auto* world_node = effect_layer.WorldNode();
-    if (world_node == nullptr || scene.shaderValueUpdater == nullptr ||
-        scene.activeCamera == nullptr) {
-        return;
-    }
-
-    /*
-     * Effect-backed text may be detached from its authored parent in the physical SceneNode tree
-     * and reintroduced by a render-order proxy. Copying WorldNode::ModelTrans during a resource
-     * refresh would then observe only that detached tree and can publish one frame at the wrong
-     * origin. Resolve through the same parent/attachment/parallax contract used by shader uniforms
-     * so transform and backing-size updates enter one coherent refresh transaction.
-     */
-    const bool apply_parallax = !effect_layer.PublishesPrivateFinalComposite();
-    const auto resolved_model =
-        scene.shaderValueUpdater->ResolveModelTransformForProjection(
-            world_node, scene.activeCamera, apply_parallax);
-    effect_layer.SyncResolvedNodeToMatrix(Eigen::Affine3f(resolved_model.cast<float>()));
-}
-
-void SyncTextLayerEffectTransform(Scene& scene, int32_t layer_id) {
-    auto* effect_layer = scene.FindImageEffectLayer(layer_id);
-    if (effect_layer == nullptr) return;
-
-    // The offscreen source camera remains in local text space; only the final published node
-    // follows the authoritative world transform.
-    SyncTextEffectLayerResolvedTransform(scene, *effect_layer);
-}
-
 } // namespace
 
 void wallpaper::RebuildTextPrimitiveVisibleMesh(SceneMesh* mesh,
@@ -2627,11 +2415,13 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     ReadLiteralOrDynamicValue(json, "pointsize", &pointsize);
     ReadLiteralOrDynamicValue(json, "maxwidth", &maxwidth);
     ReadLiteralOrDynamicValue(json, "maxrows", &maxrows);
-    ReadTextPaddingValue(json, id, &padding, &padding_edges);
+    ReadTextPaddingValue(json, id, &padding);
     GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
     GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
     ReadLiteralOrDynamicValue(json, "visible", &visible);
     ReadLiteralOrDynamicValue(json, "opaquebackground", &opaquebackground);
+    ReadLiteralOrDynamicValue(json, "nointerpolation", &nointerpolation);
+    ReadLiteralOrDynamicValue(json, "clampuvs", &clampuvs);
     ReadLiteralOrDynamicValue(json, "blockalign", &blockalign);
     ReadLiteralOrDynamicValue(json, "limitrows", &limitrows);
     ReadLiteralOrDynamicValue(json, "limituseellipsis", &limituseellipsis);
@@ -2641,7 +2431,6 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     ReadLiteralOrDynamicValue(json, "anchor", &anchor);
     ReadLiteralOrDynamicValue(json, "depthtest", &depthtest);
 
-    size_explicit = json.contains("size") && ! json.at("size").is_null();
     if (json.contains("visible")) {
         ReadVisibleBinding(json.at("visible"), &visible_binding);
         has_visible_script = json.at("visible").is_object() &&
@@ -2706,7 +2495,7 @@ std::optional<WPDynamicValue> wallpaper::ReadTextLayerProperty(const TextLayerRu
     } else if (property_name == "pointsize") {
         result = WPDynamicValue(object.pointsize);
     } else if (property_name == "padding") {
-        result = WPDynamicValue(static_cast<int32_t>(object.padding));
+        result = WPDynamicValue(object.padding);
     } else if (property_name == "horizontalalign") {
         result = WPDynamicValue(object.horizontalalign);
     } else if (property_name == "verticalalign") {
@@ -2738,7 +2527,6 @@ bool wallpaper::ApplyTextLayerDisplaySize(TextLayerRuntimeState& state,
     // geometry until the caller chooses one of the explicit runtime actions. The rasterizer owns
     // the display-space to Pango-layout conversion, so runtime scripts can round-trip
     // `thisLayer.size` without receiving or storing hidden HiDPI layout units.
-    state.object.size_explicit = true;
     return true;
 }
 
@@ -2781,16 +2569,13 @@ bool wallpaper::ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
     }
 
     if (property_name == "padding") {
-        int32_t padding = 0;
-        if (! value.tryGet(&padding)) {
+        if (! value.tryGet(&object.padding)) {
             LOG_ERROR("TextLayerPropertyApply: layer=%d name='%s' property='padding' "
-                      "failed to read scalar runtime value",
+                      "failed to read two-component runtime value",
                       object.id,
                       object.name.c_str());
             return false;
         }
-        object.padding       = padding;
-        object.padding_edges = UniformTextPadding(padding);
         applied = true;
     }
     if (!applied && property_name == "maxrows") {
@@ -3052,6 +2837,7 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
     const auto  bridge_ref  = text_object != nullptr ? text_object->ImageEffectLayer() : nullptr;
     if (bridge_ref != nullptr) {
         const auto camera_size = next_geometry.visible_display_size;
+        bridge_ref->SetCardSize(camera_size);
         const bool local_bridge_geometry_changed =
             visible_display_size_changed || visible_local_center_changed;
         for (const auto& camera_name : bridge_ref->RuntimeCameraNames()) {
@@ -3068,13 +2854,12 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
 
             if (local_bridge_geometry_changed) {
                 // Local text-box changes rebuild the final quad and bridge camera. Transform-only
-                // scripts keep that mesh intact and only republish the resolved world matrix.
+                // scripts leave this geometry intact; drawing reads the current owner placement.
                 RebuildTextMesh(&bridge_ref->FinalMesh(),
                                 camera_size,
                                 next_geometry.visible_local_center);
                 bridge_ref->SyncResolvedOutputMesh();
             }
-            SyncTextEffectLayerResolvedTransform(scene, *bridge_ref);
         }
     }
 
@@ -3183,7 +2968,8 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
     // reraster would flood the log without adding information.
     if (texture_version == 0) {
         LOG_INFO("SceneTextLayoutContract: layer=%d name='%s' bridge=%s authored-effects=%s "
-                 "shader-blend=%s pointsize=%.3f pointsize-authoring=%.3f conversion=%.3f "
+                 "shader-blend=%s padding=[%.3f %.3f] "
+                 "pointsize=%.3f pointsize-authoring=%.3f conversion=%.3f "
                  "object-scale=[%.5f %.5f %.5f] render-scale=%.3f backing-density=%.3f "
                  "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
                  "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
@@ -3194,6 +2980,8 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
                  render_contract.RequiresBridge() ? "true" : "false",
                  render_contract.has_materialized_authored_effects ? "true" : "false",
                  render_contract.uses_shader_color_blend_bridge ? "true" : "false",
+                 object.padding[0],
+                 object.padding[1],
                  object.pointsize,
                  layout.point_size_authoring_units,
                  static_cast<float>(kTextPointSizeToAuthoringUnits),
@@ -3264,6 +3052,21 @@ bool wallpaper::UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id) {
     return SyncTextLayerSceneGeometry(scene, layer_id, state, previous_geometry);
 }
 
+void wallpaper::RefreshTextLayerResources(Scene& scene, SceneObject& owner) {
+    // The parent's child-boundary callback reuses its already shaped layout. Rebuild the
+    // publication card and destination resources without invoking the shaping/rasterization
+    // factory or replacing glyph atlas pages.
+    auto& state = *owner.TextRuntimeState();
+    auto& effect_layer = *owner.ImageEffectLayer();
+    effect_layer.SetCardSize(ResolveVisibleTextDisplaySize(state));
+    RebuildTextPrimitiveVisibleMesh(&effect_layer.FinalMesh(), *state.primitive);
+    effect_layer.SyncResolvedOutputMesh();
+    UpdateTextLayerBridgeBackingInternal(scene, owner.Id(), state, true);
+    scene.MarkRenderGraphTopologyDirty();
+    LOG_INFO("SceneTextChildBoundary: layer=%d parent=%d children=%zu layout-reused=true",
+             owner.Id(), owner.ParentId(), scene.GetLayerChildren(owner.Id()).size());
+}
+
 void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
     // Text records live on the identity objects; skipping objects without one reproduces the
     // former textLayers key set (registration always stores a full record).
@@ -3276,10 +3079,6 @@ void wallpaper::UpdateAllTextLayerBridgeBackings(Scene& scene) {
             continue;
         }
 
-        // PrepareFrame() has already advanced parallax and attachment poses. Republish the same
-        // resolved world transform before sizing and resource refresh so the final composite and
-        // its projected backing always describe one frame of scene state.
-        SyncTextLayerEffectTransform(scene, layer_id);
         UpdateTextLayerBridgeBackingInternal(scene, layer_id, state, false);
     }
 }
@@ -3381,7 +3180,6 @@ bool wallpaper::ApplyTextLayerScreenAnchorTransforms(Scene& scene) {
         if (!changed) {
             continue;
         }
-        SyncTextLayerEffectTransform(scene, placement.layer_id);
         changed_any_node = true;
     }
 
@@ -3479,4 +3277,22 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     // refresh before the next draw so atlas descriptors and vertex/index buffers stay frame-coherent.
     scene.MarkTextLayerResourcesDirty(layer_id);
     return true;
+}
+
+bool wallpaper::SyncTextLayerEffectVisibility(Scene& scene, int32_t layer_id) {
+    auto& state = *scene.FindTextLayerState(layer_id);
+    const bool previous_padding = state.render_contract.UsesEffectPadding();
+    state.render_contract.has_visible_authored_effects =
+        scene.FindImageEffectLayer(layer_id)->HasVisibleEffects();
+    // Only a change in the padding predicate alters text geometry. Intermediate effect toggles
+    // still rebuild their destination sequence, but do not rerasterize unchanged glyphs. A padding
+    // transition uses the ordinary layout path so meshes, card size, cameras, interned targets and
+    // authored effect FBO extents all update before the next submitted frame.
+    if (previous_padding == state.render_contract.UsesEffectPadding()) {
+        state.primitive->render_contract = state.render_contract;
+        return true;
+    }
+    LOG_INFO("SceneTextEffectPaddingChange: layer=%d enabled=%s",
+             layer_id, state.render_contract.UsesEffectPadding() ? "true" : "false");
+    return RebuildTextLayerSceneLayout(scene, layer_id);
 }

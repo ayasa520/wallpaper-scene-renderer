@@ -38,20 +38,21 @@ struct WPTextObject {
     float                      backgroundbrightness { 1.0f };
     float                      pointsize { 32.0f };
     float                      maxwidth { 0.0f };
-    bool                       size_explicit { false };
     bool                       visible { true };
     VisibleBinding             visible_binding;
     bool                       has_visible_script { false };
     bool                       has_dynamic_layout_script { false };
     bool                       opaquebackground { false };
+    bool                       nointerpolation { false };
+    bool                       clampuvs { true };
     bool                       blockalign { false };
     bool                       limitrows { false };
     bool                       limituseellipsis { false };
     bool                       limitwidth { false };
     int32_t                    maxrows { 1 };
-    // Default padding is 32 on both axes; it only enters the layout box of effect-backed text.
-    int32_t                    padding { 32 };
-    std::array<int32_t, 4>     padding_edges { 32, 32, 32, 32 }; // top, right, bottom, left
+    // Keep the independent x/y floats through property updates; visible effects, private
+    // publication or an opaque background enable them in the layout.
+    std::array<float, 2>        padding { 32.0f, 32.0f };
     int32_t                    parent { 0 };
     std::string                attachment;
     std::string                text;

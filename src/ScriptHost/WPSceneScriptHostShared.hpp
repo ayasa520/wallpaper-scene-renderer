@@ -197,13 +197,12 @@ LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32
 LayerResidencyResources CollectRetainedResidencyResources(
     const Scene& scene, const std::unordered_set<int32_t>& excluded_layers);
 void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
+                               const LayerResidencyResources& resources,
                                const LayerResidencyResources& retained, const char* reason);
 
 // Defined in WPSceneScriptHost.cpp: the registration and node-resolution helpers the
 // residency unit calls back into.
 SceneNode*             FindNodeById(WPSceneScriptHost::Opaque* opaque, int32_t node_id);
-void                   RebindLayerRegistrations(WPSceneScriptHost::Opaque* opaque,
-                                                int32_t layer_id, SceneNode* node);
 SceneRegistrationRange CaptureSceneRegistrationRange(WPSceneScriptHost::Opaque* opaque);
 bool SceneRegistrationRangeHasNewEntries(WPSceneScriptHost::Opaque* opaque,
                                          const SceneRegistrationRange& range);

@@ -17,6 +17,7 @@ namespace wallpaper
 class Scene;
 class SceneMesh;
 class SceneNode;
+class SceneObject;
 
 namespace fs
 {
@@ -103,6 +104,7 @@ bool ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
                                  std::string_view       property_name,
                                  const WPDynamicValue&  value);
 bool SyncTextLayerSceneMaterials(Scene& scene, int32_t layer_id);
+bool SyncTextLayerEffectVisibility(Scene& scene, int32_t layer_id);
 bool RasterizeTextPrimitiveLayout(fs::VFS&                 vfs,
                                   wpscene::WPTextObject&   object,
                                   const TextLayerRenderContract& render_contract,
@@ -122,5 +124,6 @@ bool UpdateTextLayerSceneTransform(Scene& scene, int32_t layer_id);
 bool UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_id);
 bool RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id);
 void UpdateAllTextLayerBridgeBackings(Scene& scene);
+void RefreshTextLayerResources(Scene& scene, SceneObject& owner);
 
 } // namespace wallpaper

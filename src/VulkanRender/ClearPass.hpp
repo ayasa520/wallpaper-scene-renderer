@@ -21,6 +21,11 @@ public:
         ImageParameters       vk_target;
         VkClearValue          clear_value {};
         std::function<bool()> should_execute;
+        // Scene stages clear independently of their first visible draw. Other private
+        // target clears retain their explicit color and do not touch shared model depth.
+        bool                  use_scene_clear_color { false };
+        std::function<bool()> should_clear_color;
+        std::function<bool()> should_clear_model_depth;
     };
 
     explicit ClearPass(const Desc&);

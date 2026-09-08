@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "Utils/String.h"
+#include "WPJson.hpp"
 
 namespace wallpaper
 {
@@ -431,8 +432,9 @@ std::optional<WPDynamicValue> WPDynamicValue::FromJsonLiteral(const nlohmann::js
         }
         case Type::Float2: {
             std::array<float, 2> value {};
-            return ParseJsonArray(json, value) ? std::optional<WPDynamicValue>(WPDynamicValue(value))
-                                               : std::nullopt;
+            const bool parsed = json.is_array() ? ParseJsonArray(json, value)
+                                                : ReadJsonFloat2Value(json, value);
+            return parsed ? std::optional<WPDynamicValue>(WPDynamicValue(value)) : std::nullopt;
         }
         case Type::Float3: {
             std::array<float, 3> value {};

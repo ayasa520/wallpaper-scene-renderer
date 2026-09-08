@@ -20,12 +20,6 @@ class Device;
 class RenderingResources;
 class Resource;
 
-enum class DeferredPrepareResourcesState
-{
-    Ready,
-    Waiting,
-};
-
 class VulkanPass : public rg::Pass {
 public:
     VulkanPass()                                                     = default;
@@ -47,19 +41,6 @@ public:
     // recreate output framebuffers. Media thumbnails can change every track while an effect's
     // ping-pong outputs remain unchanged, so keep the two resource lifecycles independent.
     virtual void refreshImportedTextureBindings(Scene&, const Device&) {}
-    // Deferred runtime preparation is split into an asset-streaming phase and a Vulkan residency
-    // phase. A pass returns Waiting after it has queued background CPU work, allowing the renderer
-    // to keep drawing prepared content instead of blocking the render thread on asset decoding.
-    virtual DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) {
-        return DeferredPrepareResourcesState::Ready;
-    }
-    // Deferred preparation is used when a structural runtime operation adds a pass after a resident
-    // graph already exists. The default path is equivalent to ordinary prepare(), while heavier
-    // passes can override it to enforce a non-blocking streaming contract before synchronous work
-    // is allowed to run on the render thread.
-    virtual void prepareDeferred(Scene& scene, const Device& device, RenderingResources& resources) {
-        prepare(scene, device, resources);
-    }
     virtual void execute(const Device&, RenderingResources&)         = 0;
     virtual void destory(const Device&, RenderingResources&)         = 0;
     // Pipeline warm-up mirrors PSO precompilation in game engines: build immutable pipeline state

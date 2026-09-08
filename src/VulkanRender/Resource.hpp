@@ -19,6 +19,14 @@ class Scene;
 namespace vulkan
 {
 
+struct ModelDepthAttachment {
+    VmaImageParameters image;
+    // Clearing is optional scene behavior; layout initialization is a Vulkan resource
+    // lifetime requirement. Keep it with the allocation so a resize or sample-count
+    // change resets the state, without inventing a first-frame content clear.
+    VkImageLayout layout { VK_IMAGE_LAYOUT_UNDEFINED };
+};
+
 struct RenderingResources {
     Scene* scene { nullptr };
     bool   msaa_compose_dirty { false };
@@ -45,7 +53,7 @@ struct RenderingResources {
     // 3D model chunks are emitted as separate CustomShaderPass instances, but authored WE models
     // rely on them sharing one depth buffer per output target. Keeping that depth storage here makes
     // the behavior opt-in for model passes and leaves all legacy 2D render targets color-only.
-    std::unordered_map<std::string, VmaImageParameters> model_depth_images;
+    std::unordered_map<std::string, ModelDepthAttachment> model_depth_images;
     std::unordered_map<std::string, VmaImageParameters> model_depth_resolved;
     // Outputs whose multisampled model depth has been written since the last single-sample
     // resolve. Model draws only mark this; the depth-sampling consumer resolves once on demand,

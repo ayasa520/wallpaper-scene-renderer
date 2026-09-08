@@ -456,7 +456,6 @@ void AttachExtraParticleRenderer(ParseContext& context, wpscene::WPParticleObjec
         material_result = LoadMaterial(*context.vfs,
                                        effective_material,
                                        context.scene.get(),
-                                       extra_node.get(),
                                        &material,
                                        &svData,
                                        context.user_properties,
@@ -584,7 +583,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     if (! is_child) {
         svData.parallaxDepth = { wppartobj.parallaxDepth[0], wppartobj.parallaxDepth[1] };
-        svData.parallaxDepthAuthored = wppartobj.parallaxDepthAuthored;
     }
 
     const ParticleOrientationBasis orientation_basis =
@@ -695,7 +693,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         material_result = LoadMaterial(vfs,
                                        effective_material,
                                        context.scene.get(),
-                                       spNode.get(),
                                        &material,
                                        &svData,
                                        context.user_properties,
@@ -801,7 +798,6 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         ConfigureBoneAttachment(context,
                                 wppartobj.parent,
                                 wppartobj.attachment,
-                                Eigen::Affine3f(spNode->GetLocalTrans().cast<float>()),
                                 "particle object",
                                 wppartobj.name,
                                 svData);
@@ -850,7 +846,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
             ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
         } else {
-            AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
+            AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name);
         }
         context.object_nodes[wppartobj.id] = spNode;
         context.scene->AddLayerRuntimeNode(wppartobj.id, spNode.get());

@@ -356,10 +356,9 @@ private:
         const bool requires_topology_rebuild = m_rg == nullptr || m_scene->renderGraphTopologyDirty;
         if (m_rg) {
             if (requires_topology_rebuild) {
-                // Visibility never reaches this branch: its runtime gates keep the authored graph
-                // stable. Real structural changes such as dynamic object creation/destruction or
-                // render-feature reconfiguration still diff the new graph against the resident one
-                // so unchanged prepared passes can retain their Vulkan state.
+                // Effect visibility changes the destination sequence and its final writer. Like
+                // dynamic object edits and render-feature changes, it diffs the new graph against
+                // the resident graph so unaffected prepared passes retain their Vulkan state.
             } else {
                 // Minute-level effect text updates only resize existing offscreen resources.
                 // Reusing the compiled graph topology while recreating pass-owned GPU resources

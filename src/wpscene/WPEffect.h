@@ -30,6 +30,7 @@ public:
     std::string command;
     std::string target;
     std::string source;
+    bool        compose { false };
 
     int32_t afterpos { 0 }; // 0 for begin, start from 1
 };
@@ -56,9 +57,6 @@ private:
 public:
     bool                         FromJson(const nlohmann::json&, fs::VFS& vfs);
     bool                         FromFileJson(const nlohmann::json&, fs::VFS& vfs);
-    // Returns true when a parsed effect enables a shader combo either through scene pass overrides
-    // or through the resolved material, giving object parsers one semantic query for feature gates.
-    bool                         HasEnabledCombo(const std::string& combo_name) const;
     std::unordered_set<std::string> FeedbackFboNames() const;
     int32_t                      id { 0 };
     std::string                  name;

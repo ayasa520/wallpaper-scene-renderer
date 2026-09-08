@@ -1,6 +1,7 @@
 #pragma once
 
 #include "VulkanPass.hpp"
+#include "Interface/IShaderValueUpdater.h"
 
 #include <cstdint>
 #include <functional>
@@ -30,7 +31,11 @@ public:
         // rebuilds swap primitives under stable nodes; the layer id remains the durable refresh key.
         int32_t     layer_id { 0 };
         bool        execute_when_hidden { false };
+        bool        clear_before_draw { false };
         std::string output;
+        std::string camera_override;
+        bool use_active_camera_for_parallax { false };
+        ShaderModelSpace model_space { ShaderModelSpace::Object };
         AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
 
         ImageParameters          vk_output;
@@ -43,7 +48,6 @@ public:
         ImageSlotsRef            background_texture;
         std::vector<ImageSlotsRef> page_textures;
         VkClearValue             clear_value {};
-        bool                     clear_output { false };
     };
 
     TextPass(const Desc&);
@@ -83,6 +87,7 @@ private:
     MeshBuffers m_background_buffers;
     std::vector<MeshBuffers> m_page_buffers;
     uint32_t m_loaded_atlas_version { std::numeric_limits<uint32_t>::max() };
+    uint32_t m_traced_atlas_version { std::numeric_limits<uint32_t>::max() };
 };
 
 } // namespace vulkan

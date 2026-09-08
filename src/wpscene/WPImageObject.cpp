@@ -93,7 +93,7 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     // decision tied to the resolved asset metadata instead of relying only on a hard-coded path.
     GET_JSON_NAME_VALUE_NOWARN(jImage, "projectlayer", projectlayer);
     // passthrough, solidlayer and instanced are model-asset keys alongside fullscreen/autosize.
-    // The scene object's `config.passthrough` is a separate editor field read further down.
+    // The scene object's editor config does not select the runtime composition branch.
     GET_JSON_NAME_VALUE_NOWARN(jImage, "passthrough", config.passthrough);
     GET_JSON_NAME_VALUE_NOWARN(jImage, "solidlayer", solidlayer);
     GET_JSON_NAME_VALUE_NOWARN(jImage, "instanced", instanced);
@@ -103,6 +103,8 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 	GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
 	GET_JSON_NAME_VALUE_NOWARN(json, "colorBlendMode", colorBlendMode);
     GET_JSON_NAME_VALUE_NOWARN(json, "copybackground", copybackground);
+    GET_JSON_NAME_VALUE_NOWARN(json, "nointerpolation", nointerpolation);
+    GET_JSON_NAME_VALUE_NOWARN(json, "clampuvs", clampuvs);
 	if(!fullscreen) {
 		GET_JSON_NAME_VALUE(json, "origin", origin);	
 		GET_JSON_NAME_VALUE(json, "angles", angles);	
@@ -205,10 +207,6 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
              GET_JSON_NAME_VALUE_NOWARN(jLayer, "visible", layer.visible);
              puppet_layers.push_back(layer);
         }
-    }
-    if (json.contains("config")) {
-        const auto& jConf = json.at("config");
-        GET_JSON_NAME_VALUE_NOWARN(jConf, "passthrough", config.suppressHiddenFinalComposite);
     }
     return true;
 }

@@ -22,7 +22,7 @@ namespace wallpaper::vulkan
 
 struct ShaderDrawRequest {
     Scene*                scene { nullptr };
-    SceneNode*            node { nullptr };
+    SceneDraw             draw;
     int32_t               layer_id { 0 };
     bool                  execute_when_hidden { false };
     std::function<bool()> should_execute;
@@ -34,6 +34,8 @@ struct ShaderDrawRequest {
     std::string              camera_override;
     bool                     use_active_camera_for_uniforms { false };
     bool                     use_active_camera_for_parallax { false };
+    ShaderModelSpace         model_space { ShaderModelSpace::Object };
+    bool                     reflection_pass { false };
     sprite_map_t             sprites_map;
     bool                     model_pass { false };
     bool                     depth_test { false };
@@ -151,12 +153,10 @@ public:
     void setExtension(ShaderDrawExtension* extension) { m_extension = extension; }
 
     bool prepare(Scene&, const Device&, RenderingResources&);
-    bool prepareDeferred(Scene&, const Device&, RenderingResources&);
     bool refreshResources(Scene&, const Device&, RenderingResources&);
     bool refreshImportedTextureBindings(Scene&, const Device&);
     void dropOutputFramebuffers();
     void updateBeforeUpload();
-    DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&);
     bool warmupPipeline(Scene&, const Device&, RenderingResources&);
     void execute(const Device&, RenderingResources&);
     void destroy(RenderingResources&);
@@ -173,10 +173,11 @@ public:
 
 private:
     ShaderDrawData       m_desc;
-    // Keep the node identity by value. The render graph may destroy the node before it asks the
-    // previous pass for a residency key, so recomputing identity through m_desc.node would read a
-    // dangling pointer during a topology diff.
-    uint64_t             m_node_identity { 0 };
+    // Keep the draw identity by value. A topology diff can retire the source node or the
+    // object's publication resources before querying the old pass. The copied generation
+    // remains valid throughout residency matching and does not dereference retired storage.
+    uint64_t             m_draw_identity { 0 };
+    uint64_t             m_trace_draw_sequence { 0 };
     ShaderDrawExtension* m_extension { nullptr };
 };
 

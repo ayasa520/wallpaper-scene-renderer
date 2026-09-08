@@ -15,6 +15,7 @@ MaskedMeshPass.cpp
 FinPass.cpp
 Msaa.cpp
 PrePass.cpp
+RenderTargetOps.cpp
 SceneToRenderGraph.cpp
 TextPass.cpp
 VulkanPass.cpp

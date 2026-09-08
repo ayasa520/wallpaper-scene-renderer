@@ -30,11 +30,6 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
     setPrepared(m_core.prepare(scene, device, resources));
 }
 
-void CustomShaderPass::prepareDeferred(Scene& scene, const Device& device,
-                                       RenderingResources& resources) {
-    setPrepared(m_core.prepareDeferred(scene, device, resources));
-}
-
 void CustomShaderPass::refreshResources(Scene& scene, const Device& device,
                                         RenderingResources& resources) {
     if (! m_core.refreshResources(scene, device, resources)) setPrepared(false);
@@ -47,11 +42,6 @@ void CustomShaderPass::refreshImportedTextureBindings(Scene& scene, const Device
 void CustomShaderPass::dropOutputFramebuffers() { m_core.dropOutputFramebuffers(); }
 
 void CustomShaderPass::updateBeforeUpload() { m_core.updateBeforeUpload(); }
-
-DeferredPrepareResourcesState
-CustomShaderPass::requestDeferredPrepareResources(Scene& scene, const Device& device) {
-    return m_core.requestDeferredPrepareResources(scene, device);
-}
 
 void CustomShaderPass::execute(const Device& device, RenderingResources& resources) {
     m_core.execute(device, resources);

@@ -67,14 +67,15 @@ void SceneCamera::CalculateViewProjectionMatrix() {
 	};
 
 	if(m_perspective) {
-		m_viewProjectionMat = Perspective(Radians(m_fov), m_aspect, m_nearClip, m_farClip) * m_viewMat;
+		m_projectionMat = Perspective(Radians(m_fov), m_aspect, m_nearClip, m_farClip);
 	} else {
 		double left = m_hasExplicitOrthoRect ? m_orthoLeft : -m_width/2.0f;
 		double right = m_hasExplicitOrthoRect ? m_orthoRight : m_width/2.0f;
 		double bottom = m_hasExplicitOrthoRect ? m_orthoBottom : -m_height/2.0f;
 		double up = m_hasExplicitOrthoRect ? m_orthoTop : m_height/2.0f;
-		m_viewProjectionMat = Ortho(left, right, bottom, up, m_nearClip, m_farClip) * m_viewMat;
+		m_projectionMat = Ortho(left, right, bottom, up, m_nearClip, m_farClip);
 	}
+	m_viewProjectionMat = m_projectionMat * m_viewMat;
 }
 
 void SceneCamera::SetOrthographicViewRect(double left, double right, double bottom, double top) {

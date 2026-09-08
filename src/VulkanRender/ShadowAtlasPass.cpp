@@ -446,8 +446,10 @@ void ShadowAtlasPass::rebuildDrawList() {
                 auto*       node   = caster.node;
                 if (node == nullptr || ! node->Visible()) continue;
                 if (caster.bone_count > 0 && caster.skinning_pose.empty()) continue;
-                node->UpdateTrans();
-                Eigen::Matrix4f model = node->ModelTrans().cast<float>();
+                // Shadow geometry shares the visible draw's raw object/attachment matrix;
+                // camera parallax belongs only to the visible destination, not the light view.
+                Eigen::Matrix4f model = scene->shaderValueUpdater
+                    ->ResolveModelTransformForProjection(node, nullptr, false).cast<float>();
                 if (auto* mesh = node->Mesh(); mesh != nullptr) {
                     model = model * mesh->GeometryTransform().matrix();
                 }

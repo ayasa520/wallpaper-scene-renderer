@@ -1,5 +1,4 @@
 #pragma once
-#include <atomic>
 #include <cstdint>
 #include <list>
 #include <vector>
@@ -9,6 +8,8 @@
 #include <Eigen/Dense>
 #include "SceneMesh.h"
 #include "SceneCamera.h"
+#include "SceneTransform.h"
+#include "SceneDraw.h"
 
 #include "Core/Literals.hpp"
 #include "Core/NoCopyMove.hpp"
@@ -20,19 +21,11 @@ class SceneTextPrimitive;
 
 class SceneNode : NoCopy, NoMove {
 public:
-    SceneNode()
-        : m_name(),
-          m_dirty(true),
-          m_translate(Eigen::Vector3f::Zero()),
-          m_scale { 1.0f, 1.0f, 1.0f },
-          m_rotation(Eigen::Vector3f::Zero()) {}
+    SceneNode() : m_transform(std::make_shared<SceneTransform>()) {}
     SceneNode(const Eigen::Vector3f& translate, const Eigen::Vector3f& scale,
               const Eigen::Vector3f& rotation, const std::string& name = "")
         : m_name(name),
-          m_dirty(true),
-          m_translate(translate),
-          m_scale(scale),
-          m_rotation(rotation) {};
+          m_transform(std::make_shared<SceneTransform>(translate, scale, rotation)) {};
 
     const auto& Camera() const { return m_cameraName; }
     void        SetCamera(const std::string& name) { m_cameraName = name; }
@@ -44,11 +37,9 @@ public:
     void        AddText(std::shared_ptr<SceneTextPrimitive> text) { m_text = std::move(text); }
     void        AppendChild(std::shared_ptr<SceneNode> sub) {
                sub->m_parent = this;
-               // Reparenting changes the model-space basis for the entire child branch even when
-               // the child already cached a clean local-only matrix during scene construction.
-               // Force the full branch dirty here instead of using MarkTransDirty(), because that
-               // helper intentionally stops when the current node is already dirty.
-               sub->MarkTransSubtreeDirty();
+               // Reparenting invalidates this model. Its next revision propagates through child
+               // queries, including when no local transform value changed anywhere in the branch.
+               sub->m_dirty = true;
                m_children.push_back(sub);
     }
     bool        RemoveChild(SceneNode* child) {
@@ -56,47 +47,26 @@ public:
                    if (it->get() == child) {
                        auto removed = *it;
                        removed->m_parent = nullptr;
-                       // Removing a parent also changes every cached model matrix below the
-                       // removed node: descendants must drop the old inherited transform before
-                       // the shared_ptr is released from this child list.
-                       removed->MarkTransSubtreeDirty();
+                       removed->m_dirty = true;
                        m_children.erase(it);
                        return true;
                    }
                }
                return false;
     }
-    Eigen::Matrix4d GetLocalTrans() const;
+    Eigen::Matrix4d GetLocalTrans() const { return m_transform->LocalMatrix(); }
+    const std::shared_ptr<SceneTransform>& TransformState() const { return m_transform; }
 
-    const auto& Translate() const { return m_translate; }
-    const auto& Rotation() const { return m_rotation; }
-    const auto& Scale() const { return m_scale; }
-    const auto& AlignmentOffset() const { return m_alignmentOffset; }
-    void        SetRotation(Eigen::Vector3f v) {
-        m_rotation = v;
-        MarkTransDirty();
-    }
-    void        SetScale(Eigen::Vector3f v) {
-        m_scale = v;
-        MarkTransDirty();
-    }
-    void        SetTranslate(Eigen::Vector3f v) {
-        m_translate = v;
-        MarkTransDirty();
-    }
-    void        SetAlignmentOffset(Eigen::Vector3f v) {
-        m_alignmentOffset = v;
-        MarkTransDirty();
-    }
-    void        SetLocalAffine(const Eigen::Affine3f& affine);
-
-    void CopyTrans(const SceneNode& node) {
-        m_translate = node.m_translate;
-        m_scale     = node.m_scale;
-        m_rotation  = node.m_rotation;
-        m_alignmentOffset = node.m_alignmentOffset;
-        MarkTransDirty();
-    }
+    const auto& Translate() const { return m_transform->Translate(); }
+    const auto& Rotation() const { return m_transform->Rotation(); }
+    const auto& Scale() const { return m_transform->Scale(); }
+    const auto& AlignmentOffset() const { return m_transform->AlignmentOffset(); }
+    void SetRotation(Eigen::Vector3f value) { m_transform->SetRotation(value); }
+    void SetScale(Eigen::Vector3f value) { m_transform->SetScale(value); }
+    void SetTranslate(Eigen::Vector3f value) { m_transform->SetTranslate(value); }
+    void SetAlignmentOffset(Eigen::Vector3f value) { m_transform->SetAlignmentOffset(value); }
+    void SetLocalAffine(const Eigen::Affine3f& affine) { m_transform->SetLocalAffine(affine); }
+    void CopyTrans(const SceneNode& node) { m_transform->CopyFrom(*node.m_transform); }
 
     bool Visible() const noexcept {
         // Effective visibility now combines the node-local flag with the layer-level flag that the
@@ -143,34 +113,18 @@ public:
     uint64_t RenderIdentity() const noexcept { return m_render_identity; }
 
 private:
-    // mark self and all children
-    void MarkTransDirty();
-    // Reparenting requires an unconditional invalidation pass. MarkTransDirty() is optimized for
-    // ordinary local transform edits and skips recursion when the current node is already dirty,
-    // which is exactly the wrong behavior for nodes whose descendants may still hold clean cached
-    // matrices from the previous parent relationship.
-    void MarkTransSubtreeDirty();
-
     // 0 means "no authored layer": detached helper nodes keep the default so layer-id resolution
     // deterministically treats them as unowned instead of reading uninitialized memory.
-    inline static std::atomic<uint64_t> s_next_render_identity { 1 };
-
     i32         m_id { 0 };
-    uint64_t    m_render_identity {
-        s_next_render_identity.fetch_add(1, std::memory_order_relaxed)
-    };
+    uint64_t    m_render_identity { AllocateSceneDrawIdentity() };
     std::string m_name;
 
-    bool            m_dirty;
-    Eigen::Matrix4d m_trans;
-
-    Eigen::Vector3f m_translate { 0.0f, 0.0f, 0.0f };
-    Eigen::Vector3f m_scale { 1.0f, 1.0f, 1.0f };
-    Eigen::Vector3f m_rotation { 0.0f, 0.0f, 0.0f };
-    // Image alignment is part of the quad's local placement, not the authored layer origin.
-    // Keeping it separate preserves Wallpaper Engine pivot semantics when scripts later animate
-    // rotation, scale, parent attachment, or effect-composite synchronization for the same layer.
-    Eigen::Vector3f m_alignmentOffset { 0.0f, 0.0f, 0.0f };
+    std::shared_ptr<SceneTransform> m_transform;
+    bool            m_dirty { true };
+    Eigen::Matrix4d m_trans { Eigen::Matrix4d::Identity() };
+    uint64_t m_local_revision { 0 };
+    uint64_t m_parent_revision { 0 };
+    uint64_t m_model_revision { 0 };
 
     std::shared_ptr<SceneMesh> m_mesh;
     // The text primitive holds canonical text geometry, atlas resources, and optional bridge

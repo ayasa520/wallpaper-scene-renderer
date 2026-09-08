@@ -6,6 +6,7 @@
 #include "Core/MapSet.hpp"
 #include <memory>
 #include <span>
+#include <functional>
 
 namespace wallpaper
 {
@@ -42,6 +43,16 @@ public:
     Pass*     getPass(NodeID) const;
     std::shared_ptr<Pass> getPassShared(NodeID) const;
     bool                  replacePass(NodeID, std::shared_ptr<Pass>);
+
+    // Feedback index changes belong to submitted frames. Graph construction and pipeline
+    // warm-up may run repeatedly without drawing, so they only describe these state commits.
+    // A graph carrying commits must prepare its complete pass sequence before submission.
+    void onFrameSubmitted(std::function<void()> callback) {
+        m_frame_submitted_callbacks.push_back(std::move(callback));
+    }
+    const std::vector<std::function<void()>>& frameSubmittedCallbacks() const {
+        return m_frame_submitted_callbacks;
+    }
 
     // all render pass
     std::vector<NodeID>                topologicalOrder() const;
@@ -88,6 +99,7 @@ private:
     Map<std::string, NodeID> m_key_texnode;
 
     Map<NodeID, std::shared_ptr<Pass>> m_map_pass;
+    std::vector<std::function<void()>> m_frame_submitted_callbacks;
 };
 
 } // namespace rg

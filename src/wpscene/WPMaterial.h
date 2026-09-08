@@ -55,6 +55,9 @@ public:
     std::unordered_map<std::string, std::string>        usershadervalues;
     std::string                                         target;
     std::vector<WPMaterialPassBindItem>                 bind;
+    // A composed pass completes one destination step inside the effect. Subsequent passes
+    // sample that result through `previous`, independently of the number of material passes.
+    bool                                                compose { false };
 };
 
 class WPMaterial {
@@ -90,7 +93,7 @@ public:
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPassBindItem, name, index);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPUserTextureBinding, name, type);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPass, bind, target, textures, usertextures, combos,
-                                   constantshadervalues, usershadervalues);
+                                   constantshadervalues, usershadervalues, compose);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterial, blending, shader, textures, usertextures, combos,
                                    constantshadervalues, usershadervalues);
 } // namespace wpscene

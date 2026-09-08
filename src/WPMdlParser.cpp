@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -31,6 +32,8 @@ constexpr uint32_t kStaticSkinnedAttributeMask   = 0x01800000;
 constexpr uint32_t kStaticSkinFloats             = 8;
 constexpr uint32_t kStaticWideIndexFlag          = 1;
 constexpr uint32_t kStaticExtraFieldFlag         = 2;
+constexpr uint32_t kVertexNormalMask             = 0x00000002;
+constexpr uint32_t kVertexTangentMask            = 0x00000004;
 
 enum class StaticHeaderFieldRole
 {
@@ -866,17 +869,11 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
                 return false;
             }
 
-            // MDLV0021 and later partitioned puppet meshes can store a second xyz position for every
-            // vertex after the index buffer. The primary stream already contains the runtime-skinned
-            // position and texture coordinates; this authored reference-position stream belongs to
-            // the part/clipping metadata and is not a Vulkan vertex attribute in the current puppet
-            // shader contract. Consume it as one validated block so the following part table remains
-            // exactly aligned across MDLV0021, MDLV0022, and MDLV0023 files.
-            if (! f.SeekCur(payload_size)) {
-                LOG_ERROR("puppet mdl failed to skip auxiliary-position payload: %.*s",
-                          static_cast<int>(path.size()),
-                          path.data());
-                return false;
+            // This blob supplies a_PositionC1 in the prelighting source mesh. It is independent
+            // of the skinned position and the following part/clipping table, so retain its xyz
+            // values verbatim.
+            for (auto& vertex : mdl.vertexs) {
+                for (auto& value : vertex.prelighting_position) value = f.ReadFloat();
             }
         }
     }
@@ -1158,7 +1155,6 @@ void ComputePuppetAnimationBounds(WPMdl& mdl) {
 } // namespace
 
 // bytes * size
-constexpr uint32_t singile_vertex  = 4 * (3 + 4 + 4 + 2);
 constexpr uint32_t singile_indices = 2 * 3;
 constexpr uint32_t std_format_vertex_size_herald_value = 0x01800009;
 
@@ -1166,10 +1162,8 @@ constexpr uint32_t std_format_vertex_size_herald_value = 0x01800009;
 constexpr uint32_t mdat_attachment_data_byte_length = 64;
 
 // alternative consts for alternative mdl format
-constexpr uint32_t alt_singile_vertex = 4 * (3 + 4 + 4 + 2 + 7);
 constexpr uint32_t alt_format_vertex_size_herald_value = 0x0180000F;
 constexpr uint32_t static_image_vertex_size_marker      = 0x0000000F;
-constexpr uint32_t static_image_singile_vertex          = 4 * (3 + 3 + 4 + 2);
 
 constexpr uint32_t singile_bone_frame = 4 * 9;
 
@@ -1593,15 +1587,16 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
         if (! aligned) SeekNextMDLSection(f, kAnimSections);
     }
 
-    // MDAT attachment blocks may occur between MDLS and MDLA. Preserve their bone-local matrices
-    // while walking to the animation table so both legacy single-mesh puppets and MDLV0023 model
-    // chunks share exactly one skeleton/animation parser.
+    // Skeletons and animation tables are independent sections. A skinned mesh can retain its
+    // bind pose without any MDLA section; reaching the end of the section walk must therefore
+    // preserve the parsed skeleton and prepare it with an empty animation list. MDAT attachment
+    // matrices still belong to that skeleton whether or not an animation table follows them.
     std::string section_type;
     std::string section_version;
+    mdl.mdla = 0;
     do {
         if (f.Tell() >= f.Size()) {
-            LOG_ERROR("failed to locate MDLA section before EOF: %s", str_path.c_str());
-            return false;
+            break;
         }
         const std::string section = f.ReadStr();
         if (section.length() != 8) continue;
@@ -1623,7 +1618,7 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
         }
     } while (section_type != "MDLA");
 
-    if (! section_version.empty()) {
+    if (section_type == "MDLA") {
         mdl.mdla = std::stoi(section_version);
         if (mdl.mdla != 0) {
             if (mdl.mdla < 1 || mdl.mdla > 6) {
@@ -1653,6 +1648,12 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
 
     mdl.puppet->prepared();
     ComputePuppetAnimationBounds(mdl);
+    if (mdl.mdla == 0) {
+        LOG_INFO("PuppetSkeletonOnly: path='%s' bones=%zu attachments=%zu animations=0",
+                 str_path.c_str(),
+                 bones.size(),
+                 mdl.puppet->attachments.size());
+    }
     LOG_INFO("read puppet: mdlv: %d, nmdls: %d, mdla: %d, bones: %d, anims: %d",
              mdl.mdlv,
              mdl.mdls,
@@ -1797,15 +1798,19 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     f.ReadInt32(); // unk, 1
 
     mdl.mat_json_file = f.ReadStr();
-    // 0    
-    f.ReadInt32();
+    // Retain the chunk-info word used by the image instance's direct/private selector. Its bit1
+    // also introduces an extra word before bounds and geometry, rather than a vertex-size value.
+    mdl.chunk_info = mdl.mdlv >= 4 ? f.ReadUint32() : 0;
+    if (mdl.HasImagePrivateChunk()) f.ReadUint32();
 
-    bool alt_mdl_format = false;
     uint32_t curr = f.ReadUint32();
+    mdl.vertex_flag = static_image_mesh ? static_image_vertex_size_marker
+                                        : std_format_vertex_size_herald_value;
 
-    auto is_alt_vertex_marker = [&](uint32_t value) {
-        return value == alt_format_vertex_size_herald_value ||
-               (static_image_mesh && value == static_image_vertex_size_marker);
+    auto is_vertex_marker = [&](uint32_t value) {
+        return static_image_mesh ? value == static_image_vertex_size_marker
+            : value == std_format_vertex_size_herald_value ||
+              value == alt_format_vertex_size_herald_value;
     };
 
     // If the uint at the normal vertex size position is 0, this file uses a marker-delimited
@@ -1813,25 +1818,24 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     // family is image-layer geometry rather than animated skeleton data, but the cursor contract is
     // the same: seek the marker, then read the byte size immediately after it.
     if(curr == 0){
-        alt_mdl_format = true;
-        while (! is_alt_vertex_marker(curr) && f.Tell() < f.Size()){
+        while (! is_vertex_marker(curr) && f.Tell() < f.Size()){
             curr = f.ReadUint32();
         }
-        if (! is_alt_vertex_marker(curr)) {
+        if (! is_vertex_marker(curr)) {
             LOG_ERROR("failed to locate alternative vertex herald 0x%08x", alt_format_vertex_size_herald_value);
             return false;
         }
-        curr = f.ReadUint32();
     }
-    else if(curr == std_format_vertex_size_herald_value ||
-            (static_image_mesh && curr == static_image_vertex_size_marker)){
+    // The marker is the actual vertex-layout bitfield, including when it appears
+    // without a preceding reserved block. Its normal/tangent bits determine both
+    // the file stride and which attributes the GPU mesh exposes.
+    if (is_vertex_marker(curr)) {
+        mdl.vertex_flag = curr;
         curr = f.ReadUint32();
     }
 
     uint32_t vertex_size = curr;
-    const uint32_t vertex_stride =
-        static_image_mesh ? static_image_singile_vertex
-                          : (alt_mdl_format ? alt_singile_vertex : singile_vertex);
+    const uint32_t vertex_stride = OfficialVertexStride(mdl.vertex_flag);
     if (vertex_size % vertex_stride != 0) {
         LOG_ERROR("unsupport mdl vertex size %d", vertex_size);
         return false;
@@ -1840,25 +1844,24 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     uint32_t vertex_num = vertex_size / vertex_stride;
     mdl.vertexs.resize(vertex_num);
     for (auto& vert : mdl.vertexs) {
+        for (auto& v : vert.position) v = f.ReadFloat();
+        vert.prelighting_position = vert.position;
+        if ((mdl.vertex_flag & kVertexNormalMask) != 0) {
+            for (auto& v : vert.normal) v = f.ReadFloat();
+        }
+        if ((mdl.vertex_flag & kVertexTangentMask) != 0) {
+            for (auto& v : vert.tangent) v = f.ReadFloat();
+        }
         if (static_image_mesh) {
-            // Static image puppet meshes store position.xyz, normal.xyz, a vec4 payload, and
-            // texcoord.xy. They have no skinning attributes, so synthesize a neutral bone binding
-            // while preserving the authored shape and UV crop exactly for the final image layer.
-            for (auto& v : vert.position) v = f.ReadFloat();
-            for (int i = 0; i < 7; i++) f.ReadFloat();
+            // Static image meshes have no skinning attributes. Preserve their
+            // authored position, tangent basis and UVs without creating a pose.
             vert.blend_indices = { 0, 0, 0, 0 };
             vert.weight        = { 0.0f, 0.0f, 0.0f, 1.0f };
-            for (auto& v : vert.texcoord) v = f.ReadFloat();
         } else {
-            for (auto& v : vert.position) v = f.ReadFloat();
-            // If using the alternative MDL format, vertexes contain 7 extra 32-bit chunks between
-            // position and blend indices. They are opaque payload for animated puppet meshes and
-            // must stay separate from the compact static-image path above.
-            if(alt_mdl_format) {for (int i = 0; i < 7; i++) f.ReadUint32();}
             for (auto& v : vert.blend_indices) v = f.ReadUint32();
             for (auto& v : vert.weight) v = f.ReadFloat();
-            for (auto& v : vert.texcoord) v = f.ReadFloat();
         }
+        for (auto& v : vert.texcoord) v = f.ReadFloat();
     }
 
     uint32_t indices_size = f.ReadUint32();
@@ -1890,24 +1893,55 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
 }
 
 void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
-    SceneVertexArray vertex({ { WE_IN_POSITION.data(), VertexType::FLOAT3 },
-                              { WE_IN_BLENDINDICES.data(), VertexType::UINT4 },
-                              { WE_IN_BLENDWEIGHTS.data(), VertexType::FLOAT4 },
-                              { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 } },
-                            mdl.vertexs.size());
-
-    std::array<float, 16> one_vert;
-    auto                  to_one = [](const WPMdl::Vertex& in, decltype(one_vert)& out) {
-        uint offset = 0;
-        memcpy(out.data() + 4 * (offset++), in.position.data(), sizeof(in.position));
-        memcpy(out.data() + 4 * (offset++), in.blend_indices.data(), sizeof(in.blend_indices));
-        memcpy(out.data() + 4 * (offset++), in.weight.data(), sizeof(in.weight));
-        memcpy(out.data() + 4 * (offset++), in.texcoord.data(), sizeof(in.texcoord));
+    const bool skinned = (mdl.vertex_flag & kStaticSkinnedAttributeMask) != 0;
+    const bool has_normal = (mdl.vertex_flag & kVertexNormalMask) != 0;
+    const bool has_tangent = (mdl.vertex_flag & kVertexTangentMask) != 0;
+    std::vector<SceneVertexArray::SceneVertexAttribute> attributes {
+        { WE_IN_POSITION.data(), VertexType::FLOAT3 }
     };
+    // One immutable payload can serve both image draw variants: only PRELIGHTINGDUALVERTEX
+    // consumes C1, and all skinning inputs retain their original values and index order. Shader
+    // attribute reflection selects the required slots for each draw.
+    if (skinned) attributes.push_back({ WE_IN_POSITIONC1.data(), VertexType::FLOAT3 });
+    if (has_normal) attributes.push_back({ WE_IN_NORMAL.data(), VertexType::FLOAT3 });
+    if (has_tangent) attributes.push_back({ WE_IN_TANGENT4.data(), VertexType::FLOAT4 });
+    if (skinned) {
+        attributes.push_back({ WE_IN_BLENDINDICES.data(), VertexType::UINT4 });
+        attributes.push_back({ WE_IN_BLENDWEIGHTS.data(), VertexType::FLOAT4 });
+    }
+    attributes.push_back({ WE_IN_TEXCOORD.data(), VertexType::FLOAT2 });
+    SceneVertexArray vertex(attributes, mdl.vertexs.size());
+    std::vector<float> one_vert(vertex.OneSize(), 0.0f);
     for (uint i = 0; i < mdl.vertexs.size(); i++) {
-        auto& v = mdl.vertexs[i];
-        to_one(v, one_vert);
+        const auto& v = mdl.vertexs[i];
+        size_t slot = 0;
+        const auto append = [&](const auto& values) {
+            memcpy(one_vert.data() + 4 * slot++, values.data(), sizeof(values));
+        };
+        append(v.position);
+        if (skinned) append(v.prelighting_position);
+        if (has_normal) append(v.normal);
+        if (has_tangent) append(v.tangent);
+        if (skinned) {
+            append(v.blend_indices);
+            append(v.weight);
+        }
+        append(v.texcoord);
         vertex.SetVertexs(i, one_vert);
+    }
+    if (std::getenv("WESCENE_TRACE_PUPPET_VERTEX_INPUT") != nullptr) {
+        float max_position_delta = 0.0f;
+        for (const auto& v : mdl.vertexs) {
+            const Eigen::Vector3f delta = Eigen::Vector3f(v.prelighting_position.data()) -
+                                          Eigen::Vector3f(v.position.data());
+            max_position_delta = std::max(max_position_delta, delta.norm());
+        }
+        LOG_INFO("ScenePuppetVertexInput: asset='%s' layout=0x%08x vertices=%zu "
+                 "stride=%zu normal=%s tangent=%s dual-position=%s max-position-delta=%.6f",
+                 mdl.source_path.c_str(), mdl.vertex_flag, mdl.vertexs.size(),
+                 vertex.OneSizeOf(), has_normal ? "true" : "false",
+                 has_tangent ? "true" : "false", skinned ? "true" : "false",
+                 max_position_delta);
     }
     std::vector<uint32_t> indices;
     size_t                u16_count = mdl.indices.size() * 3;

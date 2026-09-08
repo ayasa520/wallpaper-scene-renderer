@@ -2,6 +2,7 @@
 #include "Core/Literals.hpp"
 #include "Core/NoCopyMove.hpp"
 #include "Core/MapSet.hpp"
+#include "Scene/SceneDraw.h"
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -24,6 +25,10 @@ using sprite_map_t    = Map<usize, SpriteAnimation>;
 using UpdateUniformOp = std::function<void(std::string_view, ShaderValue)>;
 using ExistsUniformOp = std::function<bool(std::string_view)>;
 
+// Source rasterization selects geometry coordinates while retaining the same authored owner,
+// animation palette and material data. This is draw state, never a second object transform.
+enum class ShaderModelSpace { Object, Geometry };
+
 struct ShaderUniformOverrides {
     std::string_view camera_name;
     bool             use_camera_override { false };
@@ -32,6 +37,10 @@ struct ShaderUniformOverrides {
     // against the live active camera without permanently changing the node's authored camera.
     bool             use_active_camera_for_uniforms { false };
     bool             use_active_camera_for_parallax { false };
+    ShaderModelSpace model_space { ShaderModelSpace::Object };
+    // Reflection changes the incoming destination/projection and frame camera vectors.
+    // The authored model transform, material bindings and animation pose remain shared.
+    bool             reflection_pass { false };
 };
 
 struct ShaderSkinningPose {
@@ -51,8 +60,8 @@ public:
     // later FrameBegin hook remains the draw-phase boundary for uniform/cache consumers.
     virtual void PrepareFrame()                                                    = 0;
     virtual void FrameBegin()                                                      = 0;
-    virtual void InitUniforms(SceneNode*, const ExistsUniformOp&)                  = 0;
-    virtual void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
+    virtual void InitUniforms(const SceneDraw&, const ExistsUniformOp&)                  = 0;
+    virtual void UpdateUniforms(const SceneDraw&, sprite_map_t&, const UpdateUniformOp&,
                                 const ShaderUniformOverrides* overrides = nullptr) = 0;
     virtual void FrameEnd()                                                        = 0;
 
@@ -60,7 +69,7 @@ public:
     // parallax transform contract as shader uniforms. Exposing that matrix here keeps sizing code
     // independent from the concrete Wallpaper Engine updater implementation.
     virtual Eigen::Matrix4d ResolveModelTransformForProjection(
-        SceneNode* node, const SceneCamera* camera, bool apply_parallax) = 0;
+        const SceneDraw& draw, const SceneCamera* camera, bool apply_parallax) = 0;
 
     // Depth-only material passes need the exact palette selected for the visible material in the
     // same frame. Keeping this query on the updater interface prevents render backends from owning

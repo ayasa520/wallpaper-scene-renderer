@@ -141,12 +141,12 @@ bool ResolveModelDepthIfNeeded(RenderingResources& rr, std::string_view output) 
     const auto src_it = rr.model_depth_images.find(std::string(output));
     const auto dst_it = rr.model_depth_resolved.find(std::string(output));
     if (src_it == rr.model_depth_images.end() || dst_it == rr.model_depth_resolved.end() ||
-        ! src_it->second.handle || ! dst_it->second.handle || src_it->second.samples <= 1) {
+        ! src_it->second.image.handle || ! dst_it->second.handle || src_it->second.image.samples <= 1) {
         rr.model_depth_dirty.erase(dirty_it);
         return false;
     }
 
-    auto& src = src_it->second;
+    auto& src = src_it->second.image;
     auto& dst = dst_it->second;
     auto& cmd = rr.command;
 

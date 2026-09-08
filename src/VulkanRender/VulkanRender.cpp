@@ -20,9 +20,9 @@
 #include "Msaa.hpp"
 #include "PassCommon.hpp"
 #include "VulkanPass.hpp"
-#include "PrePass.hpp"
 #include "FinPass.hpp"
 #include "CopyPass.hpp"
+#include "CustomShaderPass.hpp"
 #include "Resource.hpp"
 #include "Vulkan/Util.hpp"
 
@@ -34,7 +34,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -53,8 +52,6 @@ using namespace wallpaper::vulkan;
 
 constexpr uint64_t vk_wait_time { 10u * 1000u * 1000000u };
 constexpr uint32_t vk_command_num { 1 };
-constexpr std::size_t kDeferredPrepareMaxPassesPerFrame { 96 };
-constexpr double      kDeferredPrepareFrameBudgetMs { 2.0 };
 
 constexpr std::array base_inst_exts {
     Extension { false, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME },
@@ -62,6 +59,10 @@ constexpr std::array base_inst_exts {
 constexpr std::array base_device_exts {
     Extension { false, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME },
     Extension { false, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME },
+    // This renderer requests Vulkan 1.1, where image-format lists are not core.
+    // VK_EXT_image_drm_format_modifier therefore requires the KHR dependency to
+    // be enabled explicitly (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+    Extension { false, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME },
     Extension { false, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME },
     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME },
@@ -159,7 +160,6 @@ struct VulkanRender::Impl {
     void drawFrameOffscreen(Scene&);
     bool drainOffscreenFrame();
     int  m_compiled_msaa_samples { -1 };
-    void processDeferredGraphPreparation(Scene&);
     void dropCompiledPassFramebuffers();
     void setRenderTargetSize(Scene&, rg::RenderGraph&);
     bool isDeviceFaultResult(VkResult) const;
@@ -169,7 +169,6 @@ struct VulkanRender::Impl {
     Instance                m_instance;
     std::unique_ptr<Device> m_device;
 
-    std::unique_ptr<PrePass> m_prepass { nullptr };
     std::unique_ptr<FinPass> m_finpass { nullptr };
 
     std::unique_ptr<FinPass> m_testpass { nullptr };
@@ -196,8 +195,6 @@ struct VulkanRender::Impl {
     bool m_offscreen_fence_pending { false };
     bool m_offscreen_acquire_export_ok { false };
     bool m_trace_next_offscreen_frame { true };
-    std::deque<std::size_t> m_deferred_prepare_indices;
-    std::unordered_set<std::size_t> m_deferred_waiting_indices_logged;
 
     std::unique_ptr<VulkanExSwapchain> m_ex_swapchain;
     RenderingResources                 m_rendering_resources;
@@ -206,6 +203,7 @@ struct VulkanRender::Impl {
 
     std::vector<VulkanPass*> m_passes;
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
+    std::vector<std::function<void()>> m_frame_submitted_callbacks;
 
     // Diagnostic (VIVID_GPU_PROFILE): GPU timestamps around every executed pass in the offscreen
     // frame, aggregated by pass profile name and reported periodically. Off by default.
@@ -428,7 +426,6 @@ bool VulkanRender::Impl::checkVkResult(VkResult result, const char* operation) {
 }
 
 bool VulkanRender::Impl::initRes() {
-    m_prepass = std::make_unique<PrePass>(PrePass::Desc {});
     m_finpass = std::make_unique<FinPass>(FinPass::Desc {});
     if (m_with_surface) {
         m_finpass->setPresentFormat(m_device->swapchain().format());
@@ -481,7 +478,8 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     for (auto& semaphore : m_rendering_resources.sem_offscreen_acquire) semaphore.abandon();
     m_rendering_resources.fence_frame.abandon();
     m_rendering_resources.command.abandon();
-    for (auto& [_, image] : m_rendering_resources.model_depth_images) {
+    for (auto& [_, attachment] : m_rendering_resources.model_depth_images) {
+        auto& image = attachment.image;
         image.sampler.abandon();
         image.view.abandon();
         image.handle.abandon();
@@ -493,20 +491,15 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     if (m_rendering_resources.pipeline_cache) {
         m_rendering_resources.pipeline_cache->abandon();
     }
-    if (m_device) {
-        m_device->tex_cache().CancelDeferredGraphActivation();
-    }
     m_rendering_resources.immutable_meshes.abandon();
     m_rendering_resources.vertex_buf = nullptr;
     m_rendering_resources.dyn_buf = nullptr;
-    m_deferred_prepare_indices.clear();
-    m_deferred_waiting_indices_logged.clear();
 
     m_render_cmd.abandon();
     m_cmds.abandon();
     m_compiled_pass_refs.clear();
     m_passes.clear();
-    (void)m_prepass.release();
+    m_frame_submitted_callbacks.clear();
     (void)m_finpass.release();
     (void)m_testpass.release();
     (void)m_vertex_buf.release();
@@ -536,9 +529,7 @@ void VulkanRender::Impl::destroy() {
         }
         m_compiled_pass_refs.clear();
         m_passes.clear();
-        m_deferred_prepare_indices.clear();
-        m_deferred_waiting_indices_logged.clear();
-        m_device->tex_cache().CancelDeferredGraphActivation();
+        m_frame_submitted_callbacks.clear();
         if (m_rendering_resources.pipeline_cache) {
             m_rendering_resources.pipeline_cache->clear();
         }
@@ -569,7 +560,6 @@ void VulkanRender::Impl::destroy() {
     m_rendering_resources.fence_frame.reset();
     m_rendering_resources.vertex_buf = nullptr;
     m_rendering_resources.dyn_buf = nullptr;
-    m_prepass.reset();
     m_finpass.reset();
     m_testpass.reset();
     m_vertex_buf.reset();
@@ -651,7 +641,6 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
     m_device->video_tex_cache().Poll();
     m_device->video_tex_cache().PublishRuntimeStates(
         scene.videoTextureRuntimeStates, scene.videoTextureRuntimeStateRequests);
-    processDeferredGraphPreparation(scene);
     m_rendering_resources.scene = &scene;
 
 #if ENABLE_RENDERDOC_API
@@ -743,104 +732,6 @@ void VulkanRender::Impl::refreshImportedTextures(Scene& scene) {
     scene.dirtyImportedTextureKeys.clear();
 }
 
-void VulkanRender::Impl::processDeferredGraphPreparation(Scene& scene) {
-    if (m_deferred_prepare_indices.empty()) return;
-    if (m_device_faulted || !m_device) return;
-
-    const auto batch_started_at = std::chrono::steady_clock::now();
-    std::size_t attempted = 0;
-    std::size_t prepared = 0;
-
-    while (attempted < kDeferredPrepareMaxPassesPerFrame && !m_deferred_prepare_indices.empty()) {
-        if (attempted != 0) {
-            const auto batch_elapsed_ms =
-                static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - batch_started_at)
-                                        .count()) /
-                1000.0;
-            if (batch_elapsed_ms >= kDeferredPrepareFrameBudgetMs) {
-                break;
-            }
-        }
-
-        const auto pass_index = m_deferred_prepare_indices.front();
-        if (pass_index >= m_passes.size()) {
-            m_deferred_prepare_indices.pop_front();
-            m_deferred_waiting_indices_logged.erase(pass_index);
-            continue;
-        }
-
-        auto* pass = m_passes[pass_index];
-        if (pass == nullptr || pass->prepared()) {
-            m_deferred_prepare_indices.pop_front();
-            m_deferred_waiting_indices_logged.erase(pass_index);
-            continue;
-        }
-
-        const auto key = pass->residencyKey();
-        const auto resources_state = pass->requestDeferredPrepareResources(scene, *m_device);
-        if (resources_state == DeferredPrepareResourcesState::Waiting) {
-            if (m_deferred_waiting_indices_logged.insert(pass_index).second) {
-                LOG_INFO("RenderGraphDeferredPrepareWait: index=%zu remaining=%zu key='%s'",
-                         pass_index,
-                         m_deferred_prepare_indices.size(),
-                         key.c_str());
-            }
-            break;
-        }
-
-        m_deferred_waiting_indices_logged.erase(pass_index);
-
-        const auto pass_started_at = std::chrono::steady_clock::now();
-        pass->prepareDeferred(scene, *m_device, m_rendering_resources);
-        const auto pass_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - pass_started_at)
-                                         .count();
-        attempted++;
-        if (pass->prepared()) {
-            prepared++;
-            m_deferred_prepare_indices.pop_front();
-        }
-
-        LOG_INFO("RenderGraphDeferredPreparePass: index=%zu prepared=%s remaining=%zu "
-                 "duration=%.2fms key='%s'",
-                 pass_index,
-                 pass->prepared() ? "true" : "false",
-                 m_deferred_prepare_indices.size(),
-                 static_cast<double>(pass_elapsed_us) / 1000.0,
-                 key.c_str());
-        if (!pass->prepared()) {
-            break;
-        }
-        const auto batch_elapsed_ms =
-            static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - batch_started_at)
-                                    .count()) /
-            1000.0;
-        if (batch_elapsed_ms >= kDeferredPrepareFrameBudgetMs) {
-            break;
-        }
-    }
-
-    const auto batch_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                      std::chrono::steady_clock::now() - batch_started_at)
-                                      .count();
-    if (attempted != 0) {
-        LOG_INFO("RenderGraphDeferredPrepareBatch: attempted=%zu prepared=%zu remaining=%zu "
-                 "duration=%.2fms",
-                 attempted,
-                 prepared,
-                 m_deferred_prepare_indices.size(),
-                 static_cast<double>(batch_elapsed_us) / 1000.0);
-    }
-
-    if (m_deferred_prepare_indices.empty()) {
-        m_deferred_waiting_indices_logged.clear();
-        m_device->tex_cache().EndDeferredGraphActivation();
-        LOG_INFO("RenderGraphDeferredPrepareComplete");
-    }
-}
-
 void VulkanRender::Impl::drawFrameSwapchain() {
     static size_t resource_index = 0;
 
@@ -875,10 +766,9 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin swapchain frame command buffer"))
         return;
-    // Deferred pass preparation can allocate and write static vertex/index subranges between
-    // frames. Recording the static upload here keeps those newly resident passes drawable without
-    // a compile-time WaitIdle, matching the frame-budgeted residency model used by streaming
-    // renderers.
+    // A topology change prepares all new passes before this command is recorded. Their static
+    // vertex/index subranges still need uploading before any draw in the new graph consumes them;
+    // record those writes here rather than submitting a separate compile-time upload and WaitIdle.
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
     rr.immutable_meshes.recordUploads(rr.command);
@@ -908,6 +798,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     if (!checkVkResult(m_device->present_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit swapchain frame"))
         return;
+    for (const auto& callback : m_frame_submitted_callbacks) callback();
     VkPresentInfoKHR present_info {
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext              = nullptr,
@@ -1125,11 +1016,14 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         profiler.pending_names.emplace_back("__uploads");
     }
 
+    const char* trace_present_after = std::getenv("WESCENE_TRACE_PRESENT_AFTER");
     for (std::size_t pass_index = 0; pass_index < m_passes.size(); pass_index++) {
         auto* p = m_passes[pass_index];
         if (! p->prepared()) continue;
         std::string pass_name;
-        if (trace_frame || gpu_profile_frame) pass_name = p->profileName();
+        if (trace_frame || gpu_profile_frame || trace_present_after != nullptr) {
+            pass_name = p->profileName();
+        }
         if (trace_frame) {
             LOG_INFO("OffscreenFirstFrameTrace: stage=pass-begin index=%zu name='%s'",
                      pass_index,
@@ -1145,7 +1039,33 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
             auto& profiler = m_gpu_profiler;
             rr.command.WriteTimestamp(
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
-            profiler.pending_names.emplace_back(std::move(pass_name));
+            profiler.pending_names.emplace_back(pass_name);
+        }
+        if (trace_present_after != nullptr && pass_name == trace_present_after) {
+            // This opt-in inspection stops the offscreen frame at one exact pass identity and
+            // presents that pass's physical output before a subsequent draw can overwrite it.
+            // All dependencies up to this point execute in their ordinary order. No Workshop
+            // properties, visibility gates or material values are changed, and the normal path
+            // has no additional image allocation or copy. A diagnostic capture is intentionally
+            // an intermediate result, so it cannot stand in for full-frame regression acceptance.
+            auto* shader_pass = dynamic_cast<CustomShaderPass*>(p);
+            if (shader_pass == nullptr) {
+                LOG_ERROR("SceneTracePresent: pass has no custom-shader output name='%s'",
+                          pass_name.c_str());
+                continue;
+            }
+            const auto& output = shader_pass->outputImage();
+            if (output.samples != 1) {
+                LOG_ERROR("SceneTracePresent: output is multisampled name='%s' samples=%u",
+                          pass_name.c_str(), output.samples);
+                continue;
+            }
+            m_finpass->executeImage(*m_device, rr, output);
+            if (trace_frame) {
+                LOG_INFO("SceneTracePresent: name='%s' extent=%ux%u",
+                         pass_name.c_str(), output.extent.width, output.extent.height);
+            }
+            break;
         }
     }
 
@@ -1174,6 +1094,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
+    for (const auto& callback : m_frame_submitted_callbacks) callback();
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=submit-complete");
     if (gpu_profile_frame && m_gpu_profiler.used >= 2) {
         m_gpu_profiler.pending = true;
@@ -1381,10 +1302,12 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     gCam.SetWidth(std::max(1.0, framed_width / active_global_zoom));
     gCam.SetHeight(std::max(1.0, framed_height / active_global_zoom));
     gPerCam.SetAspect(perspective_aspect);
+    gPerCam.SetNearClip(scene.generalProjection.nearClip);
+    gPerCam.SetFarClip(scene.generalProjection.farClip);
     gPerCam.SetFov(use_active_global_perspective_fov
                        ? active_global_perspective_fov
-                       : algorism::ResolvePerspectiveFov(scene.perspectiveOverrideFov,
-                                                         gCam.Height()));
+                       : algorism::ResolvePerspectiveFov(
+                             scene.generalProjection.perspectiveOverrideFov, gCam.Height()));
     gCam.Update();
     gPerCam.Update();
     scene.UpdateLinkedCamera("global");
@@ -1397,8 +1320,9 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
             // fill-mode-adjusted framebuffer aspect. Without this, a 16:9-authored model scene keeps
             // its native projection while Vulkan draws into a 16:10 or other non-native viewport,
             // which changes the apparent object proportions even though the model transform itself
-            // is uniform. Only the aspect is synchronized here: the authored 3D FOV and the
-            // camera-path eye/center/up basis remain owned by the scene data and path playback.
+            // is uniform. Only the aspect is synchronized here: UpdateActiveCameraLayer owns
+            // the frame's general/layer FOV selection and general clip planes, while camera
+            // paths and selected layers own the eye/center/up basis.
             model_camera_it->second->SetAspect(perspective_aspect);
             model_camera_it->second->Update();
             scene.UpdateLinkedCamera(scene.modelPerspectiveCameraName);
@@ -1414,6 +1338,54 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
         }
     }
 
+    if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
+        // Inspect the actual post-framing matrix, not just a successful script setter.
+        // This opt-in frame trace distinguishes raw scene storage, selected layer FOV,
+        // effective clip planes and the independent orthographic perspective override.
+        const auto& camera = *scene.activeCamera;
+        const auto matrix = camera.GetProjectionMatrix();
+        const auto& raw = scene.generalProjection;
+        LOG_INFO("SceneProjectionFrame: time=%.6f orthographic=%s layer=%d "
+                 "owner=%s raw-fov=%.6f raw-override=%.6f raw-near=%.6f raw-far=%.6f "
+                 "perspective=%s fov=%.6f near=%.6f far=%.6f aspect=%.6f "
+                 "p00=%.9f p11=%.9f p22=%.9f p23=%.9f auxiliary-fov=%.6f",
+                 scene.elapsingTime,
+                 scene.cameraOrthographic ? "true" : "false",
+                 scene.activeCameraLayerId,
+                 scene.cameraOrthographic ? "orthographic"
+                     : (scene.activeCameraLayerId != 0 ? "camera-layer" : "general"),
+                 raw.fov, raw.perspectiveOverrideFov, raw.nearClip, raw.farClip,
+                 camera.IsPerspective() ? "true" : "false",
+                 camera.Fov(), camera.NearClip(), camera.FarClip(), camera.Aspect(),
+                 matrix(0, 0), matrix(1, 1), matrix(2, 2), matrix(2, 3), gPerCam.Fov());
+
+        // A correct layer id/FOV alone does not establish pose restoration. Record
+        // the selected eye, direction, up and actual post-framing view together so
+        // a release can be distinguished from retaining the previous layer's view.
+        // GetUp reports the selected input direction; the matrix also exposes the
+        // orthogonalized look-at basis actually consumed by rendering.
+        const auto eye = camera.GetPosition();
+        const auto direction = camera.GetDirection();
+        const auto up = camera.GetUp();
+        const auto view = camera.GetViewMatrix();
+        LOG_INFO("SceneCameraPoseFrame: time=%.6f orthographic=%s layer=%d source=%s "
+                 "eye=[%.6f,%.6f,%.6f] direction=[%.9f,%.9f,%.9f] "
+                 "up=[%.9f,%.9f,%.9f] "
+                 "view=[%.9f,%.9f,%.9f,%.9f;%.9f,%.9f,%.9f,%.9f;"
+                 "%.9f,%.9f,%.9f,%.9f]",
+                 scene.elapsingTime,
+                 scene.cameraOrthographic ? "true" : "false",
+                 scene.activeCameraLayerId,
+                 scene.cameraOrthographic ? "orthographic"
+                     : (scene.activeCameraLayerId != 0 ? "camera-layer"
+                         : (scene.modelCameraPathEnabled ? "camera-path" : "authored")),
+                 eye.x(), eye.y(), eye.z(), direction.x(), direction.y(), direction.z(),
+                 up.x(), up.y(), up.z(),
+                 view(0, 0), view(0, 1), view(0, 2), view(0, 3),
+                 view(1, 0), view(1, 1), view(1, 2), view(1, 3),
+                 view(2, 0), view(2, 1), view(2, 2), view(2, 3));
+    }
+
     // Text layers with Wallpaper Engine's screen-anchor property are authored against the project
     // canvas edge, but the active orthographic camera edge moves when aspect crop/fit changes the
     // visible frame. Re-apply those anchor transforms after camera framing so HUD-style text
@@ -1426,6 +1398,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
 }
 
 void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
+    m_frame_submitted_callbacks.clear();
     if (m_device_faulted) {
         // After device loss, pass destruction can call vkDestroyPipeline and friends on a driver
         // context that already timed out.  Leave the bounded stale graph abandoned with the renderer
@@ -1451,9 +1424,6 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     }
     m_passes.clear();
     m_compiled_pass_refs.clear();
-    m_deferred_prepare_indices.clear();
-    m_deferred_waiting_indices_logged.clear();
-    m_device->tex_cache().CancelDeferredGraphActivation();
     if (clear_scene_caches) {
         // Scene switches and renderer shutdown own a full cache teardown. Structural graph rebuilds
         // keep scene-level caches alive; dynamic layer destruction releases only keys that no
@@ -1574,7 +1544,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         m_compiled_msaa_samples = msaa_samples;
     }
     m_pass_loaded = false;
-    const bool had_resident_graph = !m_compiled_pass_refs.empty();
 
     if (refresh_resources_only && !m_passes.empty()) {
         setRenderTargetSize(scene, rg);
@@ -1641,11 +1610,9 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
 
     auto nodes             = rg.topologicalOrder();
     auto node_release_texs = rg.getLastReadTexs(nodes);
+    m_frame_submitted_callbacks = rg.frameSubmittedCallbacks();
 
     m_passes.clear();
-    m_deferred_prepare_indices.clear();
-    m_deferred_waiting_indices_logged.clear();
-    m_device->tex_cache().CancelDeferredGraphActivation();
     m_passes.resize(nodes.size());
 
     std::unordered_map<std::string, std::shared_ptr<rg::Pass>> reusable_passes;
@@ -1723,7 +1690,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
              retired_count,
              nodes.size());
 
-    m_passes.insert(m_passes.begin(), m_prepass.get());
     m_passes.push_back(m_finpass.get());
 
     setRenderTargetSize(scene, rg);
@@ -1732,15 +1698,14 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     std::size_t refreshed_count = 0;
     std::size_t prepared_count = 0;
     std::size_t dependency_prepared_count = 0;
-    std::size_t deferred_count = 0;
-    std::size_t deferred_waiting_count = 0;
     std::size_t already_prepared_count = 0;
+    std::size_t unprepared_count = 0;
     // CopyPass is a lightweight graph-residency pass, not a heavy shader pass: it registers
     // dynamic copy render targets such as `_rt_default_pingpong` in Scene::renderTargets and binds
     // their TextureCache images. Reused shader passes can legitimately sample those copy targets
     // during the same topology compile, so deferring CopyPass creation lets refreshed passes see a
-    // missing input and black out the frame. Prepare copy dependencies up front, then keep the
-    // expensive shader/image passes on the deferred residency queue.
+    // missing input and black out the frame. Prepare copy dependencies before refreshing the
+    // retained consumers; the ordinary preparation walk then completes every remaining pass.
     for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
         auto* p = m_passes[pass_index];
         if (p == nullptr || p->prepared()) continue;
@@ -1759,52 +1724,36 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
             refreshed_count++;
         }
         if (p != nullptr && !p->prepared()) {
-            const bool is_copy_dependency = dynamic_cast<CopyPass*>(p) != nullptr;
-            const bool can_defer_runtime_prepare =
-                had_resident_graph && !refresh_resources_only && p != m_prepass.get() &&
-                p != m_finpass.get() && !is_copy_dependency;
-            if (can_defer_runtime_prepare) {
-                // Dynamic object creation can add many cold passes to an already-running scene.
-                // Queue them so drawFrame() advances preparation within the existing frame budget.
-                if (p->requestDeferredPrepareResources(scene, *m_device) ==
-                    DeferredPrepareResourcesState::Waiting) {
-                    deferred_waiting_count++;
-                }
-                m_deferred_prepare_indices.push_back(pass_index);
-                deferred_count++;
-            } else {
-                p->prepare(scene, *m_device, m_rendering_resources);
-                prepared_count++;
-            }
+            // A visibility change selects the source slot and the complete ordered effect
+            // sequence for this draw. All newly routed passes must finish preparation before that
+            // graph executes. Preparing only a budgeted prefix allowed resident downstream
+            // effects to sample targets whose new cover writers had not run, producing a
+            // one-frame default record and missing square cover on a valid media replacement.
+            // Residency diffing above still preserves unchanged pipelines and GPU resources;
+            // activation itself has one preparation boundary, independent of update origin.
+            p->prepare(scene, *m_device, m_rendering_resources);
+            prepared_count++;
         } else if (p != nullptr) {
             already_prepared_count++;
         }
+        if (p != nullptr && !p->prepared()) unprepared_count++;
     }
 
     LOG_INFO("RenderGraphCompileSummary: total=%zu reused-refreshed=%zu refreshed=%zu "
-             "prepared=%zu dependency-prepared=%zu deferred=%zu already-prepared=%zu mode=%s "
+             "prepared=%zu dependency-prepared=%zu already-prepared=%zu unprepared=%zu mode=%s "
              "texture-bytes=%zu texture-images=%zu video-bytes=%zu video-entries=%zu",
              m_passes.size(),
              reused_refreshed_count,
              refreshed_count,
              prepared_count,
              dependency_prepared_count,
-             deferred_count,
              already_prepared_count,
+             unprepared_count,
              refresh_resources_only ? "resources" : "topology",
              m_device->tex_cache().GetTrackedBytes(),
              m_device->tex_cache().GetTrackedImageCount(),
              m_device->video_tex_cache().GetTrackedBytes(),
              m_device->video_tex_cache().GetTrackedEntryCount());
-    if (deferred_count > 0) {
-        m_device->tex_cache().BeginDeferredGraphActivation();
-        LOG_INFO("RenderGraphDeferredPrepareQueued: count=%zu max-passes-per-frame=%zu "
-                 "frame-budget=%.2fms resource-waiting=%zu",
-                 deferred_count,
-                 kDeferredPrepareMaxPassesPerFrame,
-                 kDeferredPrepareFrameBudgetMs,
-                 deferred_waiting_count);
-    }
 
     // Upload work queued by prepare() is recorded at the start of the next frame command buffer.
     // Avoiding a compile-time queue submit + DeviceWaitIdle keeps structural dynamic-layer changes

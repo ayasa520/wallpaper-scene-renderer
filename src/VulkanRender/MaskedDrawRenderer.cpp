@@ -50,13 +50,13 @@ bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& d
     const auto& plan = mesh.MaskedDraw();
     if (plan.empty()) {
         LOG_ERROR("MaskedDrawPrepare: empty plan node='%s'",
-                  data.node != nullptr ? data.node->Name().c_str() : "<null>");
+                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>");
         return false;
     }
     if (data.model_pass || mesh.IndexCount() == 0 || plan.orderedRanges.empty()) {
         LOG_ERROR("MaskedDrawPrepare: invalid mesh contract node='%s' model=%s indices=%zu "
                   "ordered-ranges=%zu groups=%zu",
-                  data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                   data.model_pass ? "true" : "false",
                   mesh.IndexCount(),
                   plan.orderedRanges.size(),
@@ -70,7 +70,7 @@ bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& d
             group.contentRanges.empty()) {
             LOG_ERROR("MaskedDrawPrepare: invalid group node='%s' group=%zu texture='%s' "
                       "mask-ranges=%zu content-ranges=%zu",
-                      data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                       group_index,
                       group.maskTexture.c_str(),
                       group.maskRanges.size(),
@@ -84,7 +84,7 @@ bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& d
              static_cast<size_t>(ordered.groupIndex) >= plan.groups.size())) {
             LOG_ERROR("MaskedDrawPrepare: ordered range references invalid group node='%s' "
                       "group=%d groups=%zu",
-                      data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                       ordered.groupIndex,
                       plan.groups.size());
             return false;
@@ -94,7 +94,7 @@ bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& d
     const auto stencil_format = ResolveMaskedDrawStencilFormat(device);
     if (! stencil_format.has_value()) {
         LOG_ERROR("MaskedDrawPrepare: no depth/stencil attachment format node='%s'",
-                  data.node != nullptr ? data.node->Name().c_str() : "<null>");
+                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>");
         return false;
     }
     m_stencil_format = *stencil_format;
@@ -111,13 +111,13 @@ MaskedDrawRenderer::resourceTextures(const SceneMesh& mesh) const {
 
 bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
                                          const ShaderDrawData& data) {
-    if (data.node == nullptr || data.node->Mesh() == nullptr) {
+    if (!data.draw.Valid() || data.draw.Mesh() == nullptr) {
         LOG_ERROR("MaskedDrawTexture: missing mesh node='%s'",
-                  data.node != nullptr ? data.node->Name().c_str() : "<null>");
+                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>");
         return false;
     }
 
-    const auto& groups = data.node->Mesh()->MaskedDraw().groups;
+    const auto& groups = data.draw.Mesh()->MaskedDraw().groups;
     m_textures.resize(groups.size());
     for (size_t i = 0; i < groups.size(); i++) {
         const auto& texture_name = groups[i].maskTexture;
@@ -133,7 +133,7 @@ bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
         const auto texture_it = scene.textures.find(texture_name);
         if (texture_it == scene.textures.end() || texture_it->second.isVideo) {
             LOG_ERROR("MaskedDrawTexture: invalid imported mask node='%s' group=%zu texture='%s'",
-                      data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                       i,
                       texture_name.c_str());
             return false;
@@ -145,7 +145,7 @@ bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
         }
         if (image == nullptr) {
             LOG_ERROR("MaskedDrawTexture: parse failed node='%s' group=%zu texture='%s'",
-                      data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                       i,
                       texture_name.c_str());
             return false;
@@ -155,7 +155,7 @@ bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
         scene.DropParsedImageCache(texture_name);
         if (slots.slots.empty()) {
             LOG_ERROR("MaskedDrawTexture: upload failed node='%s' group=%zu texture='%s'",
-                      data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                       i,
                       texture_name.c_str());
             return false;
@@ -187,7 +187,7 @@ VmaImageParameters* MaskedDrawRenderer::acquireAttachment(const Device& device,
     if (stencil_image == nullptr) {
         LOG_ERROR("MaskedDrawAttachment: allocation failed node='%s' output='%s' "
                   "extent=[%u,%u] format=%d",
-                  data.node != nullptr ? data.node->Name().c_str() : "<null>",
+                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
                   data.output.c_str(),
                   data.vk_output.extent.width,
                   data.vk_output.extent.height,
@@ -202,7 +202,7 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
     ShaderReflected            test_ref;
     if (! GenReflect(context.material.customShader.shader->codes, test_spvs, test_ref)) {
         LOG_ERROR("MaskedDrawPrepare: visible shader reflection failed node='%s'",
-                  context.data.node != nullptr ? context.data.node->Name().c_str() : "<null>");
+                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>");
         return false;
     }
 
@@ -231,7 +231,7 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
     test_pipeline.depth.back = test_pipeline.depth.front;
     m_test_pipeline.debug_name =
         "MaskedDrawTest[node=" +
-        (context.data.node != nullptr ? context.data.node->Name() : std::string("(null)")) +
+        (context.data.draw.Valid() ? context.data.draw.Name() : std::string("(null)")) +
         ",output=" + context.data.output + "]";
     m_test_pipeline.cache_key = ShaderDrawPipelineCompatibilityKey(
         context.render_state.color_load_op,
@@ -256,13 +256,13 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
     const auto bone_count = context.mesh.Skinning().boneCount;
     if (bone_count == 0) {
         LOG_ERROR("MaskedDrawPrepare: mesh has no bone count node='%s'",
-                  context.data.node != nullptr ? context.data.node->Name().c_str() : "<null>");
+                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>");
         return false;
     }
     auto mask_shader_codes = CompileMaskedDrawMaskShaderCodes(bone_count);
     if (! mask_shader_codes.has_value()) {
         LOG_ERROR("MaskedDrawPrepare: mask shader compilation failed node='%s' bones=%u",
-                  context.data.node != nullptr ? context.data.node->Name().c_str() : "<null>",
+                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>",
                   bone_count);
         return false;
     }
@@ -271,12 +271,12 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
     ShaderReflected            mask_ref;
     if (! GenReflect(*mask_shader_codes, mask_spvs, mask_ref)) {
         LOG_ERROR("MaskedDrawPrepare: mask shader reflection failed node='%s'",
-                  context.data.node != nullptr ? context.data.node->Name().c_str() : "<null>");
+                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>");
         return false;
     }
     if (mask_ref.blocks.size() != 1) {
         LOG_ERROR("MaskedDrawPrepare: expected one mask uniform block node='%s' blocks=%zu",
-                  context.data.node != nullptr ? context.data.node->Name().c_str() : "<null>",
+                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>",
                   mask_ref.blocks.size());
         return false;
     }
@@ -305,7 +305,7 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
                           "name='%s' node='%s'",
                           input.location,
                           name.c_str(),
-                          context.data.node != nullptr ? context.data.node->Name().c_str()
+                          context.data.draw.Valid() ? context.data.draw.Name().c_str()
                                                        : "<null>");
                 return false;
             }
@@ -317,7 +317,7 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
                           name.c_str(),
                           static_cast<int>(expected_name.size()),
                           expected_name.data(),
-                          context.data.node != nullptr ? context.data.node->Name().c_str()
+                          context.data.draw.Valid() ? context.data.draw.Name().c_str()
                                                        : "<null>");
                 return false;
             }
@@ -357,7 +357,7 @@ bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResourc
     mask_pipeline.depth.back = mask_pipeline.depth.front;
     m_mask_pipeline.debug_name =
         "MaskedDrawMask[node=" +
-        (context.data.node != nullptr ? context.data.node->Name() : std::string("(null)")) +
+        (context.data.draw.Valid() ? context.data.draw.Name() : std::string("(null)")) +
         ",output=" + context.data.output + "]";
     m_mask_pipeline.cache_key = ShaderDrawPipelineCompatibilityKey(
         context.render_state.color_load_op,
@@ -403,7 +403,7 @@ void MaskedDrawRenderer::initializeUniforms(StagingBuffer* buffer) {
 void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
     auto&       data      = context.data;
     auto&       command   = context.resources.command;
-    const auto& plan      = data.node->Mesh()->MaskedDraw();
+    const auto& plan      = data.draw.Mesh()->MaskedDraw();
     const auto& out_extent = data.vk_output.extent;
 
     const auto push_mask_descriptors = [&](size_t group_index) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
 #include <string_view>
@@ -41,10 +42,11 @@ GetJsonValue(const char* file, const char* func, int line, const nlohmann::json&
 bool ParseJson(const char* file, const char* func, int line, const std::string& source,
                nlohmann::json& result);
 
+bool ReadJsonFloat2Value(const nlohmann::json& json, std::array<float, 2>& value);
+
 class ScopedJsonUserProperties {
 public:
-    explicit ScopedJsonUserProperties(const UserPropertyMap* properties,
-                                      const nlohmann::json* root = nullptr);
+    explicit ScopedJsonUserProperties(const UserPropertyMap* properties);
     ~ScopedJsonUserProperties();
 
     ScopedJsonUserProperties(const ScopedJsonUserProperties&)            = delete;
@@ -52,6 +54,5 @@ public:
 
 private:
     const UserPropertyMap* m_previous { nullptr };
-    const nlohmann::json*  m_previous_root { nullptr };
 };
 } // namespace wallpaper

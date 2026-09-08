@@ -81,7 +81,7 @@ enum class AlphaWritePolicy
 enum class FinalOutputCapability
 {
     PrivateDependency,
-    PrivatePuppetSurface,
+    PrivatePuppetPublication,
     SceneAuthoredWriter,
     PrivateThenPublish,
 };

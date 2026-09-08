@@ -2,26 +2,22 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cmath>
 #include <array>
 #include <cstdlib>
-#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <tuple>
 #include <type_traits>
-#include <unordered_map>
 
 #include "Utils/Identity.hpp"
 #include "Utils/String.h"
-#include "WPScriptRuntime.hpp"
+#include "WPDynamicValue.hpp"
 
 namespace wallpaper
 {
 namespace
 {
 thread_local const UserPropertyMap* g_json_user_properties = nullptr;
-thread_local const nlohmann::json*  g_json_scene_root      = nullptr;
 
 template<typename T>
 struct IsStdVector : std::false_type {};
@@ -29,75 +25,17 @@ struct IsStdVector : std::false_type {};
 template<typename T, typename Allocator>
 struct IsStdVector<std::vector<T, Allocator>> : std::true_type {};
 
-struct StaticCanvasSize {
-    double x { 0.0 };
-    double y { 0.0 };
-    bool   valid { false };
-};
-
 template<typename T>
 bool TryParseNumber(std::string_view text, T& value);
 
 std::string ShortenForLog(std::string_view text, size_t max_length);
 std::string ShaderValueToString(const ShaderValue& value);
-std::string FormatNumericVectorString(const std::vector<double>& values);
 
 std::string DescribeUserPropertyValue(const UserPropertyValue& value) {
     if (const auto* shader_value = std::get_if<ShaderValue>(&value)) {
         return std::string("shader(") + ShaderValueToString(*shader_value) + ")";
     }
     return std::string("string(\"") + ShortenForLog(std::get<std::string>(value), 160) + "\")";
-}
-
-template<typename T>
-std::string DescribeConvertedOverrideValue(const T& value) {
-    std::ostringstream out;
-    out << value;
-    return out.str();
-}
-
-template<typename T>
-std::string DescribeConvertedOverrideValue(const std::vector<T>& value) {
-    std::ostringstream out;
-    out << "[";
-    for (size_t index = 0; index < value.size(); index++) {
-        if (index != 0) out << ", ";
-        out << value[index];
-    }
-    out << "]";
-    return out.str();
-}
-
-template<typename T, size_t N>
-std::string DescribeConvertedOverrideValue(const std::array<T, N>& value) {
-    std::ostringstream out;
-    out << "[";
-    for (size_t index = 0; index < N; index++) {
-        if (index != 0) out << ", ";
-        out << value[index];
-    }
-    out << "]";
-    return out.str();
-}
-
-std::string DescribeScriptValue(const WPScriptValue& value) {
-    switch (value.shape) {
-        case WPScriptValueShape::Boolean:
-            return value.boolean_value ? "bool(true)" : "bool(false)";
-        case WPScriptValueShape::String:
-            return std::string("string(\"") + value.string_value + "\")";
-        case WPScriptValueShape::NumberArray:
-            return std::string("array(") + FormatNumericVectorString(value.numeric_values) + ")";
-        case WPScriptValueShape::VectorString:
-            return std::string("vector(\"") + FormatNumericVectorString(value.numeric_values) + "\")";
-        case WPScriptValueShape::Number:
-        default: {
-            std::ostringstream out;
-            out << "number(" << (value.numeric_values.empty() ? 0.0 : value.numeric_values.front())
-                << ")";
-            return out.str();
-        }
-    }
 }
 
 std::string ShortenForLog(std::string_view text, size_t max_length = 160) {
@@ -145,32 +83,14 @@ const nlohmann::json* ResolveAnimatedInitialValue(const nlohmann::json& json) {
 }
 
 const nlohmann::json& ResolvePropertyValueNode(const nlohmann::json& json) {
+    // Property parsing reads the authored value; the script source is registered separately with
+    // the persistent scene host. That host owns init(), user-property callbacks and frame
+    // updates. Running those callbacks here would use an incomplete scene/shared state and
+    // replace valid base values with derived results before the real script instance has even
+    // been initialized.
     if (const auto* animated = ResolveAnimatedInitialValue(json)) return *animated;
     if (json.is_object() && json.contains("value")) return json.at("value");
     return json;
-}
-
-std::optional<nlohmann::json> TryResolveUserPropertyOverrideJson(const nlohmann::json& json) {
-    if (g_json_user_properties == nullptr) return std::nullopt;
-
-    const auto binding = ResolveUserPropertyBinding(json);
-    if (! binding.has_value()) return std::nullopt;
-
-    const auto* property = LookupUserProperty(g_json_user_properties, binding->name);
-    const auto* property_entry = FindUserPropertyEntry(g_json_user_properties, binding->name);
-    if (property == nullptr || property_entry == nullptr) return std::nullopt;
-
-    if (! binding->condition.empty() &&
-        ! MatchesUserPropertyCondition(*property_entry, binding->condition)) {
-        return std::nullopt;
-    }
-
-    if (const auto* shader_value = std::get_if<ShaderValue>(property)) {
-        if (shader_value->size() == 1) return (*shader_value)[0];
-        return ShaderValueToString(*shader_value);
-    }
-
-    return std::get<std::string>(*property);
 }
 
 bool TryReadJsonNumber(const nlohmann::json& json, double& value) {
@@ -194,187 +114,6 @@ bool TryReadJsonNumber(const nlohmann::json& json, double& value) {
     } catch (const nlohmann::json::exception&) {
     }
     return false;
-}
-
-std::optional<StaticCanvasSize> TryReadCanvasSize(const nlohmann::json& root) {
-    if (! root.is_object() || ! root.contains("general") || ! root.at("general").is_object()) {
-        return std::nullopt;
-    }
-
-    const auto& general = root.at("general");
-    if (! general.contains("orthogonalprojection") ||
-        ! general.at("orthogonalprojection").is_object()) {
-        return std::nullopt;
-    }
-
-    const auto& ortho = general.at("orthogonalprojection");
-    double      width = 0.0;
-    double      height = 0.0;
-    if (! ortho.contains("width") || ! ortho.contains("height") ||
-        ! TryReadJsonNumber(ortho.at("width"), width) ||
-        ! TryReadJsonNumber(ortho.at("height"), height)) {
-        return std::nullopt;
-    }
-
-    return StaticCanvasSize { width, height, true };
-}
-
-bool TryParseNumberVectorString(const std::string& source, std::vector<double>& out) {
-    std::vector<float> values;
-    if (! utils::StrToArray::Convert(source, values)) return false;
-
-    out.resize(values.size());
-    for (size_t i = 0; i < values.size(); i++) {
-        out[i] = values[i];
-    }
-    return true;
-}
-
-std::string FormatNumericVectorString(const std::vector<double>& values) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(5);
-    for (size_t i = 0; i < values.size(); i++) {
-        if (i != 0) out << ' ';
-        out << values[i];
-    }
-    return out.str();
-}
-
-std::optional<WPScriptValue> TryParseScriptValueJson(const nlohmann::json& value_node) {
-    if (value_node.is_number()) {
-        return WPScriptValue::Number(value_node.get<double>());
-    }
-
-    if (value_node.is_boolean()) {
-        return WPScriptValue::Boolean(value_node.get<bool>());
-    }
-
-    if (value_node.is_array()) {
-        std::vector<double> values;
-        values.reserve(value_node.size());
-        for (const auto& item : value_node) {
-            double component = 0.0;
-            if (! TryReadJsonNumber(item, component)) return std::nullopt;
-            values.push_back(component);
-        }
-        if (values.empty()) return std::nullopt;
-        return WPScriptValue::NumberArray(std::move(values));
-    }
-
-    if (value_node.is_string()) {
-        const auto text = value_node.get<std::string>();
-
-        std::vector<double> values;
-        if (TryParseNumberVectorString(text, values) && ! values.empty()) {
-            return WPScriptValue::VectorString(std::move(values));
-        }
-
-        return WPScriptValue::String(text);
-    }
-
-    return std::nullopt;
-}
-
-std::optional<WPScriptValue> TryReadScriptValueState(const nlohmann::json& node) {
-    return TryParseScriptValueJson(ResolvePropertyValueNode(node));
-}
-
-std::optional<WPScriptValue> TryResolveScriptPropertyValue(const nlohmann::json& json) {
-    if (const auto overridden = TryResolveUserPropertyOverrideJson(json); overridden.has_value()) {
-        const auto parsed = TryParseScriptValueJson(*overridden);
-        if (!parsed.has_value()) {
-            LOG_ERROR("SceneScript: failed to parse scriptproperty override json: %s",
-                      overridden->dump().c_str());
-        }
-        return parsed;
-    }
-
-    const auto parsed = TryReadScriptValueState(json);
-    if (!parsed.has_value()) {
-        LOG_ERROR("SceneScript: failed to parse scriptproperty default json: %s",
-                  json.dump().c_str());
-    }
-    return parsed;
-}
-
-nlohmann::json SerializeScriptValue(const WPScriptValue& value) {
-    switch (value.shape) {
-        case WPScriptValueShape::Boolean:
-            return value.boolean_value;
-        case WPScriptValueShape::String:
-            return value.string_value;
-        case WPScriptValueShape::NumberArray:
-            return nlohmann::json(value.numeric_values);
-        case WPScriptValueShape::VectorString:
-            return FormatNumericVectorString(value.numeric_values);
-        case WPScriptValueShape::Number:
-        default:
-            return value.numeric_values.empty() ? 0.0 : value.numeric_values.front();
-    }
-}
-
-WPScriptRuntime& GetScriptRuntime() {
-    thread_local WPScriptRuntime runtime;
-    return runtime;
-}
-
-std::optional<nlohmann::json> TryResolveScriptValueNode(const nlohmann::json& node,
-                                                        std::string_view      property_name = {}) {
-    if (! node.is_object() || ! node.contains("script") || ! node.at("script").is_string()) {
-        return std::nullopt;
-    }
-    if (ResolveUserPropertyBinding(node).has_value()) return std::nullopt;
-
-    const auto current_value = TryReadScriptValueState(node);
-    if (! current_value.has_value()) {
-        LOG_ERROR("SceneScript: failed to parse current value for script node: %s",
-                  node.dump().c_str());
-        return std::nullopt;
-    }
-
-    WPScriptEvaluationContext context;
-    // Parser-time script evaluation runs before the persistent host exists, so pass the authored
-    // property name through to the lightweight runtime. That lets the wrapper seed exactly
-    // thisLayer.origin, thisLayer.scale, etc. with the current base value instead of leaving every
-    // layer property at a generic zero fallback.
-    context.property_name = std::string(property_name);
-    if (g_json_scene_root != nullptr) {
-        if (const auto canvas_size = TryReadCanvasSize(*g_json_scene_root);
-            canvas_size.has_value() && canvas_size->valid) {
-            context.canvas_size = { canvas_size->x, canvas_size->y };
-        }
-    }
-
-    if (node.contains("scriptproperties") && ! node.at("scriptproperties").is_null()) {
-        if (! node.at("scriptproperties").is_object()) return std::nullopt;
-        for (const auto& [name, property_node] : node.at("scriptproperties").items()) {
-            const auto property_value = TryResolveScriptPropertyValue(property_node);
-            if (! property_value.has_value()) {
-                LOG_ERROR("SceneScript: failed to resolve scriptproperty '%s'", name.c_str());
-                return std::nullopt;
-            }
-            context.script_properties.emplace(name, *property_value);
-        }
-    }
-
-    auto& runtime = GetScriptRuntime();
-    if (! runtime.isReady()) {
-        LOG_ERROR("SceneScript: QuickJS runtime is not ready");
-        return std::nullopt;
-    }
-
-    const auto evaluated =
-        runtime.evaluate(node.at("script").get_ref<const std::string&>(), *current_value, context);
-    if (! evaluated.has_value()) {
-        // Parser-time script execution is only a best-effort value probe. The persistent
-        // QuickJS host will run the real Wallpaper Engine callbacks after the scene is loaded,
-        // so falling back to the authored raw value is expected recovery rather than a fatal
-        // scene loading error.
-        LOG_INFO("SceneScript: runtime evaluation failed, falling back to raw value");
-        return std::nullopt;
-    }
-
-    return SerializeScriptValue(*evaluated);
 }
 
 template<>
@@ -464,6 +203,17 @@ bool TryConvertUserPropertyValue(const UserPropertyValue& property, std::vector<
     return false;
 }
 
+bool TryConvertUserPropertyValue(const UserPropertyValue& property, std::array<float, 2>& value) {
+    // A float2 property consumes its own component width, even when the bound color contains
+    // three components. Use the same conversion as live user-property updates so loading a scene
+    // does not reject a value that the persistent host accepts later. This also keeps numeric
+    // broadcasting distinct from a one-component string, whose missing second component is zero
+    // in the string reader.
+    const auto converted =
+        WPDynamicValue::FromUserPropertyValue(property, WPDynamicValue::Type::Float2);
+    return converted.has_value() && converted->tryGet(&value);
+}
+
 template<typename T, std::size_t N>
 bool TryConvertUserPropertyValue(const UserPropertyValue& property, std::array<T, N>& value) {
     if (const auto* shader_value = std::get_if<ShaderValue>(&property)) {
@@ -509,6 +259,15 @@ bool TryGetUserPropertyOverride(const nlohmann::json& json, T& value) {
     }
 
     const bool converted = TryConvertUserPropertyValue(*property, value);
+    if constexpr (std::is_same_v<T, std::array<float, 2>>) {
+        if (converted && std::getenv("WESCENE_TRACE_USER_BINDINGS") != nullptr) {
+            LOG_INFO("SceneUserPropertyBinding: property='%s' type=float2 source=%s resolved=[%.6f %.6f]",
+                     binding->name.c_str(),
+                     DescribeUserPropertyValue(property_entry->value).c_str(),
+                     value[0],
+                     value[1]);
+        }
+    }
     if (!converted) {
         LOG_ERROR("SceneScript: failed to convert direct user binding '%s' raw=%s condition='%s'",
                   binding->name.c_str(),
@@ -532,14 +291,15 @@ bool ParseJson(const char* file, const char* func, int line, const std::string& 
 
 template<typename T>
 inline bool _GetJsonValue(const nlohmann::json&                  json,
-                          typename utils::is_std_array<T>::type& value,
-                          std::string_view                       property_name = {}) {
+                          typename utils::is_std_array<T>::type& value) {
     if (TryGetUserPropertyOverride(json, value)) return true;
 
-    const auto scripted = TryResolveScriptValueNode(json, property_name);
-    const auto& njson   = scripted.has_value() ? *scripted : ResolvePropertyValueNode(json);
+    const auto& njson = ResolvePropertyValueNode(json);
 
     using Tv = typename T::value_type;
+    if constexpr (std::is_same_v<T, std::array<float, 2>>) {
+        if (njson.is_number() || njson.is_string()) return ReadJsonFloat2Value(njson, value);
+    }
     if (njson.is_number()) {
         value = { njson.get<Tv>() };
         return true;
@@ -573,15 +333,8 @@ inline bool _GetJsonValue(const nlohmann::json&                  json,
 }
 
 template<typename T>
-inline bool _GetJsonValue(const nlohmann::json& json, T& value,
-                          std::string_view property_name = {}) {
+inline bool _GetJsonValue(const nlohmann::json& json, T& value) {
     if (TryGetUserPropertyOverride(json, value)) return true;
-
-    if (const auto scripted = TryResolveScriptValueNode(json, property_name);
-        scripted.has_value()) {
-        value = scripted->get<T>();
-        return true;
-    }
 
     value = ResolvePropertyValueNode(json).get<T>();
     return true;
@@ -596,9 +349,7 @@ inline bool _GetJsonValue(const char* file, const char* func, int line, const nl
     std::string nameinfo;
     if (name != nullptr) nameinfo = std::string("(key: ") + name + ")";
     try {
-        const std::string_view property_name =
-            name != nullptr ? std::string_view(name) : std::string_view {};
-        return _GetJsonValue<T>(json, value, property_name);
+        return _GetJsonValue<T>(json, value);
     } catch (const njson::type_error& e) {
         WallpaperLog(LOGLEVEL_INFO,
                      file,
@@ -685,15 +436,37 @@ T_IMPL_GET_JSON(farray<2>);
 T_IMPL_GET_JSON(farray<3>);
 T_IMPL_GET_JSON(farray<4>);
 
-ScopedJsonUserProperties::ScopedJsonUserProperties(const UserPropertyMap* properties,
-                                                   const nlohmann::json*  root)
-    : m_previous(g_json_user_properties), m_previous_root(g_json_scene_root) {
+bool ReadJsonFloat2Value(const nlohmann::json& json, std::array<float, 2>& value) {
+    // Numeric JSON values broadcast, while strings store independent components. The reader zeros
+    // both floats, converts x, then finds the first ASCII space and skips spaces before
+    // converting y. A missing second component remains zero, and additional components are not
+    // read. Share this conversion between object parsing and dynamic bindings so both populate
+    // the same runtime field.
+    if (json.is_number()) {
+        const float scalar = json.get<float>();
+        value = { scalar, scalar };
+        return true;
+    }
+    if (!json.is_string()) return false;
+
+    const auto& text = json.get_ref<const std::string&>();
+    value = { static_cast<float>(std::strtod(text.c_str(), nullptr)), 0.0f };
+    const auto separator = text.find(' ');
+    if (separator != std::string::npos) {
+        const auto second = text.find_first_not_of(' ', separator);
+        if (second != std::string::npos) {
+            value[1] = static_cast<float>(std::strtod(text.c_str() + second, nullptr));
+        }
+    }
+    return true;
+}
+
+ScopedJsonUserProperties::ScopedJsonUserProperties(const UserPropertyMap* properties)
+    : m_previous(g_json_user_properties) {
     g_json_user_properties = properties;
-    g_json_scene_root      = root;
 }
 
 ScopedJsonUserProperties::~ScopedJsonUserProperties() {
     g_json_user_properties = m_previous;
-    g_json_scene_root      = m_previous_root;
 }
 } // namespace wallpaper

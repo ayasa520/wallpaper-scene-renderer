@@ -17,12 +17,10 @@ public:
     void setDescTex(u32 index, std::string_view texture_key);
 
     void prepare(Scene&, const Device&, RenderingResources&) override;
-    void prepareDeferred(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
     void refreshImportedTextureBindings(Scene&, const Device&) override;
     void dropOutputFramebuffers() override;
     void updateBeforeUpload() override;
-    DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) override;
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
     bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;

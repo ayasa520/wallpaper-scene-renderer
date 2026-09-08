@@ -6,15 +6,14 @@
 #include "SpecTexs.hpp"
 #include "Core/MapSet.hpp"
 #include "Utils/Logging.h"
-#include "WPImageAlignment.hpp"
 
 #include "VulkanRender/AllPasses.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <functional>
 #include <limits>
-#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -155,9 +154,9 @@ void addVolumetricsSingleFillPass(RenderGraph& rgraph, const Scene* scene) {
 } // namespace wallpaper::rg
 
 static void CheckAndSetSprite(Scene& scene, vulkan::ShaderDrawRequest& desc,
-                              std::span<const std::string> texs) {
-    for (usize i = 0; i < texs.size(); i++) {
-        auto& tex = texs[i];
+                              const SceneMaterial& material) {
+    for (usize i = 0; i < material.textures.size(); i++) {
+        const auto& tex = material.Texture(i);
         if (! tex.empty() && ! IsSpecTex(tex) && scene.textures.count(tex) != 0) {
             const auto& stex = scene.textures.at(tex);
             if (stex.isSprite) {
@@ -171,10 +170,8 @@ static int32_t NodeLayerId(const Scene& scene, SceneNode* node) {
     return scene.LayerIdForNode(node);
 }
 
-static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::string_view output) {
-    // Detached final-composite nodes carry their owner layer in the node id instead of a
-    // nodeOwners registration, so resolve the layer through the shared helper.
-    const int32_t layer_id = NodeLayerId(scene, node);
+static bool ShouldExecuteHiddenDependency(Scene& scene, SceneDraw draw, std::string_view output) {
+    const int32_t layer_id = draw.LayerId(scene);
     if (layer_id == 0) return false;
     if (! scene.IsLayerOffscreenDependencySource(layer_id)) return false;
 
@@ -185,29 +182,13 @@ static bool ShouldExecuteHiddenDependency(Scene& scene, SceneNode* node, std::st
     return output != SpecTex_Default;
 }
 
-static bool ShouldExecuteLayerDestination(Scene& scene, SceneNode* node,
+static bool ShouldExecuteLayerDestination(Scene& scene, SceneDraw draw,
                                           std::string_view output) {
-    if (node == nullptr || node->Visible()) return true;
-    return ShouldExecuteHiddenDependency(scene, node, output);
-}
-
-struct DelayLinkInfo {
-    using BindTexture = void (*)(rg::Pass&, u32, std::string_view);
-
-    rg::NodeID id;
-    rg::NodeID link_id;
-    i32        tex_index;
-    BindTexture bind_texture { nullptr };
-};
-
-template <typename PassT>
-void BindShaderDrawTexture(rg::Pass& pass, u32 index, std::string_view texture_key) {
-    static_cast<PassT&>(pass).setDescTex(index, texture_key);
+    if (!draw.Valid() || draw.Visible(scene)) return true;
+    return ShouldExecuteHiddenDependency(scene, draw, output);
 }
 
 struct ExtraInfo {
-    Map<size_t, rg::TexNode*>  id_link_map {};
-    std::vector<DelayLinkInfo> link_info {};
     rg::RenderGraph*           rgraph { nullptr };
     Scene*                     scene { nullptr };
     std::unordered_map<int32_t, size_t> layer_order_index {};
@@ -222,58 +203,33 @@ static bool IsOffscreenDependencyLayer(const ExtraInfo& extra, i32 imgId) {
         extra.scene->IsLayerOffscreenDependencySource(imgId);
 }
 
-static bool ShouldPublishLayerLinkOutput(const ExtraInfo& extra, i32 imgId,
-                                         std::string_view output) {
-    if (!IsOffscreenDependencyLayer(extra, imgId)) return true;
-    if (output != SpecTex_Default) return true;
-
-    // `_rt_imageLayerComposite_<id>` is a source-texture contract, not a screen-composite contract.
-    // Hidden dependency layers may still contain historical final passes that target `_rt_default`,
-    // but those passes are deliberately blocked from executing while the layer is invisible. Letting
-    // such a skipped screen pass replace the layer's link source makes the consumer sample the
-    // wallpaper/default target instead of the dependency's raw or effect-resolved offscreen image.
-    return false;
-}
-
-static bool ShouldKeepEffectFinalOutputPrivate(const ExtraInfo& extra, SceneNode* node, i32 imgId,
-                                               std::string_view inherited_output) {
-    if (!IsOffscreenDependencyLayer(extra, imgId)) return false;
-
-    const bool visible_default_route =
-        node != nullptr && node->Visible() && inherited_output == SpecTex_Default;
-    // A layer can be both an offscreen dependency source and a normal visible wallpaper layer. The
-    // dependency route needs the final authored effect to stay in ping-pong space so
-    // `_rt_imageLayerComposite_<id>` samples a resolved private texture. The visible default route is
-    // the opposite contract: the authored final effect is the screen writer, while the synthetic
-    // fallback is gated off whenever that final effect is visible. Keeping this visible route private
-    // leaves `_rt_default` untouched and produces the gray frame reported by Rika/943626357.
-    return !visible_default_route;
-}
-
 struct OrderedRenderGraphChild {
     SceneNode* node { nullptr };
-    bool       proxy { false };
+    bool       authored { false };
     size_t     sequence { 0 };
 };
 
-struct NodePassOptions {
+struct DrawPassOptions {
     AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
     bool        clear_before_draw { false };
     std::string camera_override;
     bool        use_active_camera_for_parallax { false };
     bool        premultiplied_source_blend { false };
     bool        use_active_camera_for_uniforms { false };
+    ShaderModelSpace model_space { ShaderModelSpace::Object };
+    bool        reflection_pass { false };
 };
 
 struct TraversalRoute {
-    bool                           routed_node { false };
-    std::optional<Eigen::Matrix4d> model;
+    // Traversal determines order and destination state. Object transforms are resolved from
+    // SceneObject at draw time; membership in a composition is independent of node parenting.
     bool                           compose_source { false };
     std::string                    compose_source_camera;
     AlphaWritePolicy               compose_source_alpha_write_policy {
         AlphaWritePolicy::Preserve
     };
     bool                           premultiplied_source_blend { false };
+    bool                           reflection_pass { false };
 };
 
 static bool HasRenderableMeshMaterial(SceneNode* node) {
@@ -289,7 +245,7 @@ static size_t NodeLayerOrderIndex(SceneNode* node, const ExtraInfo& extra) {
     return std::numeric_limits<size_t>::max();
 }
 
-static bool IsEffectLocalProxyDependency(SceneNode* node, const ExtraInfo& extra) {
+static bool IsEffectLocalDependency(SceneNode* node, const ExtraInfo& extra) {
     if (extra.scene == nullptr || node == nullptr) return false;
     const int32_t layer_id = NodeLayerId(*extra.scene, node);
     return layer_id != 0 && extra.scene->IsLayerOffscreenDependencySource(layer_id);
@@ -309,140 +265,67 @@ static bool EffectSourceUsesOwnerNode(SceneImageEffectLayer* imgeff) {
         policy == SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren;
 }
 
-static bool HasRenderOrderProxyChildren(SceneNode* node, const ExtraInfo& extra) {
-    if (node == nullptr || extra.scene == nullptr) return false;
-    return ! extra.scene->RenderOrderProxyChildrenOf(node).empty();
+static bool DrawMaterialSamplesFramebuffer(SceneDraw draw) {
+    if (draw.Mesh() == nullptr || draw.Mesh()->Material() == nullptr) return false;
+    return draw.Mesh()->Material()->SamplesTexture(SpecTex_Default);
 }
 
-static bool ShouldSeedEmptyProxyComposeFromFramebuffer(SceneNode* node,
-                                                       SceneImageEffectLayer* imgeff,
-                                                       i32 imgId,
-                                                       const ExtraInfo& extra,
-                                                       std::string_view inherited_output,
-                                                       bool compose_source_route) {
-    if (node == nullptr || imgeff == nullptr) return false;
-    if (compose_source_route || inherited_output != SpecTex_Default) return false;
-    if (!node->Visible()) return false;
-    if (IsOffscreenDependencyLayer(extra, imgId)) return false;
-    if (imgeff->SourceContributionPolicy() !=
-        SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly) {
-        return false;
-    }
-    return !HasRenderOrderProxyChildren(node, extra);
-}
-
-enum class OwnerNodeSourceFallbackReason
-{
-    None,
-    EmptyProxyDependencySource,
-};
-
-static OwnerNodeSourceFallbackReason ResolveOwnerNodeSourceFallbackReason(
-    SceneNode* node, SceneImageEffectLayer* imgeff, i32 imgId, const ExtraInfo& extra) {
-    if (node == nullptr || imgeff == nullptr) return OwnerNodeSourceFallbackReason::None;
-    if (imgeff->SourceContributionPolicy() !=
-        SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly) {
-        return OwnerNodeSourceFallbackReason::None;
-    }
-    if (HasRenderOrderProxyChildren(node, extra)) return OwnerNodeSourceFallbackReason::None;
-    if (IsOffscreenDependencyLayer(extra, imgId)) {
-        return OwnerNodeSourceFallbackReason::EmptyProxyDependencySource;
-    }
-    return OwnerNodeSourceFallbackReason::None;
-}
-
-static std::string_view OwnerNodeSourceFallbackReasonName(
-    OwnerNodeSourceFallbackReason reason) {
-    switch (reason) {
-    case OwnerNodeSourceFallbackReason::None: return "none";
-    case OwnerNodeSourceFallbackReason::EmptyProxyDependencySource:
-        return "empty-proxy-dependency-source";
-    }
-    return "unknown";
-}
-
-static bool NodeMaterialSamplesFramebuffer(SceneNode* node) {
-    if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr) {
-        return false;
-    }
-
-    const auto& textures = node->Mesh()->Material()->textures;
-    return std::find(textures.begin(), textures.end(), std::string(SpecTex_Default)) !=
-        textures.end();
-}
-
-static bool NodeUsesPerspectiveCamera(const Scene& scene, SceneNode* node) {
-    // Uniform updates walk ancestors for the effective camera. Keep the same walk here so a
-    // child that inherits a perspective camera is not flattened back to the active ortho view.
-    for (auto* current = node; current != nullptr; current = current->Parent()) {
-        if (current->Camera().empty()) continue;
-        const auto camera_it = scene.cameras.find(current->Camera());
-        if (camera_it != scene.cameras.end() && camera_it->second != nullptr &&
-            camera_it->second->IsPerspective()) {
-            return true;
-        }
+static bool DrawUsesPerspectiveCamera(const Scene& scene, SceneDraw draw) {
+    const auto is_perspective = [&scene](const std::string& name) {
+        const auto camera_it = scene.cameras.find(name);
+        return camera_it != scene.cameras.end() && camera_it->second != nullptr &&
+            camera_it->second->IsPerspective();
+    };
+    // Publication selects its camera explicitly. Source nodes still inherit projection from
+    // their physical parent; keep that walk so perspective particles retain their depth scaling.
+    if (draw.Phase() != nullptr) return is_perspective(draw.Camera());
+    for (auto* current = draw.Node(); current != nullptr; current = current->Parent()) {
+        if (!current->Camera().empty() && is_perspective(current->Camera())) return true;
     }
     return false;
 }
 
 struct EffectSourceRoutingDecision {
-    OwnerNodeSourceFallbackReason owner_node_fallback_reason {
-        OwnerNodeSourceFallbackReason::None
-    };
-    bool        owner_node_source_fallback { false };
-    bool        owner_node_source_fallback_samples_framebuffer { false };
     bool        owner_node_samples_framebuffer { false };
     bool        owner_node_uses_perspective_camera { false };
     bool        owner_node_contributes_to_effect_source { false };
     bool        proxy_children_contribute_to_effect_source { false };
     std::string active_compose_source_camera;
+    std::string child_compose_source_camera;
     bool        use_compose_camera_override { false };
-    bool        seed_empty_proxy_compose_from_framebuffer { false };
 };
 
 static EffectSourceRoutingDecision ResolveEffectSourceRouting(SceneNode* node,
                                                               SceneImageEffectLayer* imgeff,
-                                                              i32 imgId,
                                                               const ExtraInfo& extra,
-                                                              std::string_view inherited_output,
                                                               const TraversalRoute& route) {
     EffectSourceRoutingDecision decision;
 
-    // Compose source routing is the policy boundary between traversal and pass emission. Keeping the
-    // derived booleans together makes each Wallpaper Engine source contract explicit: owner-card
-    // contribution, proxy-child contribution, empty dependency fallback, and framebuffer seeding are
-    // separate decisions even though the render graph eventually emits them in one traversal pass.
-    decision.owner_node_fallback_reason =
-        ResolveOwnerNodeSourceFallbackReason(node, imgeff, imgId, extra);
-    decision.owner_node_source_fallback =
-        decision.owner_node_fallback_reason != OwnerNodeSourceFallbackReason::None;
-    decision.owner_node_source_fallback_samples_framebuffer =
-        decision.owner_node_source_fallback && NodeMaterialSamplesFramebuffer(node);
-    decision.owner_node_samples_framebuffer = NodeMaterialSamplesFramebuffer(node);
+    // copybackground alone selects the owner-card contribution of a non-fullscreen composition.
+    // Empty children and private dependency ownership do not authorize an extra framebuffer draw
+    // after its transparent clear.
+    decision.owner_node_samples_framebuffer = DrawMaterialSamplesFramebuffer(node);
     decision.owner_node_uses_perspective_camera =
-        extra.scene != nullptr && NodeUsesPerspectiveCamera(*extra.scene, node);
+        extra.scene != nullptr && DrawUsesPerspectiveCamera(*extra.scene, node);
     decision.owner_node_contributes_to_effect_source =
-        EffectSourceUsesOwnerNode(imgeff) || decision.owner_node_source_fallback;
+        EffectSourceUsesOwnerNode(imgeff);
     decision.proxy_children_contribute_to_effect_source = EffectSourceUsesProxyChildren(imgeff);
     decision.active_compose_source_camera =
-        route.compose_source
-            ? route.compose_source_camera
-            : (decision.proxy_children_contribute_to_effect_source && node != nullptr
-                   ? std::string(node->Camera())
-                   : std::string());
+        route.compose_source ? route.compose_source_camera : std::string();
+    // A nested non-fullscreen composition establishes its own child projection/I state, then
+    // restores the incoming state for publication. Fullscreen leaves the incoming child state
+    // intact. Source and publication must not share one camera choice merely because both happen
+    // inside the same recursive visit.
+    decision.child_compose_source_camera =
+        decision.proxy_children_contribute_to_effect_source && imgeff != nullptr &&
+            !imgeff->IsFullscreen()
+        ? imgeff->BridgeCameraName() : decision.active_compose_source_camera;
     decision.use_compose_camera_override =
         route.compose_source && imgeff == nullptr && !decision.active_compose_source_camera.empty();
-    decision.seed_empty_proxy_compose_from_framebuffer =
-        ShouldSeedEmptyProxyComposeFromFramebuffer(node,
-                                                  imgeff,
-                                                  imgId,
-                                                  extra,
-                                                  inherited_output,
-                                                  route.compose_source);
     return decision;
 }
 
-static NodePassOptions BuildOwnerSourcePassOptions(
+static DrawPassOptions BuildOwnerSourcePassOptions(
     SceneImageEffectLayer* imgeff,
     std::string_view output,
     std::string_view inherited_output,
@@ -473,23 +356,32 @@ static NodePassOptions BuildOwnerSourcePassOptions(
     //   camera removes all authored depth scaling and makes foreground rain appear uniformly small.
     // - Private effect source targets are cleared only at the seed step; clearing later authored
     //   effect passes would erase intermediate waterwaves/foliagesway/opacity results.
-    return NodePassOptions {
+    return DrawPassOptions {
         .alpha_write_policy = route.compose_source
             ? route.compose_source_alpha_write_policy
             : AlphaWritePolicy::Preserve,
         .clear_before_draw = clear_private_effect_source,
-        .camera_override = source_route.use_compose_camera_override
-            ? source_route.active_compose_source_camera
-            : std::string(),
+        .camera_override = imgeff != nullptr
+            ? imgeff->BridgeCameraName()
+            : (source_route.use_compose_camera_override
+                   ? source_route.active_compose_source_camera
+                   : std::string()),
         .use_active_camera_for_parallax = source_route.use_compose_camera_override,
         .premultiplied_source_blend = route.premultiplied_source_blend,
         .use_active_camera_for_uniforms =
             evaluate_framebuffer_source_with_active_camera,
+        // Ordinary source materials rasterize their geometry with identity I. Passthrough retains
+        // its owner matrix. Neither choice mutates the authored transform or gives a source
+        // camera to the owner's descendants.
+        .model_space = imgeff != nullptr && !imgeff->Owner().Passthrough()
+            ? ShaderModelSpace::Geometry : ShaderModelSpace::Object,
+        .reflection_pass = route.reflection_pass,
     };
 }
 
 static std::string_view EffectSourcePolicyName(SceneImageEffectLayer::SourcePolicy policy) {
     switch (policy) {
+    case SceneImageEffectLayer::SourcePolicy::None: return "none";
     case SceneImageEffectLayer::SourcePolicy::OwnerNode: return "owner-node";
     case SceneImageEffectLayer::SourcePolicy::OwnerNodeAndProxyChildren:
         return "owner-node-and-proxy-children";
@@ -498,59 +390,62 @@ static std::string_view EffectSourcePolicyName(SceneImageEffectLayer::SourcePoli
     return "unknown";
 }
 
-static Eigen::Matrix4d ResolveRouteModel(SceneNode* node,
-                                         const std::optional<Eigen::Matrix4d>& route_model) {
-    if (route_model.has_value()) return *route_model;
-    if (node == nullptr) return Eigen::Matrix4d::Identity();
-
-    node->UpdateTrans();
-    return node->ModelTrans();
+static bool HasCompositionAncestor(const Scene& scene, const SceneObject& object) {
+    // Exclude a descendant from the scene list only when a passthrough ancestor owns its draw.
+    // Ordinary parent/bone relations affect placement and visibility, but do not move the object
+    // beside its parent in painter order.
+    auto* parent = scene.FindSceneObject(object.ParentId());
+    while (parent != nullptr) {
+        if (parent->Passthrough()) return true;
+        parent = scene.FindSceneObject(parent->ParentId());
+    }
+    return false;
 }
 
-static std::optional<Eigen::Matrix4d> BuildChildRouteModel(
-    SceneNode* parent, SceneNode* child, bool routed_child,
-    const std::optional<Eigen::Matrix4d>& parent_route_model) {
-    if (parent == nullptr || child == nullptr) return std::nullopt;
-    if (!routed_child && !parent_route_model.has_value()) return std::nullopt;
-
-    // Proxy routing is order-only in the physical SceneNode tree, but render-time transforms still
-    // need to follow Wallpaper Engine's authored parent. Propagating a resolved route matrix lets
-    // effect final passes use the same virtual parent chain that shader uniforms use later.
-    const auto parent_route =
-        RemoveImageAlignmentOffsetFromModel(ResolveRouteModel(parent, parent_route_model),
-                                            parent->AlignmentOffset());
-    return parent_route * child->GetLocalTrans();
-}
-
-static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode* node,
-                                                                       ExtraInfo& extra) {
+static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(
+    SceneNode* node, ExtraInfo& extra) {
     std::vector<OrderedRenderGraphChild> children;
     if (node == nullptr || extra.scene == nullptr) return children;
 
-    std::unordered_set<SceneNode*> seen;
+    auto& scene = *extra.scene;
+    const bool scene_list = node == scene.sceneGraph.get();
+    const auto* owner = scene.FindSceneObject(NodeLayerId(scene, node));
+    const bool owner_visit = owner != nullptr && owner->LayerNode() == node;
     size_t sequence = 0;
     for (auto& child : node->GetChildren()) {
-        if (!child || !seen.insert(child.get()).second) continue;
+        if (!child) continue;
+        const auto* child_owner = scene.FindSceneObject(NodeLayerId(scene, child.get()));
+        // The physical node tree still retains resources, such as model chunks and emitters.
+        // Authored objects are enumerated below from their own table; admitting their physical
+        // edges here would duplicate a bone child or move a normal child out of scene order.
+        if (child_owner != nullptr && child_owner->LayerNode() == child.get()) continue;
         children.push_back(OrderedRenderGraphChild {
             .node = child.get(),
-            .proxy = false,
             .sequence = sequence++,
         });
     }
 
-    for (auto* proxy_child : extra.scene->RenderOrderProxyChildrenOf(node)) {
-        if (proxy_child == nullptr || !seen.insert(proxy_child).second) continue;
-        children.push_back(OrderedRenderGraphChild {
-            .node = proxy_child,
-            .proxy = true,
-            .sequence = sequence++,
-        });
+    // A scene visit uses the authored list. Within a passthrough source, visit its child list and
+    // then ordinary descendants; nested passthrough objects establish their own source phase.
+    // Bone attachment does not change membership. Detached source/material resources never
+    // enumerate their owner's children.
+    if (scene_list || (owner_visit &&
+        (owner->Passthrough() || HasCompositionAncestor(scene, *owner)))) {
+        for (const auto layer_id : scene.layerOrder) {
+            const auto* child_owner = scene.FindSceneObject(layer_id);
+            if (child_owner == nullptr || child_owner->LayerNode() == nullptr) continue;
+            if (scene_list ? HasCompositionAncestor(scene, *child_owner)
+                           : child_owner->ParentId() != owner->Id()) continue;
+            children.push_back(OrderedRenderGraphChild {
+                .node = child_owner->LayerNode(),
+                .authored = true,
+                .sequence = sequence++,
+            });
+        }
     }
 
-    // The scene tree still owns lifetime and transforms, but the render graph needs Wallpaper
-    // Engine's authored layer order. Sorting only by known layer order and then by insertion
-    // sequence keeps helper nodes deterministic without forcing every runtime node to have an
-    // authored layer id.
+    // Resource-only children retain their insertion order relative to the same owner. Authored
+    // objects retain scene-list order at the scene boundary and sibling order inside composition.
     std::stable_sort(children.begin(), children.end(), [&extra](const auto& lhs, const auto& rhs) {
         const auto lhs_index = NodeLayerOrderIndex(lhs.node, extra);
         const auto rhs_index = NodeLayerOrderIndex(rhs.node, extra);
@@ -561,31 +456,29 @@ static std::vector<OrderedRenderGraphChild> OrderedRenderGraphChildren(SceneNode
 }
 
 template <typename PassT>
-static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
-                            std::function<bool()> should_execute, NodePassOptions options) {
+static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, ExtraInfo& extra,
+                            std::function<bool()> should_execute, DrawPassOptions options) {
     auto& rgraph = *extra.rgraph;
     auto& scene  = *extra.scene;
 
-    if (node->Mesh() == nullptr) {
+    if (draw.Mesh() == nullptr) {
         return;
     }
-    auto* mesh = node->Mesh();
+    auto* mesh = draw.Mesh();
     if (mesh->Material() == nullptr) {
         return;
     }
     auto* material = mesh->Material();
-    const std::string output_key =
-        material->modelRenderState.has_value() && !material->modelRenderState->outputOverride.empty()
-            ? material->modelRenderState->outputOverride
-            : std::string(output);
+    const std::string output_key(output);
     const bool is_model_pass = material->modelRenderState.has_value();
-    const bool clear_model_depth = is_model_pass &&
+    const bool clear_model_depth = is_model_pass && output_key != SpecTex_Default &&
+        output_key != SpecTex_Reflection &&
         extra.model_depth_outputs_seen.insert(output_key).second;
 
-    // The reflection=false quality setting keeps _rt_Reflection allocated and sampled, but skips
-    // the mirrored producer draw. Gate execution here so the checkbox is live without a topology
-    // rebuild; a companion clear pass empties the RT while the switch is off.
-    if (output_key == SpecTex_Reflection) {
+    // The entire reflected draw is quality-gated, including preparatory texture copies. Receivers
+    // retain their ordinary material and target while the checkbox is off; the independent stage
+    // clear still supplies the empty scene color.
+    if (options.reflection_pass) {
         should_execute = [inner = std::move(should_execute), &scene]() {
             if (!scene.reflectionsEnabled) return false;
             return !inner || inner();
@@ -598,16 +491,16 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
     // copying `_rt_default` for an invisible layer would still consume bandwidth and mutate its
     // snapshot target even though the subsequent shader is correctly skipped.
     auto pass_execution_gate =
-        [node, &scene, output_key, inner = std::move(should_execute)]() {
+        [draw, &scene, output_key, inner = std::move(should_execute)]() {
             if (inner && !inner()) return false;
-            return ShouldExecuteLayerDestination(scene, node, output_key);
+            return ShouldExecuteLayerDestination(scene, draw, output_key);
         };
 
     std::string passName = material->name;
     rgraph.addPass<PassT>(
         passName,
         rg::PassNode::Type::CustomShader,
-        [material, node, output_key, imgId, &rgraph, &scene, &extra,
+        [material, draw, output_key, imgId, &rgraph, &scene, &extra,
          clear_model_depth, options = std::move(options),
          pass_execution_gate = std::move(pass_execution_gate)](
             rg::RenderGraphBuilder& builder, typename PassT::Desc& pdesc) {
@@ -616,9 +509,9 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
             // render-target dependencies directly, which is what keeps first-class text bridges and
             // ordinary effect passes on the same stable render-graph contract.
             pdesc.scene      = &scene;
-            pdesc.node       = node;
+            pdesc.draw       = draw;
             pdesc.layer_id   = imgId;
-            pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
+            pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, draw, output_key);
             pdesc.should_execute      = pass_execution_gate;
             pdesc.output     = output_key;
             pdesc.alpha_write_policy = output_key != SpecTex_Default
@@ -628,22 +521,24 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
             pdesc.clear_before_draw = output_key != SpecTex_Default && options.clear_before_draw;
             pdesc.camera_override = options.camera_override;
             pdesc.use_active_camera_for_uniforms = options.use_active_camera_for_uniforms;
+            pdesc.model_space = options.model_space;
+            pdesc.reflection_pass = options.reflection_pass;
             pdesc.use_active_camera_for_parallax =
                 !pdesc.camera_override.empty() && options.use_active_camera_for_parallax;
             if (!pdesc.camera_override.empty()) {
-                LOG_INFO("SceneRenderGraphComposeCameraOverride: layer=%d node='%s' "
+                LOG_INFO("SceneRenderGraphComposeCameraOverride: layer=%d draw='%s' "
                          "output='%s' camera='%s' active-parallax=%s",
                          imgId,
-                         node != nullptr ? node->Name().c_str() : "",
+                         draw.Valid() ? draw.Name().c_str() : "",
                          output_key.c_str(),
                          pdesc.camera_override.c_str(),
                          pdesc.use_active_camera_for_parallax ? "true" : "false");
             }
             if (pdesc.use_active_camera_for_uniforms) {
-                LOG_INFO("SceneRenderGraphActiveCameraUniformOverride: layer=%d node='%s' "
+                LOG_INFO("SceneRenderGraphActiveCameraUniformOverride: layer=%d draw='%s' "
                          "output='%s'",
                          imgId,
-                         node != nullptr ? node->Name().c_str() : "",
+                         draw.Valid() ? draw.Name().c_str() : "",
                          output_key.c_str());
             }
             if (const auto& model_state = material->modelRenderState; model_state.has_value()) {
@@ -653,36 +548,37 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
                 pdesc.depth_test = model_state->depthTest;
                 pdesc.depth_write = model_state->depthWrite;
                 pdesc.depth_clear = model_state->depthClear;
-                // The shared Back RT is rebound per light, so each hull must start
-                // from a cleared depth instead of the first-writer-wins model-chunk rule.
+                // Main/reflected depth belongs to the stage, not a visibility-gated first draw.
+                // Private model targets retain their own initialization. Back is rebound per
+                // light and clears for every hull.
                 pdesc.clear_depth = clear_model_depth ||
                     output_key == SpecTex_VolumetricsBack;
             }
-            CheckAndSetSprite(scene, pdesc, material->textures);
+            CheckAndSetSprite(scene, pdesc, *material);
             for (usize i = 0; i < material->textures.size(); i++) {
-                const auto&  url = material->textures[i];
+                const auto&  url = material->Texture(i);
+                if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr &&
+                    material->systemTextureBindings.contains(i)) {
+                    LOG_INFO("SceneMaterialSystemTextureBind: layer=%d node='%s' "
+                             "shader='%s' slot=%zu authored='%s' selected='%s'",
+                             draw.LayerId(scene), draw.Name().c_str(), material->name.c_str(),
+                             i, material->textures[i].c_str(), url.c_str());
+                }
                 rg::TexNode* input { nullptr };
                 if (url.empty()) {
-                    pdesc.textures.emplace_back("");
-                    continue;
-                } else if (IsSpecLinkTex(url)) {
-                    auto id = ParseLinkTex(url);
-                    extra.link_info.push_back(DelayLinkInfo {
-                        .id           = pass.ID(),
-                        .link_id      = id,
-                        .tex_index    = (i32)i,
-                        .bind_texture = &BindShaderDrawTexture<PassT>,
-                    });
                     pdesc.textures.emplace_back("");
                     continue;
                 } else {
                     rg::TexNode::Desc desc;
                     desc.key  = url;
                     desc.name = url;
-                    // Some effect-local FBOs use plain names such as `blur_start_2_<addr>`.
-                    // Treat any key already registered in Scene::renderTargets as temporary graph
-                    // storage so those edges order like internal render targets, not external
-                    // material textures.
+                    // Private layer destinations participate in ordinary name/version
+                    // dependencies here. Their readers must sample slot zero directly, without a
+                    // layer-wide last-writer substitution or an additional GPU copy. Some
+                    // effect-local FBOs use plain names such as `blur_start_2_<addr>`. Treat any
+                    // key already registered in Scene::renderTargets as temporary graph storage
+                    // so those edges order like internal render targets, not external material
+                    // textures.
                     desc.type = ! rg::IsRuntimeRenderTarget(&scene, url)
                         ? rg::TexNode::TexType::Imported
                         : rg::TexNode::TexType::Temp;
@@ -711,7 +607,7 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
             // Mask textures belong to the mesh draw plan rather than to the visible material. The
             // selected masked pass declares them as ordinary imported reads, while an empty plan
             // leaves the regular CustomShaderPass with no mask-related graph resources at all.
-            for (const auto& group : node->Mesh()->MaskedDraw().groups) {
+            for (const auto& group : draw.Mesh()->MaskedDraw().groups) {
                 rg::TexNode::Desc desc {
                     .name = group.maskTexture,
                     .key  = group.maskTexture,
@@ -728,17 +624,14 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
                                                           .type = rg::TexNode::TexType::Temp },
                                       true);
             builder.write(output_node);
-            if (ShouldPublishLayerLinkOutput(extra, imgId, output_key)) {
-                extra.id_link_map[(usize)imgId] = output_node;
-            }
         });
 }
 
-static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
+static void AddDrawPass(SceneDraw draw, std::string_view output, i32 imgId, ExtraInfo& extra,
                         std::function<bool()> should_execute = {},
-                        NodePassOptions options = {}) {
-    if (node != nullptr && node->Mesh() != nullptr && ! node->Mesh()->MaskedDraw().empty()) {
-        AddNodePassImpl<vulkan::MaskedMeshPass>(node,
+                        DrawPassOptions options = {}) {
+    if (draw.Valid() && draw.Mesh() != nullptr && ! draw.Mesh()->MaskedDraw().empty()) {
+        AddDrawPassImpl<vulkan::MaskedMeshPass>(draw,
                                                 output,
                                                 imgId,
                                                 extra,
@@ -746,7 +639,7 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
                                                 std::move(options));
         return;
     }
-    AddNodePassImpl<vulkan::CustomShaderPass>(node,
+    AddDrawPassImpl<vulkan::CustomShaderPass>(draw,
                                               output,
                                               imgId,
                                               extra,
@@ -755,7 +648,7 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
 }
 
 static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
-                            AlphaWritePolicy alpha_write_policy) {
+                            DrawPassOptions options) {
     auto& rgraph = *extra.rgraph;
     auto& scene  = *extra.scene;
 
@@ -768,7 +661,7 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
     rgraph.addPass<vulkan::TextPass>(
         pass_name,
         rg::PassNode::Type::Text,
-        [node, output_key, imgId, alpha_write_policy, &scene, &extra](
+        [node, output_key, imgId, options = std::move(options), &scene](
             rg::RenderGraphBuilder& builder, vulkan::TextPass::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
             // Text is now emitted as its own render-graph pass. It shares the same constrained
@@ -780,9 +673,13 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
             // refresh the exact Clock/TextPass resources without broadening the dirty target set.
             pdesc.layer_id = imgId;
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
+            pdesc.clear_before_draw = options.clear_before_draw;
             pdesc.output = output_key;
+            pdesc.camera_override = options.camera_override;
+            pdesc.use_active_camera_for_parallax = options.use_active_camera_for_parallax;
+            pdesc.model_space = options.model_space;
             pdesc.alpha_write_policy = output_key != SpecTex_Default
-                ? alpha_write_policy
+                ? options.alpha_write_policy
                 : AlphaWritePolicy::Preserve;
 
             auto* output_node =
@@ -791,9 +688,6 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
                                                           .type = rg::TexNode::TexType::Temp },
                                       true);
             builder.write(output_node);
-            if (ShouldPublishLayerLinkOutput(extra, imgId, output_key)) {
-                extra.id_link_map[(usize)imgId] = output_node;
-            }
             (void)pass;
         });
 }
@@ -803,35 +697,67 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                         TraversalRoute route = {}) {
     auto& scene = *extra.scene;
 
-    if (node != nullptr && !route.routed_node) {
-        // Root-owned proxy nodes are emitted through explicit authored-order routes. Reaching
-        // them through the physical tree means the root traversal is at the wrong sibling
-        // position, so skip this visit to avoid late duplicate composites. (Detached effect
-        // sources need no such skip anymore: they are bridge-owned and never enter the tree.)
-        if (scene.IsRenderOrderProxyNode(node)) {
-            LOG_INFO("SceneRenderGraphNodeRouteSkip: layer=%d name='%s' reason='proxy'",
-                     NodeLayerId(scene, node),
-                     node->Name().c_str());
-            return;
-        }
+    if (const auto* object = scene.FindSceneObject(imgId);
+        object != nullptr && object->LayerNode() == node &&
+        std::getenv("WESCENE_TRACE_OBJECT_DRAW") != nullptr) {
+        LOG_INFO("SceneObjectDrawVisit: layer=%d parent=%d passthrough=%s "
+                 "composition-member=%s compose-source=%s output='%.*s'",
+                 object->Id(), object->ParentId(), object->Passthrough() ? "true" : "false",
+                 HasCompositionAncestor(scene, *object) ? "true" : "false",
+                 route.compose_source ? "true" : "false",
+                 static_cast<int>(inherited_output.size()), inherited_output.data());
     }
 
     std::string_view         output = inherited_output;
     SceneImageEffectLayer*   imgeff { nullptr };
-    const auto resolved_route_model = ResolveRouteModel(node, route.model);
-    if (node != nullptr && !node->Camera().empty()) {
-        // A node drawing through its layer's private bridge camera feeds the effect chain, so
-        // its output is the chain's first ping-pong target. The bridge resolves through the
-        // owning layer; the camera name only tags which of the layer's nodes takes this route.
+    if (node != nullptr) {
+        // Source geometry is owned by the authored object itself. Its visit emits the source
+        // and effect sequence directly; auxiliary resource nodes cannot select this bridge.
         auto* candidate = scene.FindImageEffectLayer(NodeLayerId(scene, node));
-        if (candidate != nullptr && candidate->BridgeCameraName() == node->Camera()) {
-            imgeff = candidate;
-            output = imgeff->FirstTarget();
+        if (candidate != nullptr && candidate->Owner().LayerNode() == node) {
+            // The zero-step, non-private passthrough arm returns before touching its source
+            // target when there are no authored children. A nonempty composition must still
+            // execute its child/source/publication phases. Effect visibility and authored
+            // hierarchy changes rebuild this graph, so the predicate follows the current sequence
+            // rather than the last authored effect.
+            if (candidate->Owner().Passthrough() &&
+                candidate->VisibleCompositionStepCount() == 0 &&
+                candidate->ResolveFinalOutputCapability() ==
+                    FinalOutputCapability::SceneAuthoredWriter &&
+                scene.GetLayerChildren(candidate->Owner().Id()).empty()) {
+                LOG_INFO("SceneRenderGraphEmptyCompositionSkip: layer=%d name='%s' "
+                         "visible-steps=0 private=false authored-children=0",
+                         candidate->Owner().Id(), candidate->Owner().Name().c_str());
+                return;
+            }
+            // Snapshot incoming camera/destination state before any private source projection.
+            // Resolve the owner's program, geometry and blend even when this build draws directly
+            // into the destination; a previous visible chain may have left the prelighting source
+            // program on the live material.
+            candidate->SetEffectSnapshotCamera(
+                route.compose_source ? route.compose_source_camera : std::string());
+            candidate->ResolveOwnerDraw(scene);
+            if (candidate->UsesDirectDraw()) {
+                LOG_INFO("SceneRenderGraphLayerDirectDraw: layer=%d name='%s' output='%.*s' "
+                         "visible-steps=0 private=false compose-source=%s primitive=%s "
+                         "visible=%s local-visible=%s",
+                         candidate->Owner().Id(), candidate->Owner().Name().c_str(),
+                         static_cast<int>(inherited_output.size()), inherited_output.data(),
+                         route.compose_source ? "true" : "false",
+                         node->Text() != nullptr ? "text" : "image",
+                         node->Visible() ? "true" : "false",
+                         node->LocalVisible() ? "true" : "false");
+            } else {
+                imgeff = candidate;
+                // A shape dispatches its effect directly in the incoming destination. Its
+                // retained half-canvas resources do not imply an image source phase.
+                output = imgeff->UsesShapeDraw() ? inherited_output : imgeff->SourceTarget();
+            }
         }
     }
 
     const auto source_route =
-        ResolveEffectSourceRouting(node, imgeff, imgId, extra, inherited_output, route);
+        ResolveEffectSourceRouting(node, imgeff, extra, route);
     if (imgeff != nullptr &&
         imgeff->SourceContributionPolicy() == SceneImageEffectLayer::SourcePolicy::ProxyChildrenOnly) {
         LOG_INFO("SceneRenderGraphComposeSourceClear: layer=%d name='%s' output='%.*s' "
@@ -840,7 +766,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                  node != nullptr ? node->Name().c_str() : "",
                  static_cast<int>(output.size()),
                  output.data(),
-                 source_route.active_compose_source_camera.c_str());
+                 source_route.child_compose_source_camera.c_str());
         const std::string clear_output(output);
         rg::addClearPass(
             *extra.rgraph,
@@ -852,58 +778,16 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             });
     }
 
-    if (source_route.seed_empty_proxy_compose_from_framebuffer &&
-        HasRenderableMeshMaterial(node)) {
-        LOG_INFO("SceneRenderGraphComposeFramebufferSeed: layer=%d name='%s' output='%.*s' "
-                 "policy=%.*s reason='empty-proxy-visible-framebuffer-source'",
-                 NodeLayerId(scene, node),
-                 node->Name().c_str(),
-                 static_cast<int>(output.size()),
-                 output.data(),
-                 static_cast<int>(EffectSourcePolicyName(imgeff->SourceContributionPolicy()).size()),
-                 EffectSourcePolicyName(imgeff->SourceContributionPolicy()).data());
-        // Empty visible compose layers are framebuffer filters: their first effect texture is the
-        // current screen image, not the composelayer card itself. The composelayer shader writes a
-        // full offscreen source target while sampling `_rt_default` through the active camera, so
-        // the later world-space effect writer replaces exactly the same screen region without
-        // exposing a rectangular owner mesh.
-        AddNodePass(node,
-                    output,
-                    imgId,
-                    extra,
-                    node_execute_gate,
-                    NodePassOptions { .use_active_camera_for_uniforms = true });
-    }
-
     if (HasRenderableMeshMaterial(node) &&
         source_route.owner_node_contributes_to_effect_source) {
-        if (source_route.owner_node_source_fallback) {
-            LOG_INFO("SceneRenderGraphComposeOwnerSourceFallback: layer=%d name='%s' output='%.*s' "
-                     "policy=%.*s reason='%.*s' framebuffer-uniforms=%s",
-                     NodeLayerId(scene, node),
-                     node->Name().c_str(),
-                     static_cast<int>(output.size()),
-                     output.data(),
-                     static_cast<int>(EffectSourcePolicyName(imgeff->SourceContributionPolicy()).size()),
-                     EffectSourcePolicyName(imgeff->SourceContributionPolicy()).data(),
-                     static_cast<int>(
-                         OwnerNodeSourceFallbackReasonName(
-                             source_route.owner_node_fallback_reason)
-                             .size()),
-                     OwnerNodeSourceFallbackReasonName(source_route.owner_node_fallback_reason)
-                         .data(),
-                     source_route.owner_node_source_fallback_samples_framebuffer ? "true"
-                                                                                 : "false");
-        }
-        AddNodePass(node,
+        AddDrawPass(node,
                     output,
                     imgId,
                     extra,
                     node_execute_gate,
                     BuildOwnerSourcePassOptions(
                         imgeff, output, inherited_output, route, source_route));
-    } else if (HasRenderableMeshMaterial(node) && imgeff != nullptr &&
-               !source_route.seed_empty_proxy_compose_from_framebuffer) {
+    } else if (HasRenderableMeshMaterial(node) && imgeff != nullptr) {
         LOG_INFO("SceneRenderGraphComposeOwnerSourceSkip: layer=%d name='%s' output='%.*s' "
                  "policy=%.*s",
                  NodeLayerId(scene, node),
@@ -917,163 +801,59 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     // text pass directly from that primitive, keeping the render graph aligned with the same
     // authoritative text object that parser and runtime updates mutate.
     if (node != nullptr && node->Text() != nullptr) {
-        const auto text_alpha_write_policy =
-            imgeff == nullptr && route.compose_source
-                ? route.compose_source_alpha_write_policy
-                : AlphaWritePolicy::Preserve;
-        AddTextNodePass(node, output, imgId, extra, text_alpha_write_policy);
+        AddTextNodePass(node, output, imgId, extra,
+                       BuildOwnerSourcePassOptions(
+                           imgeff, output, inherited_output, route, source_route));
     }
 
+    const auto children = OrderedRenderGraphChildren(node, extra);
+    const auto* owner = scene.FindSceneObject(imgId);
+    const bool defer_authored_children = route.compose_source && owner != nullptr &&
+        owner->LayerNode() == node && !owner->Passthrough();
     if (node != nullptr) {
-        // A world node's visit at its authored order position is where the owning layer's
-        // detached source draw is emitted; the bridge owns those source handles.
-        if (auto* world_bridge = scene.FindImageEffectLayer(NodeLayerId(scene, node));
-            world_bridge != nullptr && world_bridge->WorldNode() == node) {
-            for (const auto& source_node_ref : world_bridge->DetachedSourceNodes()) {
-                auto* source_node = source_node_ref.get();
-                if (source_node == nullptr) continue;
-                LOG_INFO("SceneRenderGraphDetachedSourceRoute: world-layer=%d source-layer=%d "
-                         "world-name='%s' source-name='%s' output='%.*s'",
-                         NodeLayerId(scene, node),
-                         NodeLayerId(scene, source_node),
-                         node->Name().c_str(),
-                         source_node->Name().c_str(),
-                         static_cast<int>(output.size()),
-                         output.data());
-                ToGraphPass(source_node,
-                            output,
-                            NodeLayerId(scene, source_node),
-                            extra,
-                            {},
-                            TraversalRoute {
-                                .routed_node = true,
-                                // Detached source nodes render through their own effect camera, but
-                                // the image-effect final writer belongs to the visible world node.
-                                // Forward the world route matrix so the final pass inherits virtual
-                                // render-order parents while intermediate effect passes stay local.
-                                .model = std::optional<Eigen::Matrix4d> { resolved_route_model },
-                                .compose_source = route.compose_source,
-                                .compose_source_camera =
-                                    source_route.active_compose_source_camera,
-                                .compose_source_alpha_write_policy =
-                                    route.compose_source_alpha_write_policy });
-            }
-        }
-    }
-
-    std::vector<OrderedRenderGraphChild> deferred_proxy_children;
-    if (node != nullptr) {
-        for (const auto& child : OrderedRenderGraphChildren(node, extra)) {
+        for (const auto& child : children) {
             if (child.node == nullptr) continue;
-            if (child.proxy && imgeff != nullptr &&
-                !source_route.proxy_children_contribute_to_effect_source &&
-                !IsEffectLocalProxyDependency(child.node, extra)) {
-                // A render-order proxy edge only restores authored sibling order. It does not make
-                // the proxied world-space node a real child of this image-effect source target, so
-                // defer ordinary proxies until the parent effect has resolved back to the inherited
-                // output space.
-                LOG_INFO("SceneRenderGraphProxyChildDefer: parent-layer=%d proxy-layer=%d "
-                         "inherited-output='%.*s' parent-effect-output='%.*s'",
-                         NodeLayerId(scene, node),
-                         NodeLayerId(scene, child.node),
-                         static_cast<int>(inherited_output.size()),
-                         inherited_output.data(),
-                         static_cast<int>(output.size()),
-                         output.data());
-                deferred_proxy_children.push_back(child);
-                continue;
-            }
-
-            if (child.proxy) {
-                if (imgeff != nullptr) {
-                    if (source_route.proxy_children_contribute_to_effect_source &&
-                        !IsEffectLocalProxyDependency(child.node, extra)) {
-                        LOG_INFO("SceneRenderGraphProxyComposeSourceRoute: parent-layer=%d "
-                                 "proxy-layer=%d output='%.*s' policy=%.*s camera='%s'",
-                                 NodeLayerId(scene, node),
-                                 NodeLayerId(scene, child.node),
-                                 static_cast<int>(output.size()),
-                                 output.data(),
-                                 static_cast<int>(
-                                     EffectSourcePolicyName(imgeff->SourceContributionPolicy()).size()),
-                                 EffectSourcePolicyName(imgeff->SourceContributionPolicy()).data(),
-                                 source_route.active_compose_source_camera.c_str());
-                    } else {
-                        // Wallpaper Engine `dependencies` are effect-local inputs. These proxies
-                        // must stay inside the parent effect phase because the parent shader samples
-                        // their private source target while resolving the effect chain.
-                        LOG_INFO("SceneRenderGraphProxyInlineEffectRoute: parent-layer=%d "
-                                 "proxy-layer=%d output='%.*s'",
-                                 NodeLayerId(scene, node),
-                                 NodeLayerId(scene, child.node),
-                                 static_cast<int>(output.size()),
-                                 output.data());
-                    }
-                } else {
-                    LOG_INFO("SceneRenderGraphProxyChildRoute: parent-layer=%d proxy-layer=%d "
-                             "name='%s' output='%.*s'",
-                             NodeLayerId(scene, node),
-                             NodeLayerId(scene, child.node),
-                             child.node->Name().c_str(),
-                             static_cast<int>(output.size()),
-                             output.data());
-                }
-            }
+            // An ordinary child completes its own source/effect/publication sequence before its
+            // children are visited. Those descendants still draw into the enclosing composition,
+            // not into this object's private effect texture. Only passthrough owns a child source
+            // phase; physical mesh/emitter resources remain part of their current owner draw.
+            if (defer_authored_children && child.authored) continue;
             const bool child_compose_source_route =
                 route.compose_source ||
-                (child.proxy && imgeff != nullptr &&
+                (child.authored && imgeff != nullptr &&
                  source_route.proxy_children_contribute_to_effect_source &&
-                 !IsEffectLocalProxyDependency(child.node, extra));
+                 !IsEffectLocalDependency(child.node, extra));
             const std::string child_compose_source_camera =
-                child_compose_source_route ? source_route.active_compose_source_camera
+                child_compose_source_route ? source_route.child_compose_source_camera
                                            : std::string();
             const AlphaWritePolicy child_compose_source_alpha_write_policy =
-                route.compose_source
-                    ? route.compose_source_alpha_write_policy
-                    : (child_compose_source_route && imgeff != nullptr
-                           ? imgeff->CompositionChildAlphaWritePolicy()
-                           : AlphaWritePolicy::Preserve);
+                child_compose_source_route && imgeff != nullptr &&
+                    source_route.proxy_children_contribute_to_effect_source
+                    ? imgeff->CompositionChildAlphaWritePolicy()
+                    : route.compose_source_alpha_write_policy;
             ToGraphPass(child.node,
                         output,
                         NodeLayerId(scene, child.node),
                         extra,
                         {},
                         TraversalRoute {
-                            .routed_node = child.proxy,
-                            .model = BuildChildRouteModel(node, child.node, child.proxy, route.model),
                             .compose_source = child_compose_source_route,
                             .compose_source_camera = child_compose_source_camera,
                             .compose_source_alpha_write_policy =
-                                child_compose_source_alpha_write_policy });
+                                child_compose_source_alpha_write_policy,
+                            .reflection_pass = route.reflection_pass });
         }
     }
 
     if (imgeff != nullptr) {
-        // Composite source nodes may now be transform-only containers whose children draw into the
-        // effect source target. Resolving the effect after all descendants have emitted their passes
-        // keeps those composite layers correct without requiring each child to manage effect timing.
-        // Hidden dependency layers are not visible screen compositors. When a later effect samples
-        // `_rt_imageLayerComposite_<id>`, the dependency's final authored effect must still resolve
-        // into its private ping-pong target; otherwise the generic visible-layer rewrite would move
-        // that final pass to `_rt_default`, where the hidden-layer execution gate correctly skips it.
-        const auto resolved_effect_world_affine =
-            Eigen::Affine3f(resolved_route_model.cast<float>());
+        // Finish this owner's source before its effect dispatcher, using the same owner-derived
+        // publication contract in both. Ordinary children draw their authored final segment into
+        // the enclosing composition; only the child's own dependency/puppet/blend contract
+        // requires a private publisher.
+        const auto final_output_capability = imgeff->ResolveFinalOutputCapability();
         const bool keep_final_output_private =
-            ShouldKeepEffectFinalOutputPrivate(extra, node, imgId, inherited_output);
-        // Publication policy is authored by the parsed render topology, not inferred from a shader
-        // name. Ordinary image/text layers keep the complete authored chain private and publish it
-        // through the neutral layer-surface pass. A DIRECTDRAW shape explicitly declares its final
-        // authored shader as the visible writer. Composition-source routing always overrides that
-        // declaration because the child result must remain sampleable before it is placed into the
-        // parent source target.
-        const bool dependency_route = route.compose_source || keep_final_output_private;
-        const auto final_output_capability =
-            imgeff->ResolveFinalOutputCapability(dependency_route);
-        const std::string_view layer_surface_camera =
-            !imgeff->LayerSurfaceCamera().empty()
-                ? std::string_view(imgeff->LayerSurfaceCamera())
-                : (node != nullptr ? std::string_view(node->Camera()) : std::string_view());
-        const auto private_target_it = scene.renderTargets.find(imgeff->FirstTarget());
+            final_output_capability != FinalOutputCapability::SceneAuthoredWriter;
+        const auto private_target_it = scene.renderTargets.find(imgeff->SourceTarget());
         const auto final_target_it = scene.renderTargets.find(std::string(inherited_output));
         const SceneRenderTarget* private_target =
             private_target_it != scene.renderTargets.end() ? &private_target_it->second : nullptr;
@@ -1085,8 +865,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             final_target != nullptr ? final_target->sample : TextureSample {};
         LOG_INFO("SceneRenderGraphEffectResolve: layer=%d name='%s' inherited-output='%.*s' "
                  "effect-output='%.*s' offscreen-dependency=%s visible=%s local-visible=%s "
-                 "routed=%s keep-final-private=%s compose-source-route=%s compose-camera='%s' "
-                 "capability=%.*s layer-surface-camera='%.*s' private-target='%s' "
+                 "keep-final-private=%s compose-source-route=%s compose-camera='%s' "
+                 "capability=%.*s private-target='%s' "
                  "private-target-size=[%d %d] "
                  "private-sampler=[wrap-s=%.*s wrap-t=%.*s mag=%.*s min=%.*s] "
                  "final-target='%.*s' final-target-size=[%d %d] "
@@ -1100,15 +880,12 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                  IsOffscreenDependencyLayer(extra, imgId) ? "true" : "false",
                  node != nullptr && node->Visible() ? "true" : "false",
                  node != nullptr && node->LocalVisible() ? "true" : "false",
-                 route.routed_node ? "true" : "false",
                  keep_final_output_private ? "true" : "false",
                  route.compose_source ? "true" : "false",
                  source_route.active_compose_source_camera.c_str(),
                  static_cast<int>(FinalOutputCapabilityName(final_output_capability).size()),
                  FinalOutputCapabilityName(final_output_capability).data(),
-                 static_cast<int>(layer_surface_camera.size()),
-                 layer_surface_camera.data(),
-                 imgeff->FirstTarget().c_str(),
+                 imgeff->SourceTarget().c_str(),
                  private_target != nullptr ? private_target->width : 0,
                  private_target != nullptr ? private_target->height : 0,
                  static_cast<int>(TextureWrapName(private_sample.wrapS).size()),
@@ -1133,11 +910,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                  TextureFilterName(final_sample.minFilter).data());
         imgeff->ResolveEffect(scene.default_effect_mesh,
                               "effect",
-                              layer_surface_camera,
-                              inherited_output,
-                              keep_final_output_private,
-                              &resolved_effect_world_affine,
-                              final_output_capability);
+                              inherited_output);
 
         const std::string layer_private_output(output);
         auto layer_destination_gate = [node, &scene, layer_private_output]() {
@@ -1146,105 +919,187 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
 
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
             auto& eff     = imgeff->GetEffect(i);
+            // Resource retention does not select execution. Images dispatch the visible sequence;
+            // shapes dispatch only their physical last effect, even with that effect hidden.
+            if (!imgeff->ShouldExecuteEffect(*eff)) continue;
             auto  cmdItor = eff->commands.begin();
             auto  cmdEnd  = eff->commands.end();
             int   nodePos = 0;
-            auto  effect_visible_gate = [eff, layer_destination_gate]() {
+            auto  effect_visible_gate = [eff, imgeff, layer_destination_gate]() {
                 return layer_destination_gate() &&
-                    (eff == nullptr || eff->LocalVisible());
+                    imgeff->ShouldExecuteEffect(*eff);
             };
-            auto effect_hidden_gate = [eff, layer_destination_gate]() {
-                return layer_destination_gate() &&
-                    eff != nullptr && !eff->LocalVisible();
-            };
-            for (auto& effect_node : eff->nodes) {
-                if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
-                    rg::addCopyPass(*extra.rgraph,
-                                    rg::createTexDesc(cmdItor->src, extra.scene),
-                                    rg::createTexDesc(cmdItor->dst, extra.scene),
-                                    effect_visible_gate);
+            const auto emit_commands = [&]() {
+                // Commands share the authored step order with materials. Several copies can
+                // occupy one boundary, including the boundary after the last material; each uses
+                // the pair that ResolveEffect selected at that exact composition step.
+                while (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
+                    // A target index of -1 does not submit a copy. Its compose marker still
+                    // participated in ResolveEffect, so retain the entry and advance normally.
+                    if (cmdItor->cmd == SceneImageEffect::CmdType::Copy && cmdItor->authored_dst) {
+                        rg::addCopyPass(*extra.rgraph,
+                                        rg::createTexDesc(cmdItor->src, extra.scene),
+                                        rg::createTexDesc(cmdItor->dst, extra.scene),
+                                        effect_visible_gate);
+                    }
                     cmdItor++;
                 }
+            };
+            for (auto& effect_node : eff->nodes) {
+                emit_commands();
+                // An authored final writer restores the enclosing composition's camera and alpha
+                // state, just like the owner's neutral publisher. Private intermediate and puppet
+                // surface draws retain their own camera. Otherwise removing the extra publication
+                // pass would send this ordinary child through the scene camera while writing the
+                // parent's texture.
+                const bool uses_composition_camera = effect_node.uses_owner_transform &&
+                    route.compose_source;
+                // Explicit shape FBO draws retain the incoming camera/owner I just like other
+                // shape records, but they do not inherit the enclosing composition's alpha
+                // accumulation rule. Target/viewport selection is distinct from raster matrices.
+                const bool composition_writer = uses_composition_camera &&
+                    !effect_node.output_is_fbo;
+                const bool composition_camera = uses_composition_camera &&
+                    !source_route.active_compose_source_camera.empty();
                 // Effect material nodes are private render-graph passes. They can carry a camera
                 // override for layer-surface publication, but they must not be traversed through
                 // ToGraphPass(): an override camera may itself own the same SceneImageEffectLayer,
                 // and treating this internal pass as another image-effect owner recursively
                 // rebuilds the chain while it is being emitted, overwriting the already-resolved
                 // puppet and layer-surface publication route.
-                AddNodePass(effect_node.sceneNode.get(),
+                AddDrawPass(effect_node.sceneNode.get(),
                             effect_node.output,
                             imgId,
                             extra,
                             effect_visible_gate,
-                            NodePassOptions {
-                                .alpha_write_policy = effect_node.alpha_write_policy,
+                            DrawPassOptions {
+                                .alpha_write_policy = composition_writer
+                                    ? route.compose_source_alpha_write_policy
+                                    : effect_node.alpha_write_policy,
                                 .clear_before_draw = effect_node.clear_before_draw,
-                                .camera_override = effect_node.camera_override,
+                                .camera_override = composition_camera
+                                    ? source_route.active_compose_source_camera
+                                    : effect_node.camera_override,
                                 .use_active_camera_for_parallax =
+                                    composition_camera ||
                                     effect_node.use_active_camera_for_parallax });
                 nodePos++;
             }
-            if (!eff->BypassSource().empty() && !eff->BypassTarget().empty() &&
-                eff->BypassSource() != eff->BypassTarget()) {
-                // Hidden effects must still advance the ping-pong chain. The shader and authored
-                // effect commands become no-ops through their local visibility, then this gated copy
-                // forwards the current input target to the effect output target so downstream
-                // effects sample the current frame, not the stale texture from the last visible
-                // frame.
-                rg::addCopyPass(*extra.rgraph,
-                                rg::createTexDesc(eff->BypassSource(), extra.scene),
-                                rg::createTexDesc(eff->BypassTarget(), extra.scene),
-                                effect_hidden_gate);
+            emit_commands();
+            if (eff->HasPendingFboSwap()) {
+                // Material/copy bindings above already reflect swaps at their authored positions
+                // in this frame. Persist the resulting index table only after submission, then
+                // rebuild the next frame's resource edges from it. Only an admitted owner and its
+                // selected effect stream advance history; shape's retained final effect is
+                // selected independently of its own visibility.
+                extra.rgraph->onFrameSubmitted(
+                    [eff, bindings = eff->NextFboBindings(), effect_visible_gate, &scene]() {
+                        if (effect_visible_gate() && eff->CommitFboBindings(bindings)) {
+                            scene.MarkRenderGraphTopologyDirty();
+                        }
+                    });
             }
         }
 
         if (imgeff->HasFinalComposite()) {
-            // The image-effect layer decides whether the neutral final composite is acting as the
-            // ordinary stable publisher or only as a hidden-effect bypass fallback. Keeping that
-            // policy inside SceneImageEffectLayer avoids shader/name special cases in the graph
-            // traversal while still preserving direct authored final writers for static chains.
-            auto final_composite_gate = [imgeff]() {
-                return imgeff != nullptr && imgeff->ShouldRunFinalComposite();
+            // Emit publication directly from the object's raster phase. It has no children,
+            // source routing or transform node to traverse. The layer still selects whether this
+            // phase runs, and parent composition supplies the same camera/alpha contract as an
+            // authored final material drawing into that destination. The dispatcher finishes
+            // hidden dependency work before its visible-publication arm. A parent composition
+            // target is still an enclosing destination, so the generic offscreen-source exemption
+            // must not admit this draw merely because its output is not the main framebuffer.
+            // Query the owner each frame so script visibility changes preserve the same rule.
+            auto final_composite_gate = [imgeff, &scene]() {
+                return scene.IsLayerVisible(imgeff->Owner().Id()) &&
+                    imgeff->ShouldRunFinalComposite();
             };
-            ToGraphPass(&imgeff->FinalNode(),
-                        inherited_output,
-                        imgId,
-                        extra,
-                        final_composite_gate,
-                        TraversalRoute {
-                            // The synthetic fallback is another detached final writer for the same
-                            // image effect, so it must share the resolved route matrix used by the
-                            // authored final output instead of recomputing from its physical tree.
-                            .model = std::optional<Eigen::Matrix4d> { resolved_route_model },
-                            .compose_source = route.compose_source,
-                            .compose_source_camera = source_route.active_compose_source_camera,
-                            .compose_source_alpha_write_policy =
-                                route.compose_source_alpha_write_policy,
-                            .premultiplied_source_blend =
-                                imgeff->FinalCompositeSamplesPremultipliedSource() });
+            const SceneDraw publication(imgeff->FinalCompositeDraw());
+            const bool compose_camera = route.compose_source &&
+                !source_route.active_compose_source_camera.empty();
+            LOG_INFO("SceneLayerPublication: layer=%d name='%s' output='%.*s' "
+                     "visible=%s dependency=%s composition-steps=%zu",
+                     imgeff->Owner().Id(), imgeff->Owner().Name().c_str(),
+                     static_cast<int>(inherited_output.size()), inherited_output.data(),
+                     scene.IsLayerVisible(imgeff->Owner().Id()) ? "true" : "false",
+                     scene.IsLayerOffscreenDependencySource(imgeff->Owner().Id())
+                         ? "true" : "false",
+                     imgeff->VisibleCompositionStepCount());
+            AddDrawPass(publication, inherited_output, imgId, extra, final_composite_gate,
+                        DrawPassOptions {
+                            .alpha_write_policy = route.compose_source
+                                ? route.compose_source_alpha_write_policy
+                                : AlphaWritePolicy::Preserve,
+                            .camera_override = compose_camera
+                                ? source_route.active_compose_source_camera : std::string(),
+                            .use_active_camera_for_parallax = compose_camera,
+                            .use_active_camera_for_uniforms =
+                                DrawMaterialSamplesFramebuffer(publication) &&
+                                !DrawUsesPerspectiveCamera(scene, publication) });
         }
     }
 
-    for (const auto& child : deferred_proxy_children) {
-        if (child.node == nullptr) continue;
-        LOG_INFO("SceneRenderGraphProxyOutputRoute: parent-layer=%d proxy-layer=%d output='%.*s'",
-                 NodeLayerId(scene, node),
-                 NodeLayerId(scene, child.node),
-                 static_cast<int>(inherited_output.size()),
-                 inherited_output.data());
-        ToGraphPass(child.node,
-                    inherited_output,
-                    NodeLayerId(scene, child.node),
-                    extra,
-                    {},
-                    TraversalRoute {
-                        .routed_node = true,
-                        .model = BuildChildRouteModel(node, child.node, true, route.model),
-                        .compose_source = route.compose_source,
-                        .compose_source_camera = source_route.active_compose_source_camera,
-                        .compose_source_alpha_write_policy =
-                            route.compose_source_alpha_write_policy });
+    if (defer_authored_children) {
+        for (const auto& child : children) {
+            if (!child.authored || child.node == nullptr) continue;
+            ToGraphPass(child.node, inherited_output, NodeLayerId(scene, child.node),
+                        extra, {}, route);
+        }
     }
+}
+
+static bool AddModelReflectionStage(Scene& scene, ExtraInfo& extra) {
+    // Receiver presence enables the scene phase; reflected=true only selects producers inside
+    // that phase. Inspect complete owners before emitting anything so a receiver appearing
+    // earlier in painter order samples all producers, including models appearing after it in
+    // objects[].
+    const bool has_receiver = std::any_of(scene.layerOrder.begin(), scene.layerOrder.end(),
+        [&scene](int32_t id) {
+            const auto* owner = scene.FindSceneObject(id);
+            return owner != nullptr && owner->ReceivesReflection();
+        });
+    if (!has_receiver) return false;
+
+    extra.rgraph->addPass<vulkan::ClearPass>(
+        "reflection_clear", rg::PassNode::Type::Clear,
+        [&scene](rg::RenderGraphBuilder& builder, vulkan::ClearPass::Desc& desc) {
+            if (scene.shadows.quality != 0) {
+                // This read orders the reflected phase after shadow rendering even when no
+                // reflected material samples the atlas; it does not add a texture to those
+                // materials.
+                builder.read(builder.createTexNode(
+                    rg::createTexDesc(std::string(SpecTex_ShadowAtlas), &scene)));
+            }
+            auto* target = builder.createTexNode(
+                rg::createTexDesc(std::string(SpecTex_Reflection), &scene), true);
+            builder.write(target);
+            desc.target = target->key();
+            desc.use_scene_clear_color = true;
+            // Quality off has its own unconditional color-only clear; quality on uses the scene
+            // clear setting for both attachments, while keeping the producer traversal
+            // independent.
+            desc.should_clear_color = [&scene]() {
+                return !scene.reflectionsEnabled || scene.clearEnabled;
+            };
+            desc.should_clear_model_depth = [&scene]() {
+                return scene.reflectionsEnabled && scene.clearEnabled;
+            };
+        });
+
+    size_t producers = 0;
+    for (const auto layer_id : scene.layerOrder) {
+        const auto* owner = scene.FindSceneObject(layer_id);
+        if (owner == nullptr || owner->Kind() != SceneObjectKind::Model ||
+            owner->LayerNode() == nullptr || !owner->Reflected() || owner->ReceivesReflection() ||
+            HasCompositionAncestor(scene, *owner)) continue;
+        ++producers;
+        ToGraphPass(owner->LayerNode(), SpecTex_Reflection, layer_id, extra, {},
+                    TraversalRoute { .reflection_pass = true });
+    }
+    LOG_INFO("SceneModelReflectionStage: producers=%zu quality-enabled=%s "
+             "shared-owner-resources=true before-main-scene=true",
+             producers, scene.reflectionsEnabled ? "true" : "false");
+    return true;
 }
 
 static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
@@ -1254,37 +1109,37 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
     LOG_INFO("SceneRenderGraphOrderInit: layer-count=%zu", scene.layerOrder.size());
-    if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
-        // Keep the empty-buffer contract when reflections are off: receivers still sample
-        // `_rt_Reflection`, so the target stays registered and is cleared instead of destroyed.
-        // The clear is a no-op while the quality checkbox is on.
-        rg::addClearPass(*rgraph,
-                         rg::createTexDesc(std::string(SpecTex_Reflection), &scene),
-                         { 0.0f, 0.0f, 0.0f, 0.0f },
-                         [&scene]() { return !scene.reflectionsEnabled; });
+    if (scene.shadows.quality != 0) {
+        // Publish the real atlas writer before building reflected/main consumers. A writer
+        // appended after those consumers creates a later texture version and leaves them reading
+        // an unwritten first-frame image (and previous-frame shadows thereafter). Keep ordinary
+        // owner order unchanged; this is the independent light/shadow phase, not a dependency
+        // sort.
+        rg::addShadowAtlasPass(*rgraph, &scene);
     }
+    const bool has_reflected_stage = AddModelReflectionStage(scene, extra);
+    // The main scene stage clears after the reflected walk, immediately before the ordinary scene
+    // walk. Keeping this boundary in the graph also lets reflection read the previous main
+    // target; a renderer-wide prepass would discard that target too early.
+    rgraph->addPass<vulkan::PrePass>(
+        "scene_clear", rg::PassNode::Type::Clear,
+        [&scene, has_reflected_stage](rg::RenderGraphBuilder& builder, vulkan::PrePass::Desc&) {
+            if (has_reflected_stage) {
+                // This is a phase-order edge, not a sampler binding. Graph creation
+                // order alone does not constrain an independent main-color clear:
+                // it must wait for the final reflected writer before discarding main.
+                builder.read(builder.createTexNode(
+                    rg::createTexDesc(std::string(SpecTex_Reflection), &scene)));
+            } else if (scene.shadows.quality != 0) {
+                // With no reflected phase, main follows the shadow phase directly.
+                builder.read(builder.createTexNode(
+                    rg::createTexDesc(std::string(SpecTex_ShadowAtlas), &scene)));
+            }
+            auto* target = builder.createTexNode(
+                rg::createTexDesc(std::string(SpecTex_Default), &scene), true);
+            builder.write(target);
+        });
     ToGraphPass(scene.sceneGraph.get(), SpecTex_Default, scene.sceneGraph->ID(), extra);
-
-    for (auto& info : extra.link_info) {
-        if (! exists(extra.id_link_map, info.link_id)) {
-            LOG_ERROR("link tex %d not found", info.link_id);
-            continue;
-        }
-        rgraph->afterBuild(
-            info.id, [&rgraph, &extra, &info](rg::RenderGraphBuilder& builder, rg::Pass& rgpass) {
-                auto* link_tex_node = extra.id_link_map.at(info.link_id);
-                auto  copy_desc     = link_tex_node->genDesc();
-                copy_desc.key       = GenLinkTex((idx)info.link_id);
-                copy_desc.name      = copy_desc.key;
-
-                auto new_in = rg::addCopyPass(*rgraph, link_tex_node, &copy_desc);
-                builder.read(new_in);
-                if (info.bind_texture != nullptr) {
-                    info.bind_texture(rgpass, (u32)info.tex_index, new_in->key());
-                }
-                return true;
-            });
-    }
 
     if (extra.use_mipmap_framebuffer) {
         rg::addCopyPass(*rgraph,
@@ -1294,10 +1149,6 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                         rg::TexNode::Desc { .name = WE_MIP_MAPPED_FRAME_BUFFER.data(),
                                             .key  = WE_MIP_MAPPED_FRAME_BUFFER.data(),
                                             .type = rg::TexNode::TexType::Temp });
-    }
-
-    if (scene.shadows.quality != 0) {
-        rg::addShadowAtlasPass(*rgraph, &scene);
     }
 
     if (scene.volumetrics.active && !scene.volumetrics.lights.empty()) {
@@ -1312,21 +1163,23 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
             SceneLight* light = pass.light;
             auto camera_inside = [&scene, light]() {
                 if (scene.activeCamera == nullptr || light == nullptr) return false;
-                return light->CameraInsideVolume(scene.activeCamera->GetPosition().cast<float>(),
+                // Use the same frame eye as the lighting uniforms; the orthographic projection
+                // node can lie inside a light even when the actual frame eye is outside its hull.
+                return light->CameraInsideVolume(scene.FrameEyePosition(),
                                                  scene.activeCamera->GetDirection().cast<float>());
             };
             if (pass.back) {
-                AddNodePass(pass.back.get(), SpecTex_VolumetricsBack, 0, extra);
+                AddDrawPass(pass.back.get(), SpecTex_VolumetricsBack, 0, extra);
             }
             if (pass.front) {
-                AddNodePass(pass.front.get(),
+                AddDrawPass(pass.front.get(),
                             SpecTex_VolumetricsLightBuffer,
                             0,
                             extra,
                             [camera_inside]() { return ! camera_inside(); });
             }
             if (pass.fullscreen) {
-                AddNodePass(pass.fullscreen.get(),
+                AddDrawPass(pass.fullscreen.get(),
                             SpecTex_VolumetricsLightBuffer,
                             0,
                             extra,
@@ -1335,11 +1188,11 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
         }
         if (scene.volumetrics.quality < 3 && scene.volumetrics.blur_h &&
             scene.volumetrics.blur_v) {
-            AddNodePass(scene.volumetrics.blur_h.get(), SpecTex_VolumetricsLightBufferB, 0, extra);
-            AddNodePass(scene.volumetrics.blur_v.get(), SpecTex_VolumetricsLightBuffer, 0, extra);
+            AddDrawPass(scene.volumetrics.blur_h.get(), SpecTex_VolumetricsLightBufferB, 0, extra);
+            AddDrawPass(scene.volumetrics.blur_v.get(), SpecTex_VolumetricsLightBuffer, 0, extra);
         }
         if (scene.volumetrics.combine) {
-            AddNodePass(scene.volumetrics.combine.get(), SpecTex_Default, 0, extra);
+            AddDrawPass(scene.volumetrics.combine.get(), SpecTex_Default, 0, extra);
         }
     }
 
@@ -1372,7 +1225,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                          i,
                          scene.bloom.nodes[i]->Name().c_str(),
                          scene.bloom.outputs[i].c_str());
-                AddNodePass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra);
+                AddDrawPass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra);
             }
         }
     } else if (scene.bloom.quality > 0 && scene.bloom.enabled && scene.bloom.node != nullptr) {
@@ -1383,7 +1236,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                  scene.bloom.enabled ? "true" : "false",
                  scene.bloom.strength,
                  scene.bloom.threshold);
-        AddNodePass(scene.bloom.node.get(), SpecTex_Default, 0, extra);
+        AddDrawPass(scene.bloom.node.get(), SpecTex_Default, 0, extra);
     }
 
     return rgraph;

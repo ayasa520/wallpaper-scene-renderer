@@ -55,10 +55,6 @@ void CollectLayerEffectResidencyNodes(const Scene& scene, int32_t layer_id,
     auto* effect_layer = const_cast<Scene&>(scene).FindImageEffectLayer(layer_id);
     if (effect_layer == nullptr) return;
 
-    if (effect_layer->HasFinalComposite()) {
-        PushUniqueResidencyNode(&effect_layer->FinalNode(), nodes, seen);
-    }
-
     for (size_t effect_index = 0; effect_index < effect_layer->EffectCount(); effect_index++) {
         auto& effect = effect_layer->GetEffect(effect_index);
         if (!effect) continue;
@@ -81,7 +77,7 @@ std::vector<SceneNode*> CollectLayerResidencyNodes(const Scene& scene, int32_t l
 
 void CollectResidencyTextureKey(const Scene& scene, const std::string& key,
                                 LayerResidencyResources& resources) {
-    if (key.empty() || IsSpecLinkTex(key) || key == SpecTex_Default) return;
+    if (key.empty() || key == SpecTex_Default) return;
 
     if (scene.renderTargets.count(key) != 0 || IsSpecTex(key)) {
         resources.render_targets.insert(key);
@@ -99,8 +95,8 @@ void CollectResidencyTextureKey(const Scene& scene, const std::string& key,
 
 void CollectResidencyMaterialResources(const Scene& scene, const SceneMaterial& material,
                                        LayerResidencyResources& resources) {
-    for (const auto& key : material.textures) {
-        CollectResidencyTextureKey(scene, key, resources);
+    for (usize slot = 0; slot < material.textures.size(); ++slot) {
+        CollectResidencyTextureKey(scene, material.Texture(slot), resources);
     }
 }
 
@@ -127,6 +123,10 @@ LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32
     }
 
     if (const auto* effect_layer = scene.FindImageEffectLayer(layer_id)) {
+        if (effect_layer->HasFinalComposite()) {
+            CollectResidencyMaterialResources(
+                scene, *effect_layer->FinalCompositeDraw().Mesh()->Material(), resources);
+        }
         for (const auto& key : effect_layer->RuntimeRenderTargetNames()) {
             if (!key.empty() && key != SpecTex_Default) resources.render_targets.insert(key);
         }
@@ -158,9 +158,12 @@ LayerResidencyResources CollectRetainedResidencyResources(
 }
 
 void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
+                               const LayerResidencyResources& resources,
                                const LayerResidencyResources& retained_resources,
                                const char* reason) {
-    const auto resources = CollectLayerResidencyResources(scene, layer_id);
+    // The removed owner's descriptors were captured while it was alive. Retention is decided
+    // only after the whole deletion batch, including surviving parents' destination reselection;
+    // consulting the scene again for this owner would now find no identity or draw resources.
     std::size_t queued_static = 0;
     std::size_t queued_video = 0;
     std::size_t queued_render_targets = 0;

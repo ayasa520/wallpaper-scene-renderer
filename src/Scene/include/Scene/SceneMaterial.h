@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 #include <optional>
@@ -47,11 +48,6 @@ struct SceneModelRenderState {
     // Scene depth is reversed (near = 1, far = 0): the nearest-wins test is always GREATER
     // against a buffer cleared to 0, so there is no per-material compare mode.
     float         depthClear { 0.0f };
-    // Reflection model chunks may be drawn with a negative scale on the floor normal, which changes
-    // the transform handedness and reverses triangle winding. Carry that fact as explicit model-only
-    // material state so the Vulkan pass can correct culling without changing legacy 2D materials.
-    bool          mirroredHandedness { false };
-    std::string   outputOverride;
 };
 
 struct SceneMaterial {
@@ -61,6 +57,7 @@ public:
     SceneMaterial(SceneMaterial&& o)
         : name(std::move(o.name)),
           textures(std::move(o.textures)),
+          systemTextureBindings(std::move(o.systemTextureBindings)),
           defines(std::move(o.defines)),
           uniformAliases(std::move(o.uniformAliases)),
           hasSprite(o.hasSprite),
@@ -71,13 +68,43 @@ public:
 
     std::string              name;
     std::vector<std::string> textures;
+    // The authored input and the live system property are separate values. An empty property
+    // leaves the authored input selected; it does not bind an empty image. Shared property
+    // handles also keep copied materials in sync without rewriting effect ping-pong templates or
+    // retaining material pointers.
+    Map<usize, std::shared_ptr<const std::string>> systemTextureBindings;
     std::vector<std::string> defines;
+
+    const std::string& Texture(usize slot) const {
+        const auto binding = systemTextureBindings.find(slot);
+        if (binding != systemTextureBindings.end() && !binding->second->empty()) {
+            return *binding->second;
+        }
+        return textures[slot];
+    }
+
+    bool SamplesTexture(std::string_view key) const {
+        for (usize slot = 0; slot < textures.size(); ++slot) {
+            if (Texture(slot) == key) return true;
+        }
+        return false;
+    }
 
     // Wallpaper Engine scripts address shader controls through authored material names such as
     // `raythreshold`, while the compiled shader consumes GLSL uniforms such as `g_Threshold`.
     // Keeping the parser alias table on the runtime material lets script proxies resolve those
     // authored names without depending on project-specific shader source at assignment time.
     Map<std::string, std::string> uniformAliases;
+
+    const ShaderValue* FindUniformValue(std::string_view uniform_name) const {
+        const auto key = std::string(uniform_name);
+        const auto value = customShader.constValues.find(key);
+        if (value != customShader.constValues.end()) return std::addressof(value->second);
+        if (customShader.shader == nullptr) return nullptr;
+        const auto initial = customShader.shader->default_uniforms.find(key);
+        return initial != customShader.shader->default_uniforms.end()
+            ? std::addressof(initial->second) : nullptr;
+    }
 
     bool hasSprite { false };
 

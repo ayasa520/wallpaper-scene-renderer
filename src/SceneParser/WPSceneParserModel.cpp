@@ -144,11 +144,9 @@ bool ModelBlendUsesTransparency(std::string_view blending) {
     return blending == "translucent" || blending == "additive";
 }
 
-bool ModelMaterialSamplesReflection(const wpscene::WPMaterial& material) {
-    return std::any_of(
-        material.textures.begin(), material.textures.end(), [](const std::string& texture) {
-            return texture == kModelReflectionTargetName;
-        });
+bool ModelMaterialAuthorsReflectionTexture(const wpscene::WPMaterial& material) {
+    return std::find(material.textures.begin(), material.textures.end(),
+                     kModelReflectionTargetName) != material.textures.end();
 }
 
 struct ModelMaterialRenderPolicy {
@@ -203,7 +201,7 @@ BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material,
             return std::nullopt;
         }
         policy.cullMode = *cull_mode;
-    } else if (ModelMaterialSamplesReflection(material) || policy.transparent) {
+    } else if (ModelMaterialAuthorsReflectionTexture(material) || policy.transparent) {
         // Model reflection and alpha-blended shell surfaces are intentionally double-sided when the
         // material omits culling. Opaque model chunks keep the stricter back-face default, and the
         // policy is scoped here so the legacy 2D WPMaterial defaults remain unchanged.
@@ -279,26 +277,6 @@ public:
                         const nlohmann::json* sidecar_json)
         : context_(context), model_obj_(model_obj), sidecar_json_(sidecar_json) {}
 
-    bool AnyChunkSamplesReflection(const WPMdl& mdl) const {
-        return std::any_of(
-            mdl.static_chunks.begin(), mdl.static_chunks.end(), [this](const auto& chunk) {
-                return ChunkSamplesReflection(chunk);
-            });
-    }
-
-    bool ChunkSamplesReflection(const WPMdl::StaticChunk& chunk) const {
-        const auto source = LoadSource(chunk);
-        if (!source.has_value()) {
-            LOG_ERROR("ModelReflectionMaterial: failed to inspect layer=%d name='%s' material='%s'",
-                      model_obj_.id,
-                      model_obj_.name.c_str(),
-                      ResolvePath(chunk).c_str());
-            return false;
-        }
-
-        return ModelMaterialSamplesReflection(source->material);
-    }
-
     bool UsesTransparentBlend(const WPMdl::StaticChunk& chunk) const {
         const auto source = LoadSource(chunk);
         if (! source.has_value()) {
@@ -317,8 +295,7 @@ public:
                            SceneMaterial& material, WPShaderValueData& node_data,
                            wpscene::WPMaterial& resolved_wp_material,
                            WPShaderInfo& resolved_shader_info,
-                           SceneModelColorLoadMode color_load_mode,
-                           bool mirrored_handedness, std::string output_override) const {
+                           SceneModelColorLoadMode color_load_mode) const {
         const auto source = LoadSource(chunk);
         if (! source.has_value()) {
             LOG_ERROR("ModelMaterialLoad: failed to parse layer=%d name='%s' material='%s'",
@@ -342,7 +319,6 @@ public:
         if (! LoadMaterial(*context_.vfs,
                            effective_material,
                            context_.scene.get(),
-                           chunk_node,
                            &material,
                            &node_data,
                            context_.user_properties,
@@ -356,12 +332,7 @@ public:
 
         LoadConstvalue(material, effective_material, shader_info);
         LoadUserShaderValue(material, effective_material, shader_info, context_.user_properties);
-        const auto render_state =
-            BuildRenderState(color_load_mode,
-                             mirrored_handedness,
-                             std::move(output_override),
-                             source->renderPolicy);
-        material.modelRenderState = render_state;
+        material.modelRenderState = BuildRenderState(color_load_mode, source->renderPolicy);
         // Model material JSON and shader metadata are returned to the caller so binding
         // registration can happen after mesh->AddMaterial() and node->AddMesh(). That keeps 3D
         // model chunks on the same material-ready registration path as ordinary scene layers.
@@ -372,19 +343,15 @@ public:
 
 private:
     SceneModelRenderState BuildRenderState(SceneModelColorLoadMode color_load_mode,
-                                           bool                    mirrored_handedness,
-                                           std::string             output_override,
                                            const ModelMaterialRenderPolicy& policy) const {
         // The renderer-facing model state is derived from the same validated policy used to build
-        // the effective WPMaterial, keeping shader loading, depth rules, culling, and reflection
-        // output routing on one explicit model-material contract.
+        // the effective WPMaterial. Target selection and reflection are draw state: the same
+        // model material is consumed by both the reflected and ordinary scene walks.
         return SceneModelRenderState {
             .colorLoadMode      = color_load_mode,
             .depthTest          = policy.depthTest,
             .depthWrite         = policy.depthWrite,
             .cullMode           = policy.cullMode,
-            .mirroredHandedness = mirrored_handedness,
-            .outputOverride     = std::move(output_override),
         };
     }
 
@@ -438,8 +405,9 @@ void EnsureModelReflectionTarget(ParseContext& context) {
     auto& scene = *context.scene;
     if (scene.renderTargets.count(std::string(kModelReflectionTargetName)) != 0) return;
 
-    // Reflection is a model-only render target. It is registered lazily when a model layer requests
-    // reflection so ordinary 2D scenes do not gain another render target or graph edge.
+    // Only an active receiver material requires this screen-sized target. The reflected walk
+    // changes destination state and projection before normal scene drawing; sampling uses the
+    // authored shader coordinates, with no additional texture-side Y inversion.
     scene.renderTargets[std::string(kModelReflectionTargetName)] = {
         .width                  = context.ortho_w,
         .height                 = context.ortho_h,
@@ -447,11 +415,10 @@ void EnsureModelReflectionTarget(ParseContext& context) {
         .mapHeight              = context.ortho_h,
         .allowReuse             = true,
         .withDepth              = true,
-        .screenSpaceSampleYFlip = true,
         .bind                   = { .enable = true, .screen = true },
     };
     LOG_INFO("ModelReflectionTarget: registered name='_rt_Reflection' size=%ux%u map-size=%ux%u "
-             "with-depth=true screen-aligned=true screen-space-sample-y-flip=true",
+             "with-depth=true screen-aligned=true screen-space-sample-y-flip=false",
              context.ortho_w,
              context.ortho_h,
              context.ortho_w,
@@ -502,13 +469,6 @@ struct ModelChunkOrder {
     }
 };
 
-struct ModelChunkNodeRequest {
-    std::string name;
-    std::string output_override;
-    SceneModelColorLoadMode color_load_mode { SceneModelColorLoadMode::DontCare };
-    bool        mirrored_handedness { false };
-};
-
 class ModelLayerMaterializer {
 public:
     ModelLayerMaterializer(ParseContext& context, const WPModelObject& model_obj,
@@ -530,13 +490,11 @@ public:
             shared_puppet_pose_.prepared(model_obj_.animation_layers);
         }
         RegisterRootNode();
-        const bool material_samples_reflection = material_loader_.AnyChunkSamplesReflection(mdl);
-        if (model_obj_.reflected || material_samples_reflection) {
-            EnsureModelReflectionTarget(context_);
-        }
-
+        auto& owner = context_.scene->EnsureSceneObject(model_obj_.id);
+        owner.SetReceivesReflection(false);
         const auto order = ModelChunkOrder::Build(mdl, material_loader_, model_obj_);
         AppendChunks(mdl, order);
+        if (owner.ReceivesReflection()) EnsureModelReflectionTarget(context_);
         ApplyCastsShadows(root_.get(), model_obj_.castshadow);
 
         context_.scene->ApplyLayerVisibility(model_obj_.id);
@@ -562,7 +520,6 @@ private:
         ConfigureBoneAttachment(context_,
                                 model_obj_.parent,
                                 model_obj_.attachment,
-                                Eigen::Affine3f(root_->GetLocalTrans().cast<float>()),
                                 "model",
                                 model_obj_.name,
                                 root_data);
@@ -575,7 +532,7 @@ private:
             ConfigureInheritedParentBinding(context_, model_obj_.parent, root_data);
             context_.scene->sceneGraph->AppendChild(root_);
         } else {
-            AttachNodeToScene(context_, root_, model_obj_.parent, model_obj_.name, &root_data);
+            AttachNodeToScene(context_, root_, model_obj_.parent, model_obj_.name);
         }
 
         context_.object_nodes[model_obj_.id] = root_;
@@ -586,65 +543,20 @@ private:
     }
 
     void AppendChunks(const WPMdl& mdl, const ModelChunkOrder& order) {
-        // Receiver materials and producer passes are separate contracts. A material may reference
-        // `_rt_Reflection` only so its shader can bind the runtime target, while mirrored producer
-        // geometry is authored by the model object's `"reflected": true` flag. Keeping those paths
-        // separate prevents receiver-only models from drawing phantom mirrored geometry, without
-        // disabling reflected scenes that intentionally populate the target.
-        if (model_obj_.reflected) {
-            for (usize chunk_index : order.ordered) {
-                const auto& chunk = mdl.static_chunks[chunk_index];
-                AppendReflectionChunk(chunk, chunk_index);
-            }
-        }
-
+        // The reflected list retains these same owners/resources. Materialize each chunk once,
+        // register its script bindings once, and let the render graph submit it in the
+        // independent reflection phase when needed.
         for (usize chunk_index : order.ordered) {
             const auto& chunk = mdl.static_chunks[chunk_index];
-            AppendMainChunk(chunk, chunk_index);
+            auto node = MakeChunkNode(chunk, chunk_index);
+            if (node != nullptr) root_->AppendChild(node);
         }
-    }
-
-    void AppendReflectionChunk(const WPMdl::StaticChunk& chunk, usize chunk_index) {
-        if (material_loader_.ChunkSamplesReflection(chunk)) {
-            // A material that samples `_rt_Reflection` is the receiver surface, not a producer for
-            // that same target. Skipping it avoids feedback/self-copy edges while still allowing
-            // authored reflected models to populate the target before the receiver draws.
-            return;
-        }
-
-        auto reflection_node = MakeChunkNode(
-            chunk,
-            ModelChunkNodeRequest {
-                .name                = model_obj_.name + "::__hanabi_model_reflection_chunk_" +
-                                       std::to_string(chunk_index),
-                .output_override     = std::string(kModelReflectionTargetName),
-                .color_load_mode     = NextModelOutputColorLoadMode(kModelReflectionTargetName),
-                .mirrored_handedness = true,
-            });
-        if (reflection_node == nullptr) return;
-
-        // Some authored reflection receivers sample `_rt_Reflection` as a screen-space floor
-        // mirror. Mirroring reflected chunks across the authored Y=0 floor plane gives the target
-        // the expected geometry, while `mirroredHandedness` above lets the render pass fix
-        // winding/culling without weakening cull behavior for normal 3D or any 2D scene.
-        reflection_node->SetScale(Vector3f { 1.0f, -1.0f, 1.0f });
-        root_->AppendChild(reflection_node);
-    }
-
-    void AppendMainChunk(const WPMdl::StaticChunk& chunk, usize chunk_index) {
-        auto node = MakeChunkNode(
-            chunk,
-            ModelChunkNodeRequest {
-                .name = model_obj_.name + "::__hanabi_model_chunk_" + std::to_string(chunk_index),
-                .color_load_mode = NextModelOutputColorLoadMode(SpecTex_Default),
-            });
-        if (node != nullptr) root_->AppendChild(node);
     }
 
     std::shared_ptr<SceneNode> MakeChunkNode(const WPMdl::StaticChunk& chunk,
-                                             ModelChunkNodeRequest     request) {
+                                             usize chunk_index) {
         auto node = std::make_shared<SceneNode>();
-        node->SetName(std::move(request.name));
+        node->SetName(model_obj_.name + "::__hanabi_model_chunk_" + std::to_string(chunk_index));
         node->ID() = model_obj_.id;
         // Model chunks use the isolated model camera so authored 3D view transforms cannot move
         // legacy 2D perspective particles that still render through `global_perspective`.
@@ -668,10 +580,36 @@ private:
                                                  node_data,
                                                  wp_material,
                                                  shader_info,
-                                                 request.color_load_mode,
-                                                 request.mirrored_handedness,
-                                                 std::move(request.output_override))) {
+                                                 NextModelColorLoadMode())) {
             return nullptr;
+        }
+
+        if (material.SamplesTexture(kModelReflectionTargetName)) {
+            Set<uint> active_slots;
+            if (!WPShaderParser::ReflectTextureSlots(material.customShader.shader->codes,
+                                                     active_slots)) {
+                LOG_ERROR("ModelReflectionMaterial: descriptor reflection failed layer=%d "
+                          "name='%s' chunk=%zu", model_obj_.id, model_obj_.name.c_str(), chunk_index);
+                return nullptr;
+            }
+            for (usize slot = 0; slot < material.textures.size(); ++slot) {
+                if (material.Texture(slot) != kModelReflectionTargetName) continue;
+                if (active_slots.contains(static_cast<uint>(slot))) {
+                    context_.scene->EnsureSceneObject(model_obj_.id).SetReceivesReflection(true);
+                    LOG_INFO("ModelReflectionReceiver: layer=%d name='%s' chunk=%zu "
+                             "shader='%s' active-slot=%zu whole-owner-excluded=true",
+                             model_obj_.id, model_obj_.name.c_str(), chunk_index,
+                             material.name.c_str(), slot);
+                } else {
+                    // An optimized-out sampler is neither a receiver nor a graph read.
+                    // Retaining its name would still synthesize a self-copy when this model
+                    // is drawn into reflection, despite the GPU never sampling that slot.
+                    material.textures[slot].clear();
+                    material.systemTextureBindings.erase(slot);
+                    LOG_INFO("ModelReflectionSamplerUnused: layer=%d chunk=%zu slot=%zu",
+                             model_obj_.id, chunk_index, slot);
+                }
+            }
         }
 
         mesh->AddMaterial(std::move(material));
@@ -695,7 +633,7 @@ private:
         // routed model root's inherited ancestor transform reaches every chunk. A physically
         // attached root resolves to its plain scene-graph transform through the same path, which
         // keeps unparented and bone-attached models unchanged.
-        node_data.InheritParentTransform(root_.get(), false);
+        node_data.InheritParentTransform(root_.get());
         if (shared_puppet_pose_.hasPuppet()) node_data.puppet_layer = shared_puppet_pose_;
         context_.shader_updater->SetNodeData(node.get(), node_data);
         context_.scene->AddLayerRuntimeNode(model_obj_.id, node.get());
@@ -704,24 +642,15 @@ private:
 
     void ApplyCastsShadows(SceneNode* node, bool value) {
         if (node == nullptr) return;
-        if (node->Name().find("__hanabi_model_reflection") != std::string::npos) return;
         node->SetCastsShadows(value);
         for (auto& child : node->GetChildren()) {
             ApplyCastsShadows(child.get(), value);
         }
     }
 
-    SceneModelColorLoadMode NextModelOutputColorLoadMode(std::string_view output) {
-        auto  key   = output.empty() ? std::string(SpecTex_Default) : std::string(output);
-        auto& count = context_.model_pass_count_by_output[key];
-        if (count++ > 0) return SceneModelColorLoadMode::Load;
-
-        // The default scene target is already owned by the renderer pre-pass, while private model
-        // render targets have no standalone clear pass. Clearing the first model writer to an
-        // offscreen target prevents transparent pixels from loading the previous frame, and later
-        // writers still load so multi-chunk models compose into the same target.
-        return key == SpecTex_Default ? SceneModelColorLoadMode::DontCare
-                                      : SceneModelColorLoadMode::Clear;
+    SceneModelColorLoadMode NextModelColorLoadMode() {
+        return context_.model_pass_count++ == 0 ? SceneModelColorLoadMode::DontCare
+                                               : SceneModelColorLoadMode::Load;
     }
 
     ParseContext&                 context_;

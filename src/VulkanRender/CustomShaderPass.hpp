@@ -16,13 +16,15 @@ public:
 
     void setDescTex(u32 index, std::string_view tex_key);
 
+    // Diagnostic presentation borrows the framebuffer's exact prepared image at this draw's
+    // ordering point. Looking it up again by logical name could select a different pooled image.
+    const ImageParameters& outputImage() const { return m_core.data().vk_output; }
+
     void prepare(Scene&, const Device&, RenderingResources&) override;
-    void prepareDeferred(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
     void refreshImportedTextureBindings(Scene&, const Device&) override;
     void dropOutputFramebuffers() override;
     void updateBeforeUpload() override;
-    DeferredPrepareResourcesState requestDeferredPrepareResources(Scene&, const Device&) override;
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
     bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;

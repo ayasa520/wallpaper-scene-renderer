@@ -67,19 +67,19 @@ inline bool ShaderDrawSamplesResolvedDefault(const std::vector<std::string>& tex
 }
 
 inline bool ShaderDrawWritesResolvedDefault(const Scene& scene, std::string_view output,
-                                            const SceneNode* node) {
+                                            const SceneDraw& draw) {
     (void)scene;
-    if (output != SpecTex_Default || node == nullptr) return false;
-    const auto& name = node->Name();
+    if (output != SpecTex_Default || !draw.Valid()) return false;
+    const auto& name = draw.Name();
     if (name.rfind("__hanabi_scene_bloom", 0) == 0) return true;
     if (name.rfind("__hanabi_scene_hdr_", 0) == 0) return true;
     return false;
 }
 
 inline bool ShaderDrawCanUseMsaa(const Scene& scene, std::string_view output,
-                                 const SceneNode* node) {
+                                 const SceneDraw& draw) {
     return ComposeOutputUsesMsaa(scene, output) &&
-           ! ShaderDrawWritesResolvedDefault(scene, output, node);
+           ! ShaderDrawWritesResolvedDefault(scene, output, draw);
 }
 
 struct RenderingResources;

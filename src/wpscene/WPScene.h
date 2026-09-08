@@ -35,6 +35,7 @@ public:
 class WPSceneGeneral {
 public:
     bool                 FromJson(const nlohmann::json&);
+    bool                 clearenabled { true };
     std::array<float, 3> clearcolor { 0.0f, 0.0f, 0.0f };
     // Wallpaper Engine stores Bloom in scene `general`, not in a layer effect list. Host
     // post-processing quality selects the LDR chain or the authored HDR mip chain.
@@ -74,6 +75,7 @@ public:
 class WPScene {
 public:
     bool           FromJson(const nlohmann::json&);
+    uint32_t       version { 0 };
     WPSceneCamera  camera;
     WPSceneGeneral general;
 };
@@ -81,6 +83,6 @@ public:
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Orthogonalprojection, width, height);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPSceneCamera, center, eye, up, paths);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPSceneGeneral, clearcolor, orthogonalprojection, zoom);
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPScene, camera, general);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPScene, version, camera, general);
 } // namespace wpscene
 } // namespace wallpaper

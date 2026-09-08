@@ -56,10 +56,20 @@ struct WPMdl {
 
     struct Vertex {
         std::array<float, 3>    position;
+        std::array<float, 3>    normal;
+        std::array<float, 4>    tangent;
+        // Lighting skins the primary position, while PRELIGHTINGDUALVERTEX rasterizes the
+        // authored auxiliary xyz stream unchanged. Assets without that stream use their primary
+        // xyz in both attribute slots.
+        std::array<float, 3>    prelighting_position;
         std::array<uint32_t, 4> blend_indices;
         std::array<float, 4>    weight;
         std::array<float, 2>    texcoord;
     };
+    // The image chunk's info word is independent of the vertex layout and mask-part table; bit1
+    // excludes direct skinning.
+    uint32_t                            chunk_info { 0 };
+    uint32_t                            vertex_flag { 0 };
     std::vector<Vertex>                  vertexs;
     std::vector<std::array<uint16_t, 3>> indices;
     // Vertex positions are stored in the MDL asset's puppet-local coordinate space.
@@ -84,6 +94,17 @@ struct WPMdl {
 
     // std::vector<Eigen::Matrix<float, 3, 4>> bones;
     std::shared_ptr<WPPuppet> puppet;
+    bool HasImagePrivateChunk() const {
+        constexpr uint32_t kPrivateChunkMask = 1u << 1;
+        return (chunk_info & kPrivateChunkMask) != 0;
+    }
+    bool HasImageSkinning() const {
+        // Image skinning requires vertex-layout bit23 and a nonempty live bone vector; the
+        // filename or a static image mesh does not enable skinning.
+        constexpr uint32_t kImageSkinningAttributeMask = 1u << 23;
+        return kind == MeshKind::Puppet && (vertex_flag & kImageSkinningAttributeMask) != 0 &&
+            puppet != nullptr && !puppet->bones.empty();
+    }
     // combo
     // SKINNING = 1
     // BONECOUNT

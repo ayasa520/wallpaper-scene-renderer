@@ -30,6 +30,13 @@ bool WPSceneCamera::FromJson(const nlohmann::json& json) {
 }
 
 bool WPSceneGeneral::FromJson(const nlohmann::json& json) {
+    // Scene clearing starts enabled and only a JSON boolean changes it. A dynamic property's
+    // value obeys the same rule; strings and numbers do not coerce to bool and must not turn an
+    // omitted/invalid value into a disabled clear.
+    if (auto it = json.find("clearenabled"); it != json.end()) {
+        const auto& value = it->is_object() && it->contains("value") ? it->at("value") : *it;
+        if (value.is_boolean()) clearenabled = value.get<bool>();
+    }
     GET_JSON_NAME_VALUE(json, "ambientcolor", ambientcolor);
     GET_JSON_NAME_VALUE(json, "skylightcolor", skylightcolor);
 	GET_JSON_NAME_VALUE(json, "clearcolor", clearcolor);
@@ -69,6 +76,7 @@ bool WPSceneGeneral::FromJson(const nlohmann::json& json) {
 }
 
 bool WPScene::FromJson(const nlohmann::json& json) {
+    GET_JSON_NAME_VALUE_NOWARN(json, "version", version);
     if(json.contains("camera")) {
         camera.FromJson(json.at("camera"));
     } else {

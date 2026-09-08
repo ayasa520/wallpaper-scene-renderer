@@ -45,6 +45,7 @@ public:
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
     void execute(const Device&, RenderingResources&) override;
+    void executeImage(const Device&, RenderingResources&, const ImageParameters&);
     void destory(const Device&, RenderingResources&) override;
     bool referencesRenderTarget(std::string_view) const override;
 

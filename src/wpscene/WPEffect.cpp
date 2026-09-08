@@ -1,10 +1,10 @@
 #include "wpscene/WPEffect.h"
 
-#include <algorithm>
 #include <cmath>
 #include <filesystem>
 
 #include "Fs/VFS.h"
+#include "Scene/SceneRenderTarget.h"
 #include "Utils/Logging.h"
 #include "WPJson.hpp"
 
@@ -30,16 +30,13 @@ void ReadVisibleBinding(const nlohmann::json& json, wallpaper::VisibleBinding* b
     GET_JSON_NAME_VALUE_NOWARN(user, "condition", binding->user.condition);
 }
 
-int32_t PositiveRoundedPixel(float value) {
-    return std::max(1, static_cast<int32_t>(std::lround(std::max(1.0f, value))));
-}
-
 } // namespace
 
 bool WPEffectCommand::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "command", command);
-    GET_JSON_NAME_VALUE(json, "target", target);
-    GET_JSON_NAME_VALUE(json, "source", source);
+    GET_JSON_NAME_VALUE_NOWARN(json, "target", target);
+    GET_JSON_NAME_VALUE_NOWARN(json, "source", source);
+    GET_JSON_NAME_VALUE_NOWARN(json, "compose", compose);
     return true;
 }
 
@@ -58,23 +55,7 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
 }
 
 std::array<int32_t, 2> WPEffectFbo::ResolveSize(std::array<float, 2> source_size) const {
-    const float source_width  = std::max(1.0f, source_size[0]);
-    const float source_height = std::max(1.0f, source_size[1]);
-
-    if (fit > 0) {
-        const float longest_edge = std::max(source_width, source_height);
-        const float fit_scale    = static_cast<float>(fit) / longest_edge;
-        return {
-            PositiveRoundedPixel(source_width * fit_scale),
-            PositiveRoundedPixel(source_height * fit_scale),
-        };
-    }
-
-    const float divisor = static_cast<float>(std::max<uint32_t>(1u, scale));
-    return {
-        PositiveRoundedPixel(source_width / divisor),
-        PositiveRoundedPixel(source_height / divisor),
-    };
+    return wallpaper::ResolveEffectRenderTargetExtent(source_size, scale, fit);
 }
 
 // The blacklist belongs to the shared effect parser, not to WPImageObject. Text effects and image
@@ -101,30 +82,6 @@ bool WPImageEffect::IsEffectBlacklisted(const std::string& filePath) {
             return WPImageEffect::BLACKLISTED_WORKSHOP_EFFECTS.find(effectId) != WPImageEffect::BLACKLISTED_WORKSHOP_EFFECTS.end();
         }
     }
-    return false;
-}
-
-bool WPImageEffect::HasEnabledCombo(const std::string& combo_name) const {
-    const auto combo_is_enabled = [&combo_name](const auto& combos) {
-        const auto combo_it = combos.find(combo_name);
-        return combo_it != combos.end() && combo_it->second != 0;
-    };
-
-    // Effect pass overrides are the author-facing place where Wallpaper Engine stores switches such
-    // as DIRECTDRAW. Keep that lookup inside the parsed effect model so object parsers can ask for a
-    // semantic capability without knowing whether the switch came from the scene override or from
-    // the resolved material data.
-    for (const auto& pass : passes) {
-        if (combo_is_enabled(pass.combos)) return true;
-    }
-
-    // Some packed workshop assets can bake combo state into the resolved material rather than the
-    // scene-level pass override. Treat that as the same enabled combo so callers do not have to
-    // duplicate the fallback search whenever they need to identify a shader feature.
-    for (const auto& material : materials) {
-        if (combo_is_enabled(material.combos)) return true;
-    }
-
     return false;
 }
 
@@ -156,8 +113,18 @@ std::unordered_set<std::string> WPImageEffect::FeedbackFboNames() const {
     auto apply_commands_at = [&](int32_t afterpos) {
         for (const auto& command : commands) {
             if (command.afterpos != afterpos) continue;
-            read_fbo(command.source);
-            write_fbo(command.target);
+            if (command.command == "swap") {
+                // Swap exchanges future references without copying either image. Both images can
+                // become the next frame's feedback input, so their contents must survive
+                // temporary-target lifetime release.
+                if (fbo_names.contains(command.source) && fbo_names.contains(command.target)) {
+                    feedback_fbos.insert(command.source);
+                    feedback_fbos.insert(command.target);
+                }
+            } else if (command.command == "copy") {
+                read_fbo(command.source);
+                write_fbo(command.target);
+            }
         }
     };
 
@@ -232,7 +199,6 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs) {
     }
     if(json.contains("passes")) {
         const auto& jEPasses = json.at("passes");
-        bool compose {false};
         for(const auto& jP:jEPasses) {
             if(!jP.contains("material")) {
                 if(jP.contains("command")) {
@@ -256,19 +222,6 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs) {
             WPMaterialPass pass;
             pass.FromJson(jP);
             passes.push_back(std::move(pass));
-            if(jP.contains("compose"))
-	            GET_JSON_NAME_VALUE(jP, "compose", compose);
-        }
-        if(compose) {
-            if(passes.size() != 2) {
-                LOG_ERROR("effect compose option error");
-                return false;
-            }
-            WPEffectFbo fbo; {fbo.name = "_rt_FullCompoBuffer1"; fbo.scale = 1;}
-            fbos.push_back(fbo);
-            passes.at(0).bind.push_back({ "previous", 0});
-            passes.at(0).target = "_rt_FullCompoBuffer1";
-            passes.at(1).bind.push_back({"_rt_FullCompoBuffer1", 0});
         }
     } else {
         LOG_ERROR("no passes in effect file");

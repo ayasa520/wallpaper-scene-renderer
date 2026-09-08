@@ -50,13 +50,12 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
         return;
     }
 
-    // Property animation registrations still target SceneNode-backed values. Camera layers keep a
-    // node too, but they must dispatch through the camera target so origin/zoom keyframes update
-    // the active SceneCamera instead of only the invisible layer node.
+    // Register against the authored object after its runtime state has been materialized. Camera
+    // properties select the camera dispatcher so origin/zoom keyframes also update the view.
     const bool camera_registration =
         IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
-    const auto object_node_it = context.object_nodes.find(object_id);
-    if (object_node_it == context.object_nodes.end()) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
 
     WPPropertyAnimationDefinition animation_definition;
     if (! ParsePropertyAnimationDefinition(property_json, hint, animation_definition)) return;
@@ -80,7 +79,6 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = object_node_it->second.get(),
         .target_kind =
             camera_registration ? WPSceneScriptTargetKind::Camera : WPSceneScriptTargetKind::Layer,
         .target_index = 0,
@@ -145,19 +143,17 @@ void RegisterSceneScriptBinding(ParseContext& context, const nlohmann::json& obj
         object_name = std::to_string(object_id);
     }
 
-    // Script bindings still dispatch through a SceneNode-backed target. Camera layers use the
-    // camera target so parser/runtime scripts see normal layer objects while writes are routed to
-    // the active SceneCamera state.
+    // The owner id is sufficient to resolve the live property target. Camera layers select their
+    // view-state dispatcher; ordinary layer bindings do not retain a drawing node.
     const bool camera_registration =
         IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
-    const auto object_node_it = context.object_nodes.find(object_id);
-    if (object_node_it == context.object_nodes.end()) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
 
     context.scene->scriptRegistrations.push_back(WPSceneScriptRegistration {
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = object_node_it->second.get(),
         .target_kind =
             camera_registration ? WPSceneScriptTargetKind::Camera : WPSceneScriptTargetKind::Layer,
         .target_index = 0,
@@ -206,16 +202,16 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
         return;
     }
 
-    // Sound objects are mounted as SoundManager streams and intentionally have no SceneNode in
-    // context.object_nodes. Treat volume as a first-class runtime binding anyway so live user
-    // property edits follow the same value path as the parse-time WPSoundParser::MountStream call.
+    // Sound volume targets the mounted stream on its authored object. It does not require visual
+    // placement, while visual property targets require a successfully materialized transform.
     const bool sound_volume_binding =
         property_name == "volume" && context.scene != nullptr &&
         context.scene->GetLayerSoundHandle(object_id).has_value();
     const bool camera_registration =
         IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
-    const auto object_node_it = context.object_nodes.find(object_id);
-    if (object_node_it == context.object_nodes.end() && ! sound_volume_binding) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if ((object == nullptr || object->RuntimeTransform() == nullptr) && ! sound_volume_binding)
+        return;
 
     WPUserSetting setting;
     if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasUserBinding()) return;
@@ -236,7 +232,6 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = sound_volume_binding ? nullptr : object_node_it->second.get(),
         .target_kind   = sound_volume_binding
                              ? WPSceneScriptTargetKind::Sound
                              : (camera_registration ? WPSceneScriptTargetKind::Camera
@@ -300,8 +295,8 @@ void RegisterSceneParticleOverridePropertyBinding(ParseContext&         context,
         return;
     }
 
-    const auto object_node_it = context.object_nodes.find(object_id);
-    if (object_node_it == context.object_nodes.end()) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
 
     WPUserSetting setting;
     if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasUserBinding()) return;
@@ -326,7 +321,6 @@ void RegisterSceneParticleOverridePropertyBinding(ParseContext&         context,
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = object_node_it->second.get(),
         .target_kind   = WPSceneScriptTargetKind::Layer,
         .target_index  = 0,
         .value_type    = hint,
@@ -365,8 +359,8 @@ void RegisterSceneParticleOverrideScriptBinding(ParseContext&         context,
         return;
     }
 
-    const auto object_node_it = context.object_nodes.find(object_id);
-    if (object_node_it == context.object_nodes.end()) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
 
     WPUserSetting setting;
     if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasScript()) return;
@@ -391,7 +385,6 @@ void RegisterSceneParticleOverrideScriptBinding(ParseContext&         context,
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = object_node_it->second.get(),
         .target_kind   = WPSceneScriptTargetKind::Layer,
         .target_index  = 0,
         .value_type    = hint,
@@ -411,7 +404,8 @@ void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json
 
     int32_t object_id { 0 };
     GET_JSON_NAME_VALUE_NOWARN(object_json, "id", object_id);
-    if (object_id == 0 || context.object_nodes.count(object_id) == 0 || context.scene == nullptr) {
+    if (object_id == 0 || context.scene == nullptr ||
+        context.scene->FindSceneObject(object_id) == nullptr) {
         return;
     }
 
@@ -437,7 +431,6 @@ void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json
         .object_id     = object_id,
         .object_name   = effect_name,
         .property_name = "visible",
-        .node          = context.object_nodes.at(object_id).get(),
         .target_kind   = WPSceneScriptTargetKind::Effect,
         .target_index  = effect->EffectIndex(),
         .target_id     = effect_id,
@@ -517,7 +510,8 @@ void RegisterAnimationLayerSceneScriptBinding(ParseContext&         context,
         return;
     }
 
-    if (context.object_nodes.count(object_id) == 0) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
 
     WPUserSetting setting;
     if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasScript()) return;
@@ -538,7 +532,6 @@ void RegisterAnimationLayerSceneScriptBinding(ParseContext&         context,
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = context.object_nodes.at(object_id).get(),
         .target_kind   = WPSceneScriptTargetKind::AnimationLayer,
         .target_index  = layer_index,
         .value_type    = hint,
@@ -577,7 +570,8 @@ void RegisterAnimationLayerPropertyBinding(ParseContext& context, const nlohmann
         return;
     }
 
-    if (context.object_nodes.count(object_id) == 0) return;
+    const auto* object = context.scene->FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
 
     WPUserSetting setting;
     if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasUserBinding()) return;
@@ -598,7 +592,6 @@ void RegisterAnimationLayerPropertyBinding(ParseContext& context, const nlohmann
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .node          = context.object_nodes.at(object_id).get(),
         .target_kind   = WPSceneScriptTargetKind::AnimationLayer,
         .target_index  = layer_index,
         .value_type    = hint,
@@ -625,34 +618,84 @@ void RegisterSceneGeneralPropertyBinding(ParseContext& context, const nlohmann::
 
     const auto& property_json = general_json.at(property_name);
     if (! property_json.is_object()) return;
-    // General properties do not have SceneNode owners. Keep authored animations out of the direct
-    // binding table, but allow user-bound values to drive global runtime state such as camera
-    // parallax through the same dispatch path as layer and effect properties.
-    if (property_json.contains("animation")) return;
 
     WPUserSetting setting;
-    if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasUserBinding()) return;
+    if (! ParseUserSetting(property_json, setting, hint)) return;
 
-    context.scene->bindingRegistrations.push_back(WPSceneScriptRegistration {
+    // The scene itself owns general descriptors; requiring a drawable id/name would silently
+    // discard their scripts and keyframes. Reuse the persistent host's Scene target so init,
+    // frame updates and user-property changes all address the same live storage, without creating
+    // a synthetic SceneNode.
+    WPSceneScriptRegistration registration {
         .object_id     = 0,
         .object_name   = "scene.general",
         .property_name = std::string(property_name),
-        .node          = nullptr,
         .target_kind   = WPSceneScriptTargetKind::Scene,
         .target_index  = 0,
         .value_type    = hint,
         .base_value    = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
         .setting       = std::move(setting),
-    });
+    };
 
-    LOG_INFO("SceneGeneralRegister: property='%.*s' kind=user target=scene.general",
-             static_cast<int>(property_name.size()),
-             property_name.data());
+    auto log_registration = [&](const char* kind) {
+        LOG_INFO("SceneGeneralRegister: property='%.*s' kind=%s target=scene.general",
+                 static_cast<int>(property_name.size()),
+                 property_name.data(),
+                 kind);
+    };
+
+    // Register animation and script independently, in that order. Keep both when authored
+    // together: scripts can address the owner's timeline during init. Their user bindings belong
+    // to those same registrations, just as for layer properties, rather than a second direct
+    // binding that would overwrite the derived value during user dispatch.
+    WPPropertyAnimationDefinition animation;
+    if (ParsePropertyAnimationDefinition(property_json, hint, animation)) {
+        registration.animation =
+            std::make_shared<WPPropertyAnimationDefinition>(std::move(animation));
+        context.scene->propertyAnimationRegistrations.push_back(registration);
+        log_registration("animation");
+    }
+    if (registration.setting.hasScript()) {
+        context.scene->scriptRegistrations.push_back(std::move(registration));
+        log_registration("script");
+    } else if (! property_json.contains("script") && ! property_json.contains("animation") &&
+               registration.setting.hasUserBinding()) {
+        context.scene->bindingRegistrations.push_back(std::move(registration));
+        log_registration("user");
+    }
 }
+
+namespace
+{
+bool HasFloat2LayerSizeProperty(const nlohmann::json& object_json) {
+    // Shape inherits the shared drawable size descriptor even when it has no effects. Keep
+    // cold-load and dynamic-object registration, including user bindings, keyframes and scripts,
+    // on the same classification without changing their registration order. Particle
+    // instanceoverride.size remains a separate scalar property.
+    return (object_json.contains("image") && ! object_json.at("image").is_null()) ||
+           (object_json.contains("text") && ! object_json.at("text").is_null()) ||
+           (object_json.contains("shape") && ! object_json.at("shape").is_null());
+}
+
+void RegisterImageCompositionBindings(ParseContext& context, const nlohmann::json& object_json) {
+    if (!object_json.contains("image") || object_json.at("image").is_null()) return;
+    // Initial loading and dynamic object creation register the same boolean property for user
+    // bindings, animation and scripts. The owning image keeps the value even when an empty
+    // composition currently has no drawing resources.
+    RegisterScenePropertyBinding(
+        context, object_json, "copybackground", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "copybackground", WPDynamicValue::Type::Boolean);
+    RegisterSceneScriptBinding(
+        context, object_json, "copybackground", WPDynamicValue::Type::Boolean);
+}
+} // namespace
 
 void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
     if (json.contains("general") && json.at("general").is_object()) {
         const auto& general_json = json.at("general");
+        RegisterSceneGeneralPropertyBinding(
+            context, general_json, "clearenabled", WPDynamicValue::Type::Boolean);
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "clearcolor", WPDynamicValue::Type::Float3);
         RegisterSceneGeneralPropertyBinding(
@@ -686,6 +729,8 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "fov", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(
+            context, general_json, "perspectiveoverridefov", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
             context, general_json, "nearz", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "farz", WPDynamicValue::Type::Float);
@@ -694,6 +739,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
     if (! json.contains("objects") || ! json.at("objects").is_array()) return;
 
     for (const auto& object_json : json.at("objects")) {
+        RegisterImageCompositionBindings(context, object_json);
         RegisterScenePropertyBinding(
             context, object_json, "visible", WPDynamicValue::Type::Boolean);
         RegisterScenePropertyBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
@@ -701,8 +747,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterScenePropertyBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
         RegisterScenePropertyBinding(
             context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
-        if ((object_json.contains("image") && ! object_json.at("image").is_null()) ||
-            (object_json.contains("text") && ! object_json.at("text").is_null())) {
+        if (HasFloat2LayerSizeProperty(object_json)) {
             RegisterScenePropertyBinding(
                 context, object_json, "size", WPDynamicValue::Type::Float2);
         }
@@ -740,7 +785,8 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
         RegisterScenePropertyBinding(
             context, object_json, "pointsize", WPDynamicValue::Type::Float);
-        RegisterScenePropertyBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+        // All registration paths use the same two-float runtime field.
+        RegisterScenePropertyBinding(context, object_json, "padding", WPDynamicValue::Type::Float2);
         RegisterScenePropertyBinding(
             context, object_json, "horizontalalign", WPDynamicValue::Type::String);
         RegisterScenePropertyBinding(
@@ -762,8 +808,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             context, object_json, "scale", WPDynamicValue::Type::Float3);
         RegisterScenePropertyAnimationBinding(
             context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
-        if ((object_json.contains("image") && ! object_json.at("image").is_null()) ||
-            (object_json.contains("text") && ! object_json.at("text").is_null())) {
+        if (HasFloat2LayerSizeProperty(object_json)) {
             RegisterScenePropertyAnimationBinding(
                 context, object_json, "size", WPDynamicValue::Type::Float2);
         }
@@ -782,7 +827,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterScenePropertyAnimationBinding(
             context, object_json, "pointsize", WPDynamicValue::Type::Float);
         RegisterScenePropertyAnimationBinding(
-            context, object_json, "padding", WPDynamicValue::Type::Int32);
+            context, object_json, "padding", WPDynamicValue::Type::Float2);
         RegisterScenePropertyAnimationBinding(
             context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
         RegisterScenePropertyAnimationBinding(
@@ -798,8 +843,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterSceneScriptBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
         RegisterSceneScriptBinding(
             context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
-        if ((object_json.contains("image") && ! object_json.at("image").is_null()) ||
-            (object_json.contains("text") && ! object_json.at("text").is_null())) {
+        if (HasFloat2LayerSizeProperty(object_json)) {
             RegisterSceneScriptBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
         }
         RegisterSceneScriptBinding(context, object_json, "text", WPDynamicValue::Type::String);
@@ -814,7 +858,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterSceneScriptBinding(
             context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
         RegisterSceneScriptBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
-        RegisterSceneScriptBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+        RegisterSceneScriptBinding(context, object_json, "padding", WPDynamicValue::Type::Float2);
         RegisterSceneScriptBinding(
             context, object_json, "horizontalalign", WPDynamicValue::Type::String);
         RegisterSceneScriptBinding(
@@ -910,14 +954,14 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
 }
 
 void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& object_json) {
+    RegisterImageCompositionBindings(context, object_json);
     RegisterScenePropertyBinding(context, object_json, "visible", WPDynamicValue::Type::Boolean);
     RegisterScenePropertyBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
     RegisterScenePropertyBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
     RegisterScenePropertyBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
     RegisterScenePropertyBinding(
         context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
-    if ((object_json.contains("image") && ! object_json.at("image").is_null()) ||
-        (object_json.contains("text") && ! object_json.at("text").is_null())) {
+    if (HasFloat2LayerSizeProperty(object_json)) {
         RegisterScenePropertyBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
     }
     RegisterScenePropertyBinding(context, object_json, "text", WPDynamicValue::Type::String);
@@ -951,7 +995,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterScenePropertyBinding(
         context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
     RegisterScenePropertyBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
-    RegisterScenePropertyBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+    RegisterScenePropertyBinding(context, object_json, "padding", WPDynamicValue::Type::Float2);
     RegisterScenePropertyBinding(
         context, object_json, "horizontalalign", WPDynamicValue::Type::String);
     RegisterScenePropertyBinding(
@@ -971,8 +1015,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
         context, object_json, "scale", WPDynamicValue::Type::Float3);
     RegisterScenePropertyAnimationBinding(
         context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
-    if ((object_json.contains("image") && ! object_json.at("image").is_null()) ||
-        (object_json.contains("text") && ! object_json.at("text").is_null())) {
+    if (HasFloat2LayerSizeProperty(object_json)) {
         RegisterScenePropertyAnimationBinding(
             context, object_json, "size", WPDynamicValue::Type::Float2);
     }
@@ -991,7 +1034,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterScenePropertyAnimationBinding(
         context, object_json, "pointsize", WPDynamicValue::Type::Float);
     RegisterScenePropertyAnimationBinding(
-        context, object_json, "padding", WPDynamicValue::Type::Int32);
+        context, object_json, "padding", WPDynamicValue::Type::Float2);
     RegisterScenePropertyAnimationBinding(
         context, object_json, "limitrows", WPDynamicValue::Type::Boolean);
     RegisterScenePropertyAnimationBinding(
@@ -1006,8 +1049,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterSceneScriptBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);
     RegisterSceneScriptBinding(context, object_json, "scale", WPDynamicValue::Type::Float3);
     RegisterSceneScriptBinding(context, object_json, "parallaxDepth", WPDynamicValue::Type::Float2);
-    if ((object_json.contains("image") && ! object_json.at("image").is_null()) ||
-        (object_json.contains("text") && ! object_json.at("text").is_null())) {
+    if (HasFloat2LayerSizeProperty(object_json)) {
         RegisterSceneScriptBinding(context, object_json, "size", WPDynamicValue::Type::Float2);
     }
     RegisterSceneScriptBinding(context, object_json, "text", WPDynamicValue::Type::String);
@@ -1022,7 +1064,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
     RegisterSceneScriptBinding(
         context, object_json, "opaquebackground", WPDynamicValue::Type::Boolean);
     RegisterSceneScriptBinding(context, object_json, "pointsize", WPDynamicValue::Type::Float);
-    RegisterSceneScriptBinding(context, object_json, "padding", WPDynamicValue::Type::Int32);
+    RegisterSceneScriptBinding(context, object_json, "padding", WPDynamicValue::Type::Float2);
     RegisterSceneScriptBinding(
         context, object_json, "horizontalalign", WPDynamicValue::Type::String);
     RegisterSceneScriptBinding(context, object_json, "verticalalign", WPDynamicValue::Type::String);

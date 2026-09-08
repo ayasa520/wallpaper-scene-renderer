@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace wallpaper::vulkan;
 
@@ -23,7 +24,7 @@ namespace
 {
 constexpr std::string_view kTextBackgroundTextureKey { "__text_layer_background_white" };
 
-std::string TextPipelineCompatibilityKey(bool offscreen_output,
+std::string TextPipelineCompatibilityKey(bool clear_before_draw,
                                          wallpaper::BlendMode blend_mode,
                                          wallpaper::AlphaWritePolicy alpha_write_policy,
                                          VkSampleCountFlagBits sample_count,
@@ -32,7 +33,7 @@ std::string TextPipelineCompatibilityKey(bool offscreen_output,
     // not by the layer that first requested them. This keeps visibility toggles on the same model
     // as engine-level PSO caches while still letting hidden text release atlas/framebuffer memory.
     return "TextPass|format=rgba8|final=shader-read|load=" +
-           std::to_string(static_cast<int>(offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
+           std::to_string(static_cast<int>(clear_before_draw ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                             : VK_ATTACHMENT_LOAD_OP_LOAD)) +
            "|blend=" + std::to_string(static_cast<int>(blend_mode)) +
            "|alpha-policy=" + std::to_string(static_cast<int>(alpha_write_policy)) +
@@ -266,6 +267,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
                                     RenderingResources&                   rr,
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
+                                    bool                                  clear_before_draw,
                                     wallpaper::AlphaWritePolicy           alpha_write_policy,
                                     VkSampleCountFlagBits                 sample_count,
                                     bool                                  resolve_msaa,
@@ -274,7 +276,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
     auto render_pass = CreateShaderDrawRenderPass(
         device.handle(),
         VK_FORMAT_R8G8B8A8_UNORM,
-        offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+        clear_before_draw ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         {},
         sample_count,
@@ -336,7 +338,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
         sample_count > VK_SAMPLE_COUNT_1_BIT ? sample_count : VK_SAMPLE_COUNT_1_BIT;
     pipeline_parameters.debug_name = std::move(debug_name);
     pipeline_parameters.cache_key = TextPipelineCompatibilityKey(
-        offscreen_output, blend_mode, alpha_write_policy, sample_count, resolve_msaa);
+        clear_before_draw, blend_mode, alpha_write_policy, sample_count, resolve_msaa);
     pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -380,8 +382,12 @@ TextPass::TextPass(const Desc& desc)
     m_desc.node                = desc.node;
     m_desc.layer_id            = desc.layer_id;
     m_desc.execute_when_hidden = desc.execute_when_hidden;
+    m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
+    m_desc.camera_override     = desc.camera_override;
+    m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
+    m_desc.model_space         = desc.model_space;
 }
 TextPass::~TextPass() = default;
 
@@ -400,7 +406,11 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
     const int next_samples = IntendedTextSampleCount(next->m_desc.scene, next->m_desc.output);
     return residencyKey() == next->residencyKey() &&
            m_desc.execute_when_hidden == next->m_desc.execute_when_hidden &&
+           m_desc.clear_before_draw == next->m_desc.clear_before_draw &&
            m_desc.alpha_write_policy == next->m_desc.alpha_write_policy &&
+           m_desc.camera_override == next->m_desc.camera_override &&
+           m_desc.use_active_camera_for_parallax == next->m_desc.use_active_camera_for_parallax &&
+           m_desc.model_space == next->m_desc.model_space &&
            this_samples == next_samples &&
            ! m_desc.resolve_msaa;
 }
@@ -413,8 +423,12 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_node_identity            = next->m_node_identity;
     m_desc.layer_id            = next->m_desc.layer_id;
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
+    m_desc.clear_before_draw   = next->m_desc.clear_before_draw;
     m_desc.output              = next->m_desc.output;
     m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
+    m_desc.camera_override     = next->m_desc.camera_override;
+    m_desc.use_active_camera_for_parallax = next->m_desc.use_active_camera_for_parallax;
+    m_desc.model_space         = next->m_desc.model_space;
 }
 
 bool TextPass::referencesRenderTarget(std::string_view render_target) const {
@@ -569,7 +583,13 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
     if (!BindTextPassOutput(scene, device, m_desc)) return;
 
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
-    m_desc.clear_output = offscreen_output;
+    // Direct text publishes glyphs into the currently inherited destination, including a parent's
+    // composition target. Its offscreen name does not make that shared image a text source to
+    // clear. Only BuildOwnerSourcePassOptions' private-source seed owns the clear; source
+    // initialization runs before glyph rasterization in that branch. Keep load/clear independent
+    // from the alpha-write policy, which still follows whether the destination is a composition
+    // attachment. Otherwise even an empty late text layout clears every image child already drawn
+    // into the parent's source.
     const auto debug_name =
         "TextPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
@@ -578,6 +598,7 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             rr,
             *primitive,
             offscreen_output,
+            m_desc.clear_before_draw,
             m_desc.alpha_write_policy,
             m_desc.sample_count,
             m_desc.resolve_msaa,
@@ -644,6 +665,7 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
                                           rr,
                                           *primitive,
                                           offscreen_output,
+                                          m_desc.clear_before_draw,
                                           m_desc.alpha_write_policy,
                                           sample_count,
                                           resolve_msaa,
@@ -737,6 +759,12 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     if (!m_desc.pipeline.handle || !m_desc.framebuffer) return;
     if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) return;
 
+    // Log the first actual draw of each layout revision when investigating disappearing text.
+    // Preparation alone cannot establish that an atlas, target and transform reached a draw.
+    static const bool trace_destination = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr;
+    const bool trace_revision = trace_destination &&
+        m_traced_atlas_version != primitive->atlas_version;
+
     if (primitive->atlas_version != m_loaded_atlas_version ||
         m_desc.page_textures.size() != primitive->glyph_pages.size()) {
         // Text atlas content is owned by the scene primitive, not by render-graph pass creation.
@@ -763,13 +791,24 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
 
     auto write_uniforms = [&](const std::array<float, 4>& color) {
         TextPassUniforms uniforms {};
+        bool transform_written = false;
         if (m_desc.scene != nullptr && m_desc.scene->shaderValueUpdater != nullptr && node != nullptr) {
             sprite_map_t sprites;
+            // The glyph source and its final effect draw share one authored text object.
+            // Local glyph rasterization selects its bridge projection and identity I through
+            // pass state, leaving live alignment, attachment and script transforms untouched.
+            const ShaderUniformOverrides overrides {
+                .camera_name = m_desc.camera_override,
+                .use_camera_override = !m_desc.camera_override.empty(),
+                .use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax,
+                .model_space = m_desc.model_space,
+            };
             m_desc.scene->shaderValueUpdater->UpdateUniforms(
                 node,
                 sprites,
-                [&uniforms](std::string_view name, wallpaper::ShaderValue value) {
+                [&uniforms, &transform_written](std::string_view name, wallpaper::ShaderValue value) {
                     if (name != wallpaper::G_MVP || value.size() < 16) return;
+                    transform_written = true;
                     Eigen::Matrix4f matrix = Eigen::Matrix4f::Identity();
                     for (int column = 0; column < 4; column++) {
                         for (int row = 0; row < 4; row++) {
@@ -781,9 +820,21 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                         }
                     }
                     WriteMatrixToUniform(uniforms, matrix);
-                });
+                }, &overrides);
         }
         std::copy(color.begin(), color.end(), uniforms.color);
+        if (trace_revision) {
+            const auto* matrix = uniforms.model_view_projection;
+            LOG_INFO("TextDestinationDraw: layer=%d name='%s' output='%s' extent=%ux%u "
+                     "atlas=%u pages=%zu transform=%s diagonal=[%.6f %.6f %.6f %.6f] "
+                     "translation=[%.6f %.6f %.6f] color=[%.3f %.3f %.3f %.3f]",
+                     m_desc.layer_id, node->Name().c_str(), m_desc.output.c_str(),
+                     m_desc.vk_output.extent.width, m_desc.vk_output.extent.height,
+                     primitive->atlas_version, primitive->glyph_pages.size(),
+                     transform_written ? "written" : "missing",
+                     matrix[0], matrix[5], matrix[10], matrix[15],
+                     matrix[12], matrix[13], matrix[14], color[0], color[1], color[2], color[3]);
+        }
         rr.dyn_buf->writeToBuf(m_desc.ubo_buf,
                                { reinterpret_cast<uint8_t*>(const_cast<TextPassUniforms*>(&uniforms)),
                                  sizeof(uniforms) });
@@ -836,6 +887,18 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         .clearValueCount = m_desc.resolve_msaa ? 2u : 1u,
         .pClearValues = clear_values.data(),
     };
+    if (trace_revision) {
+        // Empty layouts still begin a render pass. Include the attachment operation in the
+        // existing opt-in trace so clearing a shared composition is observable even when there
+        // are no glyph draws and therefore no TextDestinationDraw uniform log for this layer.
+        LOG_INFO("TextDestinationBegin: layer=%d name='%s' output='%s' image=%p "
+                 "extent=%ux%u clear=%s atlas=%u pages=%zu opaque-background=%s",
+                 m_desc.layer_id, node->Name().c_str(), m_desc.output.c_str(),
+                 reinterpret_cast<void*>(m_desc.vk_output.handle), output_extent.width,
+                 output_extent.height, m_desc.clear_before_draw ? "true" : "false",
+                 primitive->atlas_version, primitive->glyph_pages.size(),
+                 primitive->object.opaquebackground ? "true" : "false");
+    }
     rr.command.BeginRenderPass(begin_info, VK_SUBPASS_CONTENTS_INLINE);
     rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
 
@@ -886,6 +949,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     }
 
     rr.command.EndRenderPass();
+    if (trace_revision) m_traced_atlas_version = primitive->atlas_version;
 
     if (m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
         m_desc.output == wallpaper::SpecTex_Default) {
