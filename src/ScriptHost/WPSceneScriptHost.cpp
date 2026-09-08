@@ -832,6 +832,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        floor() { return new Vec2(Math.floor(this.x), Math.floor(this.y)); }\n"
         << "        ceil() { return new Vec2(Math.ceil(this.x), Math.ceil(this.y)); }\n"
         << "        toString() { return `${this.x} ${this.y}`; }\n"
+        << "        toConfigString() { return this.toString(); }\n"
         << "      });\n"
         << "  const Vec3 = (typeof globalThis.Vec3 === 'function')\n"
         << "    ? globalThis.Vec3\n"
@@ -885,6 +886,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        ceil() { return new Vec3(Math.ceil(this.x), Math.ceil(this.y), "
            "Math.ceil(this.z)); }\n"
         << "        toString() { return `${this.x} ${this.y} ${this.z}`; }\n"
+        << "        toConfigString() { return this.toString(); }\n"
         << "      });\n"
         << "  // The native host normally seeds these cursor vectors before any script runs, but "
            "some\n"
@@ -1366,22 +1368,26 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    }\n"
         << "    return handle;\n"
         << "  }\n"
-        << "  function normalizeCreateLayerConfig(value, topLevel = false) {\n"
-        << "    if (value === null || value === undefined) return value;\n"
-        << "    if (topLevel && typeof value === 'string') return "
-           "createLayerAssetHandle(value);\n"
-        << "    if (typeof value !== 'object') return value;\n"
-        << "    if ('__nodeId' in value) return value.__nodeId;\n"
-        << "    if (Array.isArray(value)) return value.map((item) => "
-           "normalizeCreateLayerConfig(item, false));\n"
-        << "    const keys = Object.keys(value);\n"
-        << "    if (keys.length === 1 && keys[0] === 'file' && typeof value.file === 'string') {\n"
-        << "      return topLevel ? createLayerAssetHandle(value.file) : value.file;\n"
-        << "    }\n"
-        << "    const normalized = {};\n"
-        << "    for (const [key, entry] of Object.entries(value)) {\n"
-        << "      normalized[key] = normalizeCreateLayerConfig(entry, false);\n"
-        << "    }\n"
+        // Keep value prototypes alive until JSON serialization consumes their conversion hooks.
+        // JSON.stringify calls toJSON before the replacer, which then invokes toConfigString on
+        // that result with its original receiver. Copying enumerable fields first discards
+        // inherited hooks and turns vector or material values into unrelated JSON objects.
+        // The native materializer owns nested asset handles; the outer handle still carries
+        // this script's workshop context when it names an imported asset.
+        << "  function normalizeCreateLayerConfig(value) {\n"
+        << "    if (typeof value === 'string') return createLayerAssetHandle(value);\n"
+        << "    if (value === null || typeof value !== 'object') return undefined;\n"
+        << "    const serialized = JSON.stringify(value, (_key, entry) => {\n"
+        << "      if (entry && entry.toConfigString) return entry.toConfigString();\n"
+        << "      return entry;\n"
+        << "    });\n"
+        << "    if (serialized === undefined) return undefined;\n"
+        << "    const normalized = JSON.parse(serialized);\n"
+        << "    if (normalized === null || typeof normalized !== 'object' || "
+           "Array.isArray(normalized)) return undefined;\n"
+        << "    const keys = Object.keys(normalized);\n"
+        << "    if (keys.length === 1 && keys[0] === 'file' && "
+           "typeof normalized.file === 'string') return createLayerAssetHandle(normalized.file);\n"
         << "    return normalized;\n"
         << "  }\n"
         << "  const __sceneUpdateCallbacks = [];\n"
@@ -1413,7 +1419,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    },\n"
         << "    createLayer(configuration) {\n"
         << "      const layerId = "
-           "__native.createSceneLayer(normalizeCreateLayerConfig(configuration, true));\n"
+           "__native.createSceneLayer(normalizeCreateLayerConfig(configuration));\n"
         << "      return layerId > 0 ? createLayerProxy(layerId) : undefined;\n"
         << "    },\n"
         << "    sortLayer(layer, index) {\n"
@@ -8478,11 +8484,12 @@ bool WPSceneScriptHost::RegisterPropertyScript(WPSceneScriptRegistration registr
     instance->registration  = std::move(registration);
     instance->current_value = instance->registration.setting.value;
     m_impl->instances.push_back(std::move(instance));
+    auto& registered_instance = *m_impl->instances.back();
 
     // Sprite timelines still begin when their script is registered. Resolve the current resource
     // here without retaining its drawing node in the script descriptor; material scripts can target
     // an authored effect pass or a model chunk rather than the owner's base source material.
-    const auto& target = m_impl->instances.back()->registration;
+    const auto& target = registered_instance.registration;
     if (target.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
         auto prepare = [&](SceneMaterial& material, SceneNode* node) {
             if (&material == target.material) EnsureTextureAnimationStatesForNode(m_impl, node);
@@ -8497,9 +8504,12 @@ bool WPSceneScriptHost::RegisterPropertyScript(WPSceneScriptRegistration registr
         EnsureTextureAnimationStatesForNode(m_impl, FindNodeById(m_impl, target.object_id));
     }
 
-    if (m_impl->initialized) {
-        InitializeScriptInstance(m_impl, *m_impl->instances.back());
-        RunScriptInstanceInit(m_impl, *m_impl->instances.back());
+    if (m_impl->initialized || m_impl->initializing) {
+        // Creating an owner from another script's module or init callback still requires a
+        // complete instance before createLayer returns. Retain this particular instance across
+        // compilation: its module can itself append instances, changing the registry's tail.
+        InitializeScriptInstance(m_impl, registered_instance);
+        RunScriptInstanceInit(m_impl, registered_instance);
     }
 
     return true;
@@ -8535,9 +8545,14 @@ bool WPSceneScriptHost::RegisterPropertyAnimation(WPSceneScriptRegistration regi
 void WPSceneScriptHost::Initialize() {
     if (! Ready()) return;
 
+    // Keep bootstrap value semantics until its final user-property dispatch, while allowing
+    // nested creation to initialize its new scripts immediately. The growing registry is
+    // stable; instances compiled by nested creation must not evaluate their modules twice
+    // when the outer bootstrap walk subsequently reaches them.
+    m_impl->initializing = true;
     for (const auto& instance_ptr : m_impl->instances) {
         auto& instance = *instance_ptr;
-        InitializeScriptInstance(m_impl, instance);
+        if (JS_IsUndefined(instance.exports)) InitializeScriptInstance(m_impl, instance);
     }
 
     for (const auto& instance_ptr : m_impl->instances) {
@@ -8545,6 +8560,7 @@ void WPSceneScriptHost::Initialize() {
         RunScriptInstanceInit(m_impl, instance);
     }
 
+    m_impl->initializing = false;
     m_impl->initialized = true;
     ApplyGeneralSettings(m_impl->general_settings, true);
     ApplyUserProperties(m_impl->user_properties, true);

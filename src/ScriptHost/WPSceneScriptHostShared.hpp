@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -150,10 +151,14 @@ struct WPSceneScriptHost::Opaque {
     uint64_t                                     next_timer_id { 1 };
     double                                       runtime_seconds { 0.0 };
     bool                                         initialized { false };
+    bool                                         initializing { false };
     bool                                         applying_user_properties { false };
     std::vector<WPSceneScriptRegistration>       property_bindings;
     std::vector<PropertyAnimationInstance>       property_animations;
-    std::vector<std::unique_ptr<ScriptInstance>> instances;
+    // A callback may create more scripted owners while a host dispatch is traversing this
+    // registry. Appending must preserve both the active iterator and every instance address;
+    // owner destruction is drained separately before frame dispatch begins.
+    std::list<std::unique_ptr<ScriptInstance>>   instances;
     std::vector<ScriptTimer>                     timers;
     std::vector<AudioBufferBinding>              audio_buffers;
     ExternalSceneAudioState                      external_audio;

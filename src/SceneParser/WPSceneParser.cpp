@@ -4015,6 +4015,12 @@ bool wallpaper::CreateDynamicSceneLayer(
         normalized_object_json["id"] = layer_id;
     }
 
+    // Material parsing registers its own user values, timelines and scripts before the owner's
+    // property scan. Capture the full creation range here so the host receives every descriptor
+    // produced by materialization, including effect passes and model chunks.
+    const auto binding_start            = scene.bindingRegistrations.size();
+    const auto property_animation_start = scene.propertyAnimationRegistrations.size();
+    const auto script_start             = scene.scriptRegistrations.size();
     if (! ParseDynamicSceneObject(context, normalized_object_json, user_properties, &layer_id)) {
         return false;
     }
@@ -4025,9 +4031,6 @@ bool wallpaper::CreateDynamicSceneLayer(
     const bool has_sound_runtime = scene.GetLayerSoundHandle(layer_id).has_value();
     if (layer_node == nullptr && ! has_sound_runtime) return false;
 
-    const auto binding_start            = scene.bindingRegistrations.size();
-    const auto property_animation_start = scene.propertyAnimationRegistrations.size();
-    const auto script_start             = scene.scriptRegistrations.size();
     scene.layerOrder.push_back(layer_id);
     scene.SetLayerNode(layer_id, layer_node);
     scene.SetLayerInitialConfigJson(layer_id, normalized_object_json.dump());
