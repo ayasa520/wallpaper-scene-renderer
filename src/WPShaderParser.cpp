@@ -18,6 +18,7 @@
 #include <array>
 #include <charconv>
 #include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -32,7 +33,7 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 #define SHADER_SRC_DIR "prepared-shaders02"
 #define SHADER_SRC_SUFFIX "wpsrc"
 
-static constexpr int              kPreShaderMetadataVersion { 2 };
+static constexpr int              kPreShaderMetadataVersion { 3 };
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
     // For a single-sample back buffer, texSample2DBackBuffer expands to texSample2D(s, (u)). The
@@ -1691,6 +1692,25 @@ inline bool TextureSlotCanEnableCombo(i32 index, idx texcount,
     return index < texcount && texture_index < texinfos.size() && texinfos[texture_index].enabled;
 }
 
+ShaderValue ReadMaterialMetadataDefault(const nlohmann::json& metadata, size_t components) {
+    // Shader defaults first become descriptor text, unlike the raw authored constant JSON.
+    // A numeric default therefore supplies one string component: vec3 default 0.7 means
+    // (0.7, 0, 0), not the broadcast (0.7, 0.7, 0.7) used by an authored numeric constant.
+    // An omitted default leaves empty text, hence a zero value with the declared width.
+    // Retain that width even when the project supplies no constant: live material proxies
+    // must read/write a vector rather than infer a scalar from the default's token count.
+    std::array<float, 4> values {};
+    const auto value = metadata.find("default");
+    if (value != metadata.end()) {
+        if (value->is_string()) {
+            ReadJsonFloatVectorValue(*value, std::span(values).first(components));
+        } else if (value->is_number()) {
+            values[0] = value->get<float>();
+        }
+    }
+    return ShaderValue(std::span(values).first(components));
+}
+
 inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                           const std::vector<WPShaderTexInfo>& texinfos) {
     auto& combos       = pWPShaderInfo->combos;
@@ -1731,8 +1751,8 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                     std::string material;
                     GET_JSON_NAME_VALUE_NOWARN(sv_json, "material", material);
                     if (! material.empty()) wpAliasDict[material] = defines.back();
-                    if (const auto declaration = TryParseDeclLine(line, 0, { "uniform" });
-                        declaration.has_value() && ! IsSamplerType(declaration->type)) {
+                    const auto declaration = TryParseDeclLine(line, 0, { "uniform" });
+                    if (declaration.has_value() && ! IsSamplerType(declaration->type)) {
                         pWPShaderInfo->materialTypes[declaration->name] = declaration->type;
                     }
 
@@ -1766,7 +1786,18 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                         }
 
                     } else {
-                        if (sv_json.contains("default")) {
+                        if (! material.empty() && declaration.has_value() &&
+                            ! IsSamplerType(declaration->type)) {
+                            const auto components =
+                                pWPShaderInfo->MaterialValueComponents(declaration->name);
+                            shadervalues[name] = ReadMaterialMetadataDefault(sv_json, components);
+                            if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+                                LOG_INFO("SceneMaterialDefaultType: material-value='%s' uniform='%s' "
+                                         "components=%zu metadata=%s",
+                                         material.c_str(), name.c_str(), components,
+                                         sv_json.dump().c_str());
+                            }
+                        } else if (sv_json.contains("default")) {
                             auto        value = sv_json.at("default");
                             ShaderValue sv;
                             name = defines.back();
@@ -2206,9 +2237,9 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
 inline std::string GenPreShaderSha1(std::string_view expanded_src,
                                     std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    // Declared material types are part of the persisted metadata contract. Use a new key as
-    // well as a new record version so old entries are misses, never amended after a cache hit.
-    out << "pre-shader-v5-material-declared-types\n";
+    // Descriptor defaults now retain their declared width, including empty defaults. Both the
+    // key and record version change: prior token-count values are misses, never repaired on a hit.
+    out << "pre-shader-v6-material-descriptor-defaults\n";
     out << utils::genSha1(expanded_src) << '\n';
     for (const auto& texinfo : texinfos) {
         out << static_cast<int>(texinfo.enabled);
@@ -2759,6 +2790,19 @@ inline const char* DxcStageLogName(ShaderType stage) {
 }
 
 } // namespace
+
+size_t WPShaderInfo::MaterialValueComponents(std::string_view uniform_name) const {
+    const auto declaration = materialTypes.find(std::string(uniform_name));
+    if (declaration == materialTypes.end()) return 0;
+
+    // Defaults and authored bindings consume the same declaration. Neither may choose a
+    // property width from the current JSON/default value or from its populated components.
+    const auto& type = declaration->second;
+    if (type.find("vec2") != std::string::npos || type == "float2") return 2;
+    if (type.find("vec3") != std::string::npos || type == "float3") return 3;
+    if (type.find("vec4") != std::string::npos || type == "float4") return 4;
+    return 1;
+}
 
 std::string WPShaderParser::PreShaderSrc(fs::VFS& vfs, const std::string& src,
                                          WPShaderInfo*                       pWPShaderInfo,

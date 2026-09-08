@@ -1738,19 +1738,13 @@ std::string ResolveMaterialValueUniformName(const WPShaderInfo& info,
 
 std::optional<WPDynamicValue::Type>
 DeclaredMaterialValueType(const WPShaderInfo& info, const std::string& uniform_name) {
-    const auto declaration = info.materialTypes.find(uniform_name);
-    if (declaration == info.materialTypes.end()) return std::nullopt;
-
-    // Material descriptors derive their vector width from the shader declaration, not from
-    // defaults or authored JSON. The ordinary non-vector declaration selects a float property.
-    const auto& type = declaration->second;
-    if (type.find("vec2") != std::string::npos || type == "float2")
-        return WPDynamicValue::Type::Float2;
-    if (type.find("vec3") != std::string::npos || type == "float3")
-        return WPDynamicValue::Type::Float3;
-    if (type.find("vec4") != std::string::npos || type == "float4")
-        return WPDynamicValue::Type::Float4;
-    return WPDynamicValue::Type::Float;
+    switch (info.MaterialValueComponents(uniform_name)) {
+    case 1: return WPDynamicValue::Type::Float;
+    case 2: return WPDynamicValue::Type::Float2;
+    case 3: return WPDynamicValue::Type::Float3;
+    case 4: return WPDynamicValue::Type::Float4;
+    default: return std::nullopt;
+    }
 }
 
 template<size_t N>
