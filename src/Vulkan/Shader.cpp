@@ -171,6 +171,19 @@ bool wallpaper::vulkan::GenReflect(std::span<const std::vector<uint>> codes,
 
             auto bind_name = ReflectedDescriptorName(b);
 
+            // Gather member usage before coalescing a buffer shared by multiple stages. A
+            // control can be unused in the first stage and consumed by a later one; merging
+            // only descriptor stage flags would lose that control. Keep the complete buffer
+            // layout below unchanged, including offsets and unused members needed for uploads.
+            if (b.descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                for (u32 i = 0; i < b.block.member_count; ++i) {
+                    const auto& member = b.block.members[i];
+                    if ((member.flags & SPV_REFLECT_VARIABLE_FLAGS_UNUSED) == 0) {
+                        ref.accessed_uniforms.insert(StripHlslStructPrefix(member.name));
+                    }
+                }
+            }
+
             if (exists(ref.binding_map, bind_name)) {
                 auto& bind = ref.binding_map[bind_name];
                 bind.stageFlags |= stage;

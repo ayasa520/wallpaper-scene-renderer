@@ -779,6 +779,40 @@ void RegisterSceneTextureFromHeader(Scene& scene, const std::string& name,
     scene.textures[name] = std::move(texture);
 }
 
+bool SelectCompiledMaterialDescriptors(SceneMaterialCustomShader& material_shader,
+                                        WPShaderInfo& info) {
+    Set<std::string> accessed_uniforms;
+    if (!WPShaderParser::ReflectUniforms(material_shader.shader->codes, accessed_uniforms)) {
+        return false;
+    }
+
+    // Raw metadata describes every authored combo. Publish a separate runtime view containing
+    // only controls consumed by at least one compiled stage, without pruning the raw aliases,
+    // types or defaults that the metadata cache stores. Remove inactive material defaults and
+    // base constants together: either map alone would otherwise make the script proxy report
+    // a property that the selected program does not own. Unrelated engine defaults stay intact.
+    info.activeMaterialAliases.clear();
+    auto& defaults = material_shader.shader->default_uniforms;
+    defaults       = info.svs;
+    const bool trace = std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr;
+    for (const auto& [material_name, uniform_name] : info.alias) {
+        const bool active = accessed_uniforms.contains(uniform_name);
+        if (active) {
+            info.activeMaterialAliases.emplace(material_name, uniform_name);
+        } else {
+            defaults.erase(uniform_name);
+            material_shader.constValues.erase(uniform_name);
+        }
+        if (trace) {
+            LOG_INFO("SceneMaterialDescriptorUsage: shader='%s' material-value='%s' uniform='%s' "
+                     "active=%s",
+                     material_shader.shader->name.c_str(), material_name.c_str(),
+                     uniform_name.c_str(), active ? "true" : "false");
+        }
+    }
+    return true;
+}
+
 // LoadMaterial is shared with WPSceneParserPostFx.cpp (declared in
 // WPSceneParserShared.hpp), so it needs external linkage; the anonymous
 // namespace resumes right after it.
@@ -951,8 +985,6 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         unit.src = WPShaderParser::PreShaderSrc(vfs, unit.src, pWPShaderInfo, texinfos);
     }
 
-    shader->default_uniforms = pWPShaderInfo->svs;
-
     for (const auto& el : wpmat.combos) {
         pWPShaderInfo->combos[el.first] = std::to_string(el.second);
     }
@@ -1079,13 +1111,15 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     for (const auto& el : pWPShaderInfo->baseConstSvs) {
         materialShader.constValues[el.first] = el.second;
     }
+    if (!SelectCompiledMaterialDescriptors(materialShader, *pWPShaderInfo)) {
+        return std::nullopt;
+    }
     material.customShader = materialShader;
     material.name         = wpmat.shader;
-    // Store the material-name to GLSL-uniform alias table on the live SceneMaterial. Runtime WE
-    // scripts can then write properties such as `thisObject.getMaterial(0).raythreshold` and have
-    // the script bridge resolve them to the actual shader uniform (`g_Threshold`) that this parse
-    // pass discovered from the shader metadata comments.
-    material.uniformAliases = pWPShaderInfo->alias;
+    // Runtime proxies, cold constants and dynamic registrations share the selected descriptor
+    // view. A metadata declaration excluded by the compiled program must not recreate a member
+    // through an authored script, animation or user binding after material construction.
+    material.uniformAliases = pWPShaderInfo->activeMaterialAliases;
 
     return MaterialLoadResult { .geometry_stage_loaded = geometry_stage_loaded };
 }
@@ -1583,13 +1617,14 @@ struct ResolvedUserShaderValueBinding {
 const std::string* ResolveMaterialValueUniformName(const WPShaderInfo& info,
                                                   const std::string& material_value_name) {
     // Material names are an authored namespace, distinct from shader uniform symbols. Only an
-    // explicit metadata entry selects a target; similar labels must not acquire that entry's
+    // active metadata entry selects a target; similar labels must not acquire that entry's
     // defaults or live bindings by changing case, punctuation, prefixes or parentheses.
-    const auto alias = info.alias.find(material_value_name);
-    if (alias != info.alias.end()) return &alias->second;
+    const auto alias = info.activeMaterialAliases.find(material_value_name);
+    if (alias != info.activeMaterialAliases.end()) return &alias->second;
     if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
-        LOG_INFO("SceneMaterialNameLookup: material-value='%s' result=unknown-material-name",
-                 material_value_name.c_str());
+        LOG_INFO("SceneMaterialNameLookup: material-value='%s' result=%s",
+                 material_value_name.c_str(), info.alias.contains(material_value_name)
+                     ? "inactive-material-name" : "unknown-material-name");
     }
     return nullptr;
 }
@@ -1684,10 +1719,10 @@ ResolveUserShaderValueBindings(const wpscene::WPMaterial& wpmat, const WPShaderI
     if (user_properties == nullptr) return bindings;
 
     bindings.reserve(wpmat.usershadervalues.size());
-    // Each declared material name consumes at most one shorthand {user: material} entry.
-    // Walking declarations also keeps unknown names and uniform-symbol spellings out of both
-    // cold writes and the persistent binding registry, without inventing another target name.
-    for (const auto& [material_value_name, gl_uniform_name] : info.alias) {
+    // Each active material name consumes at most one shorthand {user: material} entry.
+    // Walking selected descriptors also keeps inactive/unknown names and uniform-symbol
+    // spellings out of cold writes and the persistent registry without inventing a target.
+    for (const auto& [material_value_name, gl_uniform_name] : info.activeMaterialAliases) {
         const auto* user_property_name = FindMaterialUserPropertyName(wpmat, material_value_name);
         if (user_property_name == nullptr) continue;
         const auto* property = LookupUserPropertyShaderValue(user_properties, *user_property_name);

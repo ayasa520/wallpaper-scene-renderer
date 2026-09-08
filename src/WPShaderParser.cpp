@@ -2863,6 +2863,18 @@ bool WPShaderParser::ReflectTextureSlots(std::span<const ShaderCode> codes, Set<
     return true;
 }
 
+bool WPShaderParser::ReflectUniforms(std::span<const ShaderCode> codes,
+                                    Set<std::string>& uniforms) {
+    // Membership comes from the returned executable on both compilation and cache-hit paths.
+    // This derived query never changes the raw metadata or persisted shader records.
+    vulkan::ShaderReflected reflected;
+    std::vector<vulkan::Uni_ShaderSpv> stages;
+    if (!vulkan::GenReflect(codes, stages, reflected)) return false;
+
+    uniforms = std::move(reflected.accessed_uniforms);
+    return true;
+}
+
 bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderUnit> units,
                                   std::vector<ShaderCode>& codes, fs::VFS& vfs,
                                   WPShaderInfo* shader_info, std::span<const WPShaderTexInfo> texs) {

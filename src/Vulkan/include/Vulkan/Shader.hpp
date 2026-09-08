@@ -25,6 +25,10 @@ struct ShaderReflected {
 
     Map<std::string, VkDescriptorSetLayoutBinding> binding_map;
 
+    // Union of uniform-member accesses across stages, independent of the buffer layout.
+    // Unused members still occupy their reflected offsets but do not declare live controls.
+    Set<std::string> accessed_uniforms;
+
     struct Input {
         uint     location;
         VkFormat format;

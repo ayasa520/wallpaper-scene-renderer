@@ -24,6 +24,9 @@ struct WPShaderInfo {
     ShaderValueMap   svs;
     ShaderValueMap   baseConstSvs;
     WPAliasValueDict alias;
+    // Derived from the selected compiled program, not serialized pre-shader metadata. Raw
+    // aliases/defaults remain reusable across combos; only this view publishes live controls.
+    WPAliasValueDict activeMaterialAliases;
     // Material descriptors retain their declared shader type independently of default values.
     // A scalar-authored vec3 still owns three script/timeline channels, including on cache hits.
     Map<std::string, std::string> materialTypes;
@@ -70,5 +73,8 @@ public:
     // Inspect compiled descriptor usage, including slots introduced by shader defaults.
     // Preprocessor declarations alone do not establish that a texture survives optimization.
     static bool ReflectTextureSlots(std::span<const ShaderCode>, Set<uint>& slots);
+
+    // Query actual uniform-member use in any compiled stage without changing buffer layouts.
+    static bool ReflectUniforms(std::span<const ShaderCode>, Set<std::string>& uniforms);
 };
 } // namespace wallpaper
