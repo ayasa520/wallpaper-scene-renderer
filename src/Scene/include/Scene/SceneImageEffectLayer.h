@@ -92,14 +92,15 @@ struct SceneImageEffect {
     std::list<SceneImageEffectNode> nodes;
 
     using FboBindings = std::unordered_map<std::string, std::string>;
+    // A frame may invoke one owner in both the reflection and ordinary walks. Resolve those
+    // invocations in order against one frame-local table, then commit the final table only after
+    // submission. Retaining the effect also keeps callback ownership valid across graph rebuilds.
+    using FrameFboBindings = std::unordered_map<std::shared_ptr<SceneImageEffect>, FboBindings>;
     void RegisterFbo(const std::string& target) { m_fbo_bindings.emplace(target, target); }
     bool IsDeclaredFbo(const std::string& target) const {
         return m_fbo_bindings.contains(target);
     }
     const FboBindings& CurrentFboBindings() const { return m_fbo_bindings; }
-    const FboBindings& NextFboBindings() const { return m_next_fbo_bindings; }
-    void SetNextFboBindings(FboBindings bindings) { m_next_fbo_bindings = std::move(bindings); }
-    bool HasPendingFboSwap() const { return m_fbo_bindings != m_next_fbo_bindings; }
     bool CommitFboBindings(const FboBindings& bindings);
     static void SwapFboBindings(FboBindings&, const std::string& source,
                                 const std::string& target);
@@ -128,7 +129,6 @@ private:
     // skipped frames must not advance feedback history. Swap commands retain their fixed
     // authored operands while non-swap references use the current table at each boundary.
     FboBindings m_fbo_bindings;
-    FboBindings m_next_fbo_bindings;
     int32_t     m_owner_layer_id { 0 };
     int32_t     m_effect_id { 0 };
     uint32_t    m_effect_index { 0 };
@@ -233,16 +233,6 @@ public:
     }
     const std::string& BridgeCameraName() const { return m_bridge_camera_name; }
 
-    // Effect snapshots retain the camera and destination that were active on entry to the owner,
-    // before its private source draw. An empty name selects scene camera/destination state; a
-    // composition name selects its centered projection and identity destination. The snapshot
-    // replaces incoming I with the raw owner matrix, so this context must not use the publication
-    // draw's camera or the composition camera's attached inverse-owner transform.
-    void SetEffectSnapshotCamera(std::string camera_name) {
-        m_effect_snapshot_camera = std::move(camera_name);
-    }
-    const std::string& EffectSnapshotCamera() const { return m_effect_snapshot_camera; }
-
     // Names of the Scene::cameras entries this bridge materialized. These projection resources
     // belong to the bridge; geometry updates and layer destroy resolve them through the owner's
     // bridge instead of a Scene-level per-layer registry.
@@ -273,7 +263,8 @@ public:
     void        SyncResolvedOutputMesh();
 
     void ResolveEffect(const SceneMesh& defualt_mesh, std::string_view effect_cam,
-                       std::string_view final_output);
+                       std::string_view final_output,
+                       SceneImageEffect::FrameFboBindings& frame_bindings, bool admitted);
 
 private:
     struct FinalCompositeState {
@@ -318,7 +309,6 @@ private:
         FinalOutputCapability::PrivateThenPublish
     };
     std::string m_bridge_camera_name;
-    std::string m_effect_snapshot_camera;
     std::vector<std::string> m_runtime_camera_names;
     std::vector<std::string> m_runtime_render_target_names;
     // Each authored FBO record retains its sizing rule even when its name is shared with
@@ -343,13 +333,16 @@ private:
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
 
     void ResolveEffectMatrixPhases(bool keep_final_private);
-    void ResolveShapeEffect(const SceneMesh& default_mesh, std::string_view final_output);
+    void ResolveShapeEffect(const SceneMesh& default_mesh, std::string_view final_output,
+                            SceneImageEffect::FrameFboBindings& frame_bindings, bool admitted);
     SceneImageEffectNode* ResolveEffectPingPongChain(const SceneMesh& default_mesh,
                                                      SceneNode& default_node,
                                                      std::string_view effect_cam,
                                                      std::string_view final_output,
                                                      std::string_view& ppong_a,
-                                                     std::string_view& ppong_b);
+                                                     std::string_view& ppong_b,
+                                                     SceneImageEffect::FrameFboBindings& frame_bindings,
+                                                     bool admitted);
     FinalOutputResolveDecision ResolveFinalOutputDecision(
         FinalOutputCapability output_capability);
     void ResolveFinalComposite(const SceneMesh& default_mesh,

@@ -15,6 +15,14 @@
 
 namespace wallpaper
 {
+bool ReadJsonLiteralBoolean(const nlohmann::json& json, std::string_view name,
+                            bool default_value) {
+    // Literal object flags do not register dynamic properties or coerce strings/numbers.
+    // An absent or differently typed entry retains the field's schema default.
+    const auto value = json.find(name);
+    return value != json.end() && value->is_boolean() ? value->get<bool>() : default_value;
+}
+
 namespace
 {
 thread_local const UserPropertyMap* g_json_user_properties = nullptr;

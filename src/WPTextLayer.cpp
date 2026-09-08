@@ -2384,7 +2384,7 @@ TextLayerPropertyUpdateStrategy wallpaper::ResolveTextLayerPropertyUpdateStrateg
     const TextLayerRuntimeState& state,
     std::string_view             property_name) {
     (void)state;
-    if (property_name == "alpha" || property_name == "color" ||
+    if (property_name == "alpha" || property_name == "color" || property_name == "brightness" ||
         property_name == "backgroundcolor" || property_name == "backgroundbrightness") {
         return TextLayerPropertyUpdateStrategy::MaterialOnly;
     }
@@ -2396,6 +2396,7 @@ TextLayerPropertyUpdateStrategy wallpaper::ResolveTextLayerPropertyUpdateStrateg
 }
 
 bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
+    reflected = ReadJsonLiteralBoolean(json, "reflected", true);
     (void)vfs;
     GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
     GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
@@ -2408,6 +2409,7 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     ReadLiteralOrDynamicValue(json, "text", &text);
     ReadLiteralOrDynamicValue(json, "font", &font);
     ReadLiteralOrDynamicValue(json, "color", &color);
+    ReadLiteralOrDynamicValue(json, "brightness", &brightness);
     GET_JSON_NAME_VALUE_NOWARN(json, "colorBlendMode", colorBlendMode);
     ReadLiteralOrDynamicValue(json, "backgroundcolor", &backgroundcolor);
     ReadLiteralOrDynamicValue(json, "backgroundbrightness", &backgroundbrightness);
@@ -2461,6 +2463,7 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 bool wallpaper::HasTextLayerProperty(std::string_view property_name) {
     return property_name == "name" || property_name == "size" || property_name == "text" ||
            property_name == "font" || property_name == "color" || property_name == "alpha" ||
+           property_name == "brightness" ||
            property_name == "backgroundcolor" || property_name == "backgroundbrightness" ||
            property_name == "opaquebackground" ||
            property_name == "pointsize" || property_name == "padding" ||
@@ -2486,6 +2489,8 @@ std::optional<WPDynamicValue> wallpaper::ReadTextLayerProperty(const TextLayerRu
         result = WPDynamicValue(object.color);
     } else if (property_name == "alpha") {
         result = WPDynamicValue(object.alpha);
+    } else if (property_name == "brightness") {
+        result = WPDynamicValue(object.brightness);
     } else if (property_name == "backgroundcolor") {
         result = WPDynamicValue(object.backgroundcolor);
     } else if (property_name == "backgroundbrightness") {
@@ -2546,6 +2551,8 @@ bool wallpaper::ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
         applied = value.tryGet(&object.color);
     } else if (property_name == "alpha") {
         applied = value.tryGet(&object.alpha);
+    } else if (property_name == "brightness") {
+        applied = value.tryGet(&object.brightness);
     } else if (property_name == "backgroundcolor") {
         applied = value.tryGet(&object.backgroundcolor);
     } else if (property_name == "backgroundbrightness") {

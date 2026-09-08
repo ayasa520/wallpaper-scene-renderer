@@ -6,6 +6,7 @@
 #include "Scene/Scene.h"
 #include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SceneNode.h"
+#include "Scene/SceneTextPrimitive.h"
 #include "SpriteAnimation.hpp"
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
@@ -64,6 +65,17 @@ struct MeshBounds2D {
 Matrix4d ApplyMeshGeometryTransform(const Matrix4d& model, const SceneMesh* mesh) {
     if (mesh == nullptr) return model;
     return model * mesh->GeometryTransform().matrix().cast<double>();
+}
+
+Matrix4d DestinationViewProjection(const SceneCamera& camera, bool reflected) {
+    if (!reflected) return camera.GetViewProjectionMatrix();
+    // The mirror belongs to the incoming destination, after the view and before object
+    // placement. Invert projection Y for the top-down framebuffer convention while leaving
+    // the authored model matrix unchanged. Private projections select the ordinary branch.
+    Matrix4d projection = camera.GetProjectionMatrix();
+    projection(1, 1) = -projection(1, 1);
+    return projection * camera.GetViewMatrix() *
+        Affine3d(Eigen::Scaling(1.0, -1.0, 1.0)).matrix();
 }
 
 std::array<float, 12> NormalizedModelBasis(const Matrix4d& model) {
@@ -298,7 +310,8 @@ Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
 }
 
 WPShaderValueUpdater::EffectProjectionSnapshot
-WPShaderValueUpdater::ResolveEffectProjectionSnapshot(const SceneImageEffectLayer& layer) {
+WPShaderValueUpdater::ResolveEffectProjectionSnapshot(const SceneImageEffectLayer& layer,
+    std::string_view camera_name, bool reflected) {
     if (layer.UsesShapeDraw()) {
         // Shape's direct callback never enters the image destination operation that captures
         // owner I and placement MVP. Its stored effect matrices therefore retain the
@@ -308,9 +321,8 @@ WPShaderValueUpdater::ResolveEffectProjectionSnapshot(const SceneImageEffectLaye
         return { Matrix4d::Identity(), Matrix4d::Identity(),
                  Matrix4d::Identity(), Matrix4d::Identity() };
     }
-    const auto& camera_name = layer.EffectSnapshotCamera();
     const bool composition = !camera_name.empty();
-    const auto* camera = composition ? m_scene->cameras.at(camera_name).get()
+    const auto* camera = composition ? m_scene->cameras.at(std::string(camera_name)).get()
                                      : m_scene->activeCamera;
 
     // Snapshot I is replaced by the raw owner matrix before private raster state is installed.
@@ -335,7 +347,7 @@ WPShaderValueUpdater::ResolveEffectProjectionSnapshot(const SceneImageEffectLaye
         snapshot.view_projection = camera->GetProjectionMatrix();
         snapshot.incoming_view_projection = snapshot.view_projection;
     } else {
-        snapshot.view_projection = camera->GetViewProjectionMatrix();
+        snapshot.view_projection = DestinationViewProjection(*camera, reflected);
         const Vector3d offset = resolver.ResolveParallaxOffset(owner_draw, camera).cast<double>();
         snapshot.incoming_view_projection = snapshot.view_projection *
             Affine3d(Translation3d(offset)).matrix();
@@ -353,6 +365,9 @@ void WPShaderValueUpdater::MouseInput(double x, double y) {
 void WPShaderValueUpdater::InitUniforms(const SceneDraw& draw, const ExistsUniformOp& existsOp) {
     m_nodeUniformInfoMap[draw.DataKey()] = WPUniformInfo();
     auto& info                  = m_nodeUniformInfoMap[draw.DataKey()];
+    info.has_ALPHA              = existsOp("g_Alpha");
+    info.has_COLOR              = existsOp("g_Color");
+    info.has_COLOR4             = existsOp("g_Color4");
     info.has_MI                 = existsOp(G_MI);
     info.has_M                  = existsOp(G_M);
     info.has_AM                 = existsOp(G_AM);
@@ -432,6 +447,9 @@ void WPShaderValueUpdater::InitUniforms(const SceneDraw& draw, const ExistsUnifo
 void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& sprites,
                                           const UpdateUniformOp& updateOp,
                                           const ShaderUniformOverrides* overrides) {
+    const std::string effect_snapshot_camera = overrides != nullptr
+        ? std::string(overrides->effect_snapshot_camera) : std::string();
+    const bool reflection_snapshot = overrides != nullptr && overrides->reflection_snapshot;
     auto* pNode = draw.Node();
     const auto node_cam_name = ResolveEffectiveDrawCameraName(draw);
     const bool use_active_camera_for_uniforms =
@@ -498,6 +516,31 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
     assert(exists(m_nodeUniformInfoMap, draw.DataKey()));
     const auto& info = m_nodeUniformInfoMap[draw.DataKey()];
 
+    const auto* color_data = GetNodeData(draw.DataKey());
+    if (color_data != nullptr && color_data->text_color_owner != nullptr &&
+        (info.has_ALPHA || info.has_COLOR || info.has_COLOR4)) {
+        const auto& primitive = *color_data->text_color_owner->Text();
+        const auto color = primitive.ForegroundColor();
+        // These engine uniforms carry the current glyph source state through every authored
+        // material command. Write them after material controls have been populated, so an absent
+        // control cannot leave a zero color in the buffer. Resolve the owner on each submission
+        // because text shaping may replace the primitive without rebuilding these effect passes.
+        if (info.has_ALPHA) updateOp("g_Alpha", color[3]);
+        if (info.has_COLOR) {
+            updateOp("g_Color", std::array<float, 3> { color[0], color[1], color[2] });
+        }
+        if (info.has_COLOR4) updateOp("g_Color4", color);
+        if (std::getenv("WESCENE_TRACE_TEXT_COLOR") != nullptr) {
+            LOG_INFO("SceneTextEffectColor: frame=%llu layer=%d node='%s' reflection=%s "
+                     "rgba=[%.6f %.6f %.6f %.6f] brightness=%.6f uniforms=[%d %d %d]",
+                     static_cast<unsigned long long>(m_puppet_frame_serial),
+                     draw.LayerId(*m_scene), draw.Name().c_str(),
+                     overrides != nullptr && overrides->reflection_pass ? "true" : "false",
+                     color[0], color[1], color[2], color[3], primitive.object.brightness,
+                     info.has_ALPHA, info.has_COLOR, info.has_COLOR4);
+        }
+    }
+
     bool hasNodeData = exists(m_nodeDataMap, draw.DataKey());
     const auto* layer = hasNodeData
         ? m_nodeDataMap.at(draw.DataKey()).effect_layer_projection.layer : nullptr;
@@ -535,17 +578,21 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
     }
 
     if (material != nullptr) {
-        const auto tex_count = std::min(material->textures.size(), info.texs.size());
+        const auto* bound_textures = overrides != nullptr && overrides->textures.has_value()
+            ? &*overrides->textures : nullptr;
+        const auto tex_count = std::min(bound_textures != nullptr
+            ? bound_textures->size() : material->textures.size(), info.texs.size());
         for (size_t i = 0; i < tex_count; i++) {
             const auto& texture_uniforms = info.texs[i];
             if (!texture_uniforms.has_resolution && !texture_uniforms.has_texel &&
                 !texture_uniforms.has_mipmap) continue;
-            const auto& name = material->Texture(i);
+            const auto& name = bound_textures != nullptr
+                ? (*bound_textures)[i] : material->Texture(i);
             if (name.empty()) continue;
             // Effect chains can select a new destination after text re-layout or a pass swap.
-            // Resolve dimensions from the material's current texture slot, just as descriptor
-            // binding does. A separate parse-time list retains the previous interned image and
-            // makes blur offsets and sampling bounds disagree with the image actually sampled.
+            // Resolve dimensions from this invocation's descriptor bindings. Another invocation
+            // can use the same live material with a different FBO permutation; neither its
+            // texture names nor a parse-time list describe the image sampled by this draw.
             const auto target_it = m_scene->renderTargets.find(name);
             if (target_it != m_scene->renderTargets.end()) {
                 const auto& target = target_it->second;
@@ -588,20 +635,10 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
     bool reqETVP  = info.has_ETVP;
     bool reqETVPI = info.has_ETVPI;
 
-    Matrix4d viewProTrans = camera->GetViewProjectionMatrix();
+    Matrix4d viewProTrans = DestinationViewProjection(*camera,
+        overrides != nullptr && overrides->reflection_raster);
     const auto camera_node = camera->GetAttachedNode();
     const bool reflection_pass = overrides != nullptr && overrides->reflection_pass;
-    if (reflection_pass) {
-        // The compositor's destination stack is separate from the owner's I matrix. Insert the
-        // Y=0 reflection after the incoming view, before the authored model, and apply the
-        // top-down projection convention. In particular, reflecting a local chunk scale leaves
-        // the owner's translation on the wrong side of the floor and changes M/normal/lighting
-        // uniforms incorrectly.
-        Matrix4d projection = camera->GetProjectionMatrix();
-        projection(1, 1) = -projection(1, 1);
-        const Matrix4d reflection = Affine3d(Eigen::Scaling(1.0, -1.0, 1.0)).matrix();
-        viewProTrans = projection * camera->GetViewMatrix() * reflection;
-    }
 
     if (reqM || reqAM || reqMVP || reqLMM || reqEM || reqEMVP || reqEMVPI || reqMI ||
         reqMVPI || reqETVP || reqETVPI || info.has_VP || info.has_NORMAL_MODEL_MATRIX) {
@@ -766,8 +803,9 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             Matrix4d effectMvp = viewProTrans * modelTrans;
             Matrix4d etvpTrans;
             if (layer != nullptr) {
-                const auto snapshot = ResolveEffectProjectionSnapshot(*layer);
-                const auto& projectionCameraName = layer->EffectSnapshotCamera();
+                const auto snapshot = ResolveEffectProjectionSnapshot(*layer,
+                    effect_snapshot_camera, reflection_snapshot);
+                const auto& projectionCameraName = effect_snapshot_camera;
                 // All effect matrices come from the owner's I and placement snapshots, before
                 // private passes substitute their local camera and fullscreen mesh. LayerModel
                 // always retains I. EffectModel/EffectMVP scale X/Y by the card half-size in
@@ -845,7 +883,8 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         // the incoming camera and destination before private rasterization, excluding the owner
         // matrix. The volumetric writer below has its own contract and never enters this image
         // branch.
-        const auto snapshot = ResolveEffectProjectionSnapshot(*layer);
+        const auto snapshot = ResolveEffectProjectionSnapshot(*layer,
+            effect_snapshot_camera, reflection_snapshot);
         const auto& source = *layer->GetPrelightingSource();
         Matrix4d alternate_model = snapshot.layer_model;
         if (source.instanced) {
@@ -876,7 +915,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                      snapshot.incoming_view_projection(1, 3),
                      snapshot.incoming_view_projection(2, 3),
                      snapshot.incoming_view_projection(3, 3),
-                     layer->EffectSnapshotCamera().c_str(), info.has_AM, info.has_ANM, info.has_AVP);
+                     effect_snapshot_camera.c_str(), info.has_AM, info.has_ANM, info.has_AVP);
         }
     }
 
@@ -1043,9 +1082,13 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
     }
 
     if (info.has_VIEWUP || info.has_VIEWRIGHT || info.has_VIEWFORWARD) {
-        Vector3f forward = camera->GetDirection().cast<float>();
+        // These vectors describe the selected scene frame, like the eye position above. A
+        // private source or composition camera changes raster projection only; deriving the
+        // billboard basis from that temporary camera would replace the reflected frame state.
+        const auto* frame_camera = m_scene->activeCamera;
+        Vector3f forward = frame_camera->GetDirection().cast<float>();
         if (forward.norm() > 1e-6f) forward.normalize();
-        Vector3f up = camera->GetUp().cast<float>();
+        Vector3f up = frame_camera->GetUp().cast<float>();
         if (up.norm() > 1e-6f) up.normalize();
         Vector3f right = forward.cross(up);
         if (right.norm() > 1e-6f) right.normalize();

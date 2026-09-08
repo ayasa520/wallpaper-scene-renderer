@@ -43,6 +43,8 @@ bool ParseJson(const char* file, const char* func, int line, const std::string& 
                nlohmann::json& result);
 
 bool ReadJsonFloat2Value(const nlohmann::json& json, std::array<float, 2>& value);
+bool ReadJsonLiteralBoolean(const nlohmann::json& json, std::string_view name,
+                            bool default_value);
 
 class ScopedJsonUserProperties {
 public:

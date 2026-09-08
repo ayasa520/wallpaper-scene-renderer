@@ -31,11 +31,16 @@ public:
         // rebuilds swap primitives under stable nodes; the layer id remains the durable refresh key.
         int32_t     layer_id { 0 };
         bool        execute_when_hidden { false };
+        std::function<bool()> should_execute;
         bool        clear_before_draw { false };
         std::string output;
         std::string camera_override;
         bool use_active_camera_for_parallax { false };
         ShaderModelSpace model_space { ShaderModelSpace::Object };
+        bool reflection_pass { false };
+        bool reflection_raster { false };
+        bool reflection_snapshot { false };
+        std::string effect_snapshot_camera;
         AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
 
         ImageParameters          vk_output;
@@ -71,6 +76,7 @@ private:
         StagingBufferRef              index_buf;
         uint32_t                      draw_count { 0 };
         bool                          force_upload { true };
+        uint64_t                      uploaded_revision { 0 };
     };
 
     // The direct text pass owns its own dynamic mesh uploads because text geometry can change

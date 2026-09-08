@@ -25,6 +25,9 @@ class SceneImageEffectLayer;
 class WPNodeTransformResolver;
 
 struct WPUniformInfo {
+    bool has_ALPHA { false };
+    bool has_COLOR { false };
+    bool has_COLOR4 { false };
     bool has_MI { false };
     bool has_M { false };
     bool has_AM { false };
@@ -132,6 +135,11 @@ struct WPShaderValueData {
     WPPuppetLayer puppet_layer;
     WPNodeTransformBinding transform_binding {};
     EffectLayerProjectionBinding effect_layer_projection {};
+    // Authored text effects inherit the glyph source's color. Keep the stable owner handle:
+    // shaping replaces its primitive, while material-only property writes update that primitive.
+    // Submission must resolve the current source in both cases. Utility publication owns a
+    // separate neutral modulation and does not bind a text color source.
+    SceneNode* text_color_owner { nullptr };
     // Private source/surface phases rasterize in local coordinates. Their visible destination
     // applies the authored root's displacement once; raw object matrices never contain it.
     bool                  suppress_model_parallax { false };
@@ -231,7 +239,8 @@ private:
         Eigen::Matrix4d view_projection;
         Eigen::Matrix4d incoming_view_projection;
     };
-    EffectProjectionSnapshot ResolveEffectProjectionSnapshot(const SceneImageEffectLayer& layer);
+    EffectProjectionSnapshot ResolveEffectProjectionSnapshot(const SceneImageEffectLayer& layer,
+        std::string_view camera_name, bool reflected);
     void UpdatePointerState();
 
     Scene*               m_scene;

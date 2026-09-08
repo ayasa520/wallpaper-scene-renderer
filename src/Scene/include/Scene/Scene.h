@@ -381,6 +381,10 @@ public:
     // The reflection quality setting gates the mirrored producer pass that populates
     // _rt_Reflection. The render target stays registered when receivers exist.
     bool                 reflectionsEnabled { true };
+    // A graph containing FBO swaps plans command bindings from the admitted owner sequence.
+    // Parent or owner visibility changes must rebuild that plan before the next submission,
+    // even when two invocations cancel their swaps and leave persistent history unchanged.
+    bool                 effectCommandPlanUsesVisibility { false };
 
     struct VolumetricLightPass {
         SceneLight*                light { nullptr };

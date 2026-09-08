@@ -71,6 +71,7 @@ void ApplyImageInstanceMaterialOverride(const nlohmann::json& object_json, WPMat
 } // namespace
 
 bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
+    reflected = wallpaper::ReadJsonLiteralBoolean(json, "reflected", true);
     GET_JSON_NAME_VALUE(json, "image", image);
     ReadVisibleProperty(json, &visible, &visible_binding);
     GET_JSON_NAME_VALUE_NOWARN(json, "alignment", alignment);

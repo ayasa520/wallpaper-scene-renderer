@@ -515,9 +515,7 @@ bool WPModelObject::FromJson(const nlohmann::json& json, fs::VFS&) {
         GET_JSON_NAME_VALUE_NOWARN(json, "skin", skin);
         // This field is a literal boolean, not a script/user property. Missing and non-boolean
         // values both retain the default inclusion in the reflected-owner list.
-        const auto reflected_value = json.find("reflected");
-        reflected = reflected_value == json.end() || !reflected_value->is_boolean() ||
-            reflected_value->get<bool>();
+        reflected = ReadJsonLiteralBoolean(json, "reflected", true);
         GET_JSON_NAME_VALUE_NOWARN(json, "castshadow", castshadow);
         if (json.contains("animationlayers") && json.at("animationlayers").is_array()) {
             for (const auto& animation_json : json.at("animationlayers")) {
@@ -3296,6 +3294,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                     context,
                     BuildTextEffectMaterialContract(text_obj, *imgEffectLayer),
                     effect_node_data);
+                effect_node_data.text_color_owner = spTextNode.get();
                 const auto authored_textures = effect_material.textures;
                 spMesh->AddMaterial(std::move(effect_material));
                 spEffectNode->AddMesh(spMesh);
@@ -3799,6 +3798,9 @@ void FillSceneObjectIdentityFor(Scene& scene, const ValueT& value) {
         return;
     } else {
         object.SetAuthoredTransform(value.origin, value.scale, value.angles);
+        if constexpr (requires { value.reflected; }) {
+            object.SetReflected(value.reflected);
+        }
         if constexpr (std::is_same_v<ValueT, wpscene::WPLightObject>) {
             scene.SetLayerParentBinding(value.id, value.parent, {});
         } else {
@@ -3817,7 +3819,6 @@ void FillSceneObjectIdentityFor(Scene& scene, const ValueT& value) {
             object.SetKind(SceneObjectKind::Light);
         } else if constexpr (std::is_same_v<ValueT, WPModelObject>) {
             object.SetKind(SceneObjectKind::Model);
-            object.SetReflected(value.reflected);
         } else if constexpr (std::is_same_v<ValueT, WPShapeObject>) {
             object.SetKind(SceneObjectKind::Shape);
             object.SetEffectCount(static_cast<int32_t>(value.effects.size()));

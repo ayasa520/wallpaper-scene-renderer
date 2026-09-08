@@ -38,9 +38,20 @@ struct ShaderUniformOverrides {
     bool             use_active_camera_for_uniforms { false };
     bool             use_active_camera_for_parallax { false };
     ShaderModelSpace model_space { ShaderModelSpace::Object };
-    // Reflection changes the incoming destination/projection and frame camera vectors.
-    // The authored model transform, material bindings and animation pose remain shared.
+    // Frame vectors remain reflected inside private source/effect draws. Raster projection
+    // follows the current destination, while effect snapshots follow the owner's incoming
+    // destination before a private camera or composition child projection replaces it.
     bool             reflection_pass { false };
+    bool             reflection_raster { false };
+    bool             reflection_snapshot { false };
+    // Empty selects scene state; a composition name selects its centered projection and
+    // identity destination. Snapshots use the raw owner matrix, independently of the later
+    // publication camera or the composition camera's attached inverse-owner transform.
+    std::string_view effect_snapshot_camera;
+    // The graph resolves command swaps and framebuffer copies for each invocation. Texture
+    // dimensions must describe those exact bindings, even when another invocation of the
+    // same authored material has since resolved a different FBO table.
+    std::optional<std::span<const std::string>> textures;
 };
 
 struct ShaderSkinningPose {

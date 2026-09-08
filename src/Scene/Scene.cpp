@@ -842,7 +842,10 @@ std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
 void Scene::SetLayerLocalVisibility(int32_t layer_id, bool visible) {
     if (layer_id == 0) return;
 
-    EnsureSceneObject(layer_id).SetLocalVisible(visible);
+    auto& object = EnsureSceneObject(layer_id);
+    if (object.LocalVisible() == visible) return;
+    object.SetLocalVisible(visible);
+    if (effectCommandPlanUsesVisibility) MarkRenderGraphTopologyDirty();
 }
 
 bool Scene::GetLayerLocalVisibility(int32_t layer_id) const {

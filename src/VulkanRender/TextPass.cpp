@@ -363,12 +363,7 @@ std::array<float, 4> ResolveTextColor(const wallpaper::SceneTextPrimitive& primi
             primitive.object.alpha,
         };
     }
-    return {
-        primitive.object.color[0],
-        primitive.object.color[1],
-        primitive.object.color[2],
-        primitive.object.alpha,
-    };
+    return primitive.ForegroundColor();
 }
 } // namespace
 
@@ -382,18 +377,24 @@ TextPass::TextPass(const Desc& desc)
     m_desc.node                = desc.node;
     m_desc.layer_id            = desc.layer_id;
     m_desc.execute_when_hidden = desc.execute_when_hidden;
+    m_desc.should_execute      = desc.should_execute;
     m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
     m_desc.camera_override     = desc.camera_override;
     m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
     m_desc.model_space         = desc.model_space;
+    m_desc.reflection_pass     = desc.reflection_pass;
+    m_desc.reflection_raster   = desc.reflection_raster;
+    m_desc.reflection_snapshot = desc.reflection_snapshot;
+    m_desc.effect_snapshot_camera = desc.effect_snapshot_camera;
 }
 TextPass::~TextPass() = default;
 
 std::string TextPass::residencyKey() const {
     return "TextPass|node=" + std::to_string(m_node_identity) +
-           "|layer=" + std::to_string(m_desc.layer_id) + "|output=" + m_desc.output;
+           "|layer=" + std::to_string(m_desc.layer_id) + "|output=" + m_desc.output +
+           "|reflection=" + (m_desc.reflection_pass ? "1" : "0");
 }
 
 bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
@@ -411,6 +412,9 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
            m_desc.camera_override == next->m_desc.camera_override &&
            m_desc.use_active_camera_for_parallax == next->m_desc.use_active_camera_for_parallax &&
            m_desc.model_space == next->m_desc.model_space &&
+           m_desc.reflection_raster == next->m_desc.reflection_raster &&
+           m_desc.reflection_snapshot == next->m_desc.reflection_snapshot &&
+           m_desc.effect_snapshot_camera == next->m_desc.effect_snapshot_camera &&
            this_samples == next_samples &&
            ! m_desc.resolve_msaa;
 }
@@ -423,12 +427,17 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_node_identity            = next->m_node_identity;
     m_desc.layer_id            = next->m_desc.layer_id;
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
+    m_desc.should_execute      = next->m_desc.should_execute;
     m_desc.clear_before_draw   = next->m_desc.clear_before_draw;
     m_desc.output              = next->m_desc.output;
     m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
     m_desc.camera_override     = next->m_desc.camera_override;
     m_desc.use_active_camera_for_parallax = next->m_desc.use_active_camera_for_parallax;
     m_desc.model_space         = next->m_desc.model_space;
+    m_desc.reflection_pass     = next->m_desc.reflection_pass;
+    m_desc.reflection_raster   = next->m_desc.reflection_raster;
+    m_desc.reflection_snapshot = next->m_desc.reflection_snapshot;
+    m_desc.effect_snapshot_camera = next->m_desc.effect_snapshot_camera;
 }
 
 bool TextPass::referencesRenderTarget(std::string_view render_target) const {
@@ -537,7 +546,20 @@ bool TextPass::ensureMeshBuffers(SceneMesh& mesh, MeshBuffers& buffers, Renderin
         buffers.index_buf = {};
     }
 
-    const bool needs_upload = mesh.Dirty().load() || buffers.force_upload;
+    const auto revision = mesh.DataRevision();
+    const bool needs_upload = revision != buffers.uploaded_revision || buffers.force_upload;
+    if (!needs_upload && mesh.Dirty().load() &&
+        std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
+        // A rebuilt glyph page can reuse this allocation without increasing its byte capacity.
+        // Record rejected CPU updates at that boundary so revision identity errors can be
+        // distinguished from missing atlas data or a failed GPU upload.
+        LOG_INFO("SceneTextMeshUploadSkipped: layer=%d output='%s' reflection=%s "
+                 "revision=%llu cpu-dirty=true cpu-indices=%u uploaded-draw-count=%u",
+                 m_desc.layer_id, m_desc.output.c_str(),
+                 m_desc.reflection_pass ? "true" : "false",
+                 static_cast<unsigned long long>(revision), mesh.LogicalIndexCount(),
+                 buffers.draw_count);
+    }
     if (!needs_upload) return true;
 
     for (usize array_index = 0; array_index < mesh.VertexCount(); array_index++) {
@@ -565,7 +587,14 @@ bool TextPass::ensureMeshBuffers(SceneMesh& mesh, MeshBuffers& buffers, Renderin
     }
 
     mesh.Dirty().store(false);
+    buffers.uploaded_revision = revision;
     buffers.force_upload = false;
+    if (std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
+        LOG_INFO("SceneTextMeshUpload: layer=%d output='%s' reflection=%s revision=%llu",
+                 m_desc.layer_id, m_desc.output.c_str(),
+                 m_desc.reflection_pass ? "true" : "false",
+                 static_cast<unsigned long long>(revision));
+    }
     return true;
 }
 
@@ -753,6 +782,7 @@ void TextPass::refreshResources(Scene& scene, const Device& device, RenderingRes
 }
 
 void TextPass::execute(const Device& device, RenderingResources& rr) {
+    if (m_desc.should_execute && !m_desc.should_execute()) return;
     auto* node = m_desc.node;
     auto* primitive = node != nullptr ? node->Text() : nullptr;
     if (primitive == nullptr) return;
@@ -802,6 +832,10 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                 .use_camera_override = !m_desc.camera_override.empty(),
                 .use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax,
                 .model_space = m_desc.model_space,
+                .reflection_pass = m_desc.reflection_pass,
+                .reflection_raster = m_desc.reflection_raster,
+                .reflection_snapshot = m_desc.reflection_snapshot,
+                .effect_snapshot_camera = m_desc.effect_snapshot_camera,
             };
             m_desc.scene->shaderValueUpdater->UpdateUniforms(
                 node,

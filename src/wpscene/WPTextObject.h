@@ -35,10 +35,12 @@ struct WPTextObject {
     int32_t                    colorBlendMode { 0 };
     std::array<float, 3>       backgroundcolor { 0.0f, 0.0f, 0.0f };
     float                      alpha { 1.0f };
+    float                      brightness { 1.0f };
     float                      backgroundbrightness { 1.0f };
     float                      pointsize { 32.0f };
     float                      maxwidth { 0.0f };
     bool                       visible { true };
+    bool                       reflected { true };
     VisibleBinding             visible_binding;
     bool                       has_visible_script { false };
     bool                       has_dynamic_layout_script { false };

@@ -103,6 +103,13 @@ public:
     std::vector<GlyphPageRenderable> glyph_pages;
     uint32_t              atlas_version { 0 };
 
+    // Standard-range text uses the current owner RGB and alpha. Foreground brightness is
+    // an HDR modulation and remains separate from this color on the renderer's standard-range
+    // output. Glyph draws and authored effect uniforms consume this same source state.
+    [[nodiscard]] std::array<float, 4> ForegroundColor() const {
+        return { object.color[0], object.color[1], object.color[2], object.alpha };
+    }
+
     [[nodiscard]] std::array<float, 2> VisibleDisplaySize() const { return layout.visible_display_size; }
     [[nodiscard]] std::array<float, 2> VisibleSourceSize() const { return layout.visible_source_size; }
     [[nodiscard]] std::array<float, 2> VisibleDisplayOffset() const { return layout.visible_display_offset; }

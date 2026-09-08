@@ -247,6 +247,7 @@ bool Particle::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 }
 
 bool WPParticleObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
+    reflected = ReadJsonLiteralBoolean(json, "reflected", true);
     GET_JSON_NAME_VALUE(json, "particle", particle);
     GET_JSON_NAME_VALUE_NOWARN(json, "visible", visible);
     if (json.contains("visible")) ReadVisibleBinding(json.at("visible"), &visible_binding);

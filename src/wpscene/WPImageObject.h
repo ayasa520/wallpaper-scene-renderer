@@ -62,6 +62,7 @@ public:
     bool                       instanced { false };
     bool                       nopadding { false };
     bool                       visible { true };
+    bool                       reflected { true };
     VisibleBinding             visible_binding;
     std::string                image;
     int32_t                    parent { 0 };

@@ -36,6 +36,9 @@ struct ShaderDrawRequest {
     bool                     use_active_camera_for_parallax { false };
     ShaderModelSpace         model_space { ShaderModelSpace::Object };
     bool                     reflection_pass { false };
+    bool                     reflection_raster { false };
+    bool                     reflection_snapshot { false };
+    std::string              effect_snapshot_camera;
     sprite_map_t             sprites_map;
     bool                     model_pass { false };
     bool                     depth_test { false };
@@ -58,6 +61,7 @@ struct ShaderDrawState {
 
     bool                          dyn_vertex { false };
     bool                          force_dyn_upload { false };
+    uint64_t                      uploaded_mesh_revision { 0 };
     std::shared_ptr<ImmutableMeshGpu> immutable_mesh;
     std::vector<StagingBufferRef> vertex_bufs;
     StagingBufferRef              index_buf;

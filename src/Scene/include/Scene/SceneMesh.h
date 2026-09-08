@@ -52,7 +52,14 @@ public:
 	bool Dynamic() const { return m_dynamic; }
 	const auto& Dirty() const { return m_dirty; }
 	auto& Dirty() { return m_dirty; }
-	void SetDirty() { m_dirty.store(true); }
+	// Each draw owns its upload allocations even when several draws consume this same mesh.
+	// A revision lets every consumer observe a CPU update independently; clearing the dirty
+	// flag after one upload must not hide that update from the reflected or ordinary draw.
+	uint64_t DataRevision() const { return m_data->revision.load(std::memory_order_relaxed); }
+	void SetDirty() {
+		m_data->revision.store(NextDataRevision(), std::memory_order_relaxed);
+		m_dirty.store(true);
+	}
 
 	uint32_t ID() const { return m_id; };
 	void SetID(uint32_t v) { m_id = v; };
@@ -136,7 +143,17 @@ public:
 	}
 
 private:
+	// Upload allocations can outlive a glyph mesh and can also consume shared geometry through
+	// different mesh wrappers. Give each payload creation and mutation a process-wide revision:
+	// replacing a mesh must not restart at a value that an existing allocation already consumed,
+	// and sharing payload data must also share the revision that describes those exact bytes.
+	static uint64_t NextDataRevision() {
+		static std::atomic<uint64_t> next_revision { 1 };
+		return next_revision.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	struct Data {
+		std::atomic<uint64_t> revision { NextDataRevision() };
 		std::vector<SceneVertexArray> vertexArrays;
 		std::vector<SceneIndexArray> indexArrays;
 		MaskedDrawPlan maskedDraw;

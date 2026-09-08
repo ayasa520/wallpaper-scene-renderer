@@ -182,6 +182,7 @@ public:
     std::array<float, 2>     parallaxDepth { kDefaultParallaxDepth };
     bool                     parallaxDepthAuthored { false };
     bool                     visible { true };
+    bool                     reflected { true };
     VisibleBinding           visible_binding;
     int32_t                  parent { 0 };
     std::string              attachment;

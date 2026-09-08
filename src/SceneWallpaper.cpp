@@ -567,7 +567,10 @@ private:
         if (! msg->findBool("value", &enabled) || ! m_scene) return;
         if (m_scene->reflectionsEnabled == enabled) return;
         m_scene->reflectionsEnabled = enabled;
-        LOG_INFO("SceneWallpaper: reflections %s (live pass gate, RT kept)",
+        // Enabling the reflected invocation changes the ordered effect-command stream before
+        // the main draw. Rebuild its bindings while retaining the registered reflection target.
+        m_scene->MarkRenderGraphTopologyDirty();
+        LOG_INFO("SceneWallpaper: reflections %s (draw sequence rebuilt, RT kept)",
                  enabled ? "enabled" : "disabled");
     }
     MHANDLER_CMD(SET_VOLUMETRICS) {

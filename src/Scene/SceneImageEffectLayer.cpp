@@ -519,7 +519,9 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
     std::string_view effect_cam,
     std::string_view final_output,
     std::string_view& ppong_a,
-    std::string_view& ppong_b) {
+    std::string_view& ppong_b,
+    SceneImageEffect::FrameFboBindings& frame_bindings,
+    bool admitted) {
     SceneImageEffectNode* fallback_last_output { nullptr };
 
     for (auto& eff : m_effects) {
@@ -534,7 +536,8 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
         // Each compose marker advances the pair within this effect. Resolve material inputs and
         // commands at their authored positions so `previous` follows the last completed step;
         // resolving every binding at effect entry would make later steps resample the old input.
-        auto fbo_bindings = eff->CurrentFboBindings();
+        auto [frame_it, inserted] = frame_bindings.try_emplace(eff, eff->CurrentFboBindings());
+        auto fbo_bindings = frame_it->second;
         const auto resolve_commands_at = [&](i32 position) {
             for (auto& cmd : eff->commands) {
                 if (cmd.afterpos != position) continue;
@@ -592,7 +595,9 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
             resolve_commands_at(++position);
         }
 
-        eff->SetNextFboBindings(std::move(fbo_bindings));
+        // Retained but skipped passes must not advance the next invocation's inputs. Visibility
+        // changes that admit such a pass rebuild the frame plan before it can execute.
+        if (admitted) frame_it->second = std::move(fbo_bindings);
         std::swap(ppong_a, ppong_b);
     }
 
@@ -777,7 +782,9 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
 }
 
 void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
-                                               std::string_view final_output) {
+                                               std::string_view final_output,
+                                               SceneImageEffect::FrameFboBindings& frame_bindings,
+                                               bool admitted) {
     // Shape effect dispatch has no source draw or image composition loop. Its physical last
     // retained effect receives source slot -1 and final-draw=true for every ordered record,
     // including commands and explicit FBO draws. Earlier effects still own their materials,
@@ -792,7 +799,9 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
     if (m_effects.empty()) return;
 
     auto& effect = *m_effects.back();
-    auto bindings = effect.CurrentFboBindings();
+    auto [frame_it, inserted] = frame_bindings.try_emplace(
+        m_effects.back(), effect.CurrentFboBindings());
+    auto bindings = frame_it->second;
     LOG_INFO("SceneShapeEffectResolve: layer=%d name='%s' retained-effects=%zu "
              "selected-effect=%d selected-index=%u instance-visible=%s materials=%zu "
              "commands=%zu source-slot=-1 final-draw=true output='%.*s' publication=false",
@@ -849,15 +858,17 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
         }
         resolve_commands_at(++position);
     }
-    effect.SetNextFboBindings(std::move(bindings));
+    if (admitted) frame_it->second = std::move(bindings);
 }
 
 void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
                                           std::string_view effect_cam,
-                                          std::string_view final_output) {
+                                          std::string_view final_output,
+                                          SceneImageEffect::FrameFboBindings& frame_bindings,
+                                          bool admitted) {
     if (UsesShapeDraw()) {
         m_final_composite.ResetForResolve();
-        ResolveShapeEffect(default_mesh, final_output);
+        ResolveShapeEffect(default_mesh, final_output, frame_bindings, admitted);
         return;
     }
     const auto output_capability = ResolveFinalOutputCapability();
@@ -873,7 +884,7 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
     ResolveEffectMatrixPhases(output_capability != FinalOutputCapability::SceneAuthoredWriter);
     auto* fallback_last_output =
         ResolveEffectPingPongChain(default_mesh, default_node, effect_cam, final_output,
-                                  ppong_a, ppong_b);
+                                  ppong_a, ppong_b, frame_bindings, admitted);
     const auto final_decision = ResolveFinalOutputDecision(output_capability);
 
     std::string_view final_composite_source = ppong_a;

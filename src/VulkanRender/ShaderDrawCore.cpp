@@ -153,6 +153,9 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
     m_desc.model_space = desc.model_space;
     m_desc.reflection_pass = desc.reflection_pass;
+    m_desc.reflection_raster = desc.reflection_raster;
+    m_desc.reflection_snapshot = desc.reflection_snapshot;
+    m_desc.effect_snapshot_camera = desc.effect_snapshot_camera;
     m_desc.sprites_map         = desc.sprites_map;
     m_desc.model_pass          = desc.model_pass;
     m_desc.depth_test          = desc.depth_test;
@@ -216,6 +219,9 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
                next.m_desc.use_active_camera_for_parallax &&
            m_desc.model_space == next.m_desc.model_space &&
            m_desc.reflection_pass == next.m_desc.reflection_pass &&
+           m_desc.reflection_raster == next.m_desc.reflection_raster &&
+           m_desc.reflection_snapshot == next.m_desc.reflection_snapshot &&
+           m_desc.effect_snapshot_camera == next.m_desc.effect_snapshot_camera &&
            this_samples == next_samples &&
            ! m_desc.resolve_msaa &&
            m_desc.textures.size() == next.m_desc.textures.size();
@@ -241,6 +247,9 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.use_active_camera_for_parallax = next.m_desc.use_active_camera_for_parallax;
     m_desc.model_space = next.m_desc.model_space;
     m_desc.reflection_pass = next.m_desc.reflection_pass;
+    m_desc.reflection_raster = next.m_desc.reflection_raster;
+    m_desc.reflection_snapshot = next.m_desc.reflection_snapshot;
+    m_desc.effect_snapshot_camera = next.m_desc.effect_snapshot_camera;
     m_desc.sprites_map    = next.m_desc.sprites_map;
 }
 
@@ -598,7 +607,7 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     // Stage initialization is independent of the first visible chunk. Every reflected draw loads
     // the color/depth already cleared by that stage, even when this shared material is the first
     // model in the ordinary scene walk.
-    if (desc.reflection_pass) load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (desc.output == wallpaper::SpecTex_Reflection) load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 }
 
 std::string_view ModelColorLoadModeName(wallpaper::SceneModelColorLoadMode mode) {
@@ -1260,14 +1269,19 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             auto&       draw_count       = m_desc.draw_count;
             auto&       index_buf        = m_desc.index_buf;
             auto&       force_dyn_upload = m_desc.force_dyn_upload;
+            auto&       uploaded_revision = m_desc.uploaded_mesh_revision;
             update_dyn_buf_op                = [&mesh,
                                                 &vertex_bufs,
                                                 &draw_count,
                                                 &index_buf,
                                                 dyn_buf,
-                                                &force_dyn_upload]() {
-                const bool dirty        = mesh.Dirty().load();
-                const bool needs_upload = dirty || force_dyn_upload;
+                                                &force_dyn_upload,
+                                                &uploaded_revision,
+                                                layer_id = m_desc.layer_id,
+                                                output = m_desc.output,
+                                                reflection_pass = m_desc.reflection_pass]() {
+                const auto revision = mesh.DataRevision();
+                const bool needs_upload = revision != uploaded_revision || force_dyn_upload;
                 if (needs_upload) {
                     auto ensure_vertex_subref = [&](usize                              array_index,
                                                     const wallpaper::SceneVertexArray& vertex) {
@@ -1401,7 +1415,14 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     // allocation/write failure. Subsequent frames will keep retrying until the
                     // first complete upload lands in the new subranges.
                     mesh.Dirty().store(false);
+                    uploaded_revision = revision;
                     force_dyn_upload = false;
+                    if (std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
+                        LOG_INFO("SceneMeshUpload: layer=%d output='%s' reflection=%s "
+                                 "revision=%llu draw-count=%u",
+                                 layer_id, output.c_str(), reflection_pass ? "true" : "false",
+                                 static_cast<unsigned long long>(revision), draw_count);
+                    }
                 }
             };
         }
@@ -1430,7 +1451,11 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
              use_active_camera_for_uniforms = m_desc.use_active_camera_for_uniforms,
              use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax,
              model_space = m_desc.model_space,
-             reflection_pass = m_desc.reflection_pass]() {
+             reflection_pass = m_desc.reflection_pass,
+             reflection_raster = m_desc.reflection_raster,
+             reflection_snapshot = m_desc.reflection_snapshot,
+             effect_snapshot_camera = m_desc.effect_snapshot_camera,
+             textures = &m_desc.textures]() {
                 auto update_unf_op = [block, buf, bufref, extension](
                                          std::string_view name, wallpaper::ShaderValue value) {
                     UpdateShaderDrawUniform(buf, *bufref, block, name, value);
@@ -1446,17 +1471,16 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     .use_active_camera_for_parallax = use_active_camera_for_parallax,
                     .model_space = model_space,
                     .reflection_pass = reflection_pass,
+                    .reflection_raster = reflection_raster,
+                    .reflection_snapshot = reflection_snapshot,
+                    .effect_snapshot_camera = effect_snapshot_camera,
+                    .textures = std::span<const std::string>(*textures),
                 };
                 shader_updater->UpdateUniforms(
                     draw,
                     sprites,
                     update_unf_op,
-                    (overrides.use_camera_override ||
-                     overrides.use_active_camera_for_uniforms ||
-                     overrides.model_space != ShaderModelSpace::Object ||
-                     overrides.reflection_pass)
-                        ? &overrides
-                        : nullptr);
+                    &overrides);
                 // update image slot for sprites
                 {
                     for (auto& [i, sp] : sprites) {
@@ -1659,7 +1683,8 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     }
     if (m_desc.dyn_vertex && m_desc.update_dynamic_mesh_op != nullptr && m_desc.draw.Valid() &&
         m_desc.draw.Mesh() != nullptr &&
-        (m_desc.force_dyn_upload || m_desc.draw.Mesh()->Dirty().load())) {
+        (m_desc.force_dyn_upload ||
+         m_desc.uploaded_mesh_revision != m_desc.draw.Mesh()->DataRevision())) {
         // Text-backed effect passes keep their render-graph topology stable while the final
         // source quad changes size. Uploading the dirty dynamic mesh during the resource-refresh
         // phase lets the compile-time dynamic-buffer copy include the new quad before the first
