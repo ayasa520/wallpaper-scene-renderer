@@ -1578,162 +1578,35 @@ struct ResolvedUserShaderValueBinding {
     std::string        material_value_name;
     std::string        gl_uniform_name;
     const ShaderValue* property { nullptr };
-    bool               legacy_reversed { false };
 };
 
-enum class MaterialValueUniformResolutionKind
-{
-    ExactAlias,
-    UniformName,
-    UniformSuffix,
-    NormalizedAlias,
-    AmbiguousNormalizedAlias,
-    Unresolved,
-};
-
-struct MaterialValueUniformResolution {
-    std::string                        uniform_name;
-    std::string                        matched_alias;
-    MaterialValueUniformResolutionKind kind {
-        MaterialValueUniformResolutionKind::Unresolved
-    };
-
-    bool resolved() const noexcept {
-        return kind != MaterialValueUniformResolutionKind::Unresolved &&
-               kind != MaterialValueUniformResolutionKind::AmbiguousNormalizedAlias;
+const std::string* ResolveMaterialValueUniformName(const WPShaderInfo& info,
+                                                  const std::string& material_value_name) {
+    // Material names are an authored namespace, distinct from shader uniform symbols. Only an
+    // explicit metadata entry selects a target; similar labels must not acquire that entry's
+    // defaults or live bindings by changing case, punctuation, prefixes or parentheses.
+    const auto alias = info.alias.find(material_value_name);
+    if (alias != info.alias.end()) return &alias->second;
+    if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+        LOG_INFO("SceneMaterialNameLookup: material-value='%s' result=unknown-material-name",
+                 material_value_name.c_str());
     }
-};
-
-const char* MaterialValueUniformResolutionKindName(MaterialValueUniformResolutionKind kind) {
-    switch (kind) {
-    case MaterialValueUniformResolutionKind::ExactAlias: return "exact-alias";
-    case MaterialValueUniformResolutionKind::UniformName: return "uniform-name";
-    case MaterialValueUniformResolutionKind::UniformSuffix: return "uniform-suffix";
-    case MaterialValueUniformResolutionKind::NormalizedAlias: return "normalized-alias";
-    case MaterialValueUniformResolutionKind::AmbiguousNormalizedAlias:
-        return "ambiguous-normalized-alias";
-    case MaterialValueUniformResolutionKind::Unresolved: return "unresolved";
-    }
-    return "unknown";
+    return nullptr;
 }
 
-bool IsDirectMaterialValueResolution(MaterialValueUniformResolutionKind kind) {
-    return kind == MaterialValueUniformResolutionKind::ExactAlias ||
-           kind == MaterialValueUniformResolutionKind::UniformName ||
-           kind == MaterialValueUniformResolutionKind::UniformSuffix;
-}
-
-std::string NormalizeMaterialValueAlias(std::string_view name) {
-    std::string normalized;
-    int         parenthetical_depth = 0;
-    for (unsigned char raw_ch : name) {
-        const char ch = static_cast<char>(raw_ch);
-        if (ch == '(') {
-            parenthetical_depth++;
-            continue;
-        }
-        if (ch == ')') {
-            if (parenthetical_depth > 0) parenthetical_depth--;
-            continue;
-        }
-        if (parenthetical_depth > 0) continue;
-
-        if (std::isalnum(raw_ch)) {
-            normalized.push_back(static_cast<char>(std::tolower(raw_ch)));
+const std::string* FindMaterialUserPropertyName(const wpscene::WPMaterial& material,
+                                               std::string_view material_value_name) {
+    // Shorthand entries replace one material value in byte-sorted project-property order.
+    // Select the final key explicitly: the parsed unordered map must not choose a different
+    // winner for cold values and live registration. Selection is independent of whether that
+    // user property's current value is available; overwritten entries stay overwritten.
+    const std::string* selected { nullptr };
+    for (const auto& [property, target] : material.usershadervalues) {
+        if (target == material_value_name && (selected == nullptr || *selected < property)) {
+            selected = &property;
         }
     }
-
-    // Wallpaper Engine sometimes serializes constants by editor label ("Texture parallax depth")
-    // while the shader metadata only exposes numbered material keys ("4textureParallaxDepth").
-    // Dropping only leading digits lets those two forms meet without treating unrelated numeric
-    // suffixes as equivalent.
-    const auto first_non_digit =
-        std::find_if(normalized.begin(), normalized.end(), [](unsigned char ch) {
-            return ! std::isdigit(ch);
-        });
-    normalized.erase(normalized.begin(), first_non_digit);
-    return normalized;
-}
-
-MaterialValueUniformResolution
-ResolveMaterialValueUniform(const WPShaderInfo& info, std::string_view material_value_name,
-                            bool allow_normalized_alias) {
-    const std::string material_value_key(material_value_name);
-    if (const auto alias_it = info.alias.find(material_value_key); alias_it != info.alias.end()) {
-        return {
-            .uniform_name  = alias_it->second,
-            .matched_alias = alias_it->first,
-            .kind          = MaterialValueUniformResolutionKind::ExactAlias,
-        };
-    }
-
-    for (const auto& [alias_name, uniform_name] : info.alias) {
-        if (uniform_name == material_value_key) {
-            return {
-                .uniform_name  = uniform_name,
-                .matched_alias = alias_name,
-                .kind          = MaterialValueUniformResolutionKind::UniformName,
-            };
-        }
-
-        // Some shader metadata stores material aliases like `color1`, while the parsed GLSL
-        // uniform is named `g_Color1`. Keep this suffix match so user-facing project properties
-        // can still target old stock shaders whose material JSON uses the shorter alias instead
-        // of the final GLSL symbol.
-        if (uniform_name.size() > 2 && uniform_name.substr(2) == material_value_key) {
-            return {
-                .uniform_name  = uniform_name,
-                .matched_alias = alias_name,
-                .kind          = MaterialValueUniformResolutionKind::UniformSuffix,
-            };
-        }
-    }
-
-    if (! allow_normalized_alias) {
-        return {
-            .uniform_name = material_value_key,
-            .kind         = MaterialValueUniformResolutionKind::Unresolved,
-        };
-    }
-
-    const auto normalized_key = NormalizeMaterialValueAlias(material_value_key);
-    if (normalized_key.empty()) {
-        return {
-            .uniform_name = material_value_key,
-            .kind         = MaterialValueUniformResolutionKind::Unresolved,
-        };
-    }
-
-    std::optional<MaterialValueUniformResolution> candidate;
-    for (const auto& [alias_name, uniform_name] : info.alias) {
-        if (NormalizeMaterialValueAlias(alias_name) != normalized_key) continue;
-
-        if (candidate.has_value() && candidate->uniform_name != uniform_name) {
-            return {
-                .uniform_name  = material_value_key,
-                .matched_alias = alias_name,
-                .kind = MaterialValueUniformResolutionKind::AmbiguousNormalizedAlias,
-            };
-        }
-
-        candidate = MaterialValueUniformResolution {
-            .uniform_name  = uniform_name,
-            .matched_alias = alias_name,
-            .kind          = MaterialValueUniformResolutionKind::NormalizedAlias,
-        };
-    }
-
-    if (candidate.has_value()) return *candidate;
-    return {
-        .uniform_name = material_value_key,
-        .kind         = MaterialValueUniformResolutionKind::Unresolved,
-    };
-}
-
-std::string ResolveMaterialValueUniformName(const WPShaderInfo& info,
-                                            const std::string&  material_value_name) {
-    const auto resolution = ResolveMaterialValueUniform(info, material_value_name, true);
-    return resolution.resolved() ? resolution.uniform_name : material_value_name;
+    return selected;
 }
 
 std::optional<WPDynamicValue::Type>
@@ -1771,27 +1644,19 @@ std::optional<ShaderValue> ReadMaterialConstantValue(const nlohmann::json& json,
 
 void ApplyResolvedConstvalue(SceneMaterial& material, const WPShaderInfo& info,
                              const std::string& material_value_name,
-                             const nlohmann::json&                     authored_value,
-                             const MaterialValueUniformResolution&     resolution) {
-    if (! resolution.resolved()) return;
-    const auto type = DeclaredMaterialValueType(info, resolution.uniform_name);
+                             const nlohmann::json& authored_value,
+                             const std::string& uniform_name) {
+    const auto type = DeclaredMaterialValueType(info, uniform_name);
     if (! type.has_value()) return;
     const auto value = ReadMaterialConstantValue(authored_value, *type);
     if (! value.has_value()) return;
-    if (resolution.kind == MaterialValueUniformResolutionKind::NormalizedAlias) {
-        LOG_INFO("ShaderValueAliasFallback: material-value='%s' alias='%s' uniform='%s'",
-                 material_value_name.c_str(),
-                 resolution.matched_alias.c_str(),
-                 resolution.uniform_name.c_str());
-    }
-
-    material.customShader.constValues[resolution.uniform_name] =
-        ClampParserOpacityUniformValue(resolution.uniform_name, *value);
+    material.customShader.constValues[uniform_name] =
+        ClampParserOpacityUniformValue(uniform_name, *value);
     if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
         LOG_INFO("SceneMaterialConstantType: shader='%s' material-value='%s' uniform='%s' "
                  "declared-type=%s components=%zu authored=%s",
                  material.name.c_str(), material_value_name.c_str(),
-                 resolution.uniform_name.c_str(), DynamicValueTypeName(*type), value->size(),
+                 uniform_name.c_str(), DynamicValueTypeName(*type), value->size(),
                  authored_value.dump().c_str());
     }
 }
@@ -1801,44 +1666,11 @@ void ApplyResolvedConstvalue(SceneMaterial& material, const WPShaderInfo& info,
 
 void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                     const WPShaderInfo& info) {
-    // Apply exact authored material keys before display-name fallbacks. Some Wallpaper Engine
-    // projects serialize both forms in one pass; the display-name value is the editor-visible
-    // override and must be allowed to replace the internal default key deterministically.
-    std::unordered_set<std::string> exact_uniform_names;
     for (const auto& [name, value] : wpmat.constantshadervalues) {
-        const auto resolution = ResolveMaterialValueUniform(info, name, false);
-        if (! resolution.resolved()) continue;
-        ApplyResolvedConstvalue(material, info, name, value, resolution);
-        exact_uniform_names.insert(resolution.uniform_name);
-    }
-
-    for (const auto& [name, value] : wpmat.constantshadervalues) {
-        const auto direct_resolution = ResolveMaterialValueUniform(info, name, false);
-        if (direct_resolution.resolved() &&
-            IsDirectMaterialValueResolution(direct_resolution.kind)) {
-            continue;
+        const auto* uniform_name = ResolveMaterialValueUniformName(info, name);
+        if (uniform_name != nullptr) {
+            ApplyResolvedConstvalue(material, info, name, value, *uniform_name);
         }
-
-        const auto resolution = ResolveMaterialValueUniform(info, name, true);
-        if (resolution.resolved()) {
-            // Model importer leftovers ("Alpha", "Color") normalize onto the same uniforms as the
-            // authored lowercase keys. An exact authored key is the value the editor exported, so
-            // a normalized fallback may fill gaps but never override it; planet atmosphere shells
-            // authored as {Alpha: 1, alpha: 0.25} must stay translucent.
-            if (exact_uniform_names.count(resolution.uniform_name) != 0) {
-                LOG_INFO("ShaderValueAliasSkip: material-value='%s' uniform='%s' "
-                         "reason=exact-key-owns-uniform",
-                         name.c_str(),
-                         resolution.uniform_name.c_str());
-                continue;
-            }
-            ApplyResolvedConstvalue(material, info, name, value, resolution);
-            continue;
-        }
-
-        LOG_WARN("ShaderValue: material-value='%s' skipped reason=%s",
-                 name.c_str(),
-                 MaterialValueUniformResolutionKindName(resolution.kind));
     }
 }
 
@@ -1852,43 +1684,26 @@ ResolveUserShaderValueBindings(const wpscene::WPMaterial& wpmat, const WPShaderI
     if (user_properties == nullptr) return bindings;
 
     bindings.reserve(wpmat.usershadervalues.size());
-    for (const auto& us : wpmat.usershadervalues) {
-        // Wallpaper Engine writes `usershadervalues` as
-        // `{ "<project user property>": "<shader material value>" }`. Eagle Flag is a compact
-        // example: `schemecolor -> color1`, `flagcolor1 -> color2`, and `flagcolor2 -> color3`.
-        // Looking up the value side as a user property misses the authored colors and leaves the
-        // shader on its black/white defaults, which makes the red and green flag regions vanish.
-        std::string user_property_name  = us.first;
-        std::string material_value_name = us.second;
-        bool        legacy_reversed     = false;
-        const auto* property = LookupUserPropertyShaderValue(user_properties, user_property_name);
+    // Each declared material name consumes at most one shorthand {user: material} entry.
+    // Walking declarations also keeps unknown names and uniform-symbol spellings out of both
+    // cold writes and the persistent binding registry, without inventing another target name.
+    for (const auto& [material_value_name, gl_uniform_name] : info.alias) {
+        const auto* user_property_name = FindMaterialUserPropertyName(wpmat, material_value_name);
+        if (user_property_name == nullptr) continue;
+        const auto* property = LookupUserPropertyShaderValue(user_properties, *user_property_name);
         if (property == nullptr) {
-            // Older local builds interpreted the mapping in the opposite direction. This fallback
-            // keeps any locally-authored scenes that accidentally depended on that reversed
-            // behavior visible, while logging the mismatch so the material JSON can be fixed.
-            const auto* legacy_property =
-                LookupUserPropertyShaderValue(user_properties, material_value_name);
-            if (legacy_property != nullptr) {
-                legacy_reversed = true;
-                std::swap(user_property_name, material_value_name);
-                property = legacy_property;
-            } else {
-                if (log_missing) {
-                    LOG_INFO("UserShaderValue: property '%s' not provided for material value '%s'",
-                             user_property_name.c_str(),
-                             material_value_name.c_str());
-                }
-                continue;
+            if (log_missing) {
+                LOG_INFO("UserShaderValue: property '%s' not provided for material value '%s'",
+                         user_property_name->c_str(), material_value_name.c_str());
             }
+            continue;
         }
 
-        const auto gl_uniform_name = ResolveMaterialValueUniformName(info, material_value_name);
         bindings.push_back(ResolvedUserShaderValueBinding {
-            .user_property_name  = std::move(user_property_name),
-            .material_value_name = std::move(material_value_name),
+            .user_property_name  = *user_property_name,
+            .material_value_name = material_value_name,
             .gl_uniform_name     = gl_uniform_name,
             .property            = property,
-            .legacy_reversed     = legacy_reversed,
         });
     }
 
@@ -1915,8 +1730,6 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
 
     for (const auto& binding :
          ResolveUserShaderValueBindings(wpmat, info, context.user_properties, false)) {
-        if (binding.property == nullptr) continue;
-
         const auto value_type = DeclaredMaterialValueType(info, binding.gl_uniform_name);
         if (! value_type.has_value()) continue;
         const auto base_value =
@@ -1948,7 +1761,7 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
         });
 
         LOG_INFO("UserShaderValueRegister: layer=%d name='%.*s' user-property='%s' "
-                 "material-value='%s' uniform='%s' components=%zu value-type=%s legacy-reversed=%s",
+                 "material-value='%s' uniform='%s' components=%zu value-type=%s",
                  object_id,
                  static_cast<int>(object_name.size()),
                  object_name.data(),
@@ -1956,8 +1769,7 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
                  binding.material_value_name.c_str(),
                  binding.gl_uniform_name.c_str(),
                  binding.property->size(),
-                 DynamicValueTypeName(*value_type),
-                 binding.legacy_reversed ? "true" : "false");
+                 DynamicValueTypeName(*value_type));
     }
 }
 
@@ -1976,8 +1788,22 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
 
     for (const auto& [material_value_name, authored_value] : wpmat.constantshadervalues) {
         if (! authored_value.is_object()) continue;
-        const auto  resolution      = ResolveMaterialValueUniform(info, material_value_name, true);
-        const auto& gl_uniform_name = resolution.uniform_name;
+        const auto* uniform_name = ResolveMaterialValueUniformName(info, material_value_name);
+        if (uniform_name == nullptr) continue;
+
+        // A shorthand user mapping replaces the outer authored value object. Its base value
+        // still supplies the cold constant, but its former script, animation and user binding
+        // no longer own this descriptor. Register only the selected shorthand writer instead
+        // of retaining competing callbacks that can overwrite later user-property updates.
+        if (FindMaterialUserPropertyName(wpmat, material_value_name) != nullptr) {
+            if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+                LOG_INFO("SceneMaterialBindingReplace: layer=%d material-value='%s' "
+                         "replacement=usershadervalues",
+                         object_id, material_value_name.c_str());
+            }
+            continue;
+        }
+        const auto& gl_uniform_name = *uniform_name;
         const auto  value_type      = DeclaredMaterialValueType(info, gl_uniform_name);
         if (! value_type.has_value()) continue;
 
@@ -1993,14 +1819,14 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         if (! setting.hasUserBinding() && ! setting.hasScript() && ! has_animation) continue;
         if (! SceneMaterialHasUniform(*node->Mesh()->Material(), gl_uniform_name)) {
             LOG_INFO("ConstantShaderValueRegister: layer=%d effect-id=%d effect-index=%d "
-                     "material-index=%zu material-value='%s' unresolved uniform='%s' reason=%s",
+                     "material-index=%zu material-value='%s' unresolved uniform='%s' "
+                     "reason=uniform-not-materialized",
                      object_id,
                      effect_id,
                      effect_index,
                      material_index,
                      material_value_name.c_str(),
-                     gl_uniform_name.c_str(),
-                     MaterialValueUniformResolutionKindName(resolution.kind));
+                     gl_uniform_name.c_str());
             continue;
         }
 
@@ -2061,20 +1887,13 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
 void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                          const WPShaderInfo& info, const UserPropertyMap* user_properties) {
     for (const auto& binding : ResolveUserShaderValueBindings(wpmat, info, user_properties, true)) {
-        if (binding.legacy_reversed) {
-            LOG_INFO("UserShaderValue: legacy reversed mapping user-property '%s' -> material "
-                     "value '%s'",
-                     binding.user_property_name.c_str(),
-                     binding.material_value_name.c_str());
-        }
-
         LOG_INFO("UserShaderValue: property '%s' -> material value '%s' -> uniform '%s' (%zu)",
                  binding.user_property_name.c_str(),
                  binding.material_value_name.c_str(),
                  binding.gl_uniform_name.c_str(),
-                 binding.property != nullptr ? binding.property->size() : 0);
+                 binding.property->size());
         const auto value_type = DeclaredMaterialValueType(info, binding.gl_uniform_name);
-        if (binding.property == nullptr || ! value_type.has_value()) continue;
+        if (! value_type.has_value()) continue;
 
         // The shorthand user-property map targets the same shader descriptor as a constant's
         // object-form user binding. A one-component slider must broadcast to that descriptor's
