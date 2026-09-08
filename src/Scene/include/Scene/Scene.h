@@ -233,8 +233,8 @@ public:
         const std::array<float, 3>& authored_origin) const;
     void UpdateActiveCameraLayer();
 
-    // Official 2.3 MSAA: user `msaa.quality` is remembered, but sample count / MS RT
-    // creation use 0 unless scene.json objects[] contains a non-null "model" key.
+    // User msaa.quality is remembered, but multisampling is enabled only when scene.json
+    // objects[] contains a non-null "model" key.
     int EffectiveMsaaQuality() const { return has3dModels ? msaa.quality : 0; }
     int MsaaSampleCount() const { return msaa.SampleCount(has3dModels); }
 
@@ -361,8 +361,8 @@ public:
     std::array<float, 3> ambientColor { 0.2f, 0.2f, 0.2f };
     std::array<float, 3> skylightColor { 0.3f, 0.3f, 0.3f };
     BloomSettings        bloom;
-    // Official quality checkbox `reflection`. The RT stays registered when receivers exist;
-    // this flag only gates the mirrored producer pass that populates `_rt_Reflection`.
+    // The reflection quality setting gates the mirrored producer pass that populates
+    // _rt_Reflection. The render target stays registered when receivers exist.
     bool                 reflectionsEnabled { true };
 
     struct VolumetricLightPass {
@@ -412,8 +412,8 @@ public:
     ShadowSettings       shadows;
 
     struct MsaaSettings {
-        // Official msaa strings: none=0, x2=1, x4=2, x8=3. Sample count is 1 << quality.
-        // `quality` is the user-requested value; pass has3dModels into SampleCount().
+        // MSAA quality values: none=0, x2=1, x4=2, x8=3. Sample count is 1 << quality. quality is
+        // the user-requested value; pass has3dModels into SampleCount().
         int quality { 1 };
         int built_quality { -1 };
         // Device-clamped sample count written by the Vulkan backend. 0 means not yet queried.
@@ -450,8 +450,8 @@ public:
     void ApplyTextureResolutionForCurrentOutput();
     void PrepareParsedImageForGpu(Image& image);
     std::array<i32, 4> EffectiveImportedTextureResolution(const SceneTexture& texture) const;
-    // Official 2.3 MSAA gate. True when any objects[] entry has a non-null "model"
-    // field. `"image": "models/foo.json"` is not a model.
+    // The MSAA model-presence gate is true when any objects[] entry has a non-null "model" field.
+    // An "image": "models/foo.json" entry is not a model.
     bool                 has3dModels { false };
 
     struct LightingInventory {

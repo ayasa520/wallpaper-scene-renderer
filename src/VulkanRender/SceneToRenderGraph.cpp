@@ -582,9 +582,9 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
     const bool clear_model_depth = is_model_pass &&
         extra.model_depth_outputs_seen.insert(output_key).second;
 
-    // Official quality `reflection=false` keeps `_rt_Reflection` allocated and sampled, but
-    // skips the mirrored producer draw. Gate execution here so the checkbox is live without a
-    // topology rebuild; a companion clear pass empties the RT while the switch is off.
+    // The reflection=false quality setting keeps _rt_Reflection allocated and sampled, but skips
+    // the mirrored producer draw. Gate execution here so the checkbox is live without a topology
+    // rebuild; a companion clear pass empties the RT while the switch is off.
     if (output_key == SpecTex_Reflection) {
         should_execute = [inner = std::move(should_execute), &scene]() {
             if (!scene.reflectionsEnabled) return false;

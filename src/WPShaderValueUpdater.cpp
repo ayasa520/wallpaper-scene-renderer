@@ -221,9 +221,9 @@ void WPShaderValueUpdater::UpdatePointerState() {
     m_pointerPosLast = m_pointerPos;
     m_pointerPos     = m_pointerPosInput;
 
-    // Disabling camera parallax bypasses the complete official look-at update, so retain the last
-    // filtered target while disabled. Raw pointer uniforms above must continue advancing every
-    // frame independently; otherwise cursor feedback inherits camera-only delay semantics.
+    // Disabling camera parallax bypasses the complete look-at update, so retain the last filtered
+    // target while disabled. Raw pointer uniforms above must continue advancing every frame
+    // independently; otherwise cursor feedback inherits camera-only delay semantics.
     if (! m_parallax.enable) return;
 
     if (!(m_parallax.delay > 0.0f) || ! std::isfinite(m_parallax.delay)) {
@@ -232,9 +232,9 @@ void WPShaderValueUpdater::UpdatePointerState() {
     }
 
     const double frameTime = std::max(m_scene->frameTime, 0.0);
-    // Wallpaper Engine maps the authored 0..3 delay setting to a response rate instead of
-    // treating it as a settling duration. Keep that curve intact: scene authors tune the slider
-    // against this exact relationship, and the per-frame clamp preserves the native fast path.
+    // The authored 0..3 delay setting maps to a response rate instead of a settling duration.
+    // Keep that curve intact: scene authors tune the slider against this exact relationship, and
+    // the per-frame clamp allows an immediate response at high rates.
     const double responseRate =
         kParallaxResponseRate * (1.0 - static_cast<double>(m_parallax.delay) / kParallaxDelayRange);
     const double t = std::min(1.0, responseRate * frameTime);

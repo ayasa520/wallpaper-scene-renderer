@@ -62,7 +62,7 @@ bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingRes
             .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask    = 0,
             .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            // Official resolve replaces the 1x image; discard prior dest contents.
+            // Resolve replaces the 1x image; discard prior destination contents.
             .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .image            = resolved->handle,

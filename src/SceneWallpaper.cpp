@@ -142,9 +142,9 @@ std::string DescribeUserPropertyForLog(const UserPropertyMap& properties, std::s
 }
 
 std::string DescribeUserPropertyKeysForLog(const UserPropertyMap& properties) {
-    // Live user-property debugging must stay independent from individual wallpapers. A compact key
-    // list at the SceneWallpaper boundary proves that the native bridge delivered a payload, while
-    // the material-uniform logs prove which registered bindings consumed it.
+    // Live user-property debugging must stay independent from individual wallpapers. A compact
+    // key list at the SceneWallpaper boundary proves that the C++ bridge delivered a payload,
+    // while the material-uniform logs prove which registered bindings consumed it.
     std::string description = "[";
     size_t      count       = 0;
     for (const auto& [name, _] : properties) {

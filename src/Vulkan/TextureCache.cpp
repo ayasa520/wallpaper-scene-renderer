@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -66,6 +67,19 @@ VkFilter ToVkType(wallpaper::TextureFilter sam) {
 
 namespace
 {
+void TraceTextureUpload(const char* action, std::string_view key, const ImageParameters& image,
+                        VkImageLayout old_layout) {
+    if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") == nullptr) return;
+    // Pair the logical key with the physical allocation at queue/record boundaries.
+    // In particular, a replaced pending upload must not be mistaken for a completed
+    // layout transition simply because a descriptor already references the image.
+    LOG_INFO("TextureUploadTrace: action=%s key='%.*s' image=%p extent=%ux%u "
+             "mip-levels=%u old-layout=%d",
+             action, static_cast<int>(key.size()), key.data(),
+             reinterpret_cast<void*>(image.handle), image.extent.width, image.extent.height,
+             image.mipmap_level, static_cast<int>(old_layout));
+}
+
 constexpr uint32_t kDefaultDmabufFourcc = DRM_FORMAT_ABGR8888;
 constexpr VkFormatFeatureFlags2 kRequiredDmabufFeatures =
     static_cast<VkFormatFeatureFlags2>(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) |
@@ -676,6 +690,7 @@ bool QueueImageDataUploads(const Device& device, std::string_view key, const Ima
     }
 
     for (auto& upload : queued_uploads) {
+        TraceTextureUpload("queue-image", upload.key, upload.image, upload.old_layout);
         pending_uploads.emplace_back(std::move(upload));
     }
 
@@ -834,13 +849,24 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
             return cached;
         }
 
+        // Several CPU revisions can replace a texture while graph activation is
+        // still preparing, before RecordUploads records its first GPU transition.
+        // Reusing that allocation must keep the pending job's incoming layout;
+        // allocation/residency does not imply SHADER_READ_ONLY_OPTIMAL. All slots
+        // of a key are queued and recorded together, so their incoming layout is
+        // shared. Once no job is pending, the prior upload established shader-read.
+        const auto pending_upload = std::find_if(
+            m_pending_image_uploads.begin(), m_pending_image_uploads.end(),
+            [&image](const auto& upload) { return upload.key == image.key; });
+        const VkImageLayout incoming_layout = pending_upload != m_pending_image_uploads.end()
+            ? pending_upload->old_layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         purgeQueuedWorkForKey(image.key);
         if (CanReuseTextureSlots(cached, image) &&
             QueueImageDataUploads(m_device,
                                   image.key,
                                   image,
                                   cached,
-                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  incoming_layout,
                                   m_pending_image_uploads)) {
             m_tex_revision_map[image.key] = image_revision;
             return cached;
@@ -1175,6 +1201,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             .key   = key_string,
             .image = ImageParameters(image),
         });
+        TraceTextureUpload("queue-clear", key, image, VK_IMAGE_LAYOUT_UNDEFINED);
         LOG_INFO("TextureCacheInitialClearQueued: key='%s' render-target=%dx%d mip-levels=%u "
                  "transparent-black=true",
                  key_string.c_str(),
@@ -1331,6 +1358,19 @@ void TextureCache::purgeQueuedWorkForKey(std::string_view key) {
     const auto same_key = [key](const auto& work) {
         return work.key == key;
     };
+    if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") != nullptr) {
+        for (const auto& upload : m_pending_image_uploads) {
+            if (same_key(upload)) {
+                TraceTextureUpload("purge-pending-image", key, upload.image, upload.old_layout);
+            }
+        }
+        for (const auto& clear : m_pending_render_target_clears) {
+            if (same_key(clear)) {
+                TraceTextureUpload("purge-pending-clear", key, clear.image,
+                                   VK_IMAGE_LAYOUT_UNDEFINED);
+            }
+        }
+    }
     m_pending_image_uploads.erase(std::remove_if(m_pending_image_uploads.begin(),
                                                  m_pending_image_uploads.end(),
                                                  same_key),
@@ -1351,11 +1391,13 @@ void TextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
     if (m_pending_render_target_clears.empty() && m_pending_image_uploads.empty()) return;
 
     for (const auto& clear : m_pending_render_target_clears) {
+        TraceTextureUpload("record-clear", clear.key, clear.image, VK_IMAGE_LAYOUT_UNDEFINED);
         RecordClearNewRenderTargetToTransparentBlack(cmd, clear.image);
     }
     m_pending_render_target_clears.clear();
 
     for (auto& upload : m_pending_image_uploads) {
+        TraceTextureUpload("record-image", upload.key, upload.image, upload.old_layout);
         RecordCopyImageData(
             transform<VmaBufferParameters>(upload.stage_bufs,
                                            [](BufferParameters e) {
@@ -1418,23 +1460,21 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
                 .layerCount     = 1,
             },
     };
-    /*
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        out_bar);
-        */
-
     i32 mipWidth  = (i32)image.extent.width;
     i32 mipHeight = (i32)image.extent.height;
 
+    // CopyPass has just written level zero; every subsequent source level is the
+    // destination of the preceding blit. Publish those transfer writes when a level
+    // becomes a source. The next destination has a separate write dependency: using
+    // the source's TRANSFER_READ mask for its layout transition leaves the following
+    // blit write unsynchronized, even though both operations execute in TRANSFER.
     for (uint i = 1; i < image.mipmap_level; i++) {
         barrier.subresourceRange.baseMipLevel = i - 1;
         barrier.oldLayout                     = i == 1 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                                        : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
         barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
         cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1445,8 +1485,12 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
         barrier.subresourceRange.baseMipLevel = i;
         barrier.oldLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         barrier.newLayout                     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcAccessMask                 = VK_ACCESS_SHADER_READ_BIT |
+                                                VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask                 = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_DEPENDENCY_BY_REGION_BIT,
                             barrier);
@@ -1483,7 +1527,8 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
         barrier.subresourceRange.baseMipLevel = i - 1;
         barrier.oldLayout                     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barrier.newLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barrier.srcAccessMask                 = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.srcAccessMask                 = VK_ACCESS_TRANSFER_READ_BIT |
+                                                VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask                 = VK_ACCESS_SHADER_READ_BIT;
 
         cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1498,7 +1543,7 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
     barrier.subresourceRange.baseMipLevel = image.mipmap_level - 1;
     barrier.oldLayout                     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask                 = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcAccessMask                 = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask                 = VK_ACCESS_SHADER_READ_BIT;
 
     cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,

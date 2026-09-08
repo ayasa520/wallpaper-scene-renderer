@@ -828,9 +828,9 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterSceneScriptBinding(context, object_json, "maxwidth", WPDynamicValue::Type::Float);
 
         if (object_json.contains("light") && ! object_json.at("light").is_null()) {
-            // Official lighting docs animate Intensity (and optionally Radius) on the light
-            // object itself. These are not material uniforms, so they are scanned only for
-            // authored lights and applied to SceneLight each frame.
+            // Intensity and Radius animations belong to the light object itself. These are not
+            // material uniforms, so they are scanned only for authored lights and applied to
+            // SceneLight each frame.
             RegisterScenePropertyBinding(
                 context, object_json, "intensity", WPDynamicValue::Type::Float);
             RegisterScenePropertyBinding(

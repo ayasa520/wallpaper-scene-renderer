@@ -122,7 +122,7 @@ constexpr std::string_view SpecTex_VolumetricsSingle { "_rt_volumetricsSingle" }
 constexpr std::string_view SpecTex_VolumetricsLightBuffer { "_rt_volumetricsLightBuffer" };
 constexpr std::string_view SpecTex_VolumetricsLightBufferB { "_rt_volumetricsLightBufferB" };
 constexpr std::string_view SpecTex_ShadowAtlas { "_rt_shadowAtlas" };
-// Official model-reflection target. Receivers sample this RT; reflected producers write it.
+// Model-reflection target. Receivers sample this RT; reflected producers write it.
 constexpr std::string_view SpecTex_Reflection { "_rt_Reflection" };
 // Second physical compose image. Shader color-blend and refraction sample this snapshot while
 // writing `_rt_default`, instead of allocating a unique `_rt_default_<version>_copy` for every

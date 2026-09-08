@@ -777,10 +777,10 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         std::move(trail_uniform_update));
     auto* particle_subsystem = particleSub.get();
     particleSub->SetSceneNode(spNode.get());
-    // PARTICLE_OVERRIDE_SCHEMA stores alpha in the live layer override record. It multiplies the
-    // fully evaluated particle alpha at render time, rather than becoming part of the particle's
-    // initializer state; this is what lets authored scripts fade all existing speed-line particles
-    // to zero immediately when Sonic enters the slow state.
+    // The live layer alpha override multiplies fully evaluated particle alpha at render time,
+    // rather than becoming part of the particle's initializer state. Authored scripts can
+    // therefore fade all existing particles immediately, including particles created before the
+    // property changed.
     particleSub->SetRuntimeAlphaOverride(override.alpha);
     // instanceoverride.size is baked into initializer output during cold parse. Keep that parsed
     // multiplier as the runtime reference so later user-property size edits can rescale live

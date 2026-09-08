@@ -32,10 +32,10 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
-    // Official 1x texSample2DBackBuffer is texSample2D(s, (u)). The texture
-    // argument must stay an identifier so texSample2D can paste `_ww_sampler`.
-    // Texture2DMS.Load is only emitted with BACKBUFFER_MS, which Vivid does not
-    // run (volumetricsfront binds 1x `_rt_volumetricsBack`).
+    // For a single-sample back buffer, texSample2DBackBuffer expands to texSample2D(s, (u)). The
+    // texture argument must stay an identifier so texSample2D can paste `_ww_sampler`.
+    // Texture2DMS.Load is only emitted with BACKBUFFER_MS, which Vivid does not run
+    // (volumetricsfront binds 1x `_rt_volumetricsBack`).
     "prepared-shader-v27-backbuffer-sample\n"
 };
 

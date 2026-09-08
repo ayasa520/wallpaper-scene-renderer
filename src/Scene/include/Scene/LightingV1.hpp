@@ -8,12 +8,11 @@
 namespace wallpaper
 {
 
-// Official #require LightingV1 expands to PerformLighting_V1 plus the per-light
-// uniform arrays. Snippets match the host injector: point/spot/tube use
-// ComputePBRLightShadow; directional uses ComputePBRLightShadowInfinite;
-// shadowed point lights go through CalculateProjectedCoordsPoint +
-// PerformPointShadowMapping; shadowed spots use CalculateProjectedCoords +
-// PerformShadowMapping; shadowed directionals mix three cascade projections.
+// #require LightingV1 expands to PerformLighting_V1 plus the per-light uniform arrays. Snippets
+// match the host injector: point/spot/tube use ComputePBRLightShadow; directional uses
+// ComputePBRLightShadowInfinite; shadowed point lights go through CalculateProjectedCoordsPoint +
+// PerformPointShadowMapping; shadowed spots use CalculateProjectedCoords + PerformShadowMapping;
+// shadowed directionals mix three cascade projections.
 struct LightingV1Desc {
     int  point { 0 };
     int  spot { 0 };

@@ -496,8 +496,8 @@ Scene::EffectiveImportedTextureResolution(const SceneTexture& texture) const {
     const bool drop = textureResolution.drop_mip0 && !texture.isVideo &&
                       texture.mipmapCount > 1;
     if (texture.gpuWidth > 0 && texture.gpuHeight > 0) {
-        // Official bind path: g_TextureNResolution follows the uploaded GPU
-        // extent, not the authored .tex header, once mip0 has been dropped.
+        // g_TextureNResolution follows the uploaded GPU extent, not the authored .tex header,
+        // once mip0 has been dropped.
         if (!drop) {
             if (texture.mipmap_larger) {
                 return { texture.width, texture.height, texture.mapWidth, texture.mapHeight };

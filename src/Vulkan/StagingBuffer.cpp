@@ -49,11 +49,17 @@ void RecordCopyBufferRange(const BufferParameters& dst_buf, const BufferParamete
     };
     cmd.CopyBuffer(src_buf.handle, dst_buf.handle, copy);
 
+    // The shared allocation holds index data as well as vertex/uniform ranges. An
+    // attribute-read dependency does not make transfer writes visible to index fetch;
+    // synchronization validation reports READ_AFTER_WRITE for indexed text/light hulls.
     VkBufferMemoryBarrier in_bar {
         .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
         .pNext         = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                         VK_ACCESS_UNIFORM_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer        = dst_buf.handle,
         .offset        = offset,
         .size          = size,

@@ -174,8 +174,8 @@ void AdvanceExternalSceneAudio(ExternalSceneAudioState* state, double frame_time
     const float delta_time = static_cast<float>(std::max(0.0, frame_time));
     const bool  signal_active = global_peak >= kSceneAudioSignalThreshold;
 
-    // The native state initializes all group envelopes together on the first audible frame. This
-    // avoids a cold-start amplification spike before the asymmetric envelope tracker has settled.
+    // Initialize all group envelopes together on the first audible frame. This avoids a
+    // cold-start amplification spike before the asymmetric envelope tracker has settled.
     if (signal_active && state->envelope.front() <= kSceneAudioSignalThreshold)
         state->envelope.fill(1.0f);
 
@@ -196,7 +196,7 @@ void AdvanceExternalSceneAudio(ExternalSceneAudioState* state, double frame_time
     }
 
     if (! signal_active) {
-        // Native Scene output becomes zero below the signal threshold without consuming the
+        // Scene audio output becomes zero below the signal threshold without consuming the
         // temporal-filter or slew states; those states resume from their prior values when audio
         // becomes active again.
         state->cache = BuildExternalAudioSpectrumCache({});
@@ -4473,14 +4473,12 @@ bool RegistrationUsesScriptAngleDegrees(const WPSceneScriptRegistration& registr
 }
 
 bool RegistrationUsesNumericVisibleScriptValue(const WPSceneScriptRegistration& registration) {
-    // `visible` is stored as a renderer boolean, but Wallpaper Engine scene scripts are often
-    // generated from scalar templates that expect the init/update argument to be a numeric value.
-    // The 3666041758 ferrofluid layer is one concrete case: its visible script stores
-    // `initialValue = typeof value === 'number' ? value : value.x`, so passing a JS boolean makes
-    // `initialValue` undefined and the next update returns NaN. QuickJS then coerces NaN to false
-    // for the boolean target and the renderer legitimately hides the whole layer. Keep the native
-    // property type boolean, but expose visible registration values to scripts as 1.0/0.0 so both
-    // scalar audio-response templates and normal truthy checks behave like Wallpaper Engine.
+    // `visible` is stored as a renderer boolean, while scalar script templates expect the
+    // init/update argument to be numeric. A template that reads a number directly and otherwise
+    // takes value.x would turn a JS boolean into undefined, then return NaN and hide the layer
+    // during boolean conversion. Expose visible registration values as 1.0/0.0 while retaining
+    // boolean owner storage, so scalar templates and ordinary truthy checks receive usable
+    // values.
     if (registration.property_name != "visible") return false;
     return registration.target_kind == WPSceneScriptTargetKind::Layer ||
            registration.target_kind == WPSceneScriptTargetKind::Camera ||
