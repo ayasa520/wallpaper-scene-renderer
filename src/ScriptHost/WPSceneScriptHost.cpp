@@ -3714,46 +3714,19 @@ FindEffectMaterialTarget(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
     return std::nullopt;
 }
 
-std::string ResolveRuntimeMaterialUniformName(const SceneMaterial& material,
-                                              std::string_view     property_name) {
-    const std::string authored_name(property_name);
-    if (const auto alias_it = material.uniformAliases.find(authored_name);
-        alias_it != material.uniformAliases.end()) {
-        return alias_it->second;
-    }
-
-    for (const auto& [alias_name, uniform_name] : material.uniformAliases) {
-        if (uniform_name == authored_name) return uniform_name;
-
-        // Shader metadata commonly advertises `material:"raythreshold"` next to a GLSL uniform
-        // named `g_Threshold`. This suffix fallback mirrors the parser-side user-property
-        // resolver, so runtime scripts can use either the authored material name or the final
-        // uniform name without hard-coding a project-specific alias table in the JS wrapper.
-        if (uniform_name.size() > 2 && uniform_name.substr(2) == authored_name) {
-            return uniform_name;
-        }
-        (void)alias_name;
-    }
-
-    return authored_name;
-}
-
 const ShaderValue* FindRuntimeMaterialUniformValue(const SceneMaterial& material,
                                                    std::string_view     property_name,
                                                    std::string* out_uniform_name = nullptr) {
-    const std::string authored_name(property_name);
-    std::string       uniform_name = ResolveRuntimeMaterialUniformName(material, authored_name);
-    auto*             uniform      = FindMaterialUniformValue(material, uniform_name);
-    if (uniform == nullptr && uniform_name != authored_name) {
-        // If an authored alias points at a shader symbol that was optimized away or renamed, try
-        // the original property name before reporting failure. This preserves direct uniform
-        // writes for projects that already script GLSL names while still making alias misses
-        // visible through the caller's diagnostics.
-        uniform_name = authored_name;
-        uniform      = FindMaterialUniformValue(material, uniform_name);
-    }
-    if (out_uniform_name != nullptr) *out_uniform_name = uniform_name;
-    return uniform;
+    // The compiled material declaration owns the script property name. Backing shader symbols,
+    // their suffixes and unrelated buffer defaults do not publish additional controls. Share
+    // this exact lookup across has/get/set so a miss cannot acquire another uniform's storage.
+    // An explicitly authored symbol-looking name still selects its own alias, even when it
+    // happens to match the backing symbol of a different control in the same material.
+    const auto alias = material.uniformAliases.find(std::string(property_name));
+    if (alias == material.uniformAliases.end()) return nullptr;
+
+    if (out_uniform_name != nullptr) *out_uniform_name = alias->second;
+    return FindMaterialUniformValue(material, alias->second);
 }
 
 WPDynamicValue::Type RuntimeDynamicTypeForShaderValue(const ShaderValue& value) {
