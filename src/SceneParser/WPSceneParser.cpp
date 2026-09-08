@@ -1736,10 +1736,54 @@ std::string ResolveMaterialValueUniformName(const WPShaderInfo& info,
     return resolution.resolved() ? resolution.uniform_name : material_value_name;
 }
 
-void ApplyResolvedConstvalue(SceneMaterial& material, const std::string& material_value_name,
-                             const std::vector<float>&                 value,
+std::optional<WPDynamicValue::Type>
+DeclaredMaterialValueType(const WPShaderInfo& info, const std::string& uniform_name) {
+    const auto declaration = info.materialTypes.find(uniform_name);
+    if (declaration == info.materialTypes.end()) return std::nullopt;
+
+    // Material descriptors derive their vector width from the shader declaration, not from
+    // defaults or authored JSON. The ordinary non-vector declaration selects a float property.
+    const auto& type = declaration->second;
+    if (type.find("vec2") != std::string::npos || type == "float2")
+        return WPDynamicValue::Type::Float2;
+    if (type.find("vec3") != std::string::npos || type == "float3")
+        return WPDynamicValue::Type::Float3;
+    if (type.find("vec4") != std::string::npos || type == "float4")
+        return WPDynamicValue::Type::Float4;
+    return WPDynamicValue::Type::Float;
+}
+
+template<size_t N>
+std::optional<ShaderValue> ReadMaterialVectorValue(const nlohmann::json& json) {
+    std::array<float, N> value {};
+    if (! GET_JSON_VALUE(json, value)) return std::nullopt;
+    return ShaderValue(value);
+}
+
+std::optional<ShaderValue> ReadMaterialConstantValue(const nlohmann::json& json,
+                                                    WPDynamicValue::Type type) {
+    switch (type) {
+    case WPDynamicValue::Type::Float2: return ReadMaterialVectorValue<2>(json);
+    case WPDynamicValue::Type::Float3: return ReadMaterialVectorValue<3>(json);
+    case WPDynamicValue::Type::Float4: return ReadMaterialVectorValue<4>(json);
+    case WPDynamicValue::Type::Float: {
+        std::vector<float> value;
+        if (! GET_JSON_VALUE(json, value) || value.empty()) return std::nullopt;
+        return ShaderValue(value.front());
+    }
+    default: return std::nullopt;
+    }
+}
+
+void ApplyResolvedConstvalue(SceneMaterial& material, const WPShaderInfo& info,
+                             const std::string& material_value_name,
+                             const nlohmann::json&                     authored_value,
                              const MaterialValueUniformResolution&     resolution) {
     if (! resolution.resolved()) return;
+    const auto type = DeclaredMaterialValueType(info, resolution.uniform_name);
+    if (! type.has_value()) return;
+    const auto value = ReadMaterialConstantValue(authored_value, *type);
+    if (! value.has_value()) return;
     if (resolution.kind == MaterialValueUniformResolutionKind::NormalizedAlias) {
         LOG_INFO("ShaderValueAliasFallback: material-value='%s' alias='%s' uniform='%s'",
                  material_value_name.c_str(),
@@ -1748,7 +1792,14 @@ void ApplyResolvedConstvalue(SceneMaterial& material, const std::string& materia
     }
 
     material.customShader.constValues[resolution.uniform_name] =
-        ClampParserOpacityUniformValue(resolution.uniform_name, ShaderValue(value));
+        ClampParserOpacityUniformValue(resolution.uniform_name, *value);
+    if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+        LOG_INFO("SceneMaterialConstantType: shader='%s' material-value='%s' uniform='%s' "
+                 "declared-type=%s components=%zu authored=%s",
+                 material.name.c_str(), material_value_name.c_str(),
+                 resolution.uniform_name.c_str(), DynamicValueTypeName(*type), value->size(),
+                 authored_value.dump().c_str());
+    }
 }
 
 // Shared with WPSceneParserModel.cpp (declared in WPSceneParserShared.hpp).
@@ -1763,7 +1814,7 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
     for (const auto& [name, value] : wpmat.constantshadervalues) {
         const auto resolution = ResolveMaterialValueUniform(info, name, false);
         if (! resolution.resolved()) continue;
-        ApplyResolvedConstvalue(material, name, value, resolution);
+        ApplyResolvedConstvalue(material, info, name, value, resolution);
         exact_uniform_names.insert(resolution.uniform_name);
     }
 
@@ -1787,7 +1838,7 @@ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
                          resolution.uniform_name.c_str());
                 continue;
             }
-            ApplyResolvedConstvalue(material, name, value, resolution);
+            ApplyResolvedConstvalue(material, info, name, value, resolution);
             continue;
         }
 
@@ -1850,16 +1901,6 @@ ResolveUserShaderValueBindings(const wpscene::WPMaterial& wpmat, const WPShaderI
     return bindings;
 }
 
-WPDynamicValue::Type DynamicTypeForShaderValue(const ShaderValue& value) {
-    switch (value.size()) {
-    case 2: return WPDynamicValue::Type::Float2;
-    case 3: return WPDynamicValue::Type::Float3;
-    case 4: return WPDynamicValue::Type::Float4;
-    case 1: return WPDynamicValue::Type::Float;
-    default: return WPDynamicValue::Type::FloatVector;
-    }
-}
-
 bool SceneMaterialHasUniform(const SceneMaterial& material, std::string_view uniform_name) {
     const std::string uniform_key(uniform_name);
     if (material.customShader.constValues.count(uniform_key) != 0) return true;
@@ -1882,13 +1923,14 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
          ResolveUserShaderValueBindings(wpmat, info, context.user_properties, false)) {
         if (binding.property == nullptr) continue;
 
-        const auto value_type = DynamicTypeForShaderValue(*binding.property);
-        auto       base_value =
-            WPDynamicValue::FromUserPropertyValue(UserPropertyValue(*binding.property), value_type)
-                .value_or(WPDynamicValue {});
+        const auto value_type = DeclaredMaterialValueType(info, binding.gl_uniform_name);
+        if (! value_type.has_value()) continue;
+        const auto base_value =
+            WPDynamicValue::FromUserPropertyValue(UserPropertyValue(*binding.property), *value_type);
+        if (! base_value.has_value()) continue;
 
         WPUserSetting setting;
-        setting.value    = base_value;
+        setting.value    = *base_value;
         setting.property = UserPropertyBinding {
             .name      = binding.user_property_name,
             .condition = {},
@@ -1906,13 +1948,13 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
             .material      = node->Mesh()->Material(),
             .target_kind   = WPSceneScriptTargetKind::MaterialUniform,
             .target_index  = 0,
-            .value_type    = value_type,
-            .base_value    = base_value,
+            .value_type    = *value_type,
+            .base_value    = *base_value,
             .setting       = std::move(setting),
         });
 
         LOG_INFO("UserShaderValueRegister: layer=%d name='%.*s' user-property='%s' "
-                 "material-value='%s' uniform='%s' components=%zu legacy-reversed=%s",
+                 "material-value='%s' uniform='%s' components=%zu value-type=%s legacy-reversed=%s",
                  object_id,
                  static_cast<int>(object_name.size()),
                  object_name.data(),
@@ -1920,6 +1962,7 @@ void RegisterUserShaderValueBindings(ParseContext& context, const wpscene::WPMat
                  binding.material_value_name.c_str(),
                  binding.gl_uniform_name.c_str(),
                  binding.property->size(),
+                 DynamicValueTypeName(*value_type),
                  binding.legacy_reversed ? "true" : "false");
     }
 }
@@ -1937,13 +1980,23 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         return;
     }
 
-    for (const auto& [material_value_name, binding] : wpmat.constantshadervaluebindings) {
-        const auto& setting       = binding.setting;
-        const bool  has_animation = binding.animation != nullptr && binding.animation->valid();
-        if (! setting.hasUserBinding() && ! setting.hasScript() && ! has_animation) continue;
-
+    for (const auto& [material_value_name, authored_value] : wpmat.constantshadervalues) {
+        if (! authored_value.is_object()) continue;
         const auto  resolution      = ResolveMaterialValueUniform(info, material_value_name, true);
         const auto& gl_uniform_name = resolution.uniform_name;
+        const auto  value_type      = DeclaredMaterialValueType(info, gl_uniform_name);
+        if (! value_type.has_value()) continue;
+
+        // Preserve the raw constant through pass merging and shader loading. Only the shader
+        // descriptor can choose the property's width: a scalar JSON base for a vec3 broadcasts
+        // to three components and still registers c0/c1/c2, rather than losing two channels.
+        // Script/user binding and animation registration then share this exact typed base.
+        WPUserSetting setting;
+        if (! ParseUserSetting(authored_value, setting, *value_type)) continue;
+        WPPropertyAnimationDefinition animation_definition;
+        const bool has_animation =
+            ParsePropertyAnimationDefinition(authored_value, *value_type, animation_definition);
+        if (! setting.hasUserBinding() && ! setting.hasScript() && ! has_animation) continue;
         if (! SceneMaterialHasUniform(*node->Mesh()->Material(), gl_uniform_name)) {
             LOG_INFO("ConstantShaderValueRegister: layer=%d effect-id=%d effect-index=%d "
                      "material-index=%zu material-value='%s' unresolved uniform='%s' reason=%s",
@@ -1980,7 +2033,8 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
             // their sibling script/user binding. This keeps thisObject.getAnimation() resolvable
             // for effect scripts that replay cover-transition timelines during media changes.
             auto animation_registration      = registration;
-            animation_registration.animation = binding.animation;
+            animation_registration.animation =
+                std::make_shared<WPPropertyAnimationDefinition>(std::move(animation_definition));
             context.scene->propertyAnimationRegistrations.push_back(
                 std::move(animation_registration));
             registration_kind = "animation";
@@ -2025,9 +2079,19 @@ void LoadUserShaderValue(SceneMaterial& material, const wpscene::WPMaterial& wpm
                  binding.material_value_name.c_str(),
                  binding.gl_uniform_name.c_str(),
                  binding.property != nullptr ? binding.property->size() : 0);
-        if (binding.property != nullptr)
-            material.customShader.constValues[binding.gl_uniform_name] =
-                ClampParserOpacityUniformValue(binding.gl_uniform_name, *binding.property);
+        const auto value_type = DeclaredMaterialValueType(info, binding.gl_uniform_name);
+        if (binding.property == nullptr || ! value_type.has_value()) continue;
+
+        // The shorthand user-property map targets the same shader descriptor as a constant's
+        // object-form user binding. A one-component slider must broadcast to that descriptor's
+        // width both now and on later updates; its current numeric length does not define a type.
+        const auto value =
+            WPDynamicValue::FromUserPropertyValue(UserPropertyValue(*binding.property), *value_type);
+        if (! value.has_value()) continue;
+        const auto shader_value = value->toShaderValue();
+        if (! shader_value.has_value()) continue;
+        material.customShader.constValues[binding.gl_uniform_name] =
+            ClampParserOpacityUniformValue(binding.gl_uniform_name, *shader_value);
     }
 }
 

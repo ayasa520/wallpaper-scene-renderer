@@ -388,6 +388,21 @@ std::optional<WPScriptValue> WPDynamicValue::toScriptValue() const {
     return std::nullopt;
 }
 
+std::optional<ShaderValue> WPDynamicValue::toShaderValue() const {
+    // Cold material loading and live script/user writes must preserve the same typed numeric
+    // payload. Keep this conversion on the value rather than duplicating it in each dispatcher.
+    if (std::array<float, 4> value {}; tryGet(&value)) return ShaderValue(value);
+    if (std::array<float, 3> value {}; tryGet(&value)) return ShaderValue(value);
+    if (std::array<float, 2> value {}; tryGet(&value)) return ShaderValue(value);
+    if (std::vector<float> value; tryGet(&value)) return ShaderValue(value);
+    if (float value = 0.0f; tryGet(&value)) return ShaderValue(value);
+    if (double value = 0.0; tryGet(&value)) return ShaderValue(static_cast<float>(value));
+    if (int32_t value = 0; tryGet(&value)) return ShaderValue(static_cast<float>(value));
+    if (uint32_t value = 0; tryGet(&value)) return ShaderValue(static_cast<float>(value));
+    if (bool value = false; tryGet(&value)) return ShaderValue(value ? 1.0f : 0.0f);
+    return std::nullopt;
+}
+
 std::optional<WPDynamicValue> WPDynamicValue::FromJsonLiteral(const nlohmann::json& json, Type hint) {
     switch (hint) {
         case Type::Boolean: {
@@ -433,18 +448,20 @@ std::optional<WPDynamicValue> WPDynamicValue::FromJsonLiteral(const nlohmann::js
         case Type::Float2: {
             std::array<float, 2> value {};
             const bool parsed = json.is_array() ? ParseJsonArray(json, value)
-                                                : ReadJsonFloat2Value(json, value);
+                                                : ReadJsonFloatVectorValue(json, value);
             return parsed ? std::optional<WPDynamicValue>(WPDynamicValue(value)) : std::nullopt;
         }
         case Type::Float3: {
             std::array<float, 3> value {};
-            return ParseJsonArray(json, value) ? std::optional<WPDynamicValue>(WPDynamicValue(value))
-                                               : std::nullopt;
+            const bool parsed = json.is_array() ? ParseJsonArray(json, value)
+                                                : ReadJsonFloatVectorValue(json, value);
+            return parsed ? std::optional<WPDynamicValue>(WPDynamicValue(value)) : std::nullopt;
         }
         case Type::Float4: {
             std::array<float, 4> value {};
-            return ParseJsonArray(json, value) ? std::optional<WPDynamicValue>(WPDynamicValue(value))
-                                               : std::nullopt;
+            const bool parsed = json.is_array() ? ParseJsonArray(json, value)
+                                                : ReadJsonFloatVectorValue(json, value);
+            return parsed ? std::optional<WPDynamicValue>(WPDynamicValue(value)) : std::nullopt;
         }
         case Type::Null:
             break;

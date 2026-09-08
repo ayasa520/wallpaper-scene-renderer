@@ -32,6 +32,7 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 #define SHADER_SRC_DIR "prepared-shaders02"
 #define SHADER_SRC_SUFFIX "wpsrc"
 
+static constexpr int              kPreShaderMetadataVersion { 2 };
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
     // For a single-sample back buffer, texSample2DBackBuffer expands to texSample2D(s, (u)). The
@@ -1730,6 +1731,10 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                     std::string material;
                     GET_JSON_NAME_VALUE_NOWARN(sv_json, "material", material);
                     if (! material.empty()) wpAliasDict[material] = defines.back();
+                    if (const auto declaration = TryParseDeclLine(line, 0, { "uniform" });
+                        declaration.has_value() && ! IsSamplerType(declaration->type)) {
+                        pWPShaderInfo->materialTypes[declaration->name] = declaration->type;
+                    }
 
                     ShaderValue sv;
                     std::string name  = defines.back();
@@ -2201,7 +2206,9 @@ inline std::string GenPreparedShaderSha1(std::span<const WPShaderUnit> units,
 inline std::string GenPreShaderSha1(std::string_view expanded_src,
                                     std::span<const WPShaderTexInfo> texinfos) {
     std::ostringstream out;
-    out << "pre-shader-v4-mask-component-4\n";
+    // Declared material types are part of the persisted metadata contract. Use a new key as
+    // well as a new record version so old entries are misses, never amended after a cache hit.
+    out << "pre-shader-v5-material-declared-types\n";
     out << utils::genSha1(expanded_src) << '\n';
     for (const auto& texinfo : texinfos) {
         out << static_cast<int>(texinfo.enabled);
@@ -2314,21 +2321,20 @@ inline void SaveDefaultTexs(const WPDefaultTexs& def_texs, fs::IBinaryStreamW& f
 }
 
 inline bool LoadPreShaderInfo(WPShaderInfo& shader_info, fs::IBinaryStream& file) {
-    const auto version = ReadVersion("WSHM", file);
-    if (version != 1) return false;
-
     shader_info = {};
     if (! LoadStringMap(shader_info.combos, file)) return false;
     if (! LoadStringMap(shader_info.alias, file)) return false;
+    if (! LoadStringMap(shader_info.materialTypes, file)) return false;
     if (! LoadShaderValueMap(shader_info.svs, file)) return false;
     if (! LoadDefaultTexs(shader_info.defTexs, file)) return false;
     return true;
 }
 
 inline void SavePreShaderInfo(const WPShaderInfo& shader_info, fs::IBinaryStreamW& file) {
-    WriteVersion("WSHM", file, 1);
+    WriteVersion("WSHM", file, kPreShaderMetadataVersion);
     SaveStringMap(shader_info.combos, file);
     SaveStringMap(shader_info.alias, file);
+    SaveStringMap(shader_info.materialTypes, file);
     SaveShaderValueMap(shader_info.svs, file);
     SaveDefaultTexs(shader_info.defTexs, file);
 }
@@ -2339,6 +2345,9 @@ inline void MergeShaderInfo(WPShaderInfo& into, const WPShaderInfo& from) {
     }
     for (const auto& [key, value] : from.alias) {
         into.alias[key] = value;
+    }
+    for (const auto& [key, value] : from.materialTypes) {
+        into.materialTypes[key] = value;
     }
     for (const auto& [key, value] : from.svs) {
         into.svs[key] = value;
@@ -2766,13 +2775,22 @@ std::string WPShaderParser::PreShaderSrc(fs::VFS& vfs, const std::string& src,
     const auto cache_path = GetPreShaderCachePath(cache_key);
 
     WPShaderInfo cached_info;
+    bool         cache_hit { false };
     if (vfs.Contains(cache_path)) {
         auto cache_file = vfs.Open(cache_path);
-        if (! cache_file || ! LoadPreShaderInfo(cached_info, *cache_file)) {
+        if (! cache_file) {
             LOG_ERROR("load pre-shader metadata from '%s' failed", cache_path.c_str());
             return {};
         }
-    } else {
+        if (ReadVersion("WSHM", *cache_file) == kPreShaderMetadataVersion) {
+            if (! LoadPreShaderInfo(cached_info, *cache_file)) {
+                LOG_ERROR("load pre-shader metadata from '%s' failed", cache_path.c_str());
+                return {};
+            }
+            cache_hit = true;
+        }
+    }
+    if (! cache_hit) {
         ParseWPShader(expanded.include_src, &cached_info, texinfos);
         ParseWPShader(expanded.src_without_includes, &cached_info, texinfos);
 

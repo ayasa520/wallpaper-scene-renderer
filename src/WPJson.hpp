@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
+#include <span>
 #include <string_view>
 #include <type_traits>
 
@@ -42,7 +43,7 @@ GetJsonValue(const char* file, const char* func, int line, const nlohmann::json&
 bool ParseJson(const char* file, const char* func, int line, const std::string& source,
                nlohmann::json& result);
 
-bool ReadJsonFloat2Value(const nlohmann::json& json, std::array<float, 2>& value);
+bool ReadJsonFloatVectorValue(const nlohmann::json& json, std::span<float> value);
 bool ReadJsonLiteralBoolean(const nlohmann::json& json, std::string_view name,
                             bool default_value);
 

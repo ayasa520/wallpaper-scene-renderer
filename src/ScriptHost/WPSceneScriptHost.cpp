@@ -3881,37 +3881,6 @@ std::optional<WPDynamicValue> DynamicValueFromShaderValue(const ShaderValue& val
     return WPDynamicValue::FromUserPropertyValue(UserPropertyValue(value), hint);
 }
 
-std::optional<ShaderValue> ShaderValueFromDynamicValue(const WPDynamicValue& value) {
-    if (std::array<float, 4> float4 {}; value.tryGet(&float4)) {
-        return ShaderValue(float4);
-    }
-    if (std::array<float, 3> float3 {}; value.tryGet(&float3)) {
-        return ShaderValue(float3);
-    }
-    if (std::array<float, 2> float2 {}; value.tryGet(&float2)) {
-        return ShaderValue(float2);
-    }
-    if (std::vector<float> float_vector; value.tryGet(&float_vector)) {
-        return ShaderValue(float_vector);
-    }
-    if (float float_value = 0.0f; value.tryGet(&float_value)) {
-        return ShaderValue(float_value);
-    }
-    if (double double_value = 0.0; value.tryGet(&double_value)) {
-        return ShaderValue(static_cast<float>(double_value));
-    }
-    if (int32_t int_value = 0; value.tryGet(&int_value)) {
-        return ShaderValue(static_cast<float>(int_value));
-    }
-    if (uint32_t uint_value = 0; value.tryGet(&uint_value)) {
-        return ShaderValue(static_cast<float>(uint_value));
-    }
-    if (bool bool_value = false; value.tryGet(&bool_value)) {
-        return ShaderValue(bool_value ? 1.0f : 0.0f);
-    }
-    return std::nullopt;
-}
-
 std::optional<WPDynamicValue>
 ReadMaterialUniformPropertyValue(const WPSceneScriptRegistration& registration) {
     const auto* material = registration.material;
@@ -3929,7 +3898,7 @@ bool ApplyMaterialUniformPropertyValue(WPSceneScriptHost::Opaque*       opaque,
     auto* material = registration.material;
     if (material == nullptr) return false;
 
-    const auto shader_value = ShaderValueFromDynamicValue(value);
+    const auto shader_value = value.toShaderValue();
     if (! shader_value.has_value()) {
         LOG_ERROR("SceneMaterialUniformApply: layer=%d uniform='%s' invalid value %s",
                   registration.object_id,
@@ -5903,7 +5872,7 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
         return JS_FALSE;
     }
 
-    const auto shader_value = ShaderValueFromDynamicValue(*value);
+    const auto shader_value = value->toShaderValue();
     if (! shader_value.has_value()) {
         LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
                   "material='%s' property='%s' uniform='%s' invalid value %s",

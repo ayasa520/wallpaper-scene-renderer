@@ -24,6 +24,9 @@ struct WPShaderInfo {
     ShaderValueMap   svs;
     ShaderValueMap   baseConstSvs;
     WPAliasValueDict alias;
+    // Material descriptors retain their declared shader type independently of default values.
+    // A scalar-authored vec3 still owns three script/timeline channels, including on cache hits.
+    Map<std::string, std::string> materialTypes;
     WPDefaultTexs    defTexs;
 };
 

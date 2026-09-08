@@ -147,7 +147,7 @@ void ReadTextPaddingValue(const nlohmann::json& json,
     const auto* value_node = ResolveTextPropertyValueNode(json.at("padding"));
     if (value_node == nullptr) return;
 
-    if (ReadJsonFloat2Value(*value_node, *out_padding)) return;
+    if (ReadJsonFloatVectorValue(*value_node, *out_padding)) return;
     const std::string raw = value_node->dump();
     LOG_ERROR("TextPaddingParse: layer=%d unsupported padding=%s", object_id, raw.c_str());
 }

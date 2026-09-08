@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <optional>
@@ -286,8 +287,10 @@ inline bool _GetJsonValue(const nlohmann::json&                  json,
     const auto& njson = ResolvePropertyValueNode(json);
 
     using Tv = typename T::value_type;
-    if constexpr (std::is_same_v<T, std::array<float, 2>>) {
-        if (njson.is_number() || njson.is_string()) return ReadJsonFloat2Value(njson, value);
+    if constexpr (std::is_same_v<T, std::array<float, 2>> ||
+                  std::is_same_v<T, std::array<float, 3>> ||
+                  std::is_same_v<T, std::array<float, 4>>) {
+        if (njson.is_number() || njson.is_string()) return ReadJsonFloatVectorValue(njson, value);
     }
     if (njson.is_number()) {
         value = { njson.get<Tv>() };
@@ -425,27 +428,27 @@ T_IMPL_GET_JSON(farray<2>);
 T_IMPL_GET_JSON(farray<3>);
 T_IMPL_GET_JSON(farray<4>);
 
-bool ReadJsonFloat2Value(const nlohmann::json& json, std::array<float, 2>& value) {
-    // Numeric JSON values broadcast, while strings store independent components. The reader zeros
-    // both floats, converts x, then finds the first ASCII space and skips spaces before
-    // converting y. A missing second component remains zero, and additional components are not
-    // read. Share this conversion between object parsing and dynamic bindings so both populate
-    // the same runtime field.
+bool ReadJsonFloatVectorValue(const nlohmann::json& json, std::span<float> value) {
+    // Float2/Float3/Float4 properties share one decoding contract: numbers broadcast to the
+    // declared width, while strings initialize independent components separated by ASCII spaces.
+    // Zero the destination before reading a string so an omitted component remains zero; stop at
+    // the declared width rather than inferring a new property type from the number of tokens.
+    // Cold object/material parsing and typed dynamic values must use this same conversion.
     if (json.is_number()) {
-        const float scalar = json.get<float>();
-        value = { scalar, scalar };
+        std::fill(value.begin(), value.end(), json.get<float>());
         return true;
     }
     if (!json.is_string()) return false;
 
     const auto& text = json.get_ref<const std::string&>();
-    value = { static_cast<float>(std::strtod(text.c_str(), nullptr)), 0.0f };
-    const auto separator = text.find(' ');
-    if (separator != std::string::npos) {
-        const auto second = text.find_first_not_of(' ', separator);
-        if (second != std::string::npos) {
-            value[1] = static_cast<float>(std::strtod(text.c_str() + second, nullptr));
-        }
+    std::fill(value.begin(), value.end(), 0.0f);
+    size_t position { 0 };
+    for (auto& component : value) {
+        component = static_cast<float>(std::strtod(text.c_str() + position, nullptr));
+        const auto separator = text.find(' ', position);
+        if (separator == std::string::npos) break;
+        position = text.find_first_not_of(' ', separator);
+        if (position == std::string::npos) break;
     }
     return true;
 }

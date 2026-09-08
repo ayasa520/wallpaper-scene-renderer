@@ -60,6 +60,7 @@ public:
     bool tryGet(T* out_value) const;
 
     std::optional<WPScriptValue> toScriptValue() const;
+    std::optional<ShaderValue> toShaderValue() const;
 
     static std::optional<WPDynamicValue> FromJsonLiteral(const nlohmann::json& json, Type hint);
     static std::optional<WPDynamicValue> FromJsonLiteral(const nlohmann::json& json);
