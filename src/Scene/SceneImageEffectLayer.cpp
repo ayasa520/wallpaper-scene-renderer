@@ -103,6 +103,7 @@ SceneImageEffectLayer::SceneImageEffectLayer(SceneObject& owner, float w, float 
       m_pingpong_a(pingpong_a),
       m_pingpong_b(pingpong_b),
       m_card_size { w, h },
+      m_effect_matrix_size { w, h },
       m_source_mesh(std::make_unique<SceneMesh>()),
       m_final_mesh(std::make_unique<SceneMesh>()),
       m_direct_draw_mesh(m_source_mesh.get()),

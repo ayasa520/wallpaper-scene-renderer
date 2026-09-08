@@ -203,7 +203,10 @@ public:
     SceneDrawPhase& FinalCompositeDraw() { return m_final_composite.draw; }
     const SceneDrawPhase& FinalCompositeDraw() const { return m_final_composite.draw; }
     const std::array<float, 2>& CardSize() const { return m_card_size; }
-    void SetCardSize(const std::array<float, 2>& size) { m_card_size = size; }
+    const std::array<float, 2>& EffectMatrixSize() const { return m_effect_matrix_size; }
+    void SetCardSize(const std::array<float, 2>& size) {
+        m_card_size = m_effect_matrix_size = size;
+    }
     bool UsesLayerSpaceEffectMatrices(const SceneNode* draw_node) const;
     // Destination draws resolve the owning object's current transform at uniform evaluation.
     // Private source/effect draws retain their local camera space. This phase selection carries
@@ -221,7 +224,10 @@ public:
         return m_final_composite.publishes_private_output;
     }
     void        SetFinalCompositeSource(std::string source);
-    void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
+    void SetFullscreenTextureSize(const std::array<float, 2>& texture_size) {
+        m_fullscreen = true;
+        m_effect_matrix_size = texture_size;
+    }
     bool        IsFullscreen() const { return m_fullscreen; }
     void        SetFinalOutputCapability(FinalOutputCapability capability) {
         m_final_output_capability = capability;
@@ -292,12 +298,14 @@ private:
     SceneObject& m_owner;
     std::string m_pingpong_a;
     std::string m_pingpong_b;
-    // Effect texture projection maps a normalized card through the layer's authored size.
-    // Mesh bounds may instead describe a cropped static mesh or an animated puppet envelope;
-    // neither is the card domain sampled by the authored effect. Parser and layout/size updates
-    // keep this geometry value current independently of resource setup. Only the card-derived
-    // destination policy consumes it when a later resource boundary rebuilds the targets.
+    // The raster card and the effect-matrix extent are separate size domains. Ordinary layers
+    // advance both through layout/size updates, independently of cropped or skinned mesh bounds.
+    // Fullscreen resource setup retains a 2x2 raster card but publishes source-texture content
+    // pixels to effect matrices. Using the raster size there unprojects pointer effects far
+    // outside their simulation texture in perspective scenes. Retain the resolved content size
+    // instead of reading the live viewport: destination resources keep their setup-time extent.
     std::array<float, 2> m_card_size;
+    std::array<float, 2> m_effect_matrix_size;
     bool m_destination_uses_card_size { false };
 
     // Fullscreen utility layers, such as Wallpaper Engine's postprocess framebuffer layer, are

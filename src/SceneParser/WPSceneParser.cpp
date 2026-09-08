@@ -2814,7 +2814,16 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             // that authored shape here so ResolveEffect() can keep their final shader on the
             // effect-camera fullscreen quad instead of projecting the 2x2 utility mesh through the
             // active scene camera.
-            imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
+            if (wpimgobj.fullscreen) {
+                // Fullscreen geometry stays in the effect camera's 2x2 raster domain, while
+                // effect matrices scale by the source framebuffer's content pixels resolved
+                // during this resource setup. Do not replace the incoming scene camera or
+                // resize the raster card to compensate for that distinct matrix extent.
+                imgEffectLayer->SetFullscreenTextureSize({
+                    static_cast<float>(destination_extent.extent[0]),
+                    static_cast<float>(destination_extent.extent[1]),
+                });
+            }
             imgEffectLayer->SetFinalBlend(authored_destination_blend);
             imgEffectLayer->SetTransparentCompositionBlend(transparent_destination_blend);
             const auto source_policy = imgEffectLayer->SourceContributionPolicy();

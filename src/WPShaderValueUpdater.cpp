@@ -808,14 +808,15 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                 const auto& projectionCameraName = effect_snapshot_camera;
                 // All effect matrices come from the owner's I and placement snapshots, before
                 // private passes substitute their local camera and fullscreen mesh. LayerModel
-                // always retains I. EffectModel/EffectMVP scale X/Y by the card half-size in
+                // always retains I. EffectModel/EffectMVP scale X/Y by the stored half-size in
                 // intermediate segments and retain the raw snapshots in the final segment;
                 // EffectTextureProjection always uses the scaled placement snapshot. Mesh
                 // calibration, puppet animation bounds and render-target padding are not part
-                // of this card domain. Fullscreen rasterization also retains these owner snapshots.
+                // of this size domain. Fullscreen layers retain these owner snapshots and use
+                // their source-content pixel extent, not the separate 2x2 raster card.
                 layerModel = snapshot.layer_model;
                 const auto& placedModel = snapshot.placed_model;
-                const auto& cardSize = layer->CardSize();
+                const auto& cardSize = layer->EffectMatrixSize();
                 const Matrix4d cardScale = Affine3d(Eigen::Scaling(
                     static_cast<double>(cardSize[0]) * 0.5,
                     static_cast<double>(cardSize[1]) * 0.5, 1.0)).matrix();
@@ -832,7 +833,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                              "snapshot-source=%s "
                              "camera='%s' composition=%s fullscreen=%s layer-space=%s "
                              "projection-diagonal=[%.9f %.9f %.9f] "
-                             "card=[%.6f %.6f] raw=[%.6f %.6f %.6f] "
+                             "card=[%.6f %.6f] raster-card=[%.6f %.6f] raw=[%.6f %.6f %.6f] "
                              "placed=[%.6f %.6f %.6f] clip=[%.6f %.6f %.6f %.6f]",
                              static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
                              draw.Name().c_str(),
@@ -843,6 +844,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                              layer->UsesLayerSpaceEffectMatrices(pNode) ? "true" : "false",
                              snapshot.view_projection(0, 0), snapshot.view_projection(1, 1),
                              snapshot.view_projection(2, 2), cardSize[0], cardSize[1],
+                             layer->CardSize()[0], layer->CardSize()[1],
                              layerModel(0, 3), layerModel(1, 3), layerModel(2, 3),
                              placedModel(0, 3), placedModel(1, 3), placedModel(2, 3),
                              etvpTrans(0, 3), etvpTrans(1, 3), etvpTrans(2, 3), etvpTrans(3, 3));
@@ -865,10 +867,47 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             if (reqEMVPI) updateOp(G_EMVPI, ToDxcCBufferMatrixUniform(effectMvp.inverse()));
             if (reqETVP) updateOp(G_ETVP, ToDxcCBufferMatrixUniform(etvpTrans));
             if (reqETVPI) {
-                if (std::abs(etvpTrans.determinant()) > 1e-12) {
-                    updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(etvpTrans.inverse()));
-                } else {
-                    updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(Matrix4d::Identity()));
+                const double determinant = etvpTrans.determinant();
+                Matrix4d inverse = Matrix4d::Identity();
+                if (std::abs(determinant) > 1e-12) inverse = etvpTrans.inverse();
+                updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(inverse));
+                if (std::getenv("WESCENE_TRACE_EFFECT_PROJECTION") != nullptr &&
+                    (trace_layer == nullptr || std::to_string(layer_id) == trace_layer)) {
+                    // Evaluate the screen-to-effect mapping using the float matrix actually
+                    // uploaded to the shader. Screen-space pointer effects unproject clip Z=0
+                    // and divide XY by homogeneous W before restoring top-down texture UVs.
+                    // Reporting both W and the divided coordinates distinguishes an off-card
+                    // impulse from a pass that stopped drawing or a strength that became zero.
+                    const Matrix4f uploaded_inverse = inverse.cast<float>();
+                    const auto unproject = [&](const std::array<float, 2>& pointer) -> Vector4f {
+                        return uploaded_inverse * Vector4f(
+                            pointer[0] * 2.0f - 1.0f, 1.0f - pointer[1] * 2.0f, 0.0f, 1.0f);
+                    };
+                    const Vector4f current = unproject(m_pointerPos);
+                    const Vector4f previous = unproject(m_pointerPosLast);
+                    LOG_INFO("SceneEffectPointerProjection: frame=%llu layer=%d node='%s' "
+                             "determinant=%.12g pointer=[%.6f %.6f] last=[%.6f %.6f] "
+                             "left-down=%s homogeneous=[%.9f %.9f %.9f %.9f] "
+                             "uv=[%.9f %.9f] last-uv=[%.9f %.9f] "
+                             "inverse-rows=[%.9f %.9f %.9f %.9f; %.9f %.9f %.9f %.9f; "
+                             "%.9f %.9f %.9f %.9f; %.9f %.9f %.9f %.9f]",
+                             static_cast<unsigned long long>(m_puppet_frame_serial), layer_id,
+                             draw.Name().c_str(), determinant, m_pointerPos[0], m_pointerPos[1],
+                             m_pointerPosLast[0], m_pointerPosLast[1],
+                             m_scene->cursorLeftDown ? "true" : "false",
+                             current.x(), current.y(), current.z(), current.w(),
+                             0.5f + 0.5f * current.x() / current.w(),
+                             0.5f - 0.5f * current.y() / current.w(),
+                             0.5f + 0.5f * previous.x() / previous.w(),
+                             0.5f - 0.5f * previous.y() / previous.w(),
+                             uploaded_inverse(0, 0), uploaded_inverse(0, 1),
+                             uploaded_inverse(0, 2), uploaded_inverse(0, 3),
+                             uploaded_inverse(1, 0), uploaded_inverse(1, 1),
+                             uploaded_inverse(1, 2), uploaded_inverse(1, 3),
+                             uploaded_inverse(2, 0), uploaded_inverse(2, 1),
+                             uploaded_inverse(2, 2), uploaded_inverse(2, 3),
+                             uploaded_inverse(3, 0), uploaded_inverse(3, 1),
+                             uploaded_inverse(3, 2), uploaded_inverse(3, 3));
                 }
             }
         }
@@ -888,7 +927,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         const auto& source = *layer->GetPrelightingSource();
         Matrix4d alternate_model = snapshot.layer_model;
         if (source.instanced) {
-            const auto& card = layer->CardSize();
+            const auto& card = layer->EffectMatrixSize();
             alternate_model.col(0) *= card[0] / source.content_size[0];
             alternate_model.col(1) *= card[1] / source.content_size[1];
         }
