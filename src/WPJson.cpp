@@ -69,34 +69,15 @@ std::optional<UserPropertyBinding> ResolveUserPropertyBinding(const nlohmann::js
     return binding;
 }
 
-const nlohmann::json* ResolveAnimatedInitialValue(const nlohmann::json& json) {
-    if (! json.is_object() || ! json.contains("animation")) return nullptr;
-
-    const auto& animation = json.at("animation");
-    if (! animation.is_object()) return nullptr;
-
-    bool start_paused { false };
-    if (animation.contains("options") && animation.at("options").is_object()) {
-        GET_JSON_NAME_VALUE_NOWARN(animation.at("options"), "startpaused", start_paused);
-    }
-    if (! start_paused || ! animation.contains("c0")) return nullptr;
-
-    const auto& c0 = animation.at("c0");
-    if (! c0.is_array() || c0.empty() || ! c0.front().is_object() ||
-        ! c0.front().contains("value")) {
-        return nullptr;
-    }
-
-    return &c0.front().at("value");
-}
-
 const nlohmann::json& ResolvePropertyValueNode(const nlohmann::json& json) {
     // Property parsing reads the authored value; the script source is registered separately with
     // the persistent scene host. That host owns init(), user-property callbacks and frame
     // updates. Running those callbacks here would use an incomplete scene/shared state and
     // replace valid base values with derived results before the real script instance has even
-    // been initialized.
-    if (const auto* animated = ResolveAnimatedInitialValue(json)) return *animated;
+    // been initialized. Property timelines also register separately and apply their complete
+    // sampled value through that host. A paused timeline must retain its authored base here:
+    // substituting c0 collapses vector dimensions before material binding registration and
+    // discards the base components needed by relative animation.
     if (json.is_object() && json.contains("value")) return json.at("value");
     return json;
 }
