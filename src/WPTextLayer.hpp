@@ -78,6 +78,7 @@ enum class TextLayerPropertyUpdateStrategy
 {
     LayoutOnly,
     MaterialOnly,
+    RasterStateOnly,
     TransformOnly,
     BridgeResourceResize,
 };

@@ -2606,6 +2606,16 @@ bool ApplyTextLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t laye
         return true;
     }
 
+    if (update_strategy == TextLayerPropertyUpdateStrategy::RasterStateOnly) {
+        // Text-owner depth selects immutable state on the selected final effect draw. Publish
+        // the new owner value before rebuilding invocation descriptions so their pipeline
+        // residency comparison sees the effective change. Glyph metrics, atlas pages and the
+        // retained effect material's own testing/writing selections remain untouched.
+        if (! SyncTextLayerSceneMaterials(*opaque->scene, layer_id)) return false;
+        opaque->scene->MarkRenderGraphTopologyDirty();
+        return true;
+    }
+
     if (update_strategy == TextLayerPropertyUpdateStrategy::TransformOnly) {
         if (! UpdateTextLayerSceneTransform(*opaque->scene, layer_id)) return false;
     } else if (update_strategy == TextLayerPropertyUpdateStrategy::BridgeResourceResize) {
@@ -5662,6 +5672,41 @@ JSValue NativeGetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
     return script_value.has_value() ? ScriptValueToJS(context, *script_value) : JS_UNDEFINED;
 }
 
+JSValue ApplyTextLayerDepthTest(JSContext* context, WPSceneScriptHost::Opaque* opaque,
+                                int32_t layer_id, JSValueConst value) {
+    if (JS_IsNull(value) || JS_IsUndefined(value)) return JS_TRUE;
+
+    // Enum assignment uses explicit JavaScript ToString, including user conversion hooks and
+    // their original exceptions. Convert to a JS string before using the C-string helper so
+    // an Error object's throwing conversion is not consumed as diagnostic exception text.
+    JSValue string_value = JS_ToString(context, value);
+    if (JS_IsException(string_value)) return JS_EXCEPTION;
+    std::string spelling;
+    const bool converted = ReadJSString(context, string_value, &spelling);
+    JS_FreeValue(context, string_value);
+    if (! converted) return JS_EXCEPTION;
+
+    // The live transport ends at the first NUL; ReadJSString deliberately copies that span.
+    // Normalize before comparing so unknown/equivalent spellings do not rebuild the graph.
+    const WPDynamicValue next(std::string(spelling == "enabled" ? "enabled" : "disabled"));
+    // Conversion can rename the owner, create other layers, or re-enter this setter. Resolve
+    // the same stable layer ID again rather than retaining a text-state pointer across hooks,
+    // and compare against the state left by those hooks before applying the outer write.
+    const auto current = ReadTextLayerPropertyValue(opaque, layer_id, "depthtest");
+    if (! current.has_value()) return JS_FALSE;
+    const bool changed = ! current->equals(next);
+    if (changed && ! ApplyTextLayerPropertyValue(opaque, layer_id, "depthtest", next)) {
+        return JS_FALSE;
+    }
+    if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
+        LOG_INFO("SceneTextDepthApply: layer=%d previous=%s value=%s changed=%s topology-dirty=%s",
+                 layer_id, current->describe().c_str(), next.describe().c_str(),
+                 changed ? "true" : "false",
+                 opaque->scene->renderGraphTopologyDirty ? "true" : "false");
+    }
+    return JS_TRUE;
+}
+
 JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
     auto* opaque = GetOpaque(context);
     if (opaque == nullptr || argc < 3) return JS_FALSE;
@@ -5685,6 +5730,11 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
     }
 
     if (FindTextLayerById(opaque, node_id) != nullptr && HasTextLayerProperty(property_name)) {
+        // Keep this enum on text owners. Adding it to the shared layer type table would also
+        // advertise it on image, shape and generic owners that have no such layer property.
+        if (property_name == "depthtest") {
+            return ApplyTextLayerDepthTest(context, opaque, node_id, argv[2]);
+        }
         const auto hint = LayerValueType(property_name);
         if (! hint.supported) return JS_FALSE;
         const auto value = ReadDynamicValueFromJS(context, argv[2], hint.type);

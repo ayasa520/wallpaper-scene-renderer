@@ -2388,6 +2388,7 @@ TextLayerPropertyUpdateStrategy wallpaper::ResolveTextLayerPropertyUpdateStrateg
         property_name == "backgroundcolor" || property_name == "backgroundbrightness") {
         return TextLayerPropertyUpdateStrategy::MaterialOnly;
     }
+    if (property_name == "depthtest") return TextLayerPropertyUpdateStrategy::RasterStateOnly;
     if (property_name == "anchor") return TextLayerPropertyUpdateStrategy::TransformOnly;
     if (property_name == "opaquebackground") {
         return TextLayerPropertyUpdateStrategy::BridgeResourceResize;
@@ -2431,7 +2432,22 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     ReadLiteralOrDynamicValue(json, "horizontalalign", &horizontalalign);
     ReadLiteralOrDynamicValue(json, "verticalalign", &verticalalign);
     ReadLiteralOrDynamicValue(json, "anchor", &anchor);
-    ReadLiteralOrDynamicValue(json, "depthtest", &depthtest);
+
+    // Depth selection consumes the literal enum node, not a dynamic-property wrapper.
+    // Omission retains the initialized enabled state; every present value other than the
+    // complete string "enabled" selects disabled. Keep the JSON string length here: unlike
+    // the live script transport, an embedded NUL does not terminate the authored spelling.
+    const auto depth_value = json.find("depthtest");
+    if (depth_value != json.end()) {
+        depthtest = depth_value->is_string() &&
+                            depth_value->get_ref<const std::string&>() == "enabled"
+                        ? "enabled" : "disabled";
+    }
+    if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
+        LOG_INFO("SceneTextDepthInitial: layer=%d name='%s' input=%s value='%s'",
+                 id, name.c_str(), depth_value != json.end() ? depth_value->type_name() : "omitted",
+                 depthtest.c_str());
+    }
 
     if (json.contains("visible")) {
         ReadVisibleBinding(json.at("visible"), &visible_binding);
@@ -2468,7 +2484,7 @@ bool wallpaper::HasTextLayerProperty(std::string_view property_name) {
            property_name == "opaquebackground" ||
            property_name == "pointsize" || property_name == "padding" ||
            property_name == "horizontalalign" || property_name == "verticalalign" ||
-           property_name == "anchor" || property_name == "limitrows" ||
+           property_name == "anchor" || property_name == "depthtest" || property_name == "limitrows" ||
            property_name == "maxrows" || property_name == "limitwidth" ||
            property_name == "maxwidth";
 }
@@ -2507,6 +2523,8 @@ std::optional<WPDynamicValue> wallpaper::ReadTextLayerProperty(const TextLayerRu
         result = WPDynamicValue(object.verticalalign);
     } else if (property_name == "anchor") {
         result = WPDynamicValue(object.anchor);
+    } else if (property_name == "depthtest") {
+        result = WPDynamicValue(object.depthtest);
     } else if (property_name == "limitrows") {
         result = WPDynamicValue(object.limitrows);
     } else if (property_name == "maxrows") {
@@ -2567,6 +2585,8 @@ bool wallpaper::ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
         applied = value.tryGet(&object.verticalalign);
     } else if (property_name == "anchor") {
         applied = value.tryGet(&object.anchor);
+    } else if (property_name == "depthtest") {
+        applied = value.tryGet(&object.depthtest);
     } else if (property_name == "limitrows") {
         applied = value.tryGet(&object.limitrows);
     } else if (property_name == "limitwidth") {
