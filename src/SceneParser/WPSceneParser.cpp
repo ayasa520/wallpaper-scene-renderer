@@ -2316,7 +2316,6 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
             }
 
             const auto authored_textures = material.textures;
-            const auto authored_blend = material.blenmode;
             auto mesh = std::make_shared<SceneMesh>();
             mesh->AddMaterial(std::move(material));
             node->AddMesh(mesh);
@@ -2337,7 +2336,6 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
                 .advances_composition = material_index < authored_effect.passes.size() &&
                     authored_effect.passes[material_index].compose,
                 .is_final_material = final_material,
-                .authored_blend = authored_blend,
             });
             if (layer.UsesShapeDraw()) {
                 LOG_INFO("SceneShapeMaterialRetained: layer=%d effect=%d effect-index=%zu "
@@ -3239,6 +3237,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                                     effect_index,
                                                     material_index);
                 context.shader_updater->SetNodeData(spEffectNode.get(), effect_node_data);
+                // Text's bridge builds its own retained material list. Mark the last material
+                // here as well so final publication selects the text owner's translucent blend,
+                // while earlier private materials keep their authored raster state. The marker
+                // belongs to material order, not to a trailing command or the current text size.
                 img_effect->nodes.push_back({ .authored_output = material_output,
                                               .output = material_output,
                                               .authored_textures = authored_textures,
@@ -3247,7 +3249,9 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                                               .sceneNode = spEffectNode,
                                               .advances_composition =
                                                   material_index < wp_effect.passes.size() &&
-                                                  wp_effect.passes[material_index].compose });
+                                                  wp_effect.passes[material_index].compose,
+                                              .is_final_material =
+                                                  material_index + 1 == wp_effect.materials.size() });
             }
 
             if (effect_materials_ok) {

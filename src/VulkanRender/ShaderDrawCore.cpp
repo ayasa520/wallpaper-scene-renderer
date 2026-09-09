@@ -146,6 +146,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.textures            = desc.textures;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
+    m_desc.blend_override      = desc.blend_override;
     m_desc.premultiplied_source_blend = desc.premultiplied_source_blend;
     m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.camera_override     = desc.camera_override;
@@ -206,6 +207,7 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
            // Alpha policy changes the prepared pipeline's color write mask, blend operation, and
            // factors. Reusing a pass across that boundary would keep stale composition coverage.
            m_desc.alpha_write_policy == next.m_desc.alpha_write_policy &&
+           m_desc.blend_override == next.m_desc.blend_override &&
            m_desc.premultiplied_source_blend ==
                next.m_desc.premultiplied_source_blend &&
            m_desc.clear_before_draw == next.m_desc.clear_before_draw &&
@@ -240,6 +242,7 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.textures       = next.m_desc.textures;
     m_desc.output         = next.m_desc.output;
     m_desc.alpha_write_policy = next.m_desc.alpha_write_policy;
+    m_desc.blend_override = next.m_desc.blend_override;
     m_desc.premultiplied_source_blend = next.m_desc.premultiplied_source_blend;
     m_desc.clear_before_draw = next.m_desc.clear_before_draw;
     m_desc.camera_override = next.m_desc.camera_override;
@@ -673,11 +676,29 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
     if (writes_alpha) color_mask |= VK_COLOR_COMPONENT_A_BIT;
     state.color_blend.colorWriteMask = color_mask;
 
-    const auto blend_mode = material.blenmode;
+    const auto blend_mode = desc.blend_override.value_or(material.blenmode);
     SetBlend(blend_mode, state.color_blend);
     ApplyPremultipliedSourceBlend(desc, writes_alpha, state.color_blend);
     ApplyAlphaWritePolicy(desc.alpha_write_policy, writes_alpha, state.color_blend);
     desc.blending = state.color_blend.blendEnable;
+
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        // Capture both persistent and effective values at pipeline construction. Uniform readback
+        // alone cannot show whether a scoped owner override reached the actual raster pipeline.
+        LOG_INFO("SceneMaterialRasterState: layer=%d node='%s' material='%s' output='%s' "
+                 "stored-blend=%d override-blend=%d effective-blend=%d samples=%u "
+                 "coverage=%s blend=%u rgb=[%u %u %u] alpha=[%u %u %u] mask=%u",
+                 desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
+                 material.name.c_str(), desc.output.c_str(), static_cast<int>(material.blenmode),
+                 desc.blend_override ? static_cast<int>(*desc.blend_override) : -1,
+                 static_cast<int>(blend_mode), static_cast<unsigned>(desc.sample_count),
+                 desc.alpha_to_coverage && desc.sample_count > VK_SAMPLE_COUNT_1_BIT
+                     ? "true" : "false",
+                 state.color_blend.blendEnable, state.color_blend.srcColorBlendFactor,
+                 state.color_blend.dstColorBlendFactor, state.color_blend.colorBlendOp,
+                 state.color_blend.srcAlphaBlendFactor, state.color_blend.dstAlphaBlendFactor,
+                 state.color_blend.alphaBlendOp, state.color_blend.colorWriteMask);
+    }
 
     SetAttachmentLoadOp(blend_mode, state.color_load_op);
     ApplyModelPassDesc(material, desc, state.color_load_op);
@@ -877,7 +898,9 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
                                      : 1u));
                 if (desc.draw.Valid() && desc.draw.Mesh() != nullptr &&
                     desc.draw.Mesh()->Material() != nullptr) {
-                    desc.alpha_to_coverage = desc.draw.Mesh()->Material()->alpha_to_coverage;
+                    desc.alpha_to_coverage = desc.blend_override.value_or(
+                        desc.draw.Mesh()->Material()->blenmode) ==
+                        wallpaper::BlendMode::AlphaToCoverage;
                 }
                 return true;
             }
@@ -1569,7 +1592,8 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
             std::max(1, scene.MsaaSampleCount()));
         m_desc.resolve_msaa = false;
         if (mesh.Material() != nullptr) {
-            m_desc.alpha_to_coverage = mesh.Material()->alpha_to_coverage;
+            m_desc.alpha_to_coverage = m_desc.blend_override.value_or(
+                mesh.Material()->blenmode) == BlendMode::AlphaToCoverage;
         }
     }
     auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);

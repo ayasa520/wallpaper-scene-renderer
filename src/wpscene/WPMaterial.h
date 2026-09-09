@@ -50,7 +50,9 @@ class WPMaterial {
 public:
     bool                                                FromJson(const nlohmann::json&);
     void                                                MergePass(const WPMaterialPass&);
-    std::string                                         blending { "translucent" };
+    // Omitted blending is opaque. Retained effect materials must not acquire translucent
+    // writes merely because their resource never supplied this property.
+    std::string                                         blending { "normal" };
     std::string                                         cullmode { "nocull" };
     std::string                                         shader;
     std::string                                         depthtest { "disabled" };

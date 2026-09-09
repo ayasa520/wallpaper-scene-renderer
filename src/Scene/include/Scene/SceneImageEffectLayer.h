@@ -43,7 +43,10 @@ struct SceneImageEffectNode {
     // commands or an explicit FBO output. Shapes use their retained card for this material alone
     // and preserve other materials' blend state.
     bool is_final_material { false };
-    BlendMode authored_blend { BlendMode::Normal };
+    // Owner preparation changes the raster state for one invocation, not the retained material.
+    // Keep its blend selection beside the resolved output so concurrent reflection/main phases
+    // cannot overwrite each other's state or erase an authored private pass blend.
+    std::optional<BlendMode> blend_override {};
     // Matrix phase belongs to the deferred destination segment. Auxiliary FBO passes in that
     // segment use the same unscaled layer snapshots as its visible output material, even though
     // their raster mesh remains a fullscreen quad. ResolveEffect() recalculates this phase.

@@ -29,6 +29,9 @@ struct ShaderDrawRequest {
     std::vector<std::string> textures;
     std::string              output;
     AlphaWritePolicy         alpha_write_policy { AlphaWritePolicy::Preserve };
+    // A final effect draw may temporarily select the owner's blend. Store that invocation's
+    // selection in the request; the shared material remains the persistent authored state.
+    std::optional<BlendMode>  blend_override {};
     bool                     premultiplied_source_blend { false };
     bool                     clear_before_draw { false };
     std::string              camera_override;

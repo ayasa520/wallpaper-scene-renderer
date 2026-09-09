@@ -564,7 +564,7 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
             assert(it->sceneNode->HasMaterial());
 
             auto& material = *(it->sceneNode->Mesh()->Material());
-            material.blenmode = BlendMode::Normal;
+            it->blend_override.reset();
             it->sceneNode->SetCamera(effect_cam.data());
             it->camera_override.clear();
             it->use_active_camera_for_parallax = false;
@@ -725,7 +725,8 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
         // multiply by g_ModelViewProjectionMatrix. Keep that final pass on the effect camera so
         // the 2x2 utility quad remains a full-frame clip-space composite instead of becoming a
         // tiny active-camera world quad that leaves the effect effectively invisible.
-        material.blenmode = BlendMode::Normal;
+        final_output_node.blend_override = final_output_node.is_final_material
+            ? std::optional { BlendMode::Normal } : std::nullopt;
         final_output_node.sceneNode->SetCamera(effect_cam.data());
         final_output_node.sceneNode->CopyTrans(default_node);
         mesh.ChangeMeshDataFrom(default_mesh);
@@ -737,11 +738,14 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
                  effect_cam.data(),
                  std::string(final_output).c_str(),
                  material.name.c_str(),
-                 static_cast<int>(material.blenmode));
+                 static_cast<int>(final_output_node.blend_override.value_or(material.blenmode)));
         return;
     }
 
-    material.blenmode = FinalBlend();
+    // The owner's final-material preparation is scoped to the selected material. Other
+    // destination records keep their own blend, and private writers never acquire this override.
+    final_output_node.blend_override = final_output_node.is_final_material
+        ? std::optional { FinalBlend() } : std::nullopt;
     final_output_node.sceneNode->SetCamera(std::string());
     mesh.ChangeMeshDataFrom(*m_final_mesh);
     LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=false "
@@ -750,7 +754,7 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
              m_owner.Name().c_str(),
              std::string(final_output).c_str(),
              material.name.c_str(),
-             static_cast<int>(material.blenmode));
+             static_cast<int>(final_output_node.blend_override.value_or(material.blenmode)));
 }
 
 void SceneImageEffectLayer::ResolvePrivateFinalOutput(
@@ -765,7 +769,7 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
     final_output_node.mesh_follows_final_mesh = false;
     auto& mesh     = *(final_output_node.sceneNode->Mesh());
     auto& material = *mesh.Material();
-    material.blenmode = BlendMode::Normal;
+    final_output_node.blend_override.reset();
     final_output_node.sceneNode->SetCamera(effect_cam.data());
     final_output_node.sceneNode->CopyTrans(default_node);
     mesh.ChangeMeshDataFrom(default_mesh);
@@ -840,7 +844,8 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
         auto& mesh = *node.sceneNode->Mesh();
         auto& material = *mesh.Material();
         mesh.ChangeMeshDataFrom(node.is_final_material ? *m_final_mesh : default_mesh);
-        material.blenmode = node.is_final_material ? FinalBlend() : node.authored_blend;
+        node.blend_override = node.is_final_material
+            ? std::optional { FinalBlend() } : std::nullopt;
         material.textures = node.authored_textures;
         for (const auto slot : node.fbo_texture_slots) {
             material.textures.at(slot) = bindings.at(node.authored_textures.at(slot));
@@ -855,7 +860,7 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
                      node.output_is_fbo ? "true" : "false",
                      material.textures.empty() ? "" : material.textures[0].c_str(),
                      node.output.c_str(), node.is_final_material ? "shape-card" : "unit",
-                     static_cast<int>(material.blenmode));
+                     static_cast<int>(node.blend_override.value_or(material.blenmode)));
         }
         resolve_commands_at(++position);
     }
