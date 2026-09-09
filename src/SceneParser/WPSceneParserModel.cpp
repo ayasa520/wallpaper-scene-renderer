@@ -144,11 +144,6 @@ bool ModelBlendUsesTransparency(std::string_view blending) {
     return blending == "translucent" || blending == "additive";
 }
 
-bool ModelMaterialAuthorsReflectionTexture(const wpscene::WPMaterial& material) {
-    return std::find(material.textures.begin(), material.textures.end(),
-                     kModelReflectionTargetName) != material.textures.end();
-}
-
 struct ModelMaterialRenderPolicy {
     std::string   blending;
     bool          transparent { false };
@@ -192,6 +187,10 @@ BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material,
         policy.depthWrite = false;
     }
 
+    // Culling is independent of blending and sampled textures. An omitted cullmode keeps the
+    // initialized back-face policy, including translucent shells and reflection receivers;
+    // only an authored cull setting changes which faces participate in the model draw. Keep
+    // this separate from the blend-dependent depth-write rule above.
     if (material.cullmodeAuthored) {
         const auto cull_mode = ParseModelCullModeValue(material.cullmode);
         if (! cull_mode.has_value()) {
@@ -201,11 +200,6 @@ BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material,
             return std::nullopt;
         }
         policy.cullMode = *cull_mode;
-    } else if (ModelMaterialAuthorsReflectionTexture(material) || policy.transparent) {
-        // Model reflection and alpha-blended shell surfaces are intentionally double-sided when the
-        // material omits culling. Opaque model chunks keep the stricter back-face default, and the
-        // policy is scoped here so the legacy 2D WPMaterial defaults remain unchanged.
-        policy.cullMode = SceneCullMode::None;
     }
 
     return policy;
