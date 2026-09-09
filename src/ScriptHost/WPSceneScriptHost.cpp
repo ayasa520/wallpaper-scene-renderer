@@ -3729,6 +3729,70 @@ const ShaderValue* FindRuntimeMaterialUniformValue(const SceneMaterial& material
     return FindMaterialUniformValue(material, alias->second);
 }
 
+constexpr std::pair<std::string_view, BlendMode> kMaterialBlendingModes[] {
+    { "normal", BlendMode::Normal },
+    { "translucent", BlendMode::Translucent },
+    { "additive", BlendMode::Additive },
+    { "alphatocoverage", BlendMode::AlphaToCoverage },
+};
+
+std::string_view MaterialBlendingName(BlendMode mode) {
+    for (const auto& [name, value] : kMaterialBlendingModes) {
+        if (value == mode) return name;
+    }
+    return kMaterialBlendingModes[0].first;
+}
+
+JSValue ApplyMaterialBlending(JSContext* context, JSValueConst value,
+                              std::shared_ptr<SceneMaterial> material, Scene& scene,
+                              int32_t layer_id, int32_t effect_index, int32_t material_index) {
+    if (JS_IsNull(value) || JS_IsUndefined(value)) return JS_TRUE;
+
+    // ToString may run user hooks that mutate or destroy the owner. Retain the selected
+    // material before conversion, and write that same instance only after conversion succeeds.
+    // Calling ToString explicitly also preserves a throwing Error object's original exception;
+    // the C-string helper's special handling of exception objects must not consume that error.
+    JSValue string_value = JS_ToString(context, value);
+    if (JS_IsException(string_value)) return JS_EXCEPTION;
+    const char* text = JS_ToCString(context, string_value);
+    JS_FreeValue(context, string_value);
+    if (text == nullptr) return JS_EXCEPTION;
+
+    // These enum names are ASCII and case-sensitive. Their transport is NUL-terminated, so
+    // suffixes after an embedded NUL do not participate in matching. Every other spelling
+    // selects the first entry, including non-ASCII strings; nullish writes above are distinct.
+    const std::string_view spelling(text);
+    BlendMode next = kMaterialBlendingModes[0].second;
+    for (const auto& [name, mode] : kMaterialBlendingModes) {
+        if (name == spelling) {
+            next = mode;
+            break;
+        }
+    }
+    JS_FreeCString(context, text);
+
+    const auto previous = material->blenmode;
+    if (previous != next) {
+        material->blenmode = next;
+        // Blending is immutable Vulkan pipeline state. Rebuild the graph's invocation
+        // descriptions so each consumer can compare its captured effective blend before
+        // reusing a pipeline. Owner-final overrides stay separate, and the shader's authored
+        // compile-time combos are not changed by this raster-only property assignment.
+        // Raise the scheduling and topology flags together; the topology flag alone does not
+        // schedule a refresh when the scene has no other pending resource changes.
+        scene.MarkRenderGraphTopologyDirty();
+    }
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        LOG_INFO("SceneEffectMaterialBlendApply: layer=%d effect-index=%d material-index=%d "
+                 "material='%s' previous='%s' value='%s' changed=%s topology-dirty=%s",
+                 layer_id, effect_index, material_index, material->name.c_str(),
+                 MaterialBlendingName(previous).data(), MaterialBlendingName(next).data(),
+                 previous != next ? "true" : "false",
+                 scene.renderGraphTopologyDirty ? "true" : "false");
+    }
+    return JS_TRUE;
+}
+
 WPDynamicValue::Type RuntimeDynamicTypeForShaderValue(const ShaderValue& value) {
     // Runtime material setters do not have the parser's registration metadata, so infer the JS
     // conversion shape from the live uniform width. That keeps scalar godrays controls as numbers
@@ -5757,11 +5821,11 @@ NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValu
                                                  static_cast<uint32_t>(material_index));
     if (! target.has_value()) return JS_FALSE;
 
-    // Report only properties that resolve to a real live uniform. Returning false for unknown
-    // names keeps strict-mode script assignments noisy instead of silently accepting misspelled
-    // material controls.
+    // Shader descriptors and static material controls share the script property namespace.
+    // Unknown names remain absent instead of silently accepting misspelled controls.
     return JS_NewBool(context,
-                      FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr);
+                      FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr ||
+                          property_name == "blending");
 }
 
 JSValue
@@ -5789,7 +5853,13 @@ NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
     if (! target.has_value()) return JS_UNDEFINED;
 
     const auto* uniform = FindRuntimeMaterialUniformValue(*target->material, property_name);
-    return uniform != nullptr ? ShaderUniformValueToJS(context, *uniform) : JS_UNDEFINED;
+    // A selected shader descriptor is installed after static material descriptors, so its
+    // literal name replaces a same-named static accessor in the JavaScript object.
+    if (uniform != nullptr) return ShaderUniformValueToJS(context, *uniform);
+    if (property_name == "blending") {
+        return JS_NewString(context, MaterialBlendingName(target->material->blenmode).data());
+    }
+    return JS_UNDEFINED;
 }
 
 JSValue
@@ -5819,6 +5889,10 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
     std::string       uniform_name;
     const auto* const current_uniform =
         FindRuntimeMaterialUniformValue(*target->material, property_name, &uniform_name);
+    if (current_uniform == nullptr && property_name == "blending") {
+        return ApplyMaterialBlending(context, argv[4], target->node->Mesh()->SharedMaterial(),
+                                     *opaque->scene, layer_id, effect_index, material_index);
+    }
     if (current_uniform == nullptr) {
         LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
                   "material='%s' property='%s' unresolved uniform='%s'",

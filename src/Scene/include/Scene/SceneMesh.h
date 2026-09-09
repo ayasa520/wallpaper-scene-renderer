@@ -137,6 +137,7 @@ public:
 	}
 
 	SceneMaterial* Material() { return m_material.get(); }
+	std::shared_ptr<SceneMaterial> SharedMaterial() const { return m_material; }
 
 	void ChangeMeshDataFrom(const SceneMesh& o) {
 		m_data = o.m_data;

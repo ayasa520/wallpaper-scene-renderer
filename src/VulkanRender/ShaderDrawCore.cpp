@@ -163,6 +163,10 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.depth_write         = desc.depth_write;
     m_desc.clear_depth         = desc.clear_depth;
     m_desc.depth_clear         = desc.depth_clear;
+    if (desc.draw.Valid() && desc.draw.Mesh() != nullptr &&
+        desc.draw.Mesh()->Material() != nullptr) {
+        m_material_blend = desc.draw.Mesh()->Material()->blenmode;
+    }
 };
 
 std::string ShaderDrawCore::residencyKey(std::string_view pass_kind) const {
@@ -208,6 +212,10 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
            // factors. Reusing a pass across that boundary would keep stale composition coverage.
            m_desc.alpha_write_policy == next.m_desc.alpha_write_policy &&
            m_desc.blend_override == next.m_desc.blend_override &&
+           // Compare the captured effective value. A changed raw material blend requires a
+           // new pipeline unless both invocations still select the same owner-final override.
+           m_desc.blend_override.value_or(m_material_blend) ==
+               next.m_desc.blend_override.value_or(next.m_material_blend) &&
            m_desc.premultiplied_source_blend ==
                next.m_desc.premultiplied_source_blend &&
            m_desc.clear_before_draw == next.m_desc.clear_before_draw &&
@@ -237,6 +245,7 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.scene          = next.m_desc.scene;
     m_desc.draw           = next.m_desc.draw;
     m_draw_identity       = next.m_draw_identity;
+    m_material_blend      = next.m_material_blend;
     m_desc.layer_id       = next.m_desc.layer_id;
     m_desc.should_execute = next.m_desc.should_execute;
     m_desc.textures       = next.m_desc.textures;

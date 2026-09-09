@@ -184,6 +184,9 @@ private:
     // object's publication resources before querying the old pass. The copied generation
     // remains valid throughout residency matching and does not dereference retired storage.
     uint64_t             m_draw_identity { 0 };
+    // Capture persistent raster state by value. Both graph generations can reference the same
+    // mutable material, so dereferencing their material pointers cannot detect a live change.
+    BlendMode            m_material_blend { BlendMode::Disable };
     uint64_t             m_trace_draw_sequence { 0 };
     ShaderDrawExtension* m_extension { nullptr };
 };
