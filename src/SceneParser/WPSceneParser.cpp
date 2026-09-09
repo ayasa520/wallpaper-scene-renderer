@@ -1102,6 +1102,9 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
 
     material.blenmode = ParseBlendMode(wpmat.blending);
     material.cullMode = wpmat.cullmode == "nocull" ? SceneCullMode::None : SceneCullMode::Back;
+    material.alphaWriting = wpmat.alphawriting == "enabled" ? SceneAlphaWriting::Enabled
+        : wpmat.alphawriting == "disabled" ? SceneAlphaWriting::Disabled
+        : SceneAlphaWriting::Default;
     material.alpha_to_coverage = blending_alpha_to_coverage;
 
     const auto& fragment_unit = sd_units.back();

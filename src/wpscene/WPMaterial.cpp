@@ -32,13 +32,14 @@ void TraceMaterialRenderState(const nlohmann::json& json, const WPMaterial& mate
     // The draw trace records effective owner state separately, including depth-write changes
     // required by transparent model draws; those must not overwrite the parsed material.
     auto authored = nlohmann::json::object();
-    for (const auto* name : { "blending", "cullmode", "depthtest", "depthwrite" }) {
+    for (const auto* name : { "blending", "cullmode", "depthtest", "depthwrite", "alphawriting" }) {
         if (const auto entry = json.find(name); entry != json.end()) authored[name] = *entry;
     }
     LOG_INFO("SceneMaterialColdState: shader='%s' authored=%s blending='%s' cullmode='%s' "
-             "depthtest='%s' depthwrite='%s'",
+             "depthtest='%s' depthwrite='%s' alphawriting='%s'",
              material.shader.c_str(), authored.dump().c_str(), material.blending.c_str(),
-             material.cullmode.c_str(), material.depthtest.c_str(), material.depthwrite.c_str());
+             material.cullmode.c_str(), material.depthtest.c_str(), material.depthwrite.c_str(),
+             material.alphawriting.c_str());
 }
 } // namespace
 
@@ -187,6 +188,7 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
     ReadMaterialEnum(jContent, "blending",
                      { "normal", "translucent", "additive", "alphatocoverage" }, blending);
     ReadMaterialEnum(jContent, "cullmode", { "normal", "nocull" }, cullmode);
+    ReadMaterialEnum(jContent, "alphawriting", { "default", "disabled", "enabled" }, alphawriting);
     ReadMaterialEnum(jContent, "depthtest", { "disabled", "enabled" }, depthtest);
     ReadMaterialEnum(jContent, "depthwrite", { "disabled", "enabled" }, depthwrite);
 	GET_JSON_NAME_VALUE(jContent, "shader", shader);

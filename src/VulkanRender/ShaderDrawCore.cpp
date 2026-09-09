@@ -147,6 +147,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
     m_desc.blend_override      = desc.blend_override;
+    m_desc.destination_alpha_override = desc.destination_alpha_override;
     m_desc.premultiplied_source_blend = desc.premultiplied_source_blend;
     m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.camera_override     = desc.camera_override;
@@ -167,6 +168,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
         desc.draw.Mesh()->Material() != nullptr) {
         m_material_blend = desc.draw.Mesh()->Material()->blenmode;
         m_material_cull = desc.draw.Mesh()->Material()->cullMode;
+        m_material_alpha_writing = desc.draw.Mesh()->Material()->alphaWriting;
     }
 };
 
@@ -212,6 +214,11 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
            // Alpha policy changes the prepared pipeline's color write mask, blend operation, and
            // factors. Reusing a pass across that boundary would keep stale composition coverage.
            m_desc.alpha_write_policy == next.m_desc.alpha_write_policy &&
+           m_desc.destination_alpha_override == next.m_desc.destination_alpha_override &&
+           // Final destination state and MAX coverage do not consume the material enum. A live
+           // edit still refreshes graph descriptions, but these invocations keep their pipeline.
+           (m_desc.destination_alpha_override || m_desc.alpha_write_policy == AlphaWritePolicy::Max ||
+            m_material_alpha_writing == next.m_material_alpha_writing) &&
            m_desc.blend_override == next.m_desc.blend_override &&
            // Compare the captured effective value. A changed raw material blend requires a
            // new pipeline unless both invocations still select the same owner-final override.
@@ -249,11 +256,13 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_draw_identity       = next.m_draw_identity;
     m_material_blend      = next.m_material_blend;
     m_material_cull       = next.m_material_cull;
+    m_material_alpha_writing = next.m_material_alpha_writing;
     m_desc.layer_id       = next.m_desc.layer_id;
     m_desc.should_execute = next.m_desc.should_execute;
     m_desc.textures       = next.m_desc.textures;
     m_desc.output         = next.m_desc.output;
     m_desc.alpha_write_policy = next.m_desc.alpha_write_policy;
+    m_desc.destination_alpha_override = next.m_desc.destination_alpha_override;
     m_desc.blend_override = next.m_desc.blend_override;
     m_desc.premultiplied_source_blend = next.m_desc.premultiplied_source_blend;
     m_desc.clear_before_draw = next.m_desc.clear_before_draw;
@@ -528,7 +537,20 @@ VkCullModeFlags ToVkCullMode(wallpaper::SceneCullMode mode) {
 bool ShouldWriteCustomShaderAlpha(const wallpaper::SceneMaterial& material,
                                   std::string_view                camera_name,
                                   wallpaper::AlphaWritePolicy      alpha_write_policy,
-                                  std::string_view                output) {
+                                  std::string_view                output,
+                                  bool destination_alpha_override) {
+    // Accumulated composition coverage is independent of ordinary material alpha writes. A
+    // disabled material must not suppress MAX coverage. The selected final material restores
+    // destination alpha state after material selection: without that coverage scope it preserves
+    // destination alpha, even when an offscreen destination supplies a private camera.
+    if (alpha_write_policy == wallpaper::AlphaWritePolicy::Max) return true;
+    if (destination_alpha_override) return false;
+    switch (material.alphaWriting) {
+    case wallpaper::SceneAlphaWriting::Enabled: return true;
+    case wallpaper::SceneAlphaWriting::Disabled: return false;
+    case wallpaper::SceneAlphaWriting::Default: break;
+    }
+
     const bool is_model_pass = material.modelRenderState.has_value();
     // Model shaders may output non-opaque alpha for their own material math even when the authored
     // object is visually opaque. Allowing that alpha into `_rt_default` makes FinPass present a
@@ -683,7 +705,8 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
     const auto camera_name = EffectiveCustomShaderCamera(desc);
     const bool writes_alpha =
-        ShouldWriteCustomShaderAlpha(material, camera_name, desc.alpha_write_policy, desc.output);
+        ShouldWriteCustomShaderAlpha(material, camera_name, desc.alpha_write_policy, desc.output,
+                                     desc.destination_alpha_override);
 
     if (writes_alpha) color_mask |= VK_COLOR_COMPONENT_A_BIT;
     state.color_blend.colorWriteMask = color_mask;
@@ -715,13 +738,24 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
     SetAttachmentLoadOp(blend_mode, state.color_load_op);
     ApplyModelPassDesc(material, desc, state.color_load_op);
     ApplyExplicitClearPolicy(desc, material, state.color_load_op);
-    if ((desc.sample_count > VK_SAMPLE_COUNT_1_BIT ||
+    if ((!writes_alpha || desc.sample_count > VK_SAMPLE_COUNT_1_BIT ||
          desc.output == wallpaper::SpecTex_Default || desc.output == wallpaper::SpecTex_Reflection) &&
         state.color_load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
         // Blending disabled does not mean a draw covers every target pixel. Scene destinations
         // must LOAD the stage clear or retained history, including alpha and uncovered MSAA
-        // samples; only the stage may clear.
+        // samples; only the stage may clear. An RGB-only draw also needs LOAD on a private
+        // target: DONT_CARE would discard the previous alpha before the write mask preserves it.
         state.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    }
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        LOG_INFO("SceneMaterialAlphaState: layer=%d node='%s' material='%s' output='%s' "
+                 "stored-alpha=%d destination-override=%s coverage-policy=%d writes-alpha=%s "
+                 "mask=%u color-load=%d",
+                 desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
+                 material.name.c_str(), desc.output.c_str(), static_cast<int>(material.alphaWriting),
+                 desc.destination_alpha_override ? "true" : "false",
+                 static_cast<int>(desc.alpha_write_policy), writes_alpha ? "true" : "false",
+                 state.color_blend.colorWriteMask, static_cast<int>(state.color_load_op));
     }
     return state;
 }

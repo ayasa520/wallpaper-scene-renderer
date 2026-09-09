@@ -54,6 +54,7 @@ public:
     // enabled. Each draw owner separately decides which material states apply to its pass.
     std::string                                         blending { "normal" };
     std::string                                         cullmode { "normal" };
+    std::string                                         alphawriting { "default" };
     std::string                                         shader;
     std::string                                         depthtest { "enabled" };
     std::string                                         depthwrite { "enabled" };

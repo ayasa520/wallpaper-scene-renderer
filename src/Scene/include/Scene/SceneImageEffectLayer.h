@@ -47,6 +47,9 @@ struct SceneImageEffectNode {
     // Keep its blend selection beside the resolved output so concurrent reflection/main phases
     // cannot overwrite each other's state or erase an authored private pass blend.
     std::optional<BlendMode> blend_override {};
+    // The selected final material restores the enclosing destination's alpha state. Keep this
+    // invocation rule separate from the material enum and from the owner's RGB blend choice.
+    bool destination_alpha_override { false };
     // Matrix phase belongs to the deferred destination segment. Auxiliary FBO passes in that
     // segment use the same unscaled layer snapshots as its visible output material, even though
     // their raster mesh remains a fullscreen quad. ResolveEffect() recalculates this phase.

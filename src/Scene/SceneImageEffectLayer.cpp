@@ -565,6 +565,7 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
 
             auto& material = *(it->sceneNode->Mesh()->Material());
             it->blend_override.reset();
+            it->destination_alpha_override = false;
             it->sceneNode->SetCamera(effect_cam.data());
             it->camera_override.clear();
             it->use_active_camera_for_parallax = false;
@@ -718,6 +719,7 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
     final_output_node.uses_owner_transform = !m_fullscreen;
     final_output_node.mesh_follows_final_mesh = !m_fullscreen;
     final_output_node.output = std::string(final_output);
+    final_output_node.destination_alpha_override = final_output_node.is_final_material;
     auto& mesh               = *(final_output_node.sceneNode->Mesh());
     auto& material           = *mesh.Material();
     if (m_fullscreen) {
@@ -770,6 +772,7 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
     auto& mesh     = *(final_output_node.sceneNode->Mesh());
     auto& material = *mesh.Material();
     final_output_node.blend_override.reset();
+    final_output_node.destination_alpha_override = false;
     final_output_node.sceneNode->SetCamera(effect_cam.data());
     final_output_node.sceneNode->CopyTrans(default_node);
     mesh.ChangeMeshDataFrom(default_mesh);
@@ -846,6 +849,7 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
         mesh.ChangeMeshDataFrom(node.is_final_material ? *m_final_mesh : default_mesh);
         node.blend_override = node.is_final_material
             ? std::optional { FinalBlend() } : std::nullopt;
+        node.destination_alpha_override = node.is_final_material;
         material.textures = node.authored_textures;
         for (const auto slot : node.fbo_texture_slots) {
             material.textures.at(slot) = bindings.at(node.authored_textures.at(slot));

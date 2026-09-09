@@ -211,6 +211,7 @@ struct OrderedRenderGraphChild {
 struct DrawPassOptions {
     AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
     std::optional<BlendMode> blend_override {};
+    bool        destination_alpha_override { false };
     bool        clear_before_draw { false };
     std::string camera_override;
     bool        use_active_camera_for_parallax { false };
@@ -526,6 +527,7 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
             pdesc.should_execute      = pass_execution_gate;
             pdesc.output     = output_key;
             pdesc.blend_override = options.blend_override;
+            pdesc.destination_alpha_override = options.destination_alpha_override;
             pdesc.alpha_write_policy = output_key != SpecTex_Default
                 ? options.alpha_write_policy
                 : AlphaWritePolicy::Preserve;
@@ -1006,6 +1008,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                                     ? route.compose_source_alpha_write_policy
                                     : effect_node.alpha_write_policy,
                                 .blend_override = effect_node.blend_override,
+                                .destination_alpha_override = effect_node.destination_alpha_override,
                                 .clear_before_draw = effect_node.clear_before_draw,
                                 .camera_override = composition_camera
                                     ? source_route.active_compose_source_camera

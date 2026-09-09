@@ -3741,6 +3741,12 @@ constexpr std::pair<std::string_view, SceneCullMode> kMaterialCullModes[] {
     { "nocull", SceneCullMode::None },
 };
 
+constexpr std::pair<std::string_view, SceneAlphaWriting> kMaterialAlphaWritingModes[] {
+    { "default", SceneAlphaWriting::Default },
+    { "disabled", SceneAlphaWriting::Disabled },
+    { "enabled", SceneAlphaWriting::Enabled },
+};
+
 template <typename Mode, size_t Count>
 std::string_view MaterialEnumName(
     Mode mode, const std::pair<std::string_view, Mode> (&modes)[Count]) {
@@ -3756,6 +3762,10 @@ std::string_view MaterialBlendingName(BlendMode mode) {
 
 std::string_view MaterialCullModeName(SceneCullMode mode) {
     return MaterialEnumName(mode, kMaterialCullModes);
+}
+
+std::string_view MaterialAlphaWritingName(SceneAlphaWriting mode) {
+    return MaterialEnumName(mode, kMaterialAlphaWritingModes);
 }
 
 template <typename Mode, size_t Count>
@@ -5843,7 +5853,8 @@ NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValu
     // Unknown names remain absent instead of silently accepting misspelled controls.
     return JS_NewBool(context,
                       FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr ||
-                          property_name == "blending" || property_name == "cullmode");
+                          property_name == "blending" || property_name == "cullmode" ||
+                          property_name == "alphawriting");
 }
 
 JSValue
@@ -5879,6 +5890,9 @@ NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
     }
     if (property_name == "cullmode") {
         return JS_NewString(context, MaterialCullModeName(target->material->cullMode).data());
+    }
+    if (property_name == "alphawriting") {
+        return JS_NewString(context, MaterialAlphaWritingName(target->material->alphaWriting).data());
     }
     return JS_UNDEFINED;
 }
@@ -5921,6 +5935,12 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
                                        *opaque->scene, layer_id, effect_index, material_index,
                                        kMaterialCullModes, &SceneMaterial::cullMode,
                                        "SceneEffectMaterialCullApply");
+    }
+    if (current_uniform == nullptr && property_name == "alphawriting") {
+        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialAlphaWritingModes, &SceneMaterial::alphaWriting,
+                                       "SceneEffectMaterialAlphaApply");
     }
     if (current_uniform == nullptr) {
         LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "

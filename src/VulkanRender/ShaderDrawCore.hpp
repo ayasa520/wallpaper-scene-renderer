@@ -32,6 +32,8 @@ struct ShaderDrawRequest {
     // A final effect draw may temporarily select the owner's blend. Store that invocation's
     // selection in the request; the shared material remains the persistent authored state.
     std::optional<BlendMode>  blend_override {};
+    // A final material draw uses destination alpha state instead of its persistent enum.
+    bool                     destination_alpha_override { false };
     bool                     premultiplied_source_blend { false };
     bool                     clear_before_draw { false };
     std::string              camera_override;
@@ -188,6 +190,7 @@ private:
     // mutable material, so dereferencing their material pointers cannot detect a live change.
     BlendMode            m_material_blend { BlendMode::Disable };
     SceneCullMode        m_material_cull { SceneCullMode::None };
+    SceneAlphaWriting    m_material_alpha_writing { SceneAlphaWriting::Default };
     uint64_t             m_trace_draw_sequence { 0 };
     ShaderDrawExtension* m_extension { nullptr };
 };

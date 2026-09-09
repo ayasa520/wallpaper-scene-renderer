@@ -25,6 +25,13 @@ enum class SceneCullMode
     Front,
 };
 
+enum class SceneAlphaWriting
+{
+    Default,
+    Enabled,
+    Disabled,
+};
+
 enum class SceneModelColorLoadMode
 {
     DontCare,
@@ -63,6 +70,7 @@ public:
           customShader(std::move(o.customShader)),
           blenmode(o.blenmode),
           cullMode(o.cullMode),
+          alphaWriting(o.alphaWriting),
           modelRenderState(o.modelRenderState),
           alpha_to_coverage(o.alpha_to_coverage) {};
 
@@ -115,6 +123,10 @@ public:
     // parsed selection. Keeping one value also lets live effect writes and pipeline residency
     // observe the same state instead of maintaining separate 2D and model copies.
     SceneCullMode             cullMode { SceneCullMode::None };
+    // Retain the authored tri-state independently of a draw's destination and coverage policy.
+    // Default inherits that draw's alpha state; an explicit selection affects material draws,
+    // but does not replace a final destination override or composition coverage accumulation.
+    SceneAlphaWriting         alphaWriting { SceneAlphaWriting::Default };
     std::optional<SceneModelRenderState> modelRenderState;
     // True when the material blending mode is alphatocoverage. The ALPHATOCOVERAGE
     // combo is fixed at material compile from that blending value; rasterizer A2C
