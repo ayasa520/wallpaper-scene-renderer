@@ -44,7 +44,6 @@ struct SceneModelRenderState {
     SceneModelColorLoadMode colorLoadMode { SceneModelColorLoadMode::DontCare };
     bool          depthTest { true };
     bool          depthWrite { true };
-    SceneCullMode cullMode { SceneCullMode::Back };
     // Scene depth is reversed (near = 1, far = 0): the nearest-wins test is always GREATER
     // against a buffer cleared to 0, so there is no per-material compare mode.
     float         depthClear { 0.0f };
@@ -63,6 +62,7 @@ public:
           hasSprite(o.hasSprite),
           customShader(std::move(o.customShader)),
           blenmode(o.blenmode),
+          cullMode(o.cullMode),
           modelRenderState(o.modelRenderState),
           alpha_to_coverage(o.alpha_to_coverage) {};
 
@@ -110,6 +110,11 @@ public:
 
     SceneMaterialCustomShader customShader;
     BlendMode                 blenmode { BlendMode::Disable };
+    // Culling belongs to every shader material, independently of model-only depth/attachment
+    // state. Programmatic materials start two-sided; authored material loading installs the
+    // parsed selection. Keeping one value also lets live effect writes and pipeline residency
+    // observe the same state instead of maintaining separate 2D and model copies.
+    SceneCullMode             cullMode { SceneCullMode::None };
     std::optional<SceneModelRenderState> modelRenderState;
     // True when the material blending mode is alphatocoverage. The ALPHATOCOVERAGE
     // combo is fixed at material compile from that blending value; rasterizer A2C

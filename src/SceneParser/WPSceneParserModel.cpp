@@ -118,7 +118,6 @@ struct ModelMaterialRenderPolicy {
     bool          transparent { false };
     bool          depthTest { true };
     bool          depthWrite { true };
-    SceneCullMode cullMode { SceneCullMode::Back };
 };
 
 ModelMaterialRenderPolicy BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material) {
@@ -131,7 +130,6 @@ ModelMaterialRenderPolicy BuildModelMaterialRenderPolicy(const wpscene::WPMateri
         .transparent = transparent,
         .depthTest   = material.depthtest == "enabled",
         .depthWrite  = material.depthwrite == "enabled" && ! transparent,
-        .cullMode    = material.cullmode == "nocull" ? SceneCullMode::None : SceneCullMode::Back,
     };
 }
 
@@ -261,7 +259,6 @@ private:
             .colorLoadMode      = color_load_mode,
             .depthTest          = policy.depthTest,
             .depthWrite         = policy.depthWrite,
-            .cullMode           = policy.cullMode,
         };
     }
 

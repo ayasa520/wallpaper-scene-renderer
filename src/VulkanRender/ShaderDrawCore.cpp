@@ -166,6 +166,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     if (desc.draw.Valid() && desc.draw.Mesh() != nullptr &&
         desc.draw.Mesh()->Material() != nullptr) {
         m_material_blend = desc.draw.Mesh()->Material()->blenmode;
+        m_material_cull = desc.draw.Mesh()->Material()->cullMode;
     }
 };
 
@@ -196,7 +197,7 @@ static int IntendedShaderDrawSampleCount(const ShaderDrawData& desc) {
 bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
     // A prepared pass may be reused only when its immutable GPU contract is the same. Runtime
     // visibility gates and descriptor texture keys can be refreshed in place, but changing model
-    // depth/blend state or the owning SceneNode would require a different render pass/pipeline.
+    // depth state, material blending/culling or the owning SceneNode requires a new pipeline.
     const int this_samples = static_cast<int>(m_desc.sample_count);
     const int next_samples = IntendedShaderDrawSampleCount(next.m_desc);
     return m_desc.layer_id == next.m_desc.layer_id &&
@@ -216,6 +217,7 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
            // new pipeline unless both invocations still select the same owner-final override.
            m_desc.blend_override.value_or(m_material_blend) ==
                next.m_desc.blend_override.value_or(next.m_material_blend) &&
+           m_material_cull == next.m_material_cull &&
            m_desc.premultiplied_source_blend ==
                next.m_desc.premultiplied_source_blend &&
            m_desc.clear_before_draw == next.m_desc.clear_before_draw &&
@@ -246,6 +248,7 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.draw           = next.m_desc.draw;
     m_draw_identity       = next.m_draw_identity;
     m_material_blend      = next.m_material_blend;
+    m_material_cull       = next.m_material_cull;
     m_desc.layer_id       = next.m_desc.layer_id;
     m_desc.should_execute = next.m_desc.should_execute;
     m_desc.textures       = next.m_desc.textures;
@@ -608,9 +611,9 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     desc.depth_test    = model_state->depthTest;
     desc.depth_write   = model_state->depthWrite;
     desc.depth_clear   = model_state->depthClear;
-    // Model passes are the only custom-shader passes allowed to override the historical load/cull
-    // defaults. The parser chooses a color-load mode per output target, so offscreen model buffers
-    // can be cleared once per frame before later chunks load and composite into the same image.
+    // Model passes carry an explicit attachment-load policy. The parser chooses it per output
+    // target, so offscreen buffers are cleared once per frame before later chunks load and
+    // composite into the same image.
     switch (model_state->colorLoadMode) {
     case wallpaper::SceneModelColorLoadMode::DontCare: break;
     case wallpaper::SceneModelColorLoadMode::Load: load_op = VK_ATTACHMENT_LOAD_OP_LOAD; break;
@@ -723,25 +726,35 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
     return state;
 }
 
-void ApplyModelPipelineState(const wallpaper::SceneMaterial&                  material,
-                             const wallpaper::vulkan::ShaderDrawData& desc,
-                             GraphicsPipeline&                                pipeline) {
+void ApplyMaterialPipelineState(const wallpaper::SceneMaterial& material,
+                                const wallpaper::vulkan::ShaderDrawData& desc,
+                                GraphicsPipeline& pipeline) {
+    // Source, intermediate and final effect draws all consume the material's own cull state.
+    // An owner-final blend override does not replace it. Apply this before the model-only depth
+    // branch so ordinary effect materials need no depth attachment to select one-sided drawing.
+    // The reflected destination and projection-Y inversion cancel under the top-down viewport;
+    // neither reflection nor an authored owner scale rewrites the material's front-face rule.
+    pipeline.raster.cullMode = ToVkCullMode(material.cullMode);
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        LOG_INFO("SceneMaterialCullState: layer=%d node='%s' material='%s' output='%s' "
+                 "stored-cull=%d cull=%u front-face=%u model=%s reflection-raster=%s",
+                 desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
+                 material.name.c_str(), desc.output.c_str(), static_cast<int>(material.cullMode),
+                 static_cast<unsigned>(pipeline.raster.cullMode),
+                 static_cast<unsigned>(pipeline.raster.frontFace),
+                 material.modelRenderState.has_value() ? "true" : "false",
+                 desc.reflection_raster ? "true" : "false");
+    }
     const auto& model_state = material.modelRenderState;
     if (! model_state.has_value()) return;
 
-    // Only model materials can carry this optional state. Applying it here keeps culling separate
-    // from the old 2D custom-shader defaults while still using the existing pipeline construction
-    // path for shader reflection, descriptors, and mesh buffers.
+    // Depth and attachment ownership remain model-only; culling above does not enable them.
     pipeline.depth.depthTestEnable       = desc.depth_test;
     pipeline.depth.depthWriteEnable      = desc.depth_write;
     // Reversed depth: the only compare mode is GREATER against a 0-cleared buffer.
     pipeline.depth.depthCompareOp        = VK_COMPARE_OP_GREATER;
     pipeline.depth.depthBoundsTestEnable = false;
     pipeline.depth.stencilTestEnable     = false;
-    // The reflected destination and the projection-Y inversion each reverse handedness. With our
-    // top-down viewport their product keeps ordinary winding, so reflection does not mutate this
-    // shared material's cull policy.
-    pipeline.raster.cullMode = ToVkCullMode(model_state->cullMode);
     LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' color-load=%s "
              "reflection-pass=%s depth-test=%s depth-write=%s depth-clear=%s "
              "depth-compare=%s depth-clear-z=%.3f cull=%u",
@@ -1239,7 +1252,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         pipeline.multisample.rasterizationSamples = m_desc.sample_count;
         pipeline.multisample.alphaToCoverageEnable =
             m_desc.alpha_to_coverage && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT;
-        ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
+        ApplyMaterialPipelineState(*mesh.Material(), m_desc, pipeline);
         m_desc.pipeline.debug_name =
             "CustomShaderPass[node=" +
             (m_desc.draw.Valid() ? m_desc.draw.Name() : std::string("(null)")) +
@@ -1628,7 +1641,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
     pipeline.multisample.rasterizationSamples = m_desc.sample_count;
     pipeline.multisample.alphaToCoverageEnable =
         m_desc.alpha_to_coverage && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT;
-    ApplyModelPipelineState(*mesh.Material(), m_desc, pipeline);
+    ApplyMaterialPipelineState(*mesh.Material(), m_desc, pipeline);
     m_desc.pipeline.debug_name =
         "CustomShaderPassWarmup[node=" +
         (m_desc.draw.Valid() ? m_desc.draw.Name() : std::string("(null)")) +

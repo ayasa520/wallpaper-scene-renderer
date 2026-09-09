@@ -656,18 +656,22 @@ void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
 
     float tw = mapRate[0], th = mapRate[1];
 
+    // The strip's two triangles must face forward in the same local-space convention as
+    // authored shape/model geometry. Keep the bottom-left/top-right diagonal and move each UV
+    // with its position; changing winding must not mirror the sampled image. This applies to
+    // both layer-sized cards and the unit card used by intermediate effects.
     // clang-format off
 	const std::array pos = {
-		left, bottom, z,
 		left,  top, z,
-		right, bottom, z,
+		left, bottom, z,
 		right,  top, z,
+		right, bottom, z,
 	};
 	const std::array texCoord = {
-		0.0f, th,
 		0.0f, 0.0f,
-		tw, th,
+		0.0f, th,
 		tw, 0.0f,
+		tw, th,
 	};
     // clang-format on
 
@@ -1097,6 +1101,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     }
 
     material.blenmode = ParseBlendMode(wpmat.blending);
+    material.cullMode = wpmat.cullmode == "nocull" ? SceneCullMode::None : SceneCullMode::Back;
     material.alpha_to_coverage = blending_alpha_to_coverage;
 
     const auto& fragment_unit = sd_units.back();

@@ -3736,16 +3736,34 @@ constexpr std::pair<std::string_view, BlendMode> kMaterialBlendingModes[] {
     { "alphatocoverage", BlendMode::AlphaToCoverage },
 };
 
-std::string_view MaterialBlendingName(BlendMode mode) {
-    for (const auto& [name, value] : kMaterialBlendingModes) {
+constexpr std::pair<std::string_view, SceneCullMode> kMaterialCullModes[] {
+    { "normal", SceneCullMode::Back },
+    { "nocull", SceneCullMode::None },
+};
+
+template <typename Mode, size_t Count>
+std::string_view MaterialEnumName(
+    Mode mode, const std::pair<std::string_view, Mode> (&modes)[Count]) {
+    for (const auto& [name, value] : modes) {
         if (value == mode) return name;
     }
-    return kMaterialBlendingModes[0].first;
+    return modes[0].first;
 }
 
-JSValue ApplyMaterialBlending(JSContext* context, JSValueConst value,
-                              std::shared_ptr<SceneMaterial> material, Scene& scene,
-                              int32_t layer_id, int32_t effect_index, int32_t material_index) {
+std::string_view MaterialBlendingName(BlendMode mode) {
+    return MaterialEnumName(mode, kMaterialBlendingModes);
+}
+
+std::string_view MaterialCullModeName(SceneCullMode mode) {
+    return MaterialEnumName(mode, kMaterialCullModes);
+}
+
+template <typename Mode, size_t Count>
+JSValue ApplyMaterialRasterEnum(JSContext* context, JSValueConst value,
+                                std::shared_ptr<SceneMaterial> material, Scene& scene,
+                                int32_t layer_id, int32_t effect_index, int32_t material_index,
+                                const std::pair<std::string_view, Mode> (&modes)[Count],
+                                Mode SceneMaterial::* member, const char* trace_event) {
     if (JS_IsNull(value) || JS_IsUndefined(value)) return JS_TRUE;
 
     // ToString may run user hooks that mutate or destroy the owner. Retain the selected
@@ -3762,8 +3780,8 @@ JSValue ApplyMaterialBlending(JSContext* context, JSValueConst value,
     // suffixes after an embedded NUL do not participate in matching. Every other spelling
     // selects the first entry, including non-ASCII strings; nullish writes above are distinct.
     const std::string_view spelling(text);
-    BlendMode next = kMaterialBlendingModes[0].second;
-    for (const auto& [name, mode] : kMaterialBlendingModes) {
+    Mode next = modes[0].second;
+    for (const auto& [name, mode] : modes) {
         if (name == spelling) {
             next = mode;
             break;
@@ -3771,22 +3789,22 @@ JSValue ApplyMaterialBlending(JSContext* context, JSValueConst value,
     }
     JS_FreeCString(context, text);
 
-    const auto previous = material->blenmode;
+    const auto previous = material.get()->*member;
     if (previous != next) {
-        material->blenmode = next;
-        // Blending is immutable Vulkan pipeline state. Rebuild the graph's invocation
-        // descriptions so each consumer can compare its captured effective blend before
-        // reusing a pipeline. Owner-final overrides stay separate, and the shader's authored
-        // compile-time combos are not changed by this raster-only property assignment.
+        material.get()->*member = next;
+        // Raster enums select immutable Vulkan pipeline state. Rebuild invocation descriptions
+        // so each consumer compares its captured effective state before reusing a pipeline.
+        // Owner-final overrides stay separate; these writes change neither shader compile-time
+        // combos nor model-only depth/attachment policy.
         // Raise the scheduling and topology flags together; the topology flag alone does not
         // schedule a refresh when the scene has no other pending resource changes.
         scene.MarkRenderGraphTopologyDirty();
     }
     if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
-        LOG_INFO("SceneEffectMaterialBlendApply: layer=%d effect-index=%d material-index=%d "
+        LOG_INFO("%s: layer=%d effect-index=%d material-index=%d "
                  "material='%s' previous='%s' value='%s' changed=%s topology-dirty=%s",
-                 layer_id, effect_index, material_index, material->name.c_str(),
-                 MaterialBlendingName(previous).data(), MaterialBlendingName(next).data(),
+                 trace_event, layer_id, effect_index, material_index, material->name.c_str(),
+                 MaterialEnumName(previous, modes).data(), MaterialEnumName(next, modes).data(),
                  previous != next ? "true" : "false",
                  scene.renderGraphTopologyDirty ? "true" : "false");
     }
@@ -5825,7 +5843,7 @@ NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValu
     // Unknown names remain absent instead of silently accepting misspelled controls.
     return JS_NewBool(context,
                       FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr ||
-                          property_name == "blending");
+                          property_name == "blending" || property_name == "cullmode");
 }
 
 JSValue
@@ -5859,6 +5877,9 @@ NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
     if (property_name == "blending") {
         return JS_NewString(context, MaterialBlendingName(target->material->blenmode).data());
     }
+    if (property_name == "cullmode") {
+        return JS_NewString(context, MaterialCullModeName(target->material->cullMode).data());
+    }
     return JS_UNDEFINED;
 }
 
@@ -5890,8 +5911,16 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
     const auto* const current_uniform =
         FindRuntimeMaterialUniformValue(*target->material, property_name, &uniform_name);
     if (current_uniform == nullptr && property_name == "blending") {
-        return ApplyMaterialBlending(context, argv[4], target->node->Mesh()->SharedMaterial(),
-                                     *opaque->scene, layer_id, effect_index, material_index);
+        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialBlendingModes, &SceneMaterial::blenmode,
+                                       "SceneEffectMaterialBlendApply");
+    }
+    if (current_uniform == nullptr && property_name == "cullmode") {
+        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialCullModes, &SceneMaterial::cullMode,
+                                       "SceneEffectMaterialCullApply");
     }
     if (current_uniform == nullptr) {
         LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "

@@ -994,6 +994,7 @@ bool LoadVolumetricUtilMaterial(fs::VFS& vfs, Scene& scene, WPShaderValueUpdater
                                 SceneNode& node, std::string_view json_path,
                                 const std::unordered_map<std::string, int32_t>& extra_combos,
                                 SceneLight* light, const std::string& cookie,
+                                SceneCullMode cull_mode,
                                 const std::optional<SceneModelRenderState>& render_state,
                                 std::shared_ptr<SceneMesh> mesh) {
     nlohmann::json json;
@@ -1029,6 +1030,9 @@ bool LoadVolumetricUtilMaterial(fs::VFS& vfs, Scene& scene, WPShaderValueUpdater
                   json_path.data());
         return false;
     }
+    // These procedural passes select a geometric boundary, independently of whether they need
+    // a model depth attachment. Retain their explicit hull/fullscreen selection on the material.
+    material.cullMode = cull_mode;
     if (render_state.has_value()) material.modelRenderState = *render_state;
     mesh->AddMaterial(std::move(material));
     node.AddMesh(mesh);
@@ -1101,7 +1105,6 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     SceneModelRenderState back_state;
     back_state.depthTest     = true;
     back_state.depthWrite    = true;
-    back_state.cullMode      = SceneCullMode::Front;
     back_state.colorLoadMode = SceneModelColorLoadMode::Clear;
     // backDepth must be the exit wall of the volume. These hulls have outward winding; with the
     // negative-height Vulkan viewport and CCW front-face convention, culling FRONT retains that
@@ -1114,13 +1117,11 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     SceneModelRenderState front_hull_state;
     front_hull_state.depthTest     = false;
     front_hull_state.depthWrite    = false;
-    front_hull_state.cullMode      = SceneCullMode::Back;
     front_hull_state.colorLoadMode = SceneModelColorLoadMode::Load;
 
     SceneModelRenderState fullscreen_state;
     fullscreen_state.depthTest     = false;
     fullscreen_state.depthWrite    = false;
-    fullscreen_state.cullMode      = SceneCullMode::None;
     fullscreen_state.colorLoadMode = SceneModelColorLoadMode::Load;
 
     for (SceneLight* light : lights) {
@@ -1166,6 +1167,7 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
                                          {},
                                          light,
                                          {},
+                                         SceneCullMode::Front,
                                          back_state,
                                          back_mesh) ||
             ! LoadVolumetricUtilMaterial(vfs,
@@ -1176,6 +1178,7 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
                                          combos,
                                          light,
                                          cookie,
+                                         SceneCullMode::Back,
                                          front_hull_state,
                                          front_mesh) ||
             ! LoadVolumetricUtilMaterial(vfs,
@@ -1186,6 +1189,7 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
                                          combos,
                                          light,
                                          cookie,
+                                         SceneCullMode::None,
                                          fullscreen_state,
                                          fs_mesh)) {
             ClearSceneVolumetrics(scene);
@@ -1220,6 +1224,7 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
                                          {},
                                          nullptr,
                                          {},
+                                         SceneCullMode::None,
                                          std::nullopt,
                                          blur_h_mesh) ||
             ! LoadVolumetricUtilMaterial(vfs,
@@ -1230,6 +1235,7 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
                                          {},
                                          nullptr,
                                          {},
+                                         SceneCullMode::None,
                                          std::nullopt,
                                          blur_v_mesh)) {
             ClearSceneVolumetrics(scene);
@@ -1253,6 +1259,7 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
                                      {},
                                      nullptr,
                                      {},
+                                     SceneCullMode::None,
                                      std::nullopt,
                                      combine_mesh)) {
         ClearSceneVolumetrics(scene);

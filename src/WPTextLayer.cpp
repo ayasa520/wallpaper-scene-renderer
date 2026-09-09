@@ -65,16 +65,16 @@ void GenCardMesh(SceneMesh&                    mesh,
     const float top = size[1] / 2.0f;
     const float z = 0.0f;
 
-    // The first-class text primitive still uses quad meshes for the background card and bridge
-    // outputs. Keeping a local copy of this helper inside WPTextLayer avoids coupling the new text
-    // pipeline to parser-only helpers that are going away as part of the rewrite.
+    // Background and bridge cards use forward-facing triangles with the bottom-left/top-right
+    // diagonal. Pair UVs with these positions so a one-sided material affects visibility, not
+    // texture orientation. RebuildTextMesh below retains this winding when live text is resized.
     const std::array<float, 12> positions {
-        left, bottom, z,
         left, top, z,
-        right, bottom, z,
+        left, bottom, z,
         right, top, z,
+        right, bottom, z,
     };
-    const std::array<float, 8> texcoords { 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+    const std::array<float, 8> texcoords { 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f };
 
     SceneVertexArray vertex(
         {
@@ -1969,9 +1969,9 @@ void RebuildTextMesh(SceneMesh* mesh, std::array<float, 2> size,
     const float top    = local_center[1] + (size[1] / 2.0f);
 
     const std::array pos = {
-        left, bottom, 0.0f, left, top, 0.0f, right, bottom, 0.0f, right, top, 0.0f,
+        left, top, 0.0f, left, bottom, 0.0f, right, top, 0.0f, right, bottom, 0.0f,
     };
-    const std::array texcoord { 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+    const std::array texcoord { 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f };
 
     SceneVertexArray vertex(
         std::vector<SceneVertexArray::SceneVertexAttribute> {

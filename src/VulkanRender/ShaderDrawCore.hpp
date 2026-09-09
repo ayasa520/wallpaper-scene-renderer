@@ -187,6 +187,7 @@ private:
     // Capture persistent raster state by value. Both graph generations can reference the same
     // mutable material, so dereferencing their material pointers cannot detect a live change.
     BlendMode            m_material_blend { BlendMode::Disable };
+    SceneCullMode        m_material_cull { SceneCullMode::None };
     uint64_t             m_trace_draw_sequence { 0 };
     ShaderDrawExtension* m_extension { nullptr };
 };
