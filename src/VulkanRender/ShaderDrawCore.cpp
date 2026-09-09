@@ -1285,14 +1285,11 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         if (! RecreateCustomShaderPassFramebuffer(device, rr, m_desc, m_extension)) return false;
     }
 
-    if (! ref.blocks.empty()) {
-        auto& block = ref.blocks.front();
-        if (! rr.dyn_buf->allocateSubRef(
-                block.size, m_desc.ubo_buf, device.limits().minUniformBufferOffsetAlignment)) {
-            return false;
-        }
-    }
-    if (! ref.blocks.empty()) {
+    // Geometry residency belongs to the mesh, not to the shader's uniform layout. A dynamic
+    // effect card still needs its vertex/index bytes when the shader uses only constants or
+    // samplers. Install its upload operation independently so initial preparation, resource
+    // refresh and per-frame updates all populate the same pass-owned GPU subranges.
+    {
         std::function<void()> update_dyn_buf_op;
         if (m_desc.dyn_vertex) {
             auto&       mesh             = *m_desc.draw.Mesh();
@@ -1310,10 +1307,12 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                                                 &force_dyn_upload,
                                                 &uploaded_revision,
                                                 layer_id = m_desc.layer_id,
+                                                node_name = m_desc.draw.Name(),
                                                 output = m_desc.output,
                                                 reflection_pass = m_desc.reflection_pass]() {
                 const auto revision = mesh.DataRevision();
-                const bool needs_upload = revision != uploaded_revision || force_dyn_upload;
+                const bool bootstrap_upload = force_dyn_upload;
+                const bool needs_upload = revision != uploaded_revision || bootstrap_upload;
                 if (needs_upload) {
                     auto ensure_vertex_subref = [&](usize                              array_index,
                                                     const wallpaper::SceneVertexArray& vertex) {
@@ -1451,15 +1450,23 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     force_dyn_upload = false;
                     if (std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
                         LOG_INFO("SceneMeshUpload: layer=%d output='%s' reflection=%s "
-                                 "revision=%llu draw-count=%u",
+                                 "revision=%llu draw-count=%u node='%s' bootstrap=%s",
                                  layer_id, output.c_str(), reflection_pass ? "true" : "false",
-                                 static_cast<unsigned long long>(revision), draw_count);
+                                 static_cast<unsigned long long>(revision), draw_count,
+                                 node_name.c_str(), bootstrap_upload ? "true" : "false");
                     }
                 }
             };
         }
+        m_desc.update_dynamic_mesh_op = std::move(update_dyn_buf_op);
+    }
 
+    if (! ref.blocks.empty()) {
         auto  block  = ref.blocks.front();
+        if (! rr.dyn_buf->allocateSubRef(
+                block.size, m_desc.ubo_buf, device.limits().minUniformBufferOffsetAlignment)) {
+            return false;
+        }
         auto* buf    = rr.dyn_buf;
         auto* bufref = &m_desc.ubo_buf;
         const auto draw      = m_desc.draw;
@@ -1471,11 +1478,6 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         // authored uniforms directly and should not rediscover the material through the scene node.
         auto* material = mesh.Material();
 
-        // Keep dynamic mesh uploads separate from general pass updates because both operations own
-        // independent subranges of the shared staging buffer. They are nevertheless dispatched by
-        // updateBeforeUpload(): every CPU write that feeds the current draw must happen before
-        // VulkanRender records and flushes m_dyn_buf->recordUpload().
-        m_desc.update_dynamic_mesh_op = update_dyn_buf_op;
         m_desc.update_op =
             [shader_updater, block, buf, bufref, extension,
              draw, material, &sprites, &vk_textures,
@@ -1532,8 +1534,11 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         if (m_extension != nullptr) m_extension->initializeUniforms(buf);
         WriteMaterialUniforms(buf, *bufref, block, *mesh.Material());
         m_desc.update_op();
-        if (m_desc.update_dynamic_mesh_op) m_desc.update_dynamic_mesh_op();
     }
+    // Bootstrap geometry even when no uniform updater exists. Preserve the uniform-then-mesh
+    // ordering used by updateBeforeUpload(): all CPU writes for this draw must precede the
+    // shared staging-buffer copy recorded by VulkanRender.
+    if (m_desc.update_dynamic_mesh_op) m_desc.update_dynamic_mesh_op();
 
     {
         m_desc.clear_value =
