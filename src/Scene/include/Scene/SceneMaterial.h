@@ -40,17 +40,14 @@ enum class SceneModelColorLoadMode
 };
 
 struct SceneModelRenderState {
-    // This optional state is attached only by scene-level 3D model materialization. Keeping it out
-    // of ordinary image/effect/text materials prevents the model render-policy defaults from
-    // changing the historical 2D scene path.
+    // Model materialization owns private depth attachments and their initialization. Raw depth
+    // properties instead belong to SceneMaterial and use the same draw policy for every owner.
     // Model passes can target either the main scene buffer, which already has the ordinary pre-pass
     // clear contract, or private offscreen buffers that are sampled later by another material. The
     // color load mode makes that ownership explicit: the first offscreen producer clears to
     // transparent, later producers load and composite, and legacy main-target first passes can keep
     // the historical custom-shader load behavior.
     SceneModelColorLoadMode colorLoadMode { SceneModelColorLoadMode::DontCare };
-    bool          depthTest { true };
-    bool          depthWrite { true };
     // Scene depth is reversed (near = 1, far = 0): the nearest-wins test is always GREATER
     // against a buffer cleared to 0, so there is no per-material compare mode.
     float         depthClear { 0.0f };
@@ -71,6 +68,8 @@ public:
           blenmode(o.blenmode),
           cullMode(o.cullMode),
           alphaWriting(o.alphaWriting),
+          depthTest(o.depthTest),
+          depthWrite(o.depthWrite),
           modelRenderState(o.modelRenderState),
           alpha_to_coverage(o.alpha_to_coverage) {};
 
@@ -127,6 +126,11 @@ public:
     // Default inherits that draw's alpha state; an explicit selection affects material draws,
     // but does not replace a final destination override or composition coverage accumulation.
     SceneAlphaWriting         alphaWriting { SceneAlphaWriting::Default };
+    // Retain both independent material selections, including on color-only destinations.
+    // A draw separately resolves owner overrides, attachment availability and blend-based write
+    // suppression; none of those effective decisions rewrites what the script proxy reads.
+    bool                      depthTest { true };
+    bool                      depthWrite { true };
     std::optional<SceneModelRenderState> modelRenderState;
     // True when the material blending mode is alphatocoverage. The ALPHATOCOVERAGE
     // combo is fixed at material compile from that blending value; rasterizer A2C

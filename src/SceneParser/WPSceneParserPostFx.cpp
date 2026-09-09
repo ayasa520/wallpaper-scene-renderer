@@ -1103,8 +1103,8 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     }
 
     SceneModelRenderState back_state;
-    back_state.depthTest     = true;
-    back_state.depthWrite    = true;
+    // The utility materials already carry the back hull's enabled depth and the two lighting
+    // paths' disabled depth. Keep that parsed state instead of duplicating it in model policy.
     back_state.colorLoadMode = SceneModelColorLoadMode::Clear;
     // backDepth must be the exit wall of the volume. These hulls have outward winding; with the
     // negative-height Vulkan viewport and CCW front-face convention, culling FRONT retains that
@@ -1115,13 +1115,9 @@ bool ConfigureSceneVolumetricsImpl(Scene& scene, fs::VFS& vfs) {
     back_state.depthClear    = 0.0f;
 
     SceneModelRenderState front_hull_state;
-    front_hull_state.depthTest     = false;
-    front_hull_state.depthWrite    = false;
     front_hull_state.colorLoadMode = SceneModelColorLoadMode::Load;
 
     SceneModelRenderState fullscreen_state;
-    fullscreen_state.depthTest     = false;
-    fullscreen_state.depthWrite    = false;
     fullscreen_state.colorLoadMode = SceneModelColorLoadMode::Load;
 
     for (SceneLight* light : lights) {

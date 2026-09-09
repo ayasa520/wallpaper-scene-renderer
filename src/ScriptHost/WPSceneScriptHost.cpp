@@ -3747,6 +3747,11 @@ constexpr std::pair<std::string_view, SceneAlphaWriting> kMaterialAlphaWritingMo
     { "enabled", SceneAlphaWriting::Enabled },
 };
 
+constexpr std::pair<std::string_view, bool> kMaterialDepthModes[] {
+    { "disabled", false },
+    { "enabled", true },
+};
+
 template <typename Mode, size_t Count>
 std::string_view MaterialEnumName(
     Mode mode, const std::pair<std::string_view, Mode> (&modes)[Count]) {
@@ -3805,7 +3810,7 @@ JSValue ApplyMaterialRasterEnum(JSContext* context, JSValueConst value,
         // Raster enums select immutable Vulkan pipeline state. Rebuild invocation descriptions
         // so each consumer compares its captured effective state before reusing a pipeline.
         // Owner-final overrides stay separate; these writes change neither shader compile-time
-        // combos nor model-only depth/attachment policy.
+        // combos nor target attachment ownership.
         // Raise the scheduling and topology flags together; the topology flag alone does not
         // schedule a refresh when the scene has no other pending resource changes.
         scene.MarkRenderGraphTopologyDirty();
@@ -5854,7 +5859,8 @@ NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValu
     return JS_NewBool(context,
                       FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr ||
                           property_name == "blending" || property_name == "cullmode" ||
-                          property_name == "alphawriting");
+                          property_name == "alphawriting" || property_name == "depthtest" ||
+                          property_name == "depthwrite");
 }
 
 JSValue
@@ -5893,6 +5899,11 @@ NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
     }
     if (property_name == "alphawriting") {
         return JS_NewString(context, MaterialAlphaWritingName(target->material->alphaWriting).data());
+    }
+    if (property_name == "depthtest" || property_name == "depthwrite") {
+        const bool enabled = property_name == "depthtest"
+            ? target->material->depthTest : target->material->depthWrite;
+        return JS_NewString(context, MaterialEnumName(enabled, kMaterialDepthModes).data());
     }
     return JS_UNDEFINED;
 }
@@ -5941,6 +5952,16 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
                                        *opaque->scene, layer_id, effect_index, material_index,
                                        kMaterialAlphaWritingModes, &SceneMaterial::alphaWriting,
                                        "SceneEffectMaterialAlphaApply");
+    }
+    if (current_uniform == nullptr &&
+        (property_name == "depthtest" || property_name == "depthwrite")) {
+        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialDepthModes,
+                                       property_name == "depthtest" ? &SceneMaterial::depthTest
+                                                                    : &SceneMaterial::depthWrite,
+                                       property_name == "depthtest" ? "SceneEffectMaterialDepthTestApply"
+                                                                    : "SceneEffectMaterialDepthWriteApply");
     }
     if (current_uniform == nullptr) {
         LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "

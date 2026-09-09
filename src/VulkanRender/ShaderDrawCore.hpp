@@ -28,10 +28,16 @@ struct ShaderDrawRequest {
     std::function<bool()> should_execute;
     std::vector<std::string> textures;
     std::string              output;
+    // Post-process draws replace resolved scene color, not the multisampled scene destination.
+    // Keep that target role explicit: its color-only framebuffer must neither consume nor
+    // replace the depth attachment shared by the scene traversal's already prepared draws.
+    bool                     resolved_scene_color { false };
     AlphaWritePolicy         alpha_write_policy { AlphaWritePolicy::Preserve };
     // A final effect draw may temporarily select the owner's blend. Store that invocation's
     // selection in the request; the shared material remains the persistent authored state.
     std::optional<BlendMode>  blend_override {};
+    std::optional<bool>       depth_test_override {};
+    std::optional<bool>       depth_write_override {};
     // A final material draw uses destination alpha state instead of its persistent enum.
     bool                     destination_alpha_override { false };
     bool                     premultiplied_source_blend { false };
@@ -46,6 +52,10 @@ struct ShaderDrawRequest {
     std::string              effect_snapshot_camera;
     sprite_map_t             sprites_map;
     bool                     model_pass { false };
+    // Attachment ownership is independent of raw properties. Main/reflection draws share scene
+    // depth, model targets own their depth, and ordinary effect FBOs remain color-only. The graph
+    // captures effective test/write values for residency before mutable material state changes.
+    bool                     shared_depth { false };
     bool                     depth_test { false };
     bool                     depth_write { false };
     bool                     clear_depth { true };

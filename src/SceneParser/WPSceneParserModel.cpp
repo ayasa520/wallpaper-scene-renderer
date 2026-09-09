@@ -114,25 +114,6 @@ std::optional<nlohmann::json> LoadModelSidecarJson(fs::VFS& vfs, std::string_vie
     return json;
 }
 
-struct ModelMaterialRenderPolicy {
-    bool          transparent { false };
-    bool          depthTest { true };
-    bool          depthWrite { true };
-};
-
-ModelMaterialRenderPolicy BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material) {
-    const bool transparent = material.blending == "translucent" || material.blending == "additive";
-    // Material parsing owns enum selection and omitted-state initialization. Model drawing only
-    // derives its effective state: transparent chunks still test opaque depth but do not write
-    // depth, independently of culling. Keep that suppression out of the stored material so its
-    // selected depthwrite value remains available separately from the draw policy.
-    return ModelMaterialRenderPolicy {
-        .transparent = transparent,
-        .depthTest   = material.depthtest == "enabled",
-        .depthWrite  = material.depthwrite == "enabled" && ! transparent,
-    };
-}
-
 bool LoadModelMaterialJson(ParseContext& context, const std::string& material_path,
                            nlohmann::json& material_json) {
     const auto material_source = fs::GetFileContent(*context.vfs, "/assets/" + material_path);
@@ -177,7 +158,6 @@ void SeedModelCameraUniforms(ParseContext& context, WPShaderInfo& shader_info) {
 struct ModelMaterialSource {
     std::string               path;
     wpscene::WPMaterial       material;
-    ModelMaterialRenderPolicy renderPolicy;
 };
 
 class ModelMaterialLoader {
@@ -196,7 +176,7 @@ public:
             return false;
         }
 
-        return source->renderPolicy.transparent;
+        return source->material.blending == "translucent" || source->material.blending == "additive";
     }
 
     bool LoadChunkMaterial(const WPMdl& mdl, const WPMdl::StaticChunk& chunk,
@@ -241,7 +221,9 @@ public:
 
         LoadConstvalue(material, effective_material, shader_info);
         LoadUserShaderValue(material, effective_material, shader_info, context_.user_properties);
-        material.modelRenderState = BuildRenderState(color_load_mode, source->renderPolicy);
+        // Raw depth values come from LoadMaterial. Model-only state selects attachment lifetime
+        // and color initialization; common draw policy applies blend-based write suppression.
+        material.modelRenderState = SceneModelRenderState { .colorLoadMode = color_load_mode };
         // Model material JSON and shader metadata are returned to the caller so binding
         // registration can happen after mesh->AddMaterial() and node->AddMesh(). That keeps 3D
         // model chunks on the same material-ready registration path as ordinary scene layers.
@@ -251,17 +233,6 @@ public:
     }
 
 private:
-    SceneModelRenderState BuildRenderState(SceneModelColorLoadMode color_load_mode,
-                                           const ModelMaterialRenderPolicy& policy) const {
-        // Target selection and reflection are draw state: the same parsed material and effective
-        // model policy are consumed by both the reflected and ordinary scene walks.
-        return SceneModelRenderState {
-            .colorLoadMode      = color_load_mode,
-            .depthTest          = policy.depthTest,
-            .depthWrite         = policy.depthWrite,
-        };
-    }
-
     std::optional<ModelMaterialSource> LoadSource(const WPMdl::StaticChunk& chunk) const {
         const auto material_path = ResolvePath(chunk);
         if (const auto cached = source_cache_.find(material_path); cached != source_cache_.end()) {
@@ -286,12 +257,9 @@ private:
         wpscene::WPMaterial wp_material;
         if (! wp_material.FromJson(material_json)) return std::nullopt;
 
-        const auto render_policy = BuildModelMaterialRenderPolicy(wp_material);
-
         return ModelMaterialSource {
             .path         = material_path,
             .material     = std::move(wp_material),
-            .renderPolicy = render_policy,
         };
     }
 

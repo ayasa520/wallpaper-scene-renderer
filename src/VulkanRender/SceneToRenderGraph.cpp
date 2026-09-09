@@ -209,8 +209,11 @@ struct OrderedRenderGraphChild {
 };
 
 struct DrawPassOptions {
+    bool        resolved_scene_color { false };
     AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
     std::optional<BlendMode> blend_override {};
+    std::optional<bool> depth_test_override {};
+    std::optional<bool> depth_write_override {};
     bool        destination_alpha_override { false };
     bool        clear_before_draw { false };
     std::string camera_override;
@@ -526,7 +529,10 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, draw, output_key);
             pdesc.should_execute      = pass_execution_gate;
             pdesc.output     = output_key;
+            pdesc.resolved_scene_color = options.resolved_scene_color;
             pdesc.blend_override = options.blend_override;
+            pdesc.depth_test_override = options.depth_test_override;
+            pdesc.depth_write_override = options.depth_write_override;
             pdesc.destination_alpha_override = options.destination_alpha_override;
             pdesc.alpha_write_policy = output_key != SpecTex_Default
                 ? options.alpha_write_policy
@@ -558,18 +564,27 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
                          draw.Valid() ? draw.Name().c_str() : "",
                          output_key.c_str());
             }
+            // A material cannot create a depth attachment for a color-only effect target. Scene
+            // destinations share the same attachment as models, while masked meshes retain their
+            // independent stencil attachment. Capture effective booleans now: comparing live
+            // material pointers during residency would observe the new value in both generations.
+            // A resolved-color post-process can use the same logical output name as the scene,
+            // but not the same attachments. It remains single-sample and color-only, leaving the
+            // traversal's shared depth intact for all model/image/effect draws in that stage.
+            pdesc.shared_depth = !options.resolved_scene_color &&
+                (material->modelRenderState.has_value() ||
+                 (draw.Mesh()->MaskedDraw().empty() &&
+                  (output_key == SpecTex_Default || output_key == SpecTex_Reflection)));
+            const auto blend = options.blend_override.value_or(material->blenmode);
+            pdesc.depth_test = pdesc.shared_depth &&
+                options.depth_test_override.value_or(material->depthTest);
+            pdesc.depth_write = pdesc.depth_test &&
+                options.depth_write_override.value_or(material->depthWrite) &&
+                blend != BlendMode::Translucent && blend != BlendMode::Additive;
+            pdesc.clear_depth = clear_model_depth || output_key == SpecTex_VolumetricsBack;
             if (const auto& model_state = material->modelRenderState; model_state.has_value()) {
-                // Depth state is transported through the pass description instead of inferred from
-                // camera names, so adding model rendering cannot alter ordinary 2D custom shaders.
                 pdesc.model_pass = true;
-                pdesc.depth_test = model_state->depthTest;
-                pdesc.depth_write = model_state->depthWrite;
                 pdesc.depth_clear = model_state->depthClear;
-                // Main/reflected depth belongs to the stage, not a visibility-gated first draw.
-                // Private model targets retain their own initialization. Back is rebound per
-                // light and clears for every hull.
-                pdesc.clear_depth = clear_model_depth ||
-                    output_key == SpecTex_VolumetricsBack;
             }
             CheckAndSetSprite(scene, pdesc, *material);
             for (usize i = 0; i < material->textures.size(); i++) {
@@ -1008,6 +1023,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                                     ? route.compose_source_alpha_write_policy
                                     : effect_node.alpha_write_policy,
                                 .blend_override = effect_node.blend_override,
+                                .depth_test_override = effect_node.depth_test_override,
+                                .depth_write_override = effect_node.depth_write_override,
                                 .destination_alpha_override = effect_node.destination_alpha_override,
                                 .clear_before_draw = effect_node.clear_before_draw,
                                 .camera_override = composition_camera
@@ -1259,7 +1276,8 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                          i,
                          scene.bloom.nodes[i]->Name().c_str(),
                          scene.bloom.outputs[i].c_str());
-                AddDrawPass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra);
+                AddDrawPass(scene.bloom.nodes[i].get(), scene.bloom.outputs[i], 0, extra, {},
+                            DrawPassOptions { .resolved_scene_color = true });
             }
         }
     } else if (scene.bloom.quality > 0 && scene.bloom.enabled && scene.bloom.node != nullptr) {
@@ -1270,7 +1288,8 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                  scene.bloom.enabled ? "true" : "false",
                  scene.bloom.strength,
                  scene.bloom.threshold);
-        AddDrawPass(scene.bloom.node.get(), SpecTex_Default, 0, extra);
+        AddDrawPass(scene.bloom.node.get(), SpecTex_Default, 0, extra, {},
+                    DrawPassOptions { .resolved_scene_color = true });
     }
 
     scene.effectCommandPlanUsesVisibility = std::any_of(

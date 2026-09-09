@@ -80,9 +80,9 @@ VkPrimitiveTopology ToTopology(const wallpaper::SceneMesh& mesh) {
 
 std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent,
                                                         VkSampleCountFlagBits samples) {
-    // Model depth is allocated only for opt-in 3D model passes. The existing 2D render-target cache
-    // remains color-only, while separate model chunk passes can still behave like one depth-tested
-    // scene when they share the same output texture.
+    // Depth-capable shader draws share storage by output, independently of material selection.
+    // Main/reflection stages own initialization; model-private outputs initialize at their first
+    // draw. Ordinary effect render targets stay color-only and never request this allocation.
     VmaImageParameters image;
     VkImageCreateInfo  info {
         .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -145,8 +145,11 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.should_execute      = desc.should_execute;
     m_desc.textures            = desc.textures;
     m_desc.output              = desc.output;
+    m_desc.resolved_scene_color = desc.resolved_scene_color;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
     m_desc.blend_override      = desc.blend_override;
+    m_desc.depth_test_override = desc.depth_test_override;
+    m_desc.depth_write_override = desc.depth_write_override;
     m_desc.destination_alpha_override = desc.destination_alpha_override;
     m_desc.premultiplied_source_blend = desc.premultiplied_source_blend;
     m_desc.clear_before_draw   = desc.clear_before_draw;
@@ -160,6 +163,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.effect_snapshot_camera = desc.effect_snapshot_camera;
     m_desc.sprites_map         = desc.sprites_map;
     m_desc.model_pass          = desc.model_pass;
+    m_desc.shared_depth        = desc.shared_depth;
     m_desc.depth_test          = desc.depth_test;
     m_desc.depth_write         = desc.depth_write;
     m_desc.clear_depth         = desc.clear_depth;
@@ -190,7 +194,8 @@ std::string ShaderDrawCore::profileName(std::string_view pass_kind) const {
 }
 
 static int IntendedShaderDrawSampleCount(const ShaderDrawData& desc) {
-    if (desc.scene != nullptr && ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.draw)) {
+    if (desc.scene != nullptr &&
+        ShaderDrawCanUseMsaa(*desc.scene, desc.output, desc.resolved_scene_color)) {
         return std::max(1, desc.scene->MsaaSampleCount());
     }
     return 1;
@@ -205,8 +210,10 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
     return m_desc.layer_id == next.m_desc.layer_id &&
            m_draw_identity == next.m_draw_identity &&
            m_desc.output == next.m_desc.output &&
+           m_desc.resolved_scene_color == next.m_desc.resolved_scene_color &&
            m_desc.execute_when_hidden == next.m_desc.execute_when_hidden &&
            m_desc.model_pass == next.m_desc.model_pass &&
+           m_desc.shared_depth == next.m_desc.shared_depth &&
            m_desc.depth_test == next.m_desc.depth_test &&
            m_desc.depth_write == next.m_desc.depth_write &&
            m_desc.clear_depth == next.m_desc.clear_depth &&
@@ -264,6 +271,8 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.alpha_write_policy = next.m_desc.alpha_write_policy;
     m_desc.destination_alpha_override = next.m_desc.destination_alpha_override;
     m_desc.blend_override = next.m_desc.blend_override;
+    m_desc.depth_test_override = next.m_desc.depth_test_override;
+    m_desc.depth_write_override = next.m_desc.depth_write_override;
     m_desc.premultiplied_source_blend = next.m_desc.premultiplied_source_blend;
     m_desc.clear_before_draw = next.m_desc.clear_before_draw;
     m_desc.camera_override = next.m_desc.camera_override;
@@ -630,8 +639,6 @@ void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
     if (! model_state.has_value()) return;
 
     desc.model_pass    = true;
-    desc.depth_test    = model_state->depthTest;
-    desc.depth_write   = model_state->depthWrite;
     desc.depth_clear   = model_state->depthClear;
     // Model passes carry an explicit attachment-load policy. The parser chooses it per output
     // target, so offscreen buffers are cleared once per frame before later chunks load and
@@ -764,8 +771,8 @@ void ApplyMaterialPipelineState(const wallpaper::SceneMaterial& material,
                                 const wallpaper::vulkan::ShaderDrawData& desc,
                                 GraphicsPipeline& pipeline) {
     // Source, intermediate and final effect draws all consume the material's own cull state.
-    // An owner-final blend override does not replace it. Apply this before the model-only depth
-    // branch so ordinary effect materials need no depth attachment to select one-sided drawing.
+    // An owner-final blend override does not replace it. Ordinary effect materials need no depth
+    // attachment to select one-sided drawing.
     // The reflected destination and projection-Y inversion cancel under the top-down viewport;
     // neither reflection nor an authored owner scale rewrites the material's front-face rule.
     pipeline.raster.cullMode = ToVkCullMode(material.cullMode);
@@ -779,16 +786,30 @@ void ApplyMaterialPipelineState(const wallpaper::SceneMaterial& material,
                  material.modelRenderState.has_value() ? "true" : "false",
                  desc.reflection_raster ? "true" : "false");
     }
-    const auto& model_state = material.modelRenderState;
-    if (! model_state.has_value()) return;
-
-    // Depth and attachment ownership remain model-only; culling above does not enable them.
+    // Effective depth is captured by the graph after target and owner-state selection. The same
+    // booleans drive ordinary and model pipelines; raw readback and color-only targets remain
+    // independent. Test-disabled and translucent/additive draws never write scene depth.
     pipeline.depth.depthTestEnable       = desc.depth_test;
     pipeline.depth.depthWriteEnable      = desc.depth_write;
     // Reversed depth: the only compare mode is GREATER against a 0-cleared buffer.
     pipeline.depth.depthCompareOp        = VK_COMPARE_OP_GREATER;
     pipeline.depth.depthBoundsTestEnable = false;
     pipeline.depth.stencilTestEnable     = false;
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        LOG_INFO("SceneMaterialDepthState: layer=%d node='%s' material='%s' output='%s' "
+                 "stored-test=%s stored-write=%s override-test=%d override-write=%d "
+                 "resolved-scene-color=%s shared-depth=%s effective-test=%s effective-write=%s clear=%s",
+                 desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
+                 material.name.c_str(), desc.output.c_str(),
+                 material.depthTest ? "true" : "false", material.depthWrite ? "true" : "false",
+                 desc.depth_test_override ? static_cast<int>(*desc.depth_test_override) : -1,
+                 desc.depth_write_override ? static_cast<int>(*desc.depth_write_override) : -1,
+                 desc.resolved_scene_color ? "true" : "false",
+                 desc.shared_depth ? "true" : "false", desc.depth_test ? "true" : "false",
+                 desc.depth_write ? "true" : "false", desc.clear_depth ? "true" : "false");
+    }
+    const auto& model_state = material.modelRenderState;
+    if (! model_state.has_value()) return;
     LOG_INFO("ModelRenderStateBind: node='%s' shader='%s' output='%s' color-load=%s "
              "reflection-pass=%s depth-test=%s depth-write=%s depth-clear=%s "
              "depth-compare=%s depth-clear-z=%.3f cull=%u",
@@ -940,7 +961,7 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
     desc.resolve_msaa      = false;
     desc.alpha_to_coverage = false;
     desc.vk_resolve        = {};
-    if (ShaderDrawCanUseMsaa(scene, tex_name, desc.draw)) {
+    if (ShaderDrawCanUseMsaa(scene, tex_name, desc.resolved_scene_color)) {
         const auto ms_name = std::string(wallpaper::SpecTex_DefaultMS);
         const auto ms_it   = scene.renderTargets.find(ms_name);
         if (ms_it != scene.renderTargets.end()) {
@@ -1001,6 +1022,23 @@ VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingRe
                       static_cast<unsigned>(desc.sample_count));
             return nullptr;
         }
+        // Record both generations before releasing the old view. Framebuffers are prepared before
+        // graph execution, so this opt-in trace can identify an allocation replaced after another
+        // draw has bound it, including output/sample mismatches that ordinary draw logs omit.
+        if (std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+            LOG_INFO("SceneDepthAttachmentAllocate: layer=%d node='%s' output='%s' "
+                     "old-image=%p old-view=%p old-extent=%ux%ux%u old-samples=%u "
+                     "new-image=%p new-view=%p new-extent=%ux%ux%u new-samples=%u",
+                     desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
+                     desc.output.c_str(),
+                     depth.handle ? reinterpret_cast<void*>(*depth.handle) : nullptr,
+                     depth.view ? reinterpret_cast<void*>(*depth.view) : nullptr,
+                     depth.extent.width, depth.extent.height, depth.extent.depth, depth.samples,
+                     reinterpret_cast<void*>(*replacement->handle),
+                     reinterpret_cast<void*>(*replacement->view),
+                     replacement->extent.width, replacement->extent.height,
+                     replacement->extent.depth, replacement->samples);
+        }
         depth = std::move(replacement.value());
         attachment.layout = VK_IMAGE_LAYOUT_UNDEFINED;
         rr.model_depth_resolved.erase(desc.output);
@@ -1024,7 +1062,7 @@ VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingRe
 
 ShaderDrawAttachmentDescription ResolveShaderDrawAttachment(
     const ShaderDrawData& desc, const ShaderDrawExtension* extension) {
-    if (desc.model_pass) {
+    if (desc.shared_depth) {
         const auto depth_load_op = desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                     : VK_ATTACHMENT_LOAD_OP_LOAD;
         return ShaderDrawAttachmentDescription {
@@ -1061,7 +1099,7 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
         return false;
     }
     const auto attachment = ResolveShaderDrawAttachment(desc, extension);
-    if (desc.model_pass) {
+    if (desc.shared_depth) {
         desc.depth_stencil_image_ref = QuerySharedModelDepthImage(device, rr, desc);
     } else if (attachment.enabled() && extension != nullptr) {
         desc.depth_stencil_image_ref = extension->acquireAttachment(device, rr, desc);
@@ -1101,7 +1139,20 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
         .height          = desc.vk_output.extent.height,
         .layers          = 1,
     };
-    return device.handle().CreateFramebuffer(info, desc.fb) == VK_SUCCESS;
+    const bool created = device.handle().CreateFramebuffer(info, desc.fb) == VK_SUCCESS;
+    if (created && std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+        LOG_INFO("SceneDepthFramebuffer: layer=%d node='%s' output='%s' framebuffer=%p "
+                 "color-view=%p depth-view=%p resolved-scene-color=%s shared-depth=%s "
+                 "extent=%ux%u samples=%u",
+                 desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
+                 desc.output.c_str(), reinterpret_cast<void*>(*desc.fb),
+                 reinterpret_cast<void*>(attachments[0]),
+                 attachment.enabled() ? reinterpret_cast<void*>(attachments[1]) : nullptr,
+                 desc.resolved_scene_color ? "true" : "false",
+                 desc.shared_depth ? "true" : "false", info.width, info.height,
+                 static_cast<unsigned>(desc.sample_count));
+    }
+    return created;
 }
 
 bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
@@ -1648,7 +1699,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
             });
         }
     }
-    if (ShaderDrawCanUseMsaa(scene, m_desc.output, m_desc.draw)) {
+    if (ShaderDrawCanUseMsaa(scene, m_desc.output, m_desc.resolved_scene_color)) {
         m_desc.sample_count = static_cast<VkSampleCountFlagBits>(
             std::max(1, scene.MsaaSampleCount()));
         m_desc.resolve_msaa = false;
@@ -2117,7 +2168,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
 
     cmd.EndRenderPass();
 
-    if (m_desc.model_pass) {
+    if (m_desc.shared_depth) {
         rr.model_depth_images.at(m_desc.output).layout =
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     }
@@ -2127,7 +2178,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         NoteComposeMsaaDraw(rr, m_desc.sample_count);
     }
 
-    if (m_desc.model_pass && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
+    if (m_desc.shared_depth && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
         m_desc.depth_stencil_image_ref != nullptr && m_desc.depth_stencil_image_ref->handle) {
         // Only mark the shared multisampled depth dirty. The depth-sampling consumer materializes
         // the single-sample copy once on demand (ResolveModelDepthIfNeeded); resolving here would

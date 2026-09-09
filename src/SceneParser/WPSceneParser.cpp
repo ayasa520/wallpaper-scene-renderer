@@ -1106,6 +1106,8 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         : wpmat.alphawriting == "disabled" ? SceneAlphaWriting::Disabled
         : SceneAlphaWriting::Default;
     material.alpha_to_coverage = blending_alpha_to_coverage;
+    material.depthTest = wpmat.depthtest == "enabled";
+    material.depthWrite = wpmat.depthwrite == "enabled";
 
     const auto& fragment_unit = sd_units.back();
     assert(fragment_unit.stage == ShaderType::FRAGMENT);

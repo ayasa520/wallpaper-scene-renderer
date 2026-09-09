@@ -66,20 +66,12 @@ inline bool ShaderDrawSamplesResolvedDefault(const std::vector<std::string>& tex
     return false;
 }
 
-inline bool ShaderDrawWritesResolvedDefault(const Scene& scene, std::string_view output,
-                                            const SceneDraw& draw) {
-    (void)scene;
-    if (output != SpecTex_Default || !draw.Valid()) return false;
-    const auto& name = draw.Name();
-    if (name.rfind("__hanabi_scene_bloom", 0) == 0) return true;
-    if (name.rfind("__hanabi_scene_hdr_", 0) == 0) return true;
-    return false;
-}
-
 inline bool ShaderDrawCanUseMsaa(const Scene& scene, std::string_view output,
-                                 const SceneDraw& draw) {
-    return ComposeOutputUsesMsaa(scene, output) &&
-           ! ShaderDrawWritesResolvedDefault(scene, output, draw);
+                                 bool resolved_scene_color) {
+    // The graph selects a destination role rather than identifying post-processes by node name.
+    // Pipeline warmup, residency and actual framebuffer binding must all use this same choice;
+    // resolved-color passes never borrow the multisampled scene's color/depth attachments.
+    return ComposeOutputUsesMsaa(scene, output) && !resolved_scene_color;
 }
 
 struct RenderingResources;

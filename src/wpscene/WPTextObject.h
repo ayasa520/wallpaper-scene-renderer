@@ -65,7 +65,7 @@ struct WPTextObject {
     // Treating missing anchors as "center" changes newer unpacked scenes into explicit
     // screen-centered text and shifts left/top authored labels.
     std::string                anchor { "none" };
-    std::string                depthtest { "disabled" };
+    std::string                depthtest { "enabled" };
     // Text effects share the neutral wallpaper effect model with image layers, but the text object
     // no longer includes WPImageObject just to reference that effect chain.
     std::vector<WPImageEffect> effects;

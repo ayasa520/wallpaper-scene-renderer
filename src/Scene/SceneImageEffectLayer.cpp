@@ -3,6 +3,7 @@
 #include "SceneObject.h"
 #include "Scene.h"
 #include "SceneMesh.h"
+#include "SceneTextPrimitive.h"
 #include "SceneDestinationTarget.h"
 
 #include "SpecTexs.hpp"
@@ -565,6 +566,20 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
 
             auto& material = *(it->sceneNode->Mesh()->Material());
             it->blend_override.reset();
+            it->depth_test_override.reset();
+            it->depth_write_override.reset();
+            // Owner preparation affects only the selected final material in the destination
+            // segment, including an explicit FBO record there. Images inherit both source
+            // selections; text replaces only testing. Resolve these values per invocation so
+            // reflection/main draws and later text re-layout never mutate the retained material.
+            if (it->uses_layer_space_effect_matrices && it->is_final_material) {
+                if (const auto* text = m_owner.LayerNode()->Text(); text != nullptr) {
+                    it->depth_test_override = text->object.depthtest == "enabled";
+                } else if (auto* source = m_owner.LayerNode()->Mesh(); source != nullptr) {
+                    it->depth_test_override = source->Material()->depthTest;
+                    it->depth_write_override = source->Material()->depthWrite;
+                }
+            }
             it->destination_alpha_override = false;
             it->sceneNode->SetCamera(effect_cam.data());
             it->camera_override.clear();
@@ -839,6 +854,9 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
         node.use_active_camera_for_parallax = false;
         node.clear_before_draw = false;
         node.alpha_write_policy = AlphaWritePolicy::Preserve;
+        // Shapes select only the final blend; neither depth property is replaced by the owner.
+        node.depth_test_override.reset();
+        node.depth_write_override.reset();
 
         // The shape callback establishes I once for the whole record loop. Binding an FBO
         // changes its target/viewport, not that owner placement or incoming camera. The common

@@ -47,6 +47,8 @@ struct SceneImageEffectNode {
     // Keep its blend selection beside the resolved output so concurrent reflection/main phases
     // cannot overwrite each other's state or erase an authored private pass blend.
     std::optional<BlendMode> blend_override {};
+    std::optional<bool> depth_test_override {};
+    std::optional<bool> depth_write_override {};
     // The selected final material restores the enclosing destination's alpha state. Keep this
     // invocation rule separate from the material enum and from the owner's RGB blend choice.
     bool destination_alpha_override { false };
