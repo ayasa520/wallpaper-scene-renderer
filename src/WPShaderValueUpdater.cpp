@@ -480,8 +480,15 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
 
     if (! camera) return;
 
+    // A node-selected perspective camera changes projection without entering a private
+    // destination. Perspective particles must retain the scene root's parallax displacement,
+    // evaluated against the same active frame camera as ordinary layer drawing. Named pass
+    // overrides still select their own source/composition contract below; keep the displacement
+    // out of the raw owner matrix so projection and authored transform queries stay independent.
+    const bool node_perspective_camera = !has_camera_override && camera->IsPerspective();
     const bool use_active_parallax_camera =
-        has_camera_override && overrides->use_active_camera_for_parallax &&
+        (node_perspective_camera ||
+         (has_camera_override && overrides->use_active_camera_for_parallax)) &&
         m_scene->activeCamera != nullptr;
     const SceneCamera* model_parallax_camera =
         use_active_parallax_camera ? m_scene->activeCamera : camera;
