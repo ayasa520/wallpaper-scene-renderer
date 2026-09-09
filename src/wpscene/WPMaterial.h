@@ -50,20 +50,13 @@ class WPMaterial {
 public:
     bool                                                FromJson(const nlohmann::json&);
     void                                                MergePass(const WPMaterialPass&);
-    // Omitted blending is opaque. Retained effect materials must not acquire translucent
-    // writes merely because their resource never supplied this property.
+    // Static material state starts opaque and back-face culled, with depth testing/writing
+    // enabled. Each draw owner separately decides which material states apply to its pass.
     std::string                                         blending { "normal" };
-    std::string                                         cullmode { "nocull" };
+    std::string                                         cullmode { "normal" };
     std::string                                         shader;
-    std::string                                         depthtest { "disabled" };
-    std::string                                         depthwrite { "disabled" };
-    // Authored-state bits are deliberately stored beside the parsed material. Scene-level 3D
-    // models resolve omitted render-state fields through a separate model policy, while 2D
-    // image/effect materials must keep the old default strings when the source omitted a field.
-    bool                                                blendingAuthored { false };
-    bool                                                cullmodeAuthored { false };
-    bool                                                depthtestAuthored { false };
-    bool                                                depthwriteAuthored { false };
+    std::string                                         depthtest { "enabled" };
+    std::string                                         depthwrite { "enabled" };
     std::vector<std::string>                            textures;
     std::vector<WPUserTextureBinding>                   usertextures;
     std::unordered_map<std::string, int32_t>            combos;

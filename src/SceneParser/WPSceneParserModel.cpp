@@ -114,108 +114,25 @@ std::optional<nlohmann::json> LoadModelSidecarJson(fs::VFS& vfs, std::string_vie
     return json;
 }
 
-std::optional<SceneCullMode> ParseModelCullModeValue(std::string_view value) {
-    static const std::unordered_map<std::string_view, SceneCullMode> modes {
-        { "nocull", SceneCullMode::None }, { "none", SceneCullMode::None },
-        { "normal", SceneCullMode::Back }, { "back", SceneCullMode::Back },
-        { "front", SceneCullMode::Front },
-    };
-    if (auto it = modes.find(value); it != modes.end()) return it->second;
-    return std::nullopt;
-}
-
-std::string_view ModelCullModeMaterialString(SceneCullMode mode) {
-    switch (mode) {
-    case SceneCullMode::None: return "nocull";
-    case SceneCullMode::Back: return "back";
-    case SceneCullMode::Front: return "front";
-    }
-    return "back";
-}
-
-std::optional<bool> ParseModelRenderStateSwitch(std::string_view value) {
-    if (value == "enabled" || value == "enable" || value == "true" || value == "1") return true;
-    if (value == "disabled" || value == "disable" || value == "false" || value == "0")
-        return false;
-    return std::nullopt;
-}
-
-bool ModelBlendUsesTransparency(std::string_view blending) {
-    return blending == "translucent" || blending == "additive";
-}
-
 struct ModelMaterialRenderPolicy {
-    std::string   blending;
     bool          transparent { false };
     bool          depthTest { true };
     bool          depthWrite { true };
     SceneCullMode cullMode { SceneCullMode::Back };
 };
 
-std::optional<ModelMaterialRenderPolicy>
-BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material,
-                               const std::string&         material_path) {
-    ModelMaterialRenderPolicy policy {};
-    policy.blending    = material.blendingAuthored ? material.blending : "normal";
-    policy.transparent = ModelBlendUsesTransparency(policy.blending);
-
-    if (material.depthtestAuthored) {
-        const auto depth_test = ParseModelRenderStateSwitch(material.depthtest);
-        if (! depth_test.has_value()) {
-            LOG_ERROR("ModelMaterialState: invalid depthtest '%s' path='%s'",
-                      material.depthtest.c_str(),
-                      material_path.c_str());
-            return std::nullopt;
-        }
-        policy.depthTest = *depth_test;
-    }
-
-    if (material.depthwriteAuthored) {
-        const auto depth_write = ParseModelRenderStateSwitch(material.depthwrite);
-        if (! depth_write.has_value()) {
-            LOG_ERROR("ModelMaterialState: invalid depthwrite '%s' path='%s'",
-                      material.depthwrite.c_str(),
-                      material_path.c_str());
-            return std::nullopt;
-        }
-        policy.depthWrite = *depth_write;
-    }
-    if (policy.transparent) {
-        // Alpha-blended model chunks should test against opaque geometry but avoid writing depth;
-        // otherwise transparent quads such as glass, shadow blobs, or reflection grids can occlude
-        // later model chunks. This is a model-material rule, not a parser recovery path.
-        policy.depthWrite = false;
-    }
-
-    // Culling is independent of blending and sampled textures. An omitted cullmode keeps the
-    // initialized back-face policy, including translucent shells and reflection receivers;
-    // only an authored cull setting changes which faces participate in the model draw. Keep
-    // this separate from the blend-dependent depth-write rule above.
-    if (material.cullmodeAuthored) {
-        const auto cull_mode = ParseModelCullModeValue(material.cullmode);
-        if (! cull_mode.has_value()) {
-            LOG_ERROR("ModelMaterialState: invalid cullmode '%s' path='%s'",
-                      material.cullmode.c_str(),
-                      material_path.c_str());
-            return std::nullopt;
-        }
-        policy.cullMode = *cull_mode;
-    }
-
-    return policy;
-}
-
-wpscene::WPMaterial BuildEffectiveModelMaterial(wpscene::WPMaterial         material,
-                                                const ModelMaterialRenderPolicy& policy) {
-    // LoadMaterial still consumes WPMaterial because shader, texture, combo, and binding parsing is
-    // shared with 2D layers. This effective copy writes the already-validated model policy into the
-    // string fields before that shared loader runs, so missing model fields are resolved once at the
-    // model boundary instead of being patched later by renderer code.
-    material.blending   = policy.blending;
-    material.depthtest  = policy.depthTest ? "enabled" : "disabled";
-    material.depthwrite = policy.depthWrite ? "enabled" : "disabled";
-    material.cullmode   = std::string(ModelCullModeMaterialString(policy.cullMode));
-    return material;
+ModelMaterialRenderPolicy BuildModelMaterialRenderPolicy(const wpscene::WPMaterial& material) {
+    const bool transparent = material.blending == "translucent" || material.blending == "additive";
+    // Material parsing owns enum selection and omitted-state initialization. Model drawing only
+    // derives its effective state: transparent chunks still test opaque depth but do not write
+    // depth, independently of culling. Keep that suppression out of the stored material so its
+    // selected depthwrite value remains available separately from the draw policy.
+    return ModelMaterialRenderPolicy {
+        .transparent = transparent,
+        .depthTest   = material.depthtest == "enabled",
+        .depthWrite  = material.depthwrite == "enabled" && ! transparent,
+        .cullMode    = material.cullmode == "nocull" ? SceneCullMode::None : SceneCullMode::Back,
+    };
 }
 
 bool LoadModelMaterialJson(ParseContext& context, const std::string& material_path,
@@ -338,9 +255,8 @@ public:
 private:
     SceneModelRenderState BuildRenderState(SceneModelColorLoadMode color_load_mode,
                                            const ModelMaterialRenderPolicy& policy) const {
-        // The renderer-facing model state is derived from the same validated policy used to build
-        // the effective WPMaterial. Target selection and reflection are draw state: the same
-        // model material is consumed by both the reflected and ordinary scene walks.
+        // Target selection and reflection are draw state: the same parsed material and effective
+        // model policy are consumed by both the reflected and ordinary scene walks.
         return SceneModelRenderState {
             .colorLoadMode      = color_load_mode,
             .depthTest          = policy.depthTest,
@@ -373,13 +289,12 @@ private:
         wpscene::WPMaterial wp_material;
         if (! wp_material.FromJson(material_json)) return std::nullopt;
 
-        const auto render_policy = BuildModelMaterialRenderPolicy(wp_material, material_path);
-        if (! render_policy.has_value()) return std::nullopt;
+        const auto render_policy = BuildModelMaterialRenderPolicy(wp_material);
 
         return ModelMaterialSource {
             .path         = material_path,
-            .material     = BuildEffectiveModelMaterial(std::move(wp_material), *render_policy),
-            .renderPolicy = *render_policy,
+            .material     = std::move(wp_material),
+            .renderPolicy = render_policy,
         };
     }
 

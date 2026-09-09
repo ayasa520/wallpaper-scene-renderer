@@ -1,6 +1,46 @@
 #include "WPMaterial.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <initializer_list>
+#include <string_view>
+
 using namespace wallpaper::wpscene;
+
+namespace
+{
+void ReadMaterialEnum(const nlohmann::json& json, std::string_view name,
+                      std::initializer_list<std::string_view> choices, std::string& value) {
+    const auto entry = json.find(name);
+    if (entry == json.end()) return;
+
+    // Static raster entries consume their own literal JSON value, not a dynamic property's
+    // value/user wrapper. Omission preserves the initialized state; a present non-string or
+    // unrecognized spelling selects the first enum entry. In particular, those two cases
+    // differ for depth state. Compare the entire stored string so embedded NUL bytes are not
+    // mistaken for the end of a valid name, and do not apply live script string conversion.
+    const std::string_view text =
+        entry->is_string() ? entry->get_ref<const std::string&>() : std::string_view {};
+    const auto selected = std::find(choices.begin(), choices.end(), text);
+    value = selected == choices.end() ? *choices.begin() : *selected;
+}
+
+void TraceMaterialRenderState(const nlohmann::json& json, const WPMaterial& material) {
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") == nullptr) return;
+
+    // Keep raw entry types and omitted keys visible next to the selected material state.
+    // The draw trace records effective owner state separately, including depth-write changes
+    // required by transparent model draws; those must not overwrite the parsed material.
+    auto authored = nlohmann::json::object();
+    for (const auto* name : { "blending", "cullmode", "depthtest", "depthwrite" }) {
+        if (const auto entry = json.find(name); entry != json.end()) authored[name] = *entry;
+    }
+    LOG_INFO("SceneMaterialColdState: shader='%s' authored=%s blending='%s' cullmode='%s' "
+             "depthtest='%s' depthwrite='%s'",
+             material.shader.c_str(), authored.dump().c_str(), material.blending.c_str(),
+             material.cullmode.c_str(), material.depthtest.c_str(), material.depthwrite.c_str());
+}
+} // namespace
 
 bool WPMaterialPassBindItem::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "name", name);
@@ -144,15 +184,13 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
         LOG_ERROR("material no shader");
         return false;
     }
-    blendingAuthored = jContent.contains("blending");
-    cullmodeAuthored = jContent.contains("cullmode");
-    depthtestAuthored = jContent.contains("depthtest");
-    depthwriteAuthored = jContent.contains("depthwrite");
-	GET_JSON_NAME_VALUE(jContent, "blending", blending);
-	GET_JSON_NAME_VALUE(jContent, "cullmode", cullmode);
-	GET_JSON_NAME_VALUE(jContent, "depthtest", depthtest);
-	GET_JSON_NAME_VALUE(jContent, "depthwrite", depthwrite);
+    ReadMaterialEnum(jContent, "blending",
+                     { "normal", "translucent", "additive", "alphatocoverage" }, blending);
+    ReadMaterialEnum(jContent, "cullmode", { "normal", "nocull" }, cullmode);
+    ReadMaterialEnum(jContent, "depthtest", { "disabled", "enabled" }, depthtest);
+    ReadMaterialEnum(jContent, "depthwrite", { "disabled", "enabled" }, depthwrite);
 	GET_JSON_NAME_VALUE(jContent, "shader", shader);
+    TraceMaterialRenderState(jContent, *this);
     if(jContent.contains("textures")) {
         for(const auto& jT:jContent.at("textures")) {
             std::string tex;
