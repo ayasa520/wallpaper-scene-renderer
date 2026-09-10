@@ -271,7 +271,7 @@ bool CreateTextPipelinesForPrimitive(const Device&                         devic
                                     RenderingResources&                   rr,
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
-                                    bool                                  clear_before_draw,
+                                    bool                                  private_source,
                                     wallpaper::AlphaWritePolicy           alpha_write_policy,
                                     VkSampleCountFlagBits                 sample_count,
                                     bool                                  resolve_msaa,
@@ -303,11 +303,12 @@ bool CreateTextPipelinesForPrimitive(const Device&                         devic
     const auto vertex_layout = ResolveTextVertexInputLayout(primitive);
     if (!vertex_layout.has_value()) return false;
 
-    // colorBlendMode 31 is Wallpaper Engine's fixed-function additive case. Shader blend modes
-    // 1..30 are handled later by the independent final passthrough, so their text source remains an
-    // ordinary translucent offscreen raster.
+    // Direct text selects fixed-function additive blending in every inherited destination,
+    // including reflection and composition. A private glyph source instead remains translucent;
+    // the owner's later effect/publication draw applies its blend. Target naming alone must not
+    // merge these roles, because both can render into non-main color attachments.
     const auto blend_mode =
-        !offscreen_output && primitive.object.colorBlendMode == 31
+        !private_source && primitive.object.colorBlendMode == 31
             ? wallpaper::BlendMode::Additive
             : wallpaper::BlendMode::Translucent;
     VkPipelineColorBlendAttachmentState blend_state {};
@@ -354,34 +355,23 @@ bool CreateTextPipelinesForPrimitive(const Device&                         devic
                                PipelineParameters& parameters) {
         auto render_pass = CreateShaderDrawRenderPass(
             device.handle(), VK_FORMAT_R8G8B8A8_UNORM,
-            clear_before_draw ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            private_source ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, attachment, sample_count, resolve_msaa);
         if (!render_pass.has_value()) return false;
         pipeline.depth.depthTestEnable = depth_test;
         parameters.debug_name = name;
         parameters.cache_key = TextPipelineCompatibilityKey(
-            clear_before_draw, blend_mode, alpha_write_policy, sample_count, resolve_msaa,
+            private_source, blend_mode, alpha_write_policy, sample_count, resolve_msaa,
             shared_depth);
         return pipeline.create(device, *render_pass, parameters, rr.pipeline_cache.get());
     };
     if (!create_pipeline(glyph_depth_test, debug_name, glyph_pipeline)) return false;
-    // The opaque background has its own raster-state lifetime. Keep its existing selection
-    // independent from live glyph testing, while using a render-pass-compatible pipeline so
-    // it can draw into the same framebuffer without clearing or replacing shared scene depth.
-    return !glyph_depth_test || create_pipeline(false, debug_name + " background", background_pipeline);
-}
-
-std::array<float, 4> ResolveTextColor(const wallpaper::SceneTextPrimitive& primitive,
-                                      bool                                 background) {
-    if (background) {
-        return {
-            primitive.object.backgroundcolor[0] * primitive.object.backgroundbrightness,
-            primitive.object.backgroundcolor[1] * primitive.object.backgroundbrightness,
-            primitive.object.backgroundcolor[2] * primitive.object.backgroundbrightness,
-            primitive.object.alpha,
-        };
-    }
-    return primitive.ForegroundColor();
+    // A background can retain either depth selection while the owner changes glyph testing.
+    // Prepare the opposite variant without initializing that scene-owned material selection:
+    // hidden preparation and private source use must not choose a future direct background's
+    // policy. Both pipelines load the same compatible attachment and never write depth.
+    return !shared_depth || private_source ||
+        create_pipeline(!glyph_depth_test, debug_name + " background", background_pipeline);
 }
 } // namespace
 
@@ -396,7 +386,7 @@ TextPass::TextPass(const Desc& desc)
     m_desc.layer_id            = desc.layer_id;
     m_desc.execute_when_hidden = desc.execute_when_hidden;
     m_desc.should_execute      = desc.should_execute;
-    m_desc.clear_before_draw   = desc.clear_before_draw;
+    m_desc.private_source      = desc.private_source;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
     m_desc.shared_depth        = desc.shared_depth;
@@ -427,7 +417,7 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
     const int next_samples = IntendedTextSampleCount(next->m_desc.scene, next->m_desc.output);
     return residencyKey() == next->residencyKey() &&
            m_desc.execute_when_hidden == next->m_desc.execute_when_hidden &&
-           m_desc.clear_before_draw == next->m_desc.clear_before_draw &&
+           m_desc.private_source == next->m_desc.private_source &&
            m_desc.alpha_write_policy == next->m_desc.alpha_write_policy &&
            m_desc.shared_depth == next->m_desc.shared_depth &&
            m_desc.glyph_depth_test == next->m_desc.glyph_depth_test &&
@@ -450,7 +440,7 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.layer_id            = next->m_desc.layer_id;
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
     m_desc.should_execute      = next->m_desc.should_execute;
-    m_desc.clear_before_draw   = next->m_desc.clear_before_draw;
+    m_desc.private_source      = next->m_desc.private_source;
     m_desc.output              = next->m_desc.output;
     m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
     m_desc.shared_depth        = next->m_desc.shared_depth;
@@ -668,7 +658,7 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             rr,
             *primitive,
             offscreen_output,
-            m_desc.clear_before_draw,
+            m_desc.private_source,
             m_desc.alpha_write_policy,
             m_desc.sample_count,
             m_desc.resolve_msaa,
@@ -683,6 +673,13 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
 
     rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
                                m_desc.ubo_buf,
+                               device.limits().minUniformBufferOffsetAlignment);
+    // Uploads are recorded after draw commands have staged their data. Rewriting one allocation
+    // for the glyph foreground would replace the earlier background values before either draw
+    // executes on the GPU. Keep both uniform ranges resident, including while the background is
+    // disabled, so a live toggle never needs an allocation during command recording.
+    rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
+                               m_desc.background_ubo_buf,
                                device.limits().minUniformBufferOffsetAlignment);
 
     if (primitive->background_mesh != nullptr) {
@@ -710,14 +707,6 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             });
     }
 
-    m_desc.clear_value = VkClearValue {
-        .color = {
-            offscreen_output ? 0.0f : scene.clearColor[0],
-            offscreen_output ? 0.0f : scene.clearColor[1],
-            offscreen_output ? 0.0f : scene.clearColor[2],
-            offscreen_output ? 0.0f : 1.0f,
-        },
-    };
     setPrepared();
 }
 
@@ -738,7 +727,7 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
                                           rr,
                                           *primitive,
                                           offscreen_output,
-                                          m_desc.clear_before_draw,
+                                          m_desc.private_source,
                                           m_desc.alpha_write_policy,
                                           sample_count,
                                           resolve_msaa,
@@ -839,6 +828,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     // Log the first actual draw of each layout revision when investigating disappearing text.
     // Preparation alone cannot establish that an atlas, target and transform reached a draw.
     static const bool trace_destination = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr;
+    static const bool trace_background = std::getenv("WESCENE_TRACE_TEXT_BACKGROUND") != nullptr;
     const bool trace_revision = trace_destination &&
         m_traced_atlas_version != primitive->atlas_version;
 
@@ -866,7 +856,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         }
     }
 
-    auto write_uniforms = [&](const std::array<float, 4>& color) {
+    auto write_uniforms = [&](const std::array<float, 4>& color, const StagingBufferRef& buffer) {
         TextPassUniforms uniforms {};
         bool transform_written = false;
         if (m_desc.scene != nullptr && m_desc.scene->shaderValueUpdater != nullptr && node != nullptr) {
@@ -916,16 +906,16 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                      matrix[0], matrix[5], matrix[10], matrix[15],
                      matrix[12], matrix[13], matrix[14], color[0], color[1], color[2], color[3]);
         }
-        rr.dyn_buf->writeToBuf(m_desc.ubo_buf,
+        rr.dyn_buf->writeToBuf(buffer,
                                { reinterpret_cast<uint8_t*>(const_cast<TextPassUniforms*>(&uniforms)),
                                  sizeof(uniforms) });
     };
 
-    auto bind_uniforms = [&](const PipelineParameters& pipeline) {
+    auto bind_uniforms = [&](const PipelineParameters& pipeline, const StagingBufferRef& buffer) {
         VkDescriptorBufferInfo buffer_info {
             rr.dyn_buf->gpuBuf(),
-            m_desc.ubo_buf.offset,
-            m_desc.ubo_buf.size,
+            buffer.offset,
+            buffer.size,
         };
         VkWriteDescriptorSet write {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -959,7 +949,24 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         .width = m_desc.vk_output.extent.width,
         .height = m_desc.vk_output.extent.height,
     };
-    std::array<VkClearValue, 3> clear_values { m_desc.clear_value, {}, {} };
+    std::array<VkClearValue, 3> clear_values {};
+    if (m_desc.private_source && primitive->object.opaquebackground) {
+        // Opaque private sources initialize the complete target, including padding, before
+        // glyph rasterization. This is a live color clear, not a blended background quad, and
+        // therefore neither reads depth nor initializes the direct background material policy.
+        const auto color = primitive->BackgroundColor();
+        std::copy(color.begin(), color.end(), clear_values[0].color.float32);
+    }
+    if (trace_background && m_desc.private_source) {
+        const auto* color = clear_values[0].color.float32;
+        LOG_INFO("SceneTextBackgroundClear: layer=%d output='%s' reflection=%s opaque=%s "
+                 "color=[%.3f %.3f %.3f %.3f] direct-selection=%s",
+                 m_desc.layer_id, m_desc.output.c_str(), m_desc.reflection_pass ? "true" : "false",
+                 primitive->object.opaquebackground ? "true" : "false",
+                 color[0], color[1], color[2], color[3],
+                 !primitive->direct_background_depth_test.has_value() ? "unused" :
+                     (*primitive->direct_background_depth_test ? "enabled" : "disabled"));
+    }
     VkRenderPassBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = *m_desc.pipeline.pass,
@@ -976,7 +983,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                  "extent=%ux%u clear=%s atlas=%u pages=%zu opaque-background=%s",
                  m_desc.layer_id, node->Name().c_str(), m_desc.output.c_str(),
                  reinterpret_cast<void*>(m_desc.vk_output.handle), output_extent.width,
-                 output_extent.height, m_desc.clear_before_draw ? "true" : "false",
+                 output_extent.height, m_desc.private_source ? "true" : "false",
                  primitive->atlas_version, primitive->glyph_pages.size(),
                  primitive->object.opaquebackground ? "true" : "false");
     }
@@ -996,20 +1003,19 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
 
     auto draw_mesh = [&](MeshBuffers& buffers, const ImageSlotsRef& texture,
                          const std::array<float, 4>& color, const PipelineParameters& pipeline,
-                         bool background) {
+                         bool background, bool depth_test) {
         if (buffers.draw_count == 0) return;
+        const auto& uniform_buffer = background ? m_desc.background_ubo_buf : m_desc.ubo_buf;
         rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.handle);
-        write_uniforms(color);
-        bind_uniforms(pipeline);
+        write_uniforms(color, uniform_buffer);
+        bind_uniforms(pipeline, uniform_buffer);
         bind_texture(texture, pipeline);
         auto gpu_buf = rr.dyn_buf->gpuBuf();
         for (usize binding_index = 0; binding_index < buffers.vertex_bufs.size(); binding_index++) {
             auto& subref = buffers.vertex_bufs[binding_index];
             rr.command.BindVertexBuffers(static_cast<uint32_t>(binding_index), 1, &gpu_buf, &subref.offset);
         }
-        // Glyph page meshes are indexed, while the optional opaque background is a plain strip.
-        // Supporting both draw modes keeps the direct text primitive self-contained instead of
-        // depending on the old generic image pass behavior for one half of the text renderable.
+        // Generated glyph and background rectangles both provide triangle-list indices.
         if (buffers.index_buf) {
             rr.command.BindIndexBuffer(gpu_buf, buffers.index_buf.offset, VK_INDEX_TYPE_UINT16);
             rr.command.DrawIndexed(buffers.draw_count, 1, 0, 0, 0);
@@ -1024,26 +1030,53 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                      "shared-depth=%s test=%s write=false depth-view=%p pipeline=%p samples=%u count=%u",
                      m_desc.layer_id, m_desc.output.c_str(), m_desc.reflection_pass ? "true" : "false",
                      background ? "true" : "false", m_desc.shared_depth ? "true" : "false",
-                     !background && m_desc.glyph_depth_test ? "true" : "false",
+                     depth_test ? "true" : "false",
                      m_desc.depth_image != nullptr ? reinterpret_cast<void*>(*m_desc.depth_image->view)
                                                    : nullptr,
                      reinterpret_cast<void*>(*pipeline.handle),
                      static_cast<unsigned>(m_desc.sample_count), buffers.draw_count);
         }
+        if (trace_background) {
+            LOG_INFO("SceneTextColorDraw: layer=%d output='%s' background=%s private-source=%s "
+                     "ubo-offset=%llu color=[%.3f %.3f %.3f %.3f] brightness=%.3f blend=%s "
+                     "indexed=%s count=%u",
+                     m_desc.layer_id, m_desc.output.c_str(), background ? "true" : "false",
+                     m_desc.private_source ? "true" : "false",
+                     static_cast<unsigned long long>(uniform_buffer.offset),
+                     color[0], color[1], color[2], color[3],
+                     primitive->object.backgroundbrightness,
+                     !m_desc.private_source && primitive->object.colorBlendMode == 31
+                         ? "additive" : "translucent",
+                     buffers.index_buf ? "true" : "false", buffers.draw_count);
+        }
     };
 
-    if (primitive->object.opaquebackground && primitive->background_mesh != nullptr) {
+    if (!m_desc.private_source && primitive->object.opaquebackground &&
+        primitive->background_mesh != nullptr && m_background_buffers.draw_count > 0) {
+        if (!primitive->direct_background_depth_test.has_value()) {
+            primitive->direct_background_depth_test = primitive->object.depthtest == "enabled";
+            if (trace_background) {
+                LOG_INFO("SceneTextBackgroundSelect: layer=%d output='%s' node=%llu atlas=%u "
+                         "owner-test='%s' selected-test=%s",
+                         m_desc.layer_id, m_desc.output.c_str(),
+                         static_cast<unsigned long long>(m_node_identity), primitive->atlas_version,
+                         primitive->object.depthtest.c_str(),
+                         *primitive->direct_background_depth_test ? "true" : "false");
+            }
+        }
+        const bool depth_test = m_desc.shared_depth && *primitive->direct_background_depth_test;
         draw_mesh(m_background_buffers,
                   m_desc.background_texture,
-                  ResolveTextColor(*primitive, true),
-                  m_desc.glyph_depth_test ? m_desc.background_pipeline : m_desc.pipeline, true);
+                  primitive->BackgroundColor(),
+                  depth_test == m_desc.glyph_depth_test ? m_desc.pipeline : m_desc.background_pipeline,
+                  true, depth_test);
     }
 
     for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
         if (page_index >= m_desc.page_textures.size()) break;
         draw_mesh(m_page_buffers[page_index],
                   m_desc.page_textures[page_index],
-                  ResolveTextColor(*primitive, false), m_desc.pipeline, false);
+                  primitive->ForegroundColor(), m_desc.pipeline, false, m_desc.glyph_depth_test);
     }
 
     rr.command.EndRenderPass();
@@ -1083,5 +1116,7 @@ void TextPass::destory(const Device&, RenderingResources& rr) {
     m_page_buffers.clear();
     rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
     m_desc.ubo_buf = {};
+    rr.dyn_buf->unallocateSubRef(m_desc.background_ubo_buf);
+    m_desc.background_ubo_buf = {};
     setPrepared(false);
 }

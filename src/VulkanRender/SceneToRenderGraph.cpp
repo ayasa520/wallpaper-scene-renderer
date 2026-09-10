@@ -707,7 +707,10 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
             pdesc.layer_id = imgId;
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
             pdesc.should_execute = should_execute;
-            pdesc.clear_before_draw = options.clear_before_draw;
+            // Owner-source routing grants clear ownership only to a private seed. Carry that
+            // role explicitly into text material/color selection rather than classifying every
+            // non-main destination (including reflection and composition) as a private source.
+            pdesc.private_source = options.clear_before_draw;
             pdesc.output = output_key;
             pdesc.camera_override = options.camera_override;
             pdesc.use_active_camera_for_parallax = options.use_active_camera_for_parallax;
@@ -722,8 +725,8 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
 
             // Direct glyphs test the depth already owned by the main/reflection destination.
             // Private source/composition images stay color-only even when the text owner enables
-            // testing. Background and effect-publication state are separate consumers: this
-            // captures only the glyph selection, without changing their material policy.
+            // testing. Capture the live glyph selection here; the background's retained selection
+            // is resolved from its scene-owned material state only at an actual direct draw.
             pdesc.shared_depth = output_key == SpecTex_Default || output_key == SpecTex_Reflection;
             pdesc.glyph_depth_test = pdesc.shared_depth &&
                 node->Text()->object.depthtest == "enabled";

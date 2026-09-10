@@ -2689,6 +2689,13 @@ std::shared_ptr<SceneMesh> BuildTextPrimitiveBackgroundMesh(const SceneTextPrimi
     GenCardMesh(*mesh,
                 { ResolveTextMeshExtent(primitive.layout.logical_size[0]),
                   ResolveTextMeshExtent(primitive.layout.logical_size[1]) });
+    // TextPass uses triangle-list input assembly for both glyphs and backgrounds. The card's
+    // four vertices are strip-ordered, so explicitly index both triangles instead of leaving
+    // the last corner unused. Keep its existing positions, winding and logical extent intact.
+    const std::array<uint16_t, 6> indices { 0, 1, 2, 1, 3, 2 };
+    SceneIndexArray index_array(2);
+    index_array.AssignHalf(0, indices);
+    mesh->AddIndexArray(std::move(index_array));
     mesh->SetDirty();
     return mesh;
 }
@@ -3277,6 +3284,11 @@ bool wallpaper::RebuildTextLayerSceneLayout(Scene& scene, int32_t layer_id) {
     // and runtime.
     if (state.primitive != nullptr) {
         rebuilt_primitive->bridge = state.primitive->bridge;
+        // Rerasterization replaces layout and atlas data, not the owning background material.
+        // Retain a previously selected direct depth policy even when this rebuild was triggered
+        // by a depth-property or opaque-background change. A new owner never enters this copy.
+        rebuilt_primitive->direct_background_depth_test =
+            state.primitive->direct_background_depth_test;
     }
 
     auto primitive_nodes = FindTextPrimitiveRuntimeNodes(scene, layer_id);

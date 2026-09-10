@@ -32,7 +32,9 @@ public:
         int32_t     layer_id { 0 };
         bool        execute_when_hidden { false };
         std::function<bool()> should_execute;
-        bool        clear_before_draw { false };
+        // A private seed owns source initialization; a direct draw loads the inherited target.
+        // Reflection and composition targets do not imply a private text source by themselves.
+        bool        private_source { false };
         std::string output;
         std::string camera_override;
         bool use_active_camera_for_parallax { false };
@@ -54,11 +56,13 @@ public:
         bool                     resolve_msaa { false };
         vvk::Framebuffer         framebuffer;
         PipelineParameters       pipeline;
+        // Opposite read-only depth variant for a direct background whose retained material
+        // selection differs from the current glyph selection. Both are prepared before drawing.
         PipelineParameters       background_pipeline;
         StagingBufferRef         ubo_buf;
+        StagingBufferRef         background_ubo_buf;
         ImageSlotsRef            background_texture;
         std::vector<ImageSlotsRef> page_textures;
-        VkClearValue             clear_value {};
     };
 
     TextPass(const Desc&);

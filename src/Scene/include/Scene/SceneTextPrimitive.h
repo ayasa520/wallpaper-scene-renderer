@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -103,11 +104,24 @@ public:
     std::vector<GlyphPageRenderable> glyph_pages;
     uint32_t              atlas_version { 0 };
 
+    // Direct background material selection belongs to the text owner, not to a glyph layout or
+    // a render-graph pass. Select it only when a direct opaque background is actually submitted;
+    // private source clears and pipeline preparation must leave an unused selection untouched.
+    // Layout replacement carries this value forward, while a newly created owner starts empty.
+    std::optional<bool> direct_background_depth_test;
+
     // Standard-range text uses the current owner RGB and alpha. Foreground brightness is
     // an HDR modulation and remains separate from this color on the renderer's standard-range
     // output. Glyph draws and authored effect uniforms consume this same source state.
     [[nodiscard]] std::array<float, 4> ForegroundColor() const {
         return { object.color[0], object.color[1], object.color[2], object.alpha };
+    }
+
+    // Background brightness, like foreground brightness, is an HDR-only modulation. Both direct
+    // background draws and private source clears consume the same current standard-range color.
+    [[nodiscard]] std::array<float, 4> BackgroundColor() const {
+        return { object.backgroundcolor[0], object.backgroundcolor[1], object.backgroundcolor[2],
+                 object.alpha };
     }
 
     [[nodiscard]] std::array<float, 2> VisibleDisplaySize() const { return layout.visible_display_size; }
