@@ -17,6 +17,7 @@
 #include "SceneRenderTarget.h"
 #include "SceneNode.h"
 #include "SceneObject.h"
+#include "SceneModelData.h"
 #include "SceneLight.hpp"
 #include "WPSceneScriptHost.hpp"
 #include "WPTextLayer.hpp"
@@ -283,6 +284,7 @@ public:
     // Authored objects by layer id. unique_ptr keeps SceneObject addresses stable so script-host
     // callers may hold pointers to an object's image runtime state across rehashes.
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
+    SceneModelDataRegistry modelData;
     // Reverse index over live layer-handle nodes for FindLayerIdByNode. Scene scripts resolve a
     // handle node back to its layer id on every property write, so the reverse lookup must stay
     // O(1); the index is maintained by SetLayerNode, ClearAllLayerNodeSlots, and

@@ -511,7 +511,15 @@ bool WPModelObject::FromJson(const nlohmann::json& json, fs::VFS&) {
         }
         GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
         GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
-        GET_JSON_NAME_VALUE_NOWARN(json, "model", model);
+        if (const auto source = json.find("model"); source != json.end()) {
+            if (source->is_string()) {
+                model = source->get<std::string>();
+            } else if (source->is_number_integer() && *source > 0 &&
+                       *source <= std::numeric_limits<uint32_t>::max()) {
+                model_token = source->get<uint32_t>();
+            }
+        }
+        GET_JSON_NAME_VALUE_NOWARN(json, "perspective", perspective);
         GET_JSON_NAME_VALUE_NOWARN(json, "skin", skin);
         // This field is a literal boolean, not a script/user property. Missing and non-boolean
         // values both retain the default inclusion in the reflected-owner list.
@@ -528,7 +536,7 @@ bool WPModelObject::FromJson(const nlohmann::json& json, fs::VFS&) {
                 animation_layers.push_back(layer);
             }
         }
-        return ! model.empty();
+        return ! model.empty() || model_token != 0;
 }
 
 
@@ -3943,6 +3951,10 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
     if (object_json.contains("model") && ! object_json.at("model").is_null()) {
         WPModelObject object;
         if (! object.FromJson(object_json, *context.vfs)) return false;
+        if (object.model_token != 0 && ! context.scene->modelData.Find(object.model_token)) {
+            LOG_ERROR("ModelObjectParse: invalid generated model token=%u", object.model_token);
+            return false;
+        }
         resolve_visibility(object);
         FillSceneObjectIdentityFor(*context.scene, object);
         ParseModelObj(context, object);

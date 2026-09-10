@@ -9,6 +9,7 @@ SceneDestinationTarget.cpp
 SceneDraw.cpp
 SceneImageEffectLayer.cpp
 SceneIndexArray.cpp
+SceneModelData.cpp
 SceneNode.cpp
 SceneTransform.cpp
 SceneVertexArray.cpp

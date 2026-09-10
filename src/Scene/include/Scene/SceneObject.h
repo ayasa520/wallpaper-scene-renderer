@@ -18,6 +18,7 @@ class Scene;
 class SceneNode;
 class SceneImageEffectLayer;
 class SceneLight;
+class SceneModelData;
 class ParticleSubSystem;
 struct TextLayerRuntimeState;
 
@@ -277,6 +278,16 @@ public:
     }
     void SetModulationState(SceneLayerModulationState state) { m_modulation_state = state; }
 
+    // Each model owner retains its generated resource independently from the script handle.
+    // Materials live on the owner's draw nodes; geometry/revisions live in this shared model.
+    const std::shared_ptr<SceneModelData>& ModelData() const { return m_model_data; }
+    void SetModelData(std::shared_ptr<SceneModelData> data) { m_model_data = std::move(data); }
+
+    // Auxiliary projection is a model-owner property. Shared geometry may be drawn by owners
+    // with different projection choices, without replacing either the scene camera or mesh.
+    bool ModelPerspective() const { return m_model_perspective; }
+    void SetModelPerspective(bool perspective) { m_model_perspective = perspective; }
+
 private:
     int32_t         m_id { 0 };
     SceneObjectKind m_kind { SceneObjectKind::Empty };
@@ -318,6 +329,8 @@ private:
     bool                        m_has_image_runtime_state { false };
     SceneImageLayerRuntimeState m_image_runtime_state;
     std::optional<SceneLayerModulationState> m_modulation_state;
+    std::shared_ptr<SceneModelData> m_model_data;
+    bool                          m_model_perspective { false };
 };
 
 } // namespace wallpaper

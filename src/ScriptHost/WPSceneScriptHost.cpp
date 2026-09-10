@@ -1422,6 +1422,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "__native.createSceneLayer(normalizeCreateLayerConfig(configuration));\n"
         << "      return layerId > 0 ? createLayerProxy(layerId) : undefined;\n"
         << "    },\n"
+        << "    createModelData(configuration) { return __native.createModelData(configuration); },\n"
+        << "    destroyModelData(model) { return __native.destroyModelData(model); },\n"
         << "    sortLayer(layer, index) {\n"
         << "      return !!__native.sortSceneLayer(layer, index);\n"
         << "    },\n"
@@ -8077,7 +8079,11 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
         return false;
     }
 
-    JSValue exports = JS_Call(context, factory, JS_UNDEFINED, 1, &env);
+    JSValue exports;
+    {
+        ScopedSceneScriptPhase phase(*opaque, SceneScriptExecutionPhase::GlobalEvaluation);
+        exports = JS_Call(context, factory, JS_UNDEFINED, 1, &env);
+    }
     JS_FreeValue(context, factory);
     JS_FreeValue(context, env);
     JS_SetPropertyStr(context, global, "__sceneScriptEnv", JS_UNDEFINED);
@@ -8134,6 +8140,7 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
 bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance) {
     if (opaque == nullptr || JS_IsUndefined(instance.exports) || instance.initialized) return true;
 
+    ScopedSceneScriptPhase phase(*opaque, SceneScriptExecutionPhase::Callback);
     JSContext* context = opaque->runtime.context;
     if (! JS_IsUndefined(instance.init_fn)) {
         JSValue result       = JS_UNDEFINED;
@@ -8183,6 +8190,15 @@ bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& in
 
 } // namespace
 
+std::optional<std::string> ResolveSceneScriptAssetFile(const Scene* scene, JSContext* context,
+                                                       JSValueConst value) {
+    const auto json = JsonFromJS(context, value);
+    if (! json) return std::nullopt;
+    const auto handle = ReadScriptAssetHandle(*json);
+    if (! handle) return std::nullopt;
+    return ResolveScriptAssetFile(scene, *handle);
+}
+
 WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new Opaque()) {
     m_impl->scene           = scene;
     m_impl->runtime.runtime = JS_NewRuntime();
@@ -8210,6 +8226,7 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     m_impl->scene_object            = JS_NewObject(context);
     m_impl->native_bridge           = JS_NewObject(context);
     m_impl->user_properties_object  = JS_NewObject(context);
+    RegisterSceneModelDataBindings(*m_impl);
     m_impl->user_properties = m_scene != nullptr ? m_scene->userProperties : UserPropertyMap {};
     m_impl->dispatched_user_properties  = m_impl->user_properties;
     m_impl->general_settings            = BuildInitialGeneralSettings();
@@ -8781,6 +8798,7 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
         if (! instance.initialized || JS_IsUndefined(instance.update_fn)) continue;
 
         m_impl->current_running_instance = instance.instance_id;
+        ScopedSceneScriptPhase phase(*m_impl, SceneScriptExecutionPhase::Update);
 
         if (const auto node_value = ReadRegistrationValue(m_impl, instance.registration);
             node_value.has_value()) {

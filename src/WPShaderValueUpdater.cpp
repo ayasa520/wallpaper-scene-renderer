@@ -11,6 +11,7 @@
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
 #include "Utils/Algorism.h"
+#include "Utils/Eigen.h"
 #include "Utils/Logging.h"
 
 #include <Eigen/Dense>
@@ -76,6 +77,54 @@ Matrix4d DestinationViewProjection(const SceneCamera& camera, bool reflected) {
     projection(1, 1) = -projection(1, 1);
     return projection * camera.GetViewMatrix() *
         Affine3d(Eigen::Scaling(1.0, -1.0, 1.0)).matrix();
+}
+
+Matrix4d ModelPerspectiveViewProjection(const Scene& scene, const Matrix4d& incoming_projection,
+                                        Matrix4d destination, int32_t layer_id,
+                                        uint64_t frame_serial, bool reflected) {
+    constexpr double kMinimumFrameFov = 0.1;
+    constexpr double kMaximumFrameFov = 179.9;
+    constexpr double kPerspectiveFrameDistance = 2000.0;
+    constexpr double kNearPlane = 5.0;
+    constexpr double kMinimumFarPlane = 15000.0;
+    constexpr double kFarPlaneMargin = 1000.0;
+
+    // The angle belongs to the scene frame, while distance is derived from this invocation's
+    // incoming projection. An orthographic frame uses its effective auxiliary angle; a 3D
+    // frame derives that angle from its selected projection at a reference distance. A fixed
+    // eye combined with the raw auxiliary angle would shrink the Z=0 plane and lose live zoom.
+    const double angle = scene.cameraOrthographic
+        ? Radians(std::clamp(static_cast<double>(scene.generalProjection.perspectiveOverrideFov),
+                             kMinimumFrameFov, kMaximumFrameFov))
+        : 2.0 * std::atan(1.0 /
+            (scene.activeCamera->GetProjectionMatrix()(1, 1) * kPerspectiveFrameDistance));
+    const double distance = 1.0 / (std::tan(angle * 0.5) * incoming_projection(1, 1));
+    const double far_plane = std::max(kMinimumFarPlane, distance + kFarPlaneMargin);
+    const double aspect = static_cast<double>(scene.physicalOutputExtent[0]) /
+                          static_cast<double>(scene.physicalOutputExtent[1]);
+
+    // SceneCamera's centered orthographic projection already places the viewport anchor in
+    // its view translation. Preserve that X/Y translation and the complete incoming basis,
+    // including root parallax and reflection, and replace only destination Z. In particular,
+    // the signed projection scale is significant: reflection is incoming draw state, not a
+    // second mirror applied after constructing this model's auxiliary projection. Neither
+    // the shared camera nor the frame eye/basis uniforms are modified by this operation.
+    const Vector3d incoming_translation = destination.block<3, 1>(0, 3);
+    destination(2, 3) = -distance;
+    const Matrix4d projection = Perspective(angle, aspect, kNearPlane, far_plane);
+    if (std::getenv("WESCENE_TRACE_MODEL_PROJECTION") != nullptr) {
+        LOG_INFO("SceneModelProjection: frame=%llu layer=%d reflection=%s orthographic=%s "
+                 "angle-radians=%.9f incoming-p11=%.9f distance=%.9f aspect=%.9f "
+                 "near=%.6f far=%.6f incoming-destination=[%.9f %.9f %.9f] "
+                 "destination=[%.9f %.9f %.9f] p00=%.9f p11=%.9f p22=%.9f p23=%.9f",
+                 static_cast<unsigned long long>(frame_serial), layer_id,
+                 reflected ? "true" : "false", scene.cameraOrthographic ? "true" : "false",
+                 angle, incoming_projection(1, 1), distance, aspect, kNearPlane, far_plane,
+                 incoming_translation.x(), incoming_translation.y(), incoming_translation.z(),
+                 destination(0, 3), destination(1, 3), destination(2, 3),
+                 projection(0, 0), projection(1, 1), projection(2, 2), projection(2, 3));
+    }
+    return projection * destination;
 }
 
 std::array<float, 12> NormalizedModelBasis(const Matrix4d& model) {
@@ -701,6 +750,23 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         const Matrix4d destinationTrans =
             Affine3d(Eigen::Translation3d(destinationOffset)).matrix();
         viewProTrans = viewProTrans * destinationTrans;
+
+        const auto* model_owner = m_scene->FindSceneObject(draw.LayerId(*m_scene));
+        if (model_owner != nullptr && model_owner->Kind() == SceneObjectKind::Model &&
+            model_owner->ModelPerspective()) {
+            Matrix4d projection = camera->GetProjectionMatrix();
+            Matrix4d destination = composition_draw
+                ? Matrix4d::Identity() : camera->GetViewMatrix();
+            const bool reflected_destination = !composition_draw && overrides != nullptr &&
+                                                overrides->reflection_raster;
+            if (reflected_destination) {
+                projection(1, 1) = -projection(1, 1);
+                destination = destination * Affine3d(Eigen::Scaling(1.0, -1.0, 1.0)).matrix();
+            }
+            destination = destination * destinationTrans;
+            viewProTrans = ModelPerspectiveViewProjection(*m_scene, projection, destination,
+                model_owner->Id(), m_puppet_frame_serial, reflected_destination);
+        }
 
         // Opt-in per-layer diagnostics follow every material phase, including private source
         // draws and the authored last pass. Comparing the raw model with the submitted model

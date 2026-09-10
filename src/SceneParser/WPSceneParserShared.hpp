@@ -103,6 +103,8 @@ struct WPModelObject {
     int32_t              parent { 0 };
     std::string          attachment;
     std::string          model;
+    uint32_t             model_token { 0 };
+    bool                 perspective { false };
     int32_t              skin { 0 };
     bool                 reflected { true };
     std::vector<wallpaper::WPPuppetLayer::AnimationLayer> animation_layers;

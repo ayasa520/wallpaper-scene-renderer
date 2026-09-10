@@ -9,6 +9,7 @@
 #include <limits>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -135,6 +136,8 @@ struct RuntimeState {
     JSContext* context { nullptr };
 };
 
+enum class SceneScriptExecutionPhase { Callback, GlobalEvaluation, Update };
+
 struct WPSceneScriptHost::Opaque {
     Scene*                                       scene { nullptr };
     RuntimeState                                 runtime;
@@ -146,6 +149,8 @@ struct WPSceneScriptHost::Opaque {
     JSValue                                      scene_object { JS_UNDEFINED };
     JSValue                                      native_bridge { JS_UNDEFINED };
     JSValue                                      user_properties_object { JS_UNDEFINED };
+    JSClassID                                    model_data_class { JS_INVALID_CLASS_ID };
+    SceneScriptExecutionPhase                    execution_phase { SceneScriptExecutionPhase::Callback };
     uint32_t                                     next_instance_id { 1 };
     uint32_t                                     next_property_animation_id { 1 };
     uint64_t                                     next_timer_id { 1 };
@@ -188,6 +193,26 @@ struct WPSceneScriptHost::Opaque {
     // Diagnostic aid: instance id of the script update currently executing (0 outside updates).
     uint32_t current_running_instance { 0 };
 };
+
+// Layer creation can instantiate another script inside an executing callback. Restore the
+// caller's phase on every return/exception instead of using the update diagnostic's instance id
+// as an execution gate; global evaluation and nested init are distinct invocation contexts.
+class ScopedSceneScriptPhase {
+public:
+    ScopedSceneScriptPhase(WPSceneScriptHost::Opaque& opaque, SceneScriptExecutionPhase phase)
+        : m_opaque(opaque), m_previous(opaque.execution_phase) { opaque.execution_phase = phase; }
+    ~ScopedSceneScriptPhase() { m_opaque.execution_phase = m_previous; }
+    ScopedSceneScriptPhase(const ScopedSceneScriptPhase&) = delete;
+    ScopedSceneScriptPhase& operator=(const ScopedSceneScriptPhase&) = delete;
+
+private:
+    WPSceneScriptHost::Opaque& m_opaque;
+    SceneScriptExecutionPhase m_previous;
+};
+
+void RegisterSceneModelDataBindings(WPSceneScriptHost::Opaque& opaque);
+std::optional<std::string> ResolveSceneScriptAssetFile(const Scene* scene, JSContext* context,
+                                                       JSValueConst value);
 
 // The textures and render targets a layer tree currently holds resident on the GPU.
 struct LayerResidencyResources {

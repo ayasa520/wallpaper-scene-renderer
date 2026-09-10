@@ -1,8 +1,8 @@
 #include "WPSceneParser.hpp"
 #include "WPSceneParserShared.hpp"
 
-// 3D model (MDL) layer materialization: model material path resolution, the material loader
-// and layer materializer, and ParseModelObj. Split from WPSceneParser.cpp as a cohesive unit;
+// Model layer materialization: geometry-source adaptation, material path resolution, the
+// material loader and layer materializer. Split from WPSceneParser.cpp as a cohesive unit;
 // the parser internals it consumes (ParseContext, LoadMaterial, attachment/scene-state
 // helpers) and the ParseModelObj entry point the core parser dispatches into are declared in
 // the shared header.
@@ -131,20 +131,20 @@ bool LoadModelMaterialJson(ParseContext& context, const std::string& material_pa
 
 void SeedModelCameraUniforms(ParseContext& context, WPShaderInfo& shader_info) {
     auto& scene     = *context.scene;
-    auto  camera_it = scene.cameras.find(std::string(kSceneModelPerspectiveCameraName));
-    if (camera_it == scene.cameras.end() || ! camera_it->second) return;
+    const auto* camera = scene.activeCamera;
+    if (camera == nullptr) return;
 
-    const auto eye     = camera_it->second->GetPosition().cast<float>();
-    Vector3f   forward = camera_it->second->GetDirection().cast<float>();
+    const auto eye     = scene.FrameEyePosition();
+    Vector3f   forward = camera->GetDirection().cast<float>();
     if (forward.norm() > 1e-6f) forward.normalize();
-    Vector3f up = camera_it->second->GetUp().cast<float>();
+    Vector3f up = camera->GetUp().cast<float>();
     if (up.norm() > 1e-6f) up.normalize();
     Vector3f right = forward.cross(up);
     if (right.norm() > 1e-6f) right.normalize();
 
-    // These constants are seeded only for model materials. Runtime updates in WPShaderValueUpdater
-    // keep them animated for camera paths, while 2D materials never receive this 3D camera
-    // contract.
+    // Model materials consume the selected scene frame's world-space eye and basis, even when
+    // their raster projection is an auxiliary perspective view. Runtime updates keep these
+    // constants synchronized with camera paths, layers and reflected frame state.
     shader_info.baseConstSvs[std::string(G_EYE_POSITION)] =
         std::array<float, 3> { eye.x(), eye.y(), eye.z() };
     shader_info.baseConstSvs[std::string(G_VIEWUP)] =
@@ -154,6 +154,15 @@ void SeedModelCameraUniforms(ParseContext& context, WPShaderInfo& shader_info) {
     shader_info.baseConstSvs[std::string(G_VIEWFORWARD)] =
         std::array<float, 3> { forward.x(), forward.y(), forward.z() };
 }
+
+// Both source kinds feed the same layer/material lifecycle. File geometry is decoded once;
+// generated geometry supplies a layer-local mesh wrapper over its shared CPU payload. Keeping
+// this adapter independent from materials avoids duplicating layer ownership or manufacturing
+// an MDL file for script-owned buffers.
+struct ModelGeometryChunk {
+    std::string material_path;
+    std::shared_ptr<SceneMesh> geometry;
+};
 
 struct ModelMaterialSource {
     std::string               path;
@@ -166,7 +175,7 @@ public:
                         const nlohmann::json* sidecar_json)
         : context_(context), model_obj_(model_obj), sidecar_json_(sidecar_json) {}
 
-    bool UsesTransparentBlend(const WPMdl::StaticChunk& chunk) const {
+    bool UsesTransparentBlend(const ModelGeometryChunk& chunk) const {
         const auto source = LoadSource(chunk);
         if (! source.has_value()) {
             LOG_ERROR("ModelRenderOrder: failed to inspect layer=%d name='%s' material='%s'",
@@ -179,8 +188,7 @@ public:
         return source->material.blending == "translucent" || source->material.blending == "additive";
     }
 
-    bool LoadChunkMaterial(const WPMdl& mdl, const WPMdl::StaticChunk& chunk,
-                           SceneNode* chunk_node,
+    bool LoadChunkMaterial(const WPMdl* file_model, const ModelGeometryChunk& chunk,
                            SceneMaterial& material, WPShaderValueData& node_data,
                            wpscene::WPMaterial& resolved_wp_material,
                            WPShaderInfo& resolved_shader_info,
@@ -198,12 +206,12 @@ public:
         shader_info.baseConstSvs = context_.global_base_uniforms;
         SeedModelCameraUniforms(context_, shader_info);
         auto effective_material = source->material;
-        if (mdl.puppet != nullptr) {
+        if (file_model != nullptr && file_model->puppet != nullptr) {
             // MDLV0023 model chunks retain their authored interleaved blend-index/weight
             // attributes. Enabling the stock shader combos here declares the g_Bones float4x3
             // array consumed by those attributes on every material chunk.
-            WPMdlParser::AddPuppetMatInfo(effective_material, mdl);
-            WPMdlParser::AddPuppetShaderInfo(shader_info, mdl);
+            WPMdlParser::AddPuppetMatInfo(effective_material, *file_model);
+            WPMdlParser::AddPuppetShaderInfo(shader_info, *file_model);
         }
         if (! LoadMaterial(*context_.vfs,
                            effective_material,
@@ -233,7 +241,7 @@ public:
     }
 
 private:
-    std::optional<ModelMaterialSource> LoadSource(const WPMdl::StaticChunk& chunk) const {
+    std::optional<ModelMaterialSource> LoadSource(const ModelGeometryChunk& chunk) const {
         const auto material_path = ResolvePath(chunk);
         if (const auto cached = source_cache_.find(material_path); cached != source_cache_.end()) {
             return cached->second;
@@ -263,9 +271,8 @@ private:
         };
     }
 
-    std::string ResolvePath(const WPMdl::StaticChunk& chunk) const {
-        return ResolveModelMaterialPath(
-            ResolveStaticChunkMaterialPath(chunk, model_obj_.skin), sidecar_json_, model_obj_.skin);
+    std::string ResolvePath(const ModelGeometryChunk& chunk) const {
+        return ResolveModelMaterialPath(chunk.material_path, sidecar_json_, model_obj_.skin);
     }
 
     ParseContext&         context_;
@@ -304,14 +311,15 @@ struct ModelChunkOrder {
     std::vector<usize> transparent;
     std::vector<usize> ordered;
 
-    static ModelChunkOrder Build(const WPMdl& mdl, const ModelMaterialLoader& material_loader,
+    static ModelChunkOrder Build(const std::vector<ModelGeometryChunk>& chunks,
+                                 const ModelMaterialLoader& material_loader,
                                  const WPModelObject& model_obj) {
         ModelChunkOrder order;
-        order.opaque.reserve(mdl.static_chunks.size());
-        order.transparent.reserve(mdl.static_chunks.size());
+        order.opaque.reserve(chunks.size());
+        order.transparent.reserve(chunks.size());
 
-        for (usize chunk_index = 0; chunk_index < mdl.static_chunks.size(); chunk_index++) {
-            const auto& chunk = mdl.static_chunks[chunk_index];
+        for (usize chunk_index = 0; chunk_index < chunks.size(); chunk_index++) {
+            const auto& chunk = chunks[chunk_index];
             if (material_loader.UsesTransparentBlend(chunk)) {
                 order.transparent.push_back(chunk_index);
             } else {
@@ -319,7 +327,7 @@ struct ModelChunkOrder {
             }
         }
 
-        order.ordered.reserve(mdl.static_chunks.size());
+        order.ordered.reserve(chunks.size());
         order.ordered.insert(order.ordered.end(), order.opaque.begin(), order.opaque.end());
         order.ordered.insert(
             order.ordered.end(), order.transparent.begin(), order.transparent.end());
@@ -346,28 +354,35 @@ struct ModelChunkOrder {
 class ModelLayerMaterializer {
 public:
     ModelLayerMaterializer(ParseContext& context, const WPModelObject& model_obj,
-                           const WPMdl& mdl)
+                           const std::vector<ModelGeometryChunk>& chunks,
+                           const WPMdl* file_model,
+                           std::shared_ptr<SceneModelData> model_data = {})
         : context_(context),
           model_obj_(model_obj),
-          mdl_(mdl),
-          sidecar_json_(LoadModelSidecarJson(*context.vfs, model_obj.model)),
+          chunks_(chunks),
+          file_model_(file_model),
+          model_data_(std::move(model_data)),
+          sidecar_json_(file_model != nullptr
+                            ? LoadModelSidecarJson(*context.vfs, model_obj.model) : std::nullopt),
           material_loader_(context_, model_obj_, SidecarJson()) {}
 
-    void Materialize(const WPMdl& mdl) {
+    void Materialize() {
         root_ = CreateRootNode();
-        if (mdl.puppet != nullptr) {
+        if (file_model_ != nullptr && file_model_->puppet != nullptr) {
             // One model owns one animation-layer stack even when its geometry is split across
             // several material chunks. Copies of WPPuppetLayer share the same runtime state, so
             // scripts mutate the logical root once and every chunk uploads the identical pose
             // snapshot during the frame transaction.
-            shared_puppet_pose_ = WPPuppetLayer(mdl.puppet);
+            shared_puppet_pose_ = WPPuppetLayer(file_model_->puppet);
             shared_puppet_pose_.prepared(model_obj_.animation_layers);
         }
         RegisterRootNode();
         auto& owner = context_.scene->EnsureSceneObject(model_obj_.id);
+        owner.SetModelData(model_data_);
+        owner.SetModelPerspective(model_obj_.perspective);
         owner.SetReceivesReflection(false);
-        const auto order = ModelChunkOrder::Build(mdl, material_loader_, model_obj_);
-        AppendChunks(mdl, order);
+        const auto order = ModelChunkOrder::Build(chunks_, material_loader_, model_obj_);
+        AppendChunks(order);
         if (owner.ReceivesReflection()) EnsureModelReflectionTarget(context_);
         ApplyCastsShadows(root_.get(), model_obj_.castshadow);
 
@@ -416,28 +431,27 @@ private:
             context_, model_obj_.id, model_obj_.parent, model_obj_.attachment, model_obj_.visible);
     }
 
-    void AppendChunks(const WPMdl& mdl, const ModelChunkOrder& order) {
+    void AppendChunks(const ModelChunkOrder& order) {
         // The reflected list retains these same owners/resources. Materialize each chunk once,
         // register its script bindings once, and let the render graph submit it in the
         // independent reflection phase when needed.
         for (usize chunk_index : order.ordered) {
-            const auto& chunk = mdl.static_chunks[chunk_index];
+            const auto& chunk = chunks_[chunk_index];
             auto node = MakeChunkNode(chunk, chunk_index);
             if (node != nullptr) root_->AppendChild(node);
         }
     }
 
-    std::shared_ptr<SceneNode> MakeChunkNode(const WPMdl::StaticChunk& chunk,
+    std::shared_ptr<SceneNode> MakeChunkNode(const ModelGeometryChunk& chunk,
                                              usize chunk_index) {
         auto node = std::make_shared<SceneNode>();
         node->SetName(model_obj_.name + "::__hanabi_model_chunk_" + std::to_string(chunk_index));
         node->ID() = model_obj_.id;
-        // Model chunks use the isolated model camera so authored 3D view transforms cannot move
-        // legacy 2D perspective particles that still render through `global_perspective`.
-        node->SetCamera(std::string(kSceneModelPerspectiveCameraName));
+        // Model chunks inherit the current destination camera. The owner's perspective flag
+        // changes only its submitted projection/destination matrices; a named particle camera
+        // would discard the incoming view, framing and camera-layer displacement.
 
-        auto mesh = std::make_shared<SceneMesh>();
-        WPMdlParser::GenStaticMesh(*mesh, chunk);
+        auto mesh = chunk.geometry;
         if (shared_puppet_pose_.hasPuppet()) {
             mesh->SetSkinning(
                 { .boneCount = static_cast<uint32_t>(shared_puppet_pose_.Puppet()->bones.size()) });
@@ -447,9 +461,8 @@ private:
         WPShaderValueData   node_data;
         wpscene::WPMaterial wp_material;
         WPShaderInfo        shader_info;
-        if (! material_loader_.LoadChunkMaterial(mdl_,
+        if (! material_loader_.LoadChunkMaterial(file_model_,
                                                  chunk,
-                                                 node.get(),
                                                  material,
                                                  node_data,
                                                  wp_material,
@@ -529,7 +542,9 @@ private:
 
     ParseContext&                 context_;
     const WPModelObject&          model_obj_;
-    const WPMdl&                  mdl_;
+    const std::vector<ModelGeometryChunk>& chunks_;
+    const WPMdl*                  file_model_;
+    std::shared_ptr<SceneModelData> model_data_;
     std::optional<nlohmann::json> sidecar_json_;
     ModelMaterialLoader           material_loader_;
     std::shared_ptr<SceneNode>    root_;
@@ -539,6 +554,27 @@ private:
 } // namespace
 
 void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
+    if (model_obj.model_token != 0) {
+        auto model_data = context.scene->modelData.Find(model_obj.model_token);
+        if (! model_data) {
+            LOG_ERROR("ModelObjectParse: invalid generated model token=%u layer=%d",
+                      model_obj.model_token, model_obj.id);
+            return;
+        }
+        std::vector<ModelGeometryChunk> chunks;
+        chunks.reserve(model_data->Shapes().size());
+        for (const auto& shape : model_data->Shapes()) {
+            auto mesh = std::make_shared<SceneMesh>(shape.geometry->Dynamic());
+            mesh->ChangeMeshDataFrom(*shape.geometry);
+            chunks.push_back({ shape.material, std::move(mesh) });
+        }
+        ModelLayerMaterializer(context, model_obj, chunks, nullptr, model_data).Materialize();
+        LOG_INFO("ModelDataLayer: token=%u layer=%d name='%s' shapes=%zu perspective=%s",
+                 model_obj.model_token, model_obj.id, model_obj.name.c_str(), chunks.size(),
+                 model_obj.perspective ? "true" : "false");
+        return;
+    }
+
     WPMdl mdl;
     if (! WPMdlParser::ParseStaticModel(model_obj.model,
                                         *context.vfs,
@@ -551,5 +587,12 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
         return;
     }
 
-    ModelLayerMaterializer(context, model_obj, mdl).Materialize(mdl);
+    std::vector<ModelGeometryChunk> chunks;
+    chunks.reserve(mdl.static_chunks.size());
+    for (const auto& chunk : mdl.static_chunks) {
+        auto mesh = std::make_shared<SceneMesh>();
+        WPMdlParser::GenStaticMesh(*mesh, chunk);
+        chunks.push_back({ ResolveStaticChunkMaterialPath(chunk, model_obj.skin), std::move(mesh) });
+    }
+    ModelLayerMaterializer(context, model_obj, chunks, &mdl).Materialize();
 }

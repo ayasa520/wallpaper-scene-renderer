@@ -270,6 +270,10 @@ void ApplyCameraProjectionState(Scene& scene,
 Scene::Scene(): sceneGraph(std::make_shared<SceneNode>()) ,paritileSys(std::make_unique<ParticleSystem>(*this)) {}
 
 Scene::~Scene() {
+    // Destroy callbacks may release generated models and still query their layer owners. Run
+    // them while all scene registries, transforms and VFS resources are alive; reverse member
+    // destruction order would otherwise dispose of those registries before the script host.
+    scriptHost.reset();
     ClearParsedImageCache();
 }
 
@@ -596,6 +600,7 @@ void Scene::DestroySceneObject(int32_t layer_id) {
         }
     }
     sceneObjects.erase(it);
+    modelData.Prune();
 }
 
 int32_t Scene::LayerIdForNode(const SceneNode* node) const {
