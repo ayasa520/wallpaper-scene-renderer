@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <functional>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <numbers>
@@ -30,6 +31,14 @@
 
 namespace miniaudio
 {
+
+inline bool TraceSoundMixEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("WESCENE_TRACE_SOUND_MIX");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 struct DeviceDesc {
     ma_uint32              phyChannels;
@@ -267,8 +276,35 @@ private:
                     m_channels[i].chn->NextPcmData(m_frameBuffer.data(), frameCount);
                 if (framesReaded != 0) {
                     const float channel_volume = m_channels[i].chn->Volume();
+                    const float master_volume = m_volume;
+                    const float effective_volume = master_volume * channel_volume;
                     for (size_t i = 0; i < framesSize; i++)
-                        pOutput_float[i] += m_volume * channel_volume * pBuffer_float[i];
+                        pOutput_float[i] += effective_volume * pBuffer_float[i];
+
+                    // Trace the gain actually consumed by the mixer, not merely a script's
+                    // requested value. A zero-gain looping stream may continue decoding while
+                    // contributing no samples. Emit only its first decoded buffer and gain
+                    // transitions; the additional peak scan is opt-in diagnostic work.
+                    auto& channel = m_channels[i];
+                    if (TraceSoundMixEnabled() &&
+                        (! channel.mix_traced || channel.traced_volume != channel_volume ||
+                         channel.traced_master_volume != master_volume)) {
+                        float source_peak = 0.0f;
+                        for (size_t sample = 0; sample < framesSize; sample++) {
+                            source_peak = std::max(source_peak, std::abs(pBuffer_float[sample]));
+                        }
+                        LOG_INFO("SceneSoundMix: channel=%p volume=%.6f master=%.6f frames=%llu "
+                                 "source_peak=%.6f contribution_peak=%.6f",
+                                 static_cast<void*>(channel.chn.get()),
+                                 channel_volume,
+                                 master_volume,
+                                 static_cast<unsigned long long>(framesReaded),
+                                 source_peak,
+                                 std::abs(effective_volume) * source_peak);
+                        channel.mix_traced = true;
+                        channel.traced_volume = channel_volume;
+                        channel.traced_master_volume = master_volume;
+                    }
                 }
                 if (m_channels[i].chn->ShouldRemove()) m_channels[i].end = true;
             }
@@ -351,6 +387,9 @@ private:
     struct ChannelWrap {
         bool                     end { false };
         std::shared_ptr<Channel> chn;
+        bool                    mix_traced { false };
+        float                   traced_volume { 0.0f };
+        float                   traced_master_volume { 0.0f };
     };
     ma_device         m_device {}; // must init c struct
     std::mutex        m_mutex;     // for operating channel vector

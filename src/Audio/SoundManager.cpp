@@ -161,6 +161,13 @@ SoundHandle SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss, float v
     const SoundHandle handle = pImpl->next_handle++;
     auto channel = std::make_shared<Channel_Impl>(std::move(ss), volume, autoplay);
     pImpl->channels.emplace(handle, channel);
+    if (miniaudio::TraceSoundMixEnabled()) {
+        LOG_INFO("SceneSoundChannelMount: handle=%u channel=%p volume=%.6f autoplay=%s",
+                 handle,
+                 static_cast<void*>(channel.get()),
+                 channel->Volume(),
+                 autoplay ? "true" : "false");
+    }
     pImpl->device.MountChannel(std::move(channel));
     return handle;
 }

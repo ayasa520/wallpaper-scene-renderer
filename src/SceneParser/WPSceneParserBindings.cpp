@@ -21,6 +21,28 @@
 
 using namespace wallpaper;
 
+namespace
+{
+std::optional<WPSceneScriptTargetKind> ResolveObjectPropertyTarget(
+    const Scene& scene, const nlohmann::json& object_json, int32_t object_id,
+    std::string_view property_name) {
+    // User bindings, scripts and timelines must resolve the same live property consumer.
+    // Sound owners intentionally have no visual transform: their volume belongs to the
+    // mounted stream. Requiring drawable materialization before selecting this target
+    // would discard volume scripts and leave autoplay streams at their authored base gain.
+    if (property_name == "volume" && scene.GetLayerSoundHandle(object_id).has_value()) {
+        return WPSceneScriptTargetKind::Sound;
+    }
+
+    const auto* object = scene.FindSceneObject(object_id);
+    if (object == nullptr || object->RuntimeTransform() == nullptr) return std::nullopt;
+    if (IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name)) {
+        return WPSceneScriptTargetKind::Camera;
+    }
+    return WPSceneScriptTargetKind::Layer;
+}
+} // namespace
+
 std::optional<WPDynamicValue> ParsePropertyBaseValue(const nlohmann::json& property_json,
                                                      WPDynamicValue::Type  hint) {
     if (! property_json.is_object() || ! property_json.contains("value")) return std::nullopt;
@@ -50,12 +72,9 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
         return;
     }
 
-    // Register against the authored object after its runtime state has been materialized. Camera
-    // properties select the camera dispatcher so origin/zoom keyframes also update the view.
-    const bool camera_registration =
-        IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
-    const auto* object = context.scene->FindSceneObject(object_id);
-    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
+    const auto target =
+        ResolveObjectPropertyTarget(*context.scene, object_json, object_id, property_name);
+    if (! target.has_value()) return;
 
     WPPropertyAnimationDefinition animation_definition;
     if (! ParsePropertyAnimationDefinition(property_json, hint, animation_definition)) return;
@@ -79,8 +98,7 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .target_kind =
-            camera_registration ? WPSceneScriptTargetKind::Camera : WPSceneScriptTargetKind::Layer,
+        .target_kind  = *target,
         .target_index = 0,
         .value_type   = hint,
         .base_value   = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
@@ -98,7 +116,13 @@ void RegisterScenePropertyAnimationBinding(ParseContext& context, const nlohmann
                                  registration.setting,
                                  registration.base_value);
     }
-    if (camera_registration) {
+    if (*target == WPSceneScriptTargetKind::Sound) {
+        LOG_INFO("SceneSoundRegister: layer=%d property='%.*s' kind=animation target=sound",
+                 object_id,
+                 static_cast<int>(property_name.size()),
+                 property_name.data());
+    }
+    if (*target == WPSceneScriptTargetKind::Camera) {
         LOG_INFO("SceneCameraLayerRegister: layer=%d property='%.*s' kind=animation target=camera",
                  object_id,
                  static_cast<int>(property_name.size()),
@@ -143,19 +167,15 @@ void RegisterSceneScriptBinding(ParseContext& context, const nlohmann::json& obj
         object_name = std::to_string(object_id);
     }
 
-    // The owner id is sufficient to resolve the live property target. Camera layers select their
-    // view-state dispatcher; ordinary layer bindings do not retain a drawing node.
-    const bool camera_registration =
-        IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
-    const auto* object = context.scene->FindSceneObject(object_id);
-    if (object == nullptr || object->RuntimeTransform() == nullptr) return;
+    const auto target =
+        ResolveObjectPropertyTarget(*context.scene, object_json, object_id, property_name);
+    if (! target.has_value()) return;
 
     context.scene->scriptRegistrations.push_back(WPSceneScriptRegistration {
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .target_kind =
-            camera_registration ? WPSceneScriptTargetKind::Camera : WPSceneScriptTargetKind::Layer,
+        .target_kind  = *target,
         .target_index = 0,
         .value_type   = hint,
         .base_value   = setting.value,
@@ -171,7 +191,13 @@ void RegisterSceneScriptBinding(ParseContext& context, const nlohmann::json& obj
                                  registration.setting,
                                  registration.base_value);
     }
-    if (camera_registration) {
+    if (*target == WPSceneScriptTargetKind::Sound) {
+        LOG_INFO("SceneSoundRegister: layer=%d property='%.*s' kind=script target=sound",
+                 object_id,
+                 static_cast<int>(property_name.size()),
+                 property_name.data());
+    }
+    if (*target == WPSceneScriptTargetKind::Camera) {
         LOG_INFO("SceneCameraLayerRegister: layer=%d property='%.*s' kind=script target=camera",
                  object_id,
                  static_cast<int>(property_name.size()),
@@ -202,16 +228,9 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
         return;
     }
 
-    // Sound volume targets the mounted stream on its authored object. It does not require visual
-    // placement, while visual property targets require a successfully materialized transform.
-    const bool sound_volume_binding =
-        property_name == "volume" && context.scene != nullptr &&
-        context.scene->GetLayerSoundHandle(object_id).has_value();
-    const bool camera_registration =
-        IsCameraLayerObjectJson(object_json) && IsCameraLayerRuntimeProperty(property_name);
-    const auto* object = context.scene->FindSceneObject(object_id);
-    if ((object == nullptr || object->RuntimeTransform() == nullptr) && ! sound_volume_binding)
-        return;
+    const auto target =
+        ResolveObjectPropertyTarget(*context.scene, object_json, object_id, property_name);
+    if (! target.has_value()) return;
 
     WPUserSetting setting;
     if (! ParseUserSetting(property_json, setting, hint) || ! setting.hasUserBinding()) return;
@@ -232,16 +251,13 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
         .object_id     = object_id,
         .object_name   = std::move(object_name),
         .property_name = std::string(property_name),
-        .target_kind   = sound_volume_binding
-                             ? WPSceneScriptTargetKind::Sound
-                             : (camera_registration ? WPSceneScriptTargetKind::Camera
-                                                    : WPSceneScriptTargetKind::Layer),
+        .target_kind   = *target,
         .target_index  = 0,
         .value_type    = hint,
         .base_value    = setting.value,
         .setting       = std::move(setting),
     });
-    if (sound_volume_binding) {
+    if (*target == WPSceneScriptTargetKind::Sound) {
         LOG_INFO("SceneSoundRegister: layer=%d property='%.*s' kind=user target=sound",
                  object_id,
                  static_cast<int>(property_name.size()),
@@ -257,7 +273,7 @@ void RegisterScenePropertyBinding(ParseContext& context, const nlohmann::json& o
                                  registration.setting,
                                  registration.base_value);
     }
-    if (camera_registration) {
+    if (*target == WPSceneScriptTargetKind::Camera) {
         LOG_INFO("SceneCameraLayerRegister: layer=%d property='%.*s' kind=user target=camera",
                  object_id,
                  static_cast<int>(property_name.size()),
@@ -689,6 +705,17 @@ void RegisterImageCompositionBindings(ParseContext& context, const nlohmann::jso
     RegisterSceneScriptBinding(
         context, object_json, "copybackground", WPDynamicValue::Type::Boolean);
 }
+
+void RegisterSoundVolumeBindings(ParseContext& context, const nlohmann::json& object_json) {
+    if (! object_json.contains("sound") || ! object_json.at("sound").is_array()) return;
+    // Keep cold loading and dynamic creation on one complete property-registration path.
+    // An authored volume may contain both a script and a timeline; each registers its own
+    // behavior against the sound target, while plain user bindings keep their existing path.
+    RegisterScenePropertyBinding(context, object_json, "volume", WPDynamicValue::Type::Float);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "volume", WPDynamicValue::Type::Float);
+    RegisterSceneScriptBinding(context, object_json, "volume", WPDynamicValue::Type::Float);
+}
 } // namespace
 
 void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
@@ -774,9 +801,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
         RegisterScenePropertyBinding(
             context, object_json, "brightness", WPDynamicValue::Type::Float);
-        // Sound-layer volume is authored beside visual layer properties, but its runtime target is
-        // the mounted audio stream instead of a SceneNode material.
-        RegisterScenePropertyBinding(context, object_json, "volume", WPDynamicValue::Type::Float);
+        RegisterSoundVolumeBindings(context, object_json);
         RegisterScenePropertyBinding(
             context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
         RegisterScenePropertyBinding(
@@ -985,9 +1010,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
         context, object_json, "rate", WPDynamicValue::Type::Float);
     RegisterScenePropertyBinding(context, object_json, "alpha", WPDynamicValue::Type::Float);
     RegisterScenePropertyBinding(context, object_json, "brightness", WPDynamicValue::Type::Float);
-    // Dynamic materialization reuses the same registration helper, so keep sound volume in this
-    // per-object path as well as the initial full-scene scan.
-    RegisterScenePropertyBinding(context, object_json, "volume", WPDynamicValue::Type::Float);
+    RegisterSoundVolumeBindings(context, object_json);
     RegisterScenePropertyBinding(
         context, object_json, "backgroundcolor", WPDynamicValue::Type::Float3);
     RegisterScenePropertyBinding(

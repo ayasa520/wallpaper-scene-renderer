@@ -2303,12 +2303,13 @@ PropertyAnimationInstance* FindPropertyAnimation(WPSceneScriptHost::Opaque* opaq
                                                  std::string_view animation_name) {
     if (opaque == nullptr || layer_id == 0) return nullptr;
     for (auto& animation : opaque->property_animations) {
-        // Camera layers expose property animations through the same script-facing layer object as
-        // empty/image layers. Include camera targets here so thisLayer.getAnimation("zoom") can
-        // resolve the authored camera timeline instead of disappearing behind the target split.
+        // Layer wrappers retain the authored owner identity across visual, camera and sound
+        // property dispatchers. A sound volume timeline needs no drawing node, but remains
+        // addressable through that owner's property name or authored animation name.
         if (animation.registration.object_id != layer_id ||
             (animation.registration.target_kind != WPSceneScriptTargetKind::Layer &&
-             animation.registration.target_kind != WPSceneScriptTargetKind::Camera)) {
+             animation.registration.target_kind != WPSceneScriptTargetKind::Camera &&
+             animation.registration.target_kind != WPSceneScriptTargetKind::Sound)) {
             continue;
         }
 
@@ -2330,13 +2331,13 @@ const PropertyAnimationInstance* FindPropertyAnimation(const WPSceneScriptHost::
                                                        std::string_view property_name) {
     if (opaque == nullptr || layer_id == 0) return nullptr;
     for (const auto& animation : opaque->property_animations) {
-        // Runtime property reads use the same authored object for layer and camera registrations;
-        // keeping both target kinds discoverable prevents camera keyframes from being treated as
-        // unrelated state when scripts query animation handles by property name.
+        // Reading a property's timeline uses the same owner-target membership as the mutable
+        // lookup, including audio owners whose values are stored in mounted streams.
         if (animation.registration.object_id == layer_id &&
             animation.registration.property_name == property_name &&
             (animation.registration.target_kind == WPSceneScriptTargetKind::Layer ||
-             animation.registration.target_kind == WPSceneScriptTargetKind::Camera)) {
+             animation.registration.target_kind == WPSceneScriptTargetKind::Camera ||
+             animation.registration.target_kind == WPSceneScriptTargetKind::Sound)) {
             return &animation;
         }
     }
