@@ -282,6 +282,8 @@ public:
     // Materials live on the owner's draw nodes; geometry/revisions live in this shared model.
     const std::shared_ptr<SceneModelData>& ModelData() const { return m_model_data; }
     void SetModelData(std::shared_ptr<SceneModelData> data) { m_model_data = std::move(data); }
+    uint64_t ModelDataRevision() const { return m_model_data_revision; }
+    void SetModelDataRevision(uint64_t revision) { m_model_data_revision = revision; }
 
     // Auxiliary projection is a model-owner property. Shared geometry may be drawn by owners
     // with different projection choices, without replacing either the scene camera or mesh.
@@ -330,6 +332,7 @@ private:
     SceneImageLayerRuntimeState m_image_runtime_state;
     std::optional<SceneLayerModulationState> m_modulation_state;
     std::shared_ptr<SceneModelData> m_model_data;
+    uint64_t m_model_data_revision { 0 };
     bool                          m_model_perspective { false };
 };
 

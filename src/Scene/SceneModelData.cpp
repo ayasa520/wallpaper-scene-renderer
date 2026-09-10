@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 
@@ -130,9 +131,67 @@ std::shared_ptr<SceneMesh> BuildGeometry(const SceneModelShapeUpdate& data, std:
     return mesh;
 }
 
-bool ValidateApply(const SceneModelData::Shape& shape, const SceneModelShapeUpdate& data,
-                    std::string& error) {
+bool IndexLayoutMatches(const SceneMesh& mesh, const SceneModelIndices& indices) {
+    return std::visit([&](const auto& values) {
+        using T = std::decay_t<decltype(values)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return mesh.IndexCount() == 0;
+        } else {
+            return mesh.IndexCount() != 0 &&
+                   mesh.IndexElementBytes() == sizeof(typename T::value_type) &&
+                   mesh.LogicalIndexCount() == values.size();
+        }
+    }, indices);
+}
+
+bool NeedsGeometryRebuild(const SceneModelData::Shape& shape,
+                           const SceneModelShapeUpdate& data) {
     const auto& mesh = *shape.geometry;
+    return (data.vertex_format && *data.vertex_format != shape.vertex_format) ||
+           (data.vertex_dynamic && *data.vertex_dynamic != shape.vertex_dynamic) ||
+           (data.index_dynamic && *data.index_dynamic != shape.index_dynamic) ||
+           (data.vertex_buffer && (! shape.vertex_dynamic ||
+                data.vertex_buffer->size() != mesh.GetVertexArray(0).DataSize())) ||
+           (data.index_buffer && (! IndexLayoutMatches(mesh, *data.index_buffer) ||
+                (! shape.index_dynamic && mesh.IndexCount() != 0)));
+}
+
+SceneModelShapeUpdate CompleteReplacement(const SceneModelData::Shape& shape,
+                                          const SceneModelShapeUpdate& data) {
+    auto complete = data;
+    const auto& mesh = *shape.geometry;
+    // Structural replacement is an infrequent operation. Reconstruct a complete owned shape
+    // from the current CPU payload before allocating new draw storage; omitted fields retain
+    // their current values even when another field changes the layout, counts or mutability.
+    // No pointer into either a JS view or the retired geometry survives this reconstruction.
+    if (! complete.vertex_buffer) {
+        const auto& vertices = mesh.GetVertexArray(0);
+        complete.vertex_buffer.emplace(vertices.Data(), vertices.Data() + vertices.DataSize());
+    }
+    if (! complete.index_buffer) {
+        if (mesh.IndexCount() == 0) {
+            complete.index_buffer.emplace(std::monostate {});
+        } else if (mesh.IndexElementBytes() == sizeof(uint16_t)) {
+            std::vector<uint16_t> indices(mesh.LogicalIndexCount());
+            std::memcpy(indices.data(), mesh.GetIndexArray(0).Data(),
+                        indices.size() * sizeof(uint16_t));
+            complete.index_buffer.emplace(std::move(indices));
+        } else {
+            const auto* indices = mesh.GetIndexArray(0).Data();
+            complete.index_buffer.emplace(
+                std::vector<uint32_t>(indices, indices + mesh.LogicalIndexCount()));
+        }
+    }
+    if (! complete.vertex_format) complete.vertex_format = shape.vertex_format;
+    if (! complete.material) complete.material = shape.material;
+    if (! complete.vertex_dynamic) complete.vertex_dynamic = shape.vertex_dynamic;
+    if (! complete.index_dynamic) complete.index_dynamic = shape.index_dynamic;
+    return complete;
+}
+
+bool ValidateApplyStructure(const SceneModelData::Shape& shape,
+                            const SceneModelShapeUpdate& data, bool apply_indices,
+                            std::string& error) {
     if (data.remove || (data.material && *data.material != shape.material) ||
         (data.vertex_format && *data.vertex_format != shape.vertex_format) ||
         (data.vertex_dynamic && *data.vertex_dynamic != shape.vertex_dynamic) ||
@@ -140,38 +199,44 @@ bool ValidateApply(const SceneModelData::Shape& shape, const SceneModelShapeUpda
         error = "applyData cannot change shape structure, material, format or dynamic flags";
         return false;
     }
+    if (data.vertex_buffer && ! shape.vertex_dynamic) {
+        error = "vertexBuffer was not created with isVertexBufferDynamic";
+        return false;
+    }
+    if (apply_indices && ! shape.index_dynamic) {
+        error = "indexBuffer was not created with isIndexBufferDynamic";
+        return false;
+    }
+    return true;
+}
+
+bool ApplyShapePayload(SceneModelData::Shape& shape, const SceneModelShapeUpdate& data,
+                        bool replace, bool& vertices_changed, std::string& error) {
+    auto& mesh = *shape.geometry;
+    const bool apply_indices = data.index_buffer &&
+        ! (replace && mesh.IndexCount() == 0 &&
+           std::holds_alternative<std::monostate>(*data.index_buffer));
+    if (! ValidateApplyStructure(shape, data, apply_indices, error)) return false;
     if (data.vertex_buffer) {
-        if (! shape.vertex_dynamic) {
-            error = "vertexBuffer was not created with isVertexBufferDynamic";
-            return false;
-        }
         if (data.vertex_buffer->size() != mesh.GetVertexArray(0).DataSize()) {
             error = "applyData vertexBuffer length must match the retained buffer";
             return false;
         }
         if (! ValidateVertices(*data.vertex_buffer, shape.vertex_format, error)) return false;
+        mesh.GetVertexArray(0).SetVertexs(0, *data.vertex_buffer);
+        mesh.SetDirty();
+        vertices_changed = true;
     }
-    if (data.index_buffer) {
-        if (! shape.index_dynamic) {
-            error = "indexBuffer was not created with isIndexBufferDynamic";
-            return false;
-        }
-        const bool matches = std::visit([&](const auto& values) {
-            using T = std::decay_t<decltype(values)>;
-            if constexpr (std::is_same_v<T, std::monostate>) {
-                return false;
-            } else {
-                return mesh.IndexCount() != 0 &&
-                       mesh.IndexElementBytes() == sizeof(typename T::value_type) &&
-                       mesh.LogicalIndexCount() == values.size();
-            }
-        }, *data.index_buffer);
-        if (! matches) {
+    if (apply_indices) {
+        if (std::holds_alternative<std::monostate>(*data.index_buffer) ||
+            ! IndexLayoutMatches(mesh, *data.index_buffer)) {
             error = "applyData indexBuffer length and type must match the retained buffer";
             return false;
         }
         if (! ValidateIndices(*data.index_buffer, mesh.GetVertexArray(0).VertexCount(), error))
             return false;
+        WriteIndices(mesh.GetIndexArray(0), *data.index_buffer);
+        mesh.SetDirty();
     }
     return true;
 }
@@ -208,31 +273,85 @@ std::shared_ptr<SceneModelData> SceneModelData::Create(const SceneModelDataUpdat
 }
 
 bool SceneModelData::ApplyData(const SceneModelDataUpdate& data, std::string& error) {
-    if (data.shapes.empty() || data.shapes.size() > m_shapes.size()) {
+    return UpdateData(data, false, error);
+}
+
+bool SceneModelData::ReplaceData(const SceneModelDataUpdate& data, std::string& error) {
+    return UpdateData(data, true, error);
+}
+
+bool SceneModelData::UpdateData(const SceneModelDataUpdate& data, bool replace,
+                                std::string& error) {
+    if (data.shapes.empty() || (! replace && data.shapes.size() > m_shapes.size())) {
         error = "applyData must address existing shapes";
         return false;
     }
     if (! ValidBounds(data.bounds, error)) return false;
-    // Validate the owned snapshots before publishing any bytes. Property getters can re-enter
-    // scripts during conversion, so validation belongs here, against the final current resource,
-    // rather than being interleaved with reads of JS fields and mutations of shared geometry.
-    for (size_t i = 0; i < data.shapes.size(); ++i) {
-        if (! ValidateApply(m_shapes[i], data.shapes[i], error)) return false;
-    }
     bool vertices_changed = false;
+    bool succeeded = true;
+    // JS extraction finishes before publication, so getters can re-enter without invalidating
+    // a borrowed view or a shape reference. Resource checks then use that final current model.
+    // Publication is ordered, not transactional: a later error retains earlier valid writes,
+    // including a changed material on the failing shape. Deletions are applied only after this
+    // first pass succeeds, keeping input indices stable throughout the operation.
     for (size_t i = 0; i < data.shapes.size(); ++i) {
         const auto& update = data.shapes[i];
-        auto& mesh = *m_shapes[i].geometry;
-        if (update.vertex_buffer) {
-            mesh.GetVertexArray(0).SetVertexs(0, *update.vertex_buffer);
+        if (update.remove) {
+            if (! replace || i >= m_shapes.size()) {
+                error = "only replaceData can remove an existing shape";
+                succeeded = false;
+                break;
+            }
+            continue;
+        }
+        if (i == m_shapes.size()) {
+            auto geometry = BuildGeometry(update, error);
+            if (! geometry) {
+                succeeded = false;
+                break;
+            }
+            m_shapes.push_back({ .geometry = std::move(geometry), .material = *update.material,
+                                  .vertex_format = *update.vertex_format,
+                                  .vertex_dynamic = update.vertex_dynamic.value_or(false),
+                                  .index_dynamic = update.index_dynamic.value_or(false) });
+            ++m_structure_revision;
+            vertices_changed = true;
+            continue;
+        }
+        auto& shape = m_shapes[i];
+        if (replace && update.material && *update.material != shape.material) {
+            shape.material = *update.material;
+            ++m_structure_revision;
+        }
+        if (replace && NeedsGeometryRebuild(shape, update)) {
+            const auto complete = CompleteReplacement(shape, update);
+            auto geometry = BuildGeometry(complete, error);
+            if (! geometry) {
+                succeeded = false;
+                break;
+            }
+            shape.geometry = std::move(geometry);
+            shape.vertex_format = *complete.vertex_format;
+            shape.vertex_dynamic = *complete.vertex_dynamic;
+            shape.index_dynamic = *complete.index_dynamic;
+            ++m_structure_revision;
+            vertices_changed = true;
+        } else if (! ApplyShapePayload(shape, update, replace, vertices_changed, error)) {
+            succeeded = false;
+            break;
+        }
+    }
+    if (succeeded && replace) {
+        for (size_t i = data.shapes.size(); i-- > 0;) {
+            if (! data.shapes[i].remove) continue;
+            m_shapes.erase(m_shapes.begin() + static_cast<std::vector<Shape>::difference_type>(i));
+            ++m_structure_revision;
             vertices_changed = true;
         }
-        if (update.index_buffer) WriteIndices(mesh.GetIndexArray(0), *update.index_buffer);
-        if (update.vertex_buffer || update.index_buffer) mesh.SetDirty();
     }
-    if (data.bounds) m_declared_bounds = data.bounds;
-    if (vertices_changed || data.bounds) RefreshBounds();
-    return true;
+    if (succeeded && data.bounds) m_declared_bounds = data.bounds;
+    if (vertices_changed || (succeeded && data.bounds)) RefreshBounds();
+    return succeeded;
 }
 
 void SceneModelData::RefreshBounds() {

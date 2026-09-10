@@ -81,7 +81,7 @@ Matrix4d DestinationViewProjection(const SceneCamera& camera, bool reflected) {
 
 Matrix4d ModelPerspectiveViewProjection(const Scene& scene, const Matrix4d& incoming_projection,
                                         Matrix4d destination, int32_t layer_id,
-                                        uint64_t frame_serial, bool reflected) {
+                                        uint64_t frame_serial, bool reflected, bool trace = true) {
     constexpr double kMinimumFrameFov = 0.1;
     constexpr double kMaximumFrameFov = 179.9;
     constexpr double kPerspectiveFrameDistance = 2000.0;
@@ -112,7 +112,7 @@ Matrix4d ModelPerspectiveViewProjection(const Scene& scene, const Matrix4d& inco
     const Vector3d incoming_translation = destination.block<3, 1>(0, 3);
     destination(2, 3) = -distance;
     const Matrix4d projection = Perspective(angle, aspect, kNearPlane, far_plane);
-    if (std::getenv("WESCENE_TRACE_MODEL_PROJECTION") != nullptr) {
+    if (trace && std::getenv("WESCENE_TRACE_MODEL_PROJECTION") != nullptr) {
         LOG_INFO("SceneModelProjection: frame=%llu layer=%d reflection=%s orthographic=%s "
                  "angle-radians=%.9f incoming-p11=%.9f distance=%.9f aspect=%.9f "
                  "near=%.6f far=%.6f incoming-destination=[%.9f %.9f %.9f] "
@@ -356,6 +356,30 @@ Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
 
 
     return transform_resolver.ResolveParallaxedModelTransform(draw, camera, apply_parallax);
+}
+
+Matrix4d WPShaderValueUpdater::ResolveModelViewProjectionForInput(const SceneDraw& draw) {
+    const auto& camera = *m_scene->activeCamera;
+    Map<void*, Matrix4d> model_cache;
+    Map<void*, Vector3f> parallax_cache;
+    WPNodeTransformResolver resolver(*m_scene, m_parallax, m_nodeDataMap, model_cache,
+                                      parallax_cache, m_parallaxPointerPos, m_puppet_frame_serial);
+    Matrix4d destination = camera.GetViewMatrix();
+    if (const auto* data = GetNodeData(draw.DataKey());
+        data != nullptr && data->AppliesModelParallax()) {
+        const Vector3d offset = resolver.ResolveParallaxOffset(draw, &camera).cast<double>();
+        destination = destination * Affine3d(Translation3d(offset)).matrix();
+    }
+    const auto& owner = *m_scene->FindSceneObject(draw.LayerId(*m_scene));
+    // Hit tests address the main scene destination, not its reflected copy. Reuse the draw's
+    // auxiliary projection calculation, including live FOV/zoom and destination displacement;
+    // projecting a model with the particle camera or a world-plane shortcut would diverge as
+    // soon as a vertex leaves Z=0. Local caches observe preceding script transform writes.
+    if (owner.ModelPerspective()) {
+        return ModelPerspectiveViewProjection(*m_scene, camera.GetProjectionMatrix(), destination,
+                                                owner.Id(), m_puppet_frame_serial, false, false);
+    }
+    return camera.GetProjectionMatrix() * destination;
 }
 
 WPShaderValueUpdater::EffectProjectionSnapshot

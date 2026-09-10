@@ -3993,6 +3993,15 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
 } // namespace
 
 
+bool wallpaper::RefreshGeneratedSceneModelLayer(Scene& scene, int32_t layer_id,
+                                                const UserPropertyMap* user_properties) {
+    auto& owner = *scene.FindSceneObject(layer_id);
+    ParseContext context {};
+    if (! InitDynamicParseContext(context, scene, user_properties)) return false;
+    RefreshModelObj(context, owner);
+    return true;
+}
+
 bool wallpaper::CreateDynamicSceneLayer(
     Scene& scene, const nlohmann::json& object_json, const UserPropertyMap* user_properties,
     std::vector<WPSceneScriptRegistration>* out_binding_registrations,

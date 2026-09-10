@@ -168,6 +168,7 @@ struct WPSceneScriptHost::Opaque {
     std::vector<AudioBufferBinding>              audio_buffers;
     ExternalSceneAudioState                      external_audio;
     std::vector<int32_t>                         pending_destroy_layer_ids;
+    std::unordered_set<uint32_t>                 pending_model_refresh_tokens;
     UserPropertyMap                              user_properties;
     UserPropertyMap                              dispatched_user_properties;
     std::unordered_set<std::string>              user_property_names;
@@ -211,6 +212,9 @@ private:
 };
 
 void RegisterSceneModelDataBindings(WPSceneScriptHost::Opaque& opaque);
+void ProcessPendingSceneModelRefresh(WPSceneScriptHost::Opaque& opaque);
+void FreeScriptInstance(JSContext* context, ScriptInstance& instance);
+void ResortSceneLayerTree(const WPSceneScriptHost::Opaque& opaque);
 std::optional<std::string> ResolveSceneScriptAssetFile(const Scene* scene, JSContext* context,
                                                        JSValueConst value);
 

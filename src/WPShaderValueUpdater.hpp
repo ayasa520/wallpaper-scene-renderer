@@ -211,6 +211,7 @@ public:
     void FrameEnd() override;
     Eigen::Matrix4d ResolveModelTransformForProjection(
         const SceneDraw& draw, const SceneCamera* camera, bool apply_parallax) override;
+    Eigen::Matrix4d ResolveModelViewProjectionForInput(const SceneDraw& draw);
     std::optional<ShaderSkinningPose> SkinningPose(SceneNode* node) const override;
     void MouseInput(double, double) override;
     void SetTexelSize(float x, float y) override;

@@ -270,6 +270,7 @@ std::string NormalizeLocaleToWallpaperLanguage(std::string locale_name);
 
 LayerValueHint LayerValueType(std::string_view property_name) {
     if (property_name == "visible") return { WPDynamicValue::Type::Boolean, true };
+    if (property_name == "perspective") return { WPDynamicValue::Type::Boolean, true };
     if (property_name == "origin") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "angles") return { WPDynamicValue::Type::Float3, true };
     if (property_name == "scale") return { WPDynamicValue::Type::Float3, true };
@@ -3080,6 +3081,8 @@ void ClearDestroyedParentTransformBindings(WPSceneScriptHost::Opaque* opaque, in
     }
 }
 
+} // namespace
+
 void FreeScriptInstance(JSContext* context, ScriptInstance& instance) {
     if (context == nullptr) return;
     if (instance.initialized && ! JS_IsUndefined(instance.destroy_fn)) {
@@ -3108,6 +3111,13 @@ void FreeScriptInstance(JSContext* context, ScriptInstance& instance) {
     FreeJSValue(context, instance.destroy_fn);
     FreeJSValue(context, instance.resize_screen_fn);
 }
+
+void ResortSceneLayerTree(const WPSceneScriptHost::Opaque& opaque) {
+    ResortLayerTree(opaque.scene->sceneGraph.get(), &opaque);
+}
+
+namespace
+{
 
 void ResortChildLayers(SceneNode* parent, const WPSceneScriptHost::Opaque* opaque) {
     if (parent == nullptr || opaque == nullptr || opaque->scene == nullptr) return;
@@ -4204,12 +4214,103 @@ std::optional<std::array<double, 4>> ComputeNodeBounds2D(const WPSceneScriptHost
 }
 
 std::optional<std::array<double, 4>>
+ComputeBoxBounds2D(const Eigen::Matrix4d& model, const Eigen::Vector3f& min,
+                    const Eigen::Vector3f& max, const Eigen::Matrix4d& clip) {
+    std::array<Eigen::Vector4d, 8> corners;
+    for (size_t i = 0; i < corners.size(); ++i) {
+        corners[i] = clip * model * Eigen::Vector4d(
+            (i & 1) ? max.x() : min.x(), (i & 2) ? max.y() : min.y(),
+            (i & 4) ? max.z() : min.z(), 1.0);
+    }
+    std::array<double, 4> bounds { std::numeric_limits<double>::max(),
+                                   std::numeric_limits<double>::max(),
+                                   std::numeric_limits<double>::lowest(),
+                                   std::numeric_limits<double>::lowest() };
+    const auto accumulate = [&](const Eigen::Vector4d& point) {
+        const double x = point.x() / point.w();
+        const double y = point.y() / point.w();
+        bounds[0] = std::min(bounds[0], x);
+        bounds[1] = std::min(bounds[1], y);
+        bounds[2] = std::max(bounds[2], x);
+        bounds[3] = std::max(bounds[3], y);
+    };
+    const auto depth_distances = [](const Eigen::Vector4d& p) {
+        return std::array<double, 3> { p.w() - 1e-4, p.z(), p.w() - p.z() };
+    };
+    // Clip all twelve box edges against the eye and the actual reversed-depth clip slab
+    // (0 <= z <= w) before dividing. Dropping behind-eye corners alone creates giant hit boxes;
+    // ignoring near/far planes makes entirely clipped models clickable. The clipped box is a
+    // conservative screen-space target, not a triangle intersection or a reflected hit surface.
+    for (size_t i = 0; i < corners.size(); ++i) {
+        for (const size_t bit : { 1u, 2u, 4u }) {
+            if ((i & bit) != 0) continue;
+            const auto& a = corners[i];
+            const auto& b = corners[i | bit];
+            const auto da = depth_distances(a);
+            const auto db = depth_distances(b);
+            double start = 0.0;
+            double end = 1.0;
+            for (size_t plane = 0; plane < da.size(); ++plane) {
+                if (da[plane] < 0.0 && db[plane] < 0.0) {
+                    end = -1.0;
+                    break;
+                }
+                if (da[plane] < 0.0) {
+                    start = std::max(start, da[plane] / (da[plane] - db[plane]));
+                } else if (db[plane] < 0.0) {
+                    end = std::min(end, da[plane] / (da[plane] - db[plane]));
+                }
+            }
+            if (start <= end) {
+                accumulate(a + (b - a) * start);
+                accumulate(a + (b - a) * end);
+            }
+        }
+    }
+    if (bounds[0] > bounds[2] || bounds[1] > bounds[3]) return std::nullopt;
+    return bounds;
+}
+
+std::optional<std::array<double, 4>>
+ComputeModelBounds2D(const WPSceneScriptHost::Opaque* opaque, const SceneObject& owner,
+                      const Eigen::Matrix4d& clip) {
+    if (const auto& data = owner.ModelData()) {
+        if (data->Shapes().empty()) return std::nullopt;
+        const auto& bounds = data->Bounds();
+        return ComputeBoxBounds2D(ResolveLayerModelTransform(opaque, owner.LayerNode()),
+                                   bounds.min, bounds.max, clip);
+    }
+    std::optional<std::array<double, 4>> result;
+    for (auto* chunk : owner.RuntimeNodes()) {
+        const auto* mesh = chunk->Mesh();
+        if (mesh == nullptr || ! mesh->HasBounds()) continue;
+        const auto bounds = ComputeBoxBounds2D(
+            ResolveLayerModelTransform(opaque, chunk) *
+                mesh->GeometryTransform().matrix().cast<double>(),
+            mesh->BoundsMin(), mesh->BoundsMax(), clip);
+        if (! bounds) continue;
+        if (! result) {
+            result = bounds;
+        } else {
+            (*result)[0] = std::min((*result)[0], (*bounds)[0]);
+            (*result)[1] = std::min((*result)[1], (*bounds)[1]);
+            (*result)[2] = std::max((*result)[2], (*bounds)[2]);
+            (*result)[3] = std::max((*result)[3], (*bounds)[3]);
+        }
+    }
+    return result;
+}
+
+std::optional<std::array<double, 4>>
 ComputeCursorTargetBounds2D(const WPSceneScriptHost::Opaque* opaque,
                             const WPSceneScriptRegistration& registration,
                             const Eigen::Matrix4d*           clip) {
     const auto* object = opaque->scene->FindSceneObject(registration.object_id);
     auto* node = object != nullptr ? object->LayerNode() : nullptr;
     if (node == nullptr) return std::nullopt;
+    if (object->Kind() == SceneObjectKind::Model) {
+        return ComputeModelBounds2D(opaque, *object, *clip);
+    }
 
     if (auto mesh_bounds = ComputeNodeBounds2D(opaque, node, clip);
         mesh_bounds.has_value()) {
@@ -4252,12 +4353,17 @@ bool InstanceReceivesCursor(const WPSceneScriptHost::Opaque* opaque, const Scrip
         return false;
     }
 
-    // Perspective scenes share one view camera for every layer, so the cursor test happens in
-    // clip space: quad corners project through the view, the cursor arrives as its clip-space
-    // position. Orthographic scenes keep the historical world-plane comparison.
+    // Models can select an auxiliary perspective destination in an orthographic scene. Always
+    // project their root bounds with the draw calculation; other layer kinds retain their
+    // established scene-perspective versus world-plane cursor coordinates.
     Eigen::Matrix4d        clip_matrix;
     const Eigen::Matrix4d* clip = nullptr;
-    if (cursor.perspective && opaque != nullptr && opaque->scene != nullptr &&
+    const auto* owner = opaque->scene->FindSceneObject(layer_id);
+    const bool is_model = owner != nullptr && owner->Kind() == SceneObjectKind::Model;
+    if (is_model) {
+        clip_matrix = GetShaderUpdater(opaque)->ResolveModelViewProjectionForInput(owner->LayerNode());
+        clip = &clip_matrix;
+    } else if (cursor.perspective && opaque != nullptr && opaque->scene != nullptr &&
         opaque->scene->activeCamera != nullptr && opaque->scene->activeCamera->IsPerspective()) {
         clip_matrix = opaque->scene->activeCamera->GetViewProjectionMatrix();
         clip        = &clip_matrix;
@@ -4267,8 +4373,15 @@ bool InstanceReceivesCursor(const WPSceneScriptHost::Opaque* opaque, const Scrip
     if (! bounds.has_value()) return false;
     const double cursor_x = clip != nullptr ? cursor.ndc_x : cursor.world_x;
     const double cursor_y = clip != nullptr ? cursor.ndc_y : cursor.world_y;
-    return cursor_x >= (*bounds)[0] && cursor_x <= (*bounds)[2] &&
-           cursor_y >= (*bounds)[1] && cursor_y <= (*bounds)[3];
+    const bool hit = cursor_x >= (*bounds)[0] && cursor_x <= (*bounds)[2] &&
+                     cursor_y >= (*bounds)[1] && cursor_y <= (*bounds)[3];
+    if (is_model && std::getenv("WESCENE_TRACE_MODEL_INPUT") != nullptr) {
+        LOG_INFO("SceneModelCursorBounds: layer=%d perspective=%s cursor=[%.6f %.6f] "
+                 "bounds=[%.6f %.6f %.6f %.6f] hit=%s",
+                 layer_id, owner->ModelPerspective() ? "true" : "false", cursor_x, cursor_y,
+                 (*bounds)[0], (*bounds)[1], (*bounds)[2], (*bounds)[3], hit ? "true" : "false");
+    }
+    return hit;
 }
 
 JSValue MakeCursorEventObject(JSContext* context, const CursorPositionState& cursor,
@@ -4536,6 +4649,9 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
 
     if (property_name == "name") return WPDynamicValue(object->Name());
     if (property_name == "visible") return WPDynamicValue(object->LocalVisible());
+    if (property_name == "perspective" && object->Kind() == SceneObjectKind::Model) {
+        return WPDynamicValue(object->ModelPerspective());
+    }
     if (const auto* modulation = object->ModulationState()) {
         // A property's value is retained on the owner; neither an empty effect list nor a private
         // draw's camera changes this read.
@@ -4670,6 +4786,15 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id
     auto* object = opaque->scene->FindSceneObject(layer_id);
     if (object == nullptr || object->RuntimeTransform() == nullptr) return false;
     auto* node = object->LayerNode();
+
+    if (property_name == "perspective" && object->Kind() == SceneObjectKind::Model) {
+        bool perspective = false;
+        if (! value.tryGet(&perspective)) return false;
+        // Projection belongs to this owner and is evaluated for each draw and cursor query.
+        // Shared model data, the scene camera and graph topology do not change with this bit.
+        object->SetModelPerspective(perspective);
+        return true;
+    }
 
     if (property_name == "name") {
         std::string name;
@@ -6092,6 +6217,11 @@ JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValue
 
     std::string member_name;
     if (! ReadJSString(context, argv[1], &member_name)) return JS_FALSE;
+    if (member_name == "perspective") {
+        const auto* owner = opaque != nullptr && opaque->scene != nullptr
+            ? opaque->scene->FindSceneObject(node_id) : nullptr;
+        return JS_NewBool(context, owner != nullptr && owner->Kind() == SceneObjectKind::Model);
+    }
     if (member_name == "originalOrigin") {
         // Report originalOrigin as a real layer API only when the layer still has an initial
         // configuration record. That keeps deleted/dynamic lookup failures observable while
@@ -7766,6 +7896,8 @@ CursorPositionState ComputeCursorPositionState(const WPSceneScriptHost::Opaque* 
 
     const float normalized_x = std::clamp(opaque->scene->mousePositionNormalized[0], 0.0f, 1.0f);
     const float normalized_y = std::clamp(opaque->scene->mousePositionNormalized[1], 0.0f, 1.0f);
+    state.ndc_x = normalized_x * 2.0 - 1.0;
+    state.ndc_y = 1.0 - normalized_y * 2.0;
     // input.cursorScreenPosition shares its coordinate frame with engine.screenResolution:
     // scripts divide one by the other to normalize the pointer. Use the published output size
     // and only fall back to the authored canvas before the surface size is known.
@@ -8740,6 +8872,7 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
     if (! Ready()) return;
 
     ProcessPendingSceneLayerDestroy(m_impl);
+    ProcessPendingSceneModelRefresh(*m_impl);
     m_impl->runtime_seconds += std::max(0.0, frame_time);
 
     JSContext* context = m_impl->runtime.context;
@@ -8847,6 +8980,9 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
         JS_FreeValue(context, result);
     }
     m_impl->current_running_instance = 0;
+    // Timers and nested initialization can replace models during this frame. Drain only after
+    // all script iterators and callback references have left scope, before render preparation.
+    ProcessPendingSceneModelRefresh(*m_impl);
 }
 
 void WPSceneScriptHost::ApplyAudioSamples(const std::vector<float>& audio_samples) {

@@ -329,6 +329,40 @@ JSValue NativeApplyModelData(JSContext* context, JSValueConst receiver, int argc
         return JS_ThrowOutOfMemory(context);
     }
 }
+
+JSValue NativeReplaceModelData(JSContext* context, JSValueConst receiver, int argc,
+                               JSValueConst* argv) {
+    auto* opaque = static_cast<WPSceneScriptHost::Opaque*>(JS_GetContextOpaque(context));
+    if (opaque->execution_phase == SceneScriptExecutionPhase::Update) {
+        return JS_ThrowTypeError(context, "replaceData is not available in an update callback");
+    }
+    const auto* token = ModelToken(context, receiver);
+    if (token == nullptr) return JS_EXCEPTION;
+    auto model = opaque->scene->modelData.Find(*token);
+    if (! model) return JS_ThrowTypeError(context, "replaceData: model resource has been released");
+    if (argc < 1) return JS_ThrowTypeError(context, "replaceData requires shape updates");
+    try {
+        SceneModelDataUpdate data;
+        if (! ReadModelUpdate(context, argv[0], data)) return JS_EXCEPTION;
+        // A material callback can replace the very resource it is evaluating. Publish CPU data
+        // now, but retire/re-register draw materials only outside JS dispatch. Queue before
+        // publication so a later shape error still refreshes earlier structural changes. The
+        // frame drain compares owner revisions, making unchanged/payload-only requests cheap.
+        opaque->pending_model_refresh_tokens.insert(*token);
+        std::string error;
+        const bool succeeded = model->ReplaceData(data, error);
+        if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+            LOG_INFO("SceneModelDataReplace: token=%u shapes=%zu revision=%llu success=%s",
+                     *token, model->Shapes().size(),
+                     static_cast<unsigned long long>(model->StructureRevision()),
+                     succeeded ? "true" : "false");
+        }
+        if (! succeeded) return JS_ThrowTypeError(context, "replaceData: %s", error.c_str());
+        return JS_UNDEFINED;
+    } catch (const std::bad_alloc&) {
+        return JS_ThrowOutOfMemory(context);
+    }
+}
 } // namespace
 
 void RegisterSceneModelDataBindings(WPSceneScriptHost::Opaque& opaque) {
@@ -341,6 +375,8 @@ void RegisterSceneModelDataBindings(WPSceneScriptHost::Opaque& opaque) {
                        JS_NewCFunction(context, ModelToConfigString, "toConfigString", 0));
     JS_SetPropertyStr(context, prototype.Get(), "applyData",
                        JS_NewCFunction(context, NativeApplyModelData, "applyData", 1));
+    JS_SetPropertyStr(context, prototype.Get(), "replaceData",
+                       JS_NewCFunction(context, NativeReplaceModelData, "replaceData", 1));
     ModelJSValue constructor(context,
                              JS_NewCFunction2(context, ModelConstructor, "IModelData", 0,
                                               JS_CFUNC_constructor, 0));

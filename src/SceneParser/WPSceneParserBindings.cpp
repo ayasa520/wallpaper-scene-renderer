@@ -706,6 +706,16 @@ void RegisterImageCompositionBindings(ParseContext& context, const nlohmann::jso
         context, object_json, "copybackground", WPDynamicValue::Type::Boolean);
 }
 
+void RegisterModelPerspectiveBindings(ParseContext& context, const nlohmann::json& object_json) {
+    if (! object_json.contains("model") || object_json.at("model").is_null()) return;
+    RegisterScenePropertyBinding(
+        context, object_json, "perspective", WPDynamicValue::Type::Boolean);
+    RegisterScenePropertyAnimationBinding(
+        context, object_json, "perspective", WPDynamicValue::Type::Boolean);
+    RegisterSceneScriptBinding(
+        context, object_json, "perspective", WPDynamicValue::Type::Boolean);
+}
+
 void RegisterSoundVolumeBindings(ParseContext& context, const nlohmann::json& object_json) {
     if (! object_json.contains("sound") || ! object_json.at("sound").is_array()) return;
     // Keep cold loading and dynamic creation on one complete property-registration path.
@@ -767,6 +777,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
 
     for (const auto& object_json : json.at("objects")) {
         RegisterImageCompositionBindings(context, object_json);
+        RegisterModelPerspectiveBindings(context, object_json);
         RegisterScenePropertyBinding(
             context, object_json, "visible", WPDynamicValue::Type::Boolean);
         RegisterScenePropertyBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
@@ -980,6 +991,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
 
 void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& object_json) {
     RegisterImageCompositionBindings(context, object_json);
+    RegisterModelPerspectiveBindings(context, object_json);
     RegisterScenePropertyBinding(context, object_json, "visible", WPDynamicValue::Type::Boolean);
     RegisterScenePropertyBinding(context, object_json, "origin", WPDynamicValue::Type::Float3);
     RegisterScenePropertyBinding(context, object_json, "angles", WPDynamicValue::Type::Float3);

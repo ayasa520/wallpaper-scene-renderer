@@ -149,6 +149,7 @@ void LoadUserShaderValue(wallpaper::SceneMaterial& material,
 
 // Defined in WPSceneParserModel.cpp; the core parser dispatches model objects into it.
 void ParseModelObj(ParseContext& context, WPModelObject& model_obj);
+void RefreshModelObj(ParseContext& context, wallpaper::SceneObject& owner);
 
 // Defined in WPSceneParser.cpp; shared with the bindings unit.
 bool IsTextLayerObjectJson(const nlohmann::json& object_json);

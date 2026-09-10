@@ -39,5 +39,7 @@ bool CreateDynamicSceneLayer(Scene&                                      scene,
                              int32_t*                                    out_layer_id                         = nullptr);
 
 bool ConfigureSceneVolumetrics(Scene& scene, fs::VFS& vfs);
+bool RefreshGeneratedSceneModelLayer(Scene& scene, int32_t layer_id,
+                                     const UserPropertyMap* user_properties);
 bool ConfigureSceneBloom(Scene& scene, fs::VFS& vfs);
 } // namespace wallpaper

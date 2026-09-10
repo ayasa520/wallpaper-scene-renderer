@@ -380,6 +380,19 @@ public:
         auto& owner = context_.scene->EnsureSceneObject(model_obj_.id);
         owner.SetModelData(model_data_);
         owner.SetModelPerspective(model_obj_.perspective);
+        MaterializeChunks();
+    }
+
+    void Refresh(std::shared_ptr<SceneNode> root) {
+        // Only chunk resources are being replaced. Re-registering the root would reset its
+        // transform/parent binding and replace the identity addressed by live layer scripts.
+        root_ = std::move(root);
+        MaterializeChunks();
+    }
+
+private:
+    void MaterializeChunks() {
+        auto& owner = context_.scene->EnsureSceneObject(model_obj_.id);
         owner.SetReceivesReflection(false);
         const auto order = ModelChunkOrder::Build(chunks_, material_loader_, model_obj_);
         AppendChunks(order);
@@ -387,9 +400,9 @@ public:
         ApplyCastsShadows(root_.get(), model_obj_.castshadow);
 
         context_.scene->ApplyLayerVisibility(model_obj_.id);
+        if (model_data_) owner.SetModelDataRevision(model_data_->StructureRevision());
     }
 
-private:
     const nlohmann::json* SidecarJson() const {
         return sidecar_json_.has_value() ? &*sidecar_json_ : nullptr;
     }
@@ -551,7 +564,28 @@ private:
     WPPuppetLayer                 shared_puppet_pose_;
 };
 
+std::vector<ModelGeometryChunk> GeneratedModelChunks(const SceneModelData& model_data) {
+    std::vector<ModelGeometryChunk> chunks;
+    chunks.reserve(model_data.Shapes().size());
+    for (const auto& shape : model_data.Shapes()) {
+        auto mesh = std::make_shared<SceneMesh>(shape.geometry->Dynamic());
+        mesh->ChangeMeshDataFrom(*shape.geometry);
+        chunks.push_back({ shape.material, std::move(mesh) });
+    }
+    return chunks;
+}
+
 } // namespace
+
+void RefreshModelObj(ParseContext& context, SceneObject& owner) {
+    const auto root = context.object_nodes.at(owner.Id());
+    WPModelObject model_obj;
+    model_obj.id = owner.Id();
+    model_obj.name = owner.Name();
+    model_obj.castshadow = root->CastsShadows();
+    const auto chunks = GeneratedModelChunks(*owner.ModelData());
+    ModelLayerMaterializer(context, model_obj, chunks, nullptr, owner.ModelData()).Refresh(root);
+}
 
 void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
     if (model_obj.model_token != 0) {
@@ -561,13 +595,7 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
                       model_obj.model_token, model_obj.id);
             return;
         }
-        std::vector<ModelGeometryChunk> chunks;
-        chunks.reserve(model_data->Shapes().size());
-        for (const auto& shape : model_data->Shapes()) {
-            auto mesh = std::make_shared<SceneMesh>(shape.geometry->Dynamic());
-            mesh->ChangeMeshDataFrom(*shape.geometry);
-            chunks.push_back({ shape.material, std::move(mesh) });
-        }
+        const auto chunks = GeneratedModelChunks(*model_data);
         ModelLayerMaterializer(context, model_obj, chunks, nullptr, model_data).Materialize();
         LOG_INFO("ModelDataLayer: token=%u layer=%d name='%s' shapes=%zu perspective=%s",
                  model_obj.model_token, model_obj.id, model_obj.name.c_str(), chunks.size(),

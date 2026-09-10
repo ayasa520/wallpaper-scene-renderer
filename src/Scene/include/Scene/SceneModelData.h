@@ -69,20 +69,24 @@ public:
     static std::shared_ptr<SceneModelData> Create(const SceneModelDataUpdate& data,
                                                  std::string& error);
     bool ApplyData(const SceneModelDataUpdate& data, std::string& error);
+    bool ReplaceData(const SceneModelDataUpdate& data, std::string& error);
 
     const std::vector<Shape>& Shapes() const { return m_shapes; }
     const SceneModelBounds& Bounds() const { return m_bounds; }
     uint32_t Token() const { return m_token; }
+    uint64_t StructureRevision() const { return m_structure_revision; }
 
 private:
     friend class SceneModelDataRegistry;
     SceneModelData() = default;
+    bool UpdateData(const SceneModelDataUpdate& data, bool replace, std::string& error);
     void RefreshBounds();
 
     std::vector<Shape> m_shapes;
     std::optional<SceneModelBounds> m_declared_bounds;
     SceneModelBounds m_bounds;
     uint32_t m_token { 0 };
+    uint64_t m_structure_revision { 1 };
 };
 
 // A scene owns the script reference, and each model layer owns a shared resource reference.
