@@ -2113,6 +2113,11 @@ bool ApplyParticlePropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer
 
     auto& scene = *opaque->scene;
 
+    // Shared property names do not imply a particle owner. Establish subsystem membership
+    // before decoding their values: an image's float2 size is valid image input, not an
+    // invalid scalar particle override. Actual particle owners still use the validators below.
+    if (scene.GetLayerRuntimeParticleSubsystems(layer_id).empty()) return false;
+
     if (IsParticleColorProperty(property_name)) {
         const auto color = NormalizeParticleColorValue(property_name, value);
         if (! color.has_value()) {
@@ -4034,8 +4039,11 @@ bool UpdateQuadMeshSize(SceneMesh* mesh, const std::array<float, 2>& size) {
     const float      right    = size[0] * 0.5f;
     const float      bottom   = -(size[1] * 0.5f);
     const float      top      = size[1] * 0.5f;
+    // Resize in the same corner order used when constructing the card. UVs and strip indices
+    // remain attached to their original vertices, so swapping top and bottom here would both
+    // mirror the sampled image vertically and reverse its front face under material culling.
     const std::array position = {
-        left, bottom, 0.0f, left, top, 0.0f, right, bottom, 0.0f, right, top, 0.0f,
+        left, top, 0.0f, left, bottom, 0.0f, right, top, 0.0f, right, bottom, 0.0f,
     };
 
     if (! vertex.SetVertex(WE_IN_POSITION, position)) return false;
