@@ -1080,11 +1080,25 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                      scene.IsLayerOffscreenDependencySource(imgeff->Owner().Id())
                          ? "true" : "false",
                      imgeff->VisibleCompositionStepCount());
+            // Text utility publication enables owner-selected depth testing from scene version
+            // 2 onward, independently of the utility shader family's version-3 transition.
+            // Select this per invocation rather than changing the shared material: live depth
+            // and layout updates rebuild these descriptions, unlike the direct background's
+            // separately retained first-draw selection. Disabled owners and earlier versions
+            // keep the utility material's own state. Writing and attachment ownership remain
+            // independent, so private/composition color targets do not acquire scene depth.
+            std::optional<bool> publication_depth_test {};
+            if (const auto* text = imgeff->Owner().LayerNode()->Text();
+                text != nullptr && scene.authoredVersion >= 2 &&
+                text->object.depthtest == "enabled") {
+                publication_depth_test = true;
+            }
             AddDrawPass(publication, inherited_output, imgId, extra, final_composite_gate,
                         DrawPassOptions {
                             .alpha_write_policy = route.compose_source
                                 ? route.compose_source_alpha_write_policy
                                 : AlphaWritePolicy::Preserve,
+                            .depth_test_override = publication_depth_test,
                             .camera_override = compose_camera
                                 ? source_route.active_compose_source_camera : std::string(),
                             .use_active_camera_for_parallax = compose_camera,
