@@ -10,6 +10,7 @@
 #include "Utils/Logging.h"
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
+#include "RenderTargetOps.hpp"
 #include "PassCommon.hpp"
 #include "Msaa.hpp"
 #include "Interface/IImageParser.h"
@@ -76,59 +77,6 @@ VkPrimitiveTopology ToTopology(const wallpaper::SceneMesh& mesh) {
     }
     assert(false);
     return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-}
-
-std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent,
-                                                        VkSampleCountFlagBits samples) {
-    // Depth-capable shader draws share storage by output, independently of material selection.
-    // Main/reflection stages own initialization; model-private outputs initialize at their first
-    // draw. Ordinary effect render targets stay color-only and never request this allocation.
-    VmaImageParameters image;
-    VkImageCreateInfo  info {
-        .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext                 = nullptr,
-        .imageType             = VK_IMAGE_TYPE_2D,
-        .format                = VK_FORMAT_D32_SFLOAT,
-        .extent                = extent,
-        .mipLevels             = 1,
-        .arrayLayers           = 1,
-        .samples               = samples,
-        .tiling                = VK_IMAGE_TILING_OPTIMAL,
-        // SAMPLED + TRANSFER_SRC: the volumetrics fill pass blits this scene depth
-        // into `_rt_volumetricsSingle`.
-        .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-    image.extent       = extent;
-    image.mipmap_level = 1;
-    image.samples      = static_cast<uint>(samples);
-
-    VmaAllocationCreateInfo vma_info {};
-    vma_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-    VVK_CHECK_ACT(return std::nullopt,
-                         vvk::CreateImage(device.vma_allocator(), info, vma_info, image.handle));
-
-    VkImageViewCreateInfo view_info {
-        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext    = nullptr,
-        .image    = *image.handle,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = VK_FORMAT_D32_SFLOAT,
-        .subresourceRange =
-            VkImageSubresourceRange {
-                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
-                .baseMipLevel   = 0,
-                .levelCount     = 1,
-                .baseArrayLayer = 0,
-                .layerCount     = 1,
-            },
-    };
-    VVK_CHECK_ACT(return std::nullopt, device.handle().CreateImageView(view_info, image.view));
-    return image;
 }
 
 } // namespace
@@ -998,85 +946,25 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
     return false;
 }
 
-VmaImageParameters* QuerySharedModelDepthImage(const Device& device, RenderingResources& rr,
-                                               ShaderDrawData& desc) {
-    auto&      attachment = rr.model_depth_images[desc.output];
-    auto&      depth      = attachment.image;
-    const bool missing    = ! depth.view || ! depth.handle;
-    const bool wrong_size = depth.extent.width != desc.vk_output.extent.width ||
-                            depth.extent.height != desc.vk_output.extent.height ||
-                            depth.extent.depth != desc.vk_output.extent.depth;
-    const bool wrong_samples = depth.samples != static_cast<uint>(desc.sample_count);
-    if (missing || wrong_size || wrong_samples) {
-        // A single output can receive many model chunk passes. Recreate the shared depth image only
-        // when the output extent or sample count changes, then later chunks can load the same depth
-        // written by the earlier chunks in render-graph order.
-        auto replacement = CreateModelDepthImage(device, desc.vk_output.extent, desc.sample_count);
-        if (! replacement.has_value()) {
-            LOG_ERROR("CustomShaderPassRefresh: cannot create shared model depth image node='%s' "
-                      "output='%s' extent=[%u,%u] samples=%u",
-                      desc.draw.Valid() ? desc.draw.Name().c_str() : "<null>",
-                      desc.output.c_str(),
-                      desc.vk_output.extent.width,
-                      desc.vk_output.extent.height,
-                      static_cast<unsigned>(desc.sample_count));
-            return nullptr;
-        }
-        // Record both generations before releasing the old view. Framebuffers are prepared before
-        // graph execution, so this opt-in trace can identify an allocation replaced after another
-        // draw has bound it, including output/sample mismatches that ordinary draw logs omit.
-        if (std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
-            LOG_INFO("SceneDepthAttachmentAllocate: layer=%d node='%s' output='%s' "
-                     "old-image=%p old-view=%p old-extent=%ux%ux%u old-samples=%u "
-                     "new-image=%p new-view=%p new-extent=%ux%ux%u new-samples=%u",
-                     desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
-                     desc.output.c_str(),
-                     depth.handle ? reinterpret_cast<void*>(*depth.handle) : nullptr,
-                     depth.view ? reinterpret_cast<void*>(*depth.view) : nullptr,
-                     depth.extent.width, depth.extent.height, depth.extent.depth, depth.samples,
-                     reinterpret_cast<void*>(*replacement->handle),
-                     reinterpret_cast<void*>(*replacement->view),
-                     replacement->extent.width, replacement->extent.height,
-                     replacement->extent.depth, replacement->samples);
-        }
-        depth = std::move(replacement.value());
-        attachment.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        rr.model_depth_resolved.erase(desc.output);
-        rr.model_depth_dirty.erase(desc.output);
-    }
-    if (desc.sample_count > VK_SAMPLE_COUNT_1_BIT) {
-        auto&      resolved      = rr.model_depth_resolved[desc.output];
-        const bool res_missing   = ! resolved.view || ! resolved.handle;
-        const bool res_wrong_size = resolved.extent.width != desc.vk_output.extent.width ||
-                                    resolved.extent.height != desc.vk_output.extent.height;
-        if (res_missing || res_wrong_size) {
-            auto replacement =
-                CreateModelDepthImage(device, desc.vk_output.extent, VK_SAMPLE_COUNT_1_BIT);
-            if (replacement.has_value()) {
-                resolved = std::move(replacement.value());
-            }
-        }
-    }
-    return &depth;
+ShaderDrawAttachmentDescription wallpaper::vulkan::SceneDepthAttachmentDescription(bool clear_depth) {
+    const auto load_op = clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    return ShaderDrawAttachmentDescription {
+        .format           = VK_FORMAT_D32_SFLOAT,
+        .depth_load_op    = load_op,
+        .depth_store_op   = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencil_load_op  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencil_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initial_layout   = clear_depth ? VK_IMAGE_LAYOUT_UNDEFINED
+                                        : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .final_layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .cache_tag        = "model-depth",
+    };
 }
 
 ShaderDrawAttachmentDescription ResolveShaderDrawAttachment(
     const ShaderDrawData& desc, const ShaderDrawExtension* extension) {
     if (desc.shared_depth) {
-        const auto depth_load_op = desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                    : VK_ATTACHMENT_LOAD_OP_LOAD;
-        return ShaderDrawAttachmentDescription {
-            .format           = VK_FORMAT_D32_SFLOAT,
-            .depth_load_op    = depth_load_op,
-            .depth_store_op   = VK_ATTACHMENT_STORE_OP_STORE,
-            .stencil_load_op  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .stencil_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .initial_layout   = depth_load_op == VK_ATTACHMENT_LOAD_OP_LOAD
-                                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                                    : VK_IMAGE_LAYOUT_UNDEFINED,
-            .final_layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            .cache_tag        = "model-depth",
-        };
+        return SceneDepthAttachmentDescription(desc.clear_depth);
     }
     return extension != nullptr ? extension->attachmentDescription()
                                 : ShaderDrawAttachmentDescription {};
@@ -1100,7 +988,8 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
     }
     const auto attachment = ResolveShaderDrawAttachment(desc, extension);
     if (desc.shared_depth) {
-        desc.depth_stencil_image_ref = QuerySharedModelDepthImage(device, rr, desc);
+        desc.depth_stencil_image_ref = AcquireSceneDepthImage(
+            device, rr, desc.output, desc.vk_output.extent, desc.sample_count);
     } else if (attachment.enabled() && extension != nullptr) {
         desc.depth_stencil_image_ref = extension->acquireAttachment(device, rr, desc);
     } else {

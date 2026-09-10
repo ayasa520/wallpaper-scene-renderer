@@ -42,13 +42,19 @@ public:
         bool reflection_snapshot { false };
         std::string effect_snapshot_camera;
         AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
+        // Capture graph-selected raster state by value. Live text properties mutate the same
+        // primitive in both graph generations, so comparing primitive pointers loses the change.
+        bool shared_depth { false };
+        bool glyph_depth_test { false };
 
         ImageParameters          vk_output;
         ImageParameters          vk_resolve;
+        VmaImageParameters*       depth_image { nullptr };
         VkSampleCountFlagBits    sample_count { VK_SAMPLE_COUNT_1_BIT };
         bool                     resolve_msaa { false };
         vvk::Framebuffer         framebuffer;
         PipelineParameters       pipeline;
+        PipelineParameters       background_pipeline;
         StagingBufferRef         ubo_buf;
         ImageSlotsRef            background_texture;
         std::vector<ImageSlotsRef> page_textures;
@@ -84,7 +90,7 @@ private:
     // pass instance absorb atlas page count and quad changes in place.
     bool ensureMeshBuffers(SceneMesh&, MeshBuffers&, RenderingResources&);
     bool refreshTextures(const Device&);
-    bool recreateFramebuffer(const Device&);
+    bool recreateFramebuffer(const Device&, RenderingResources&);
 
     Desc m_desc;
     // Store the node identity independently of the raw node pointer because an old text pass can be

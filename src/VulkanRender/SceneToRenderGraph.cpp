@@ -720,6 +720,14 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
                 ? options.alpha_write_policy
                 : AlphaWritePolicy::Preserve;
 
+            // Direct glyphs test the depth already owned by the main/reflection destination.
+            // Private source/composition images stay color-only even when the text owner enables
+            // testing. Background and effect-publication state are separate consumers: this
+            // captures only the glyph selection, without changing their material policy.
+            pdesc.shared_depth = output_key == SpecTex_Default || output_key == SpecTex_Reflection;
+            pdesc.glyph_depth_test = pdesc.shared_depth &&
+                node->Text()->object.depthtest == "enabled";
+
             auto* output_node =
                 builder.createTexNode(rg::TexNode::Desc { .name = output_key,
                                                           .key = output_key,

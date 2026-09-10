@@ -118,6 +118,8 @@ struct ShaderDrawAttachmentDescription {
     bool enabled() const { return format != VK_FORMAT_UNDEFINED; }
 };
 
+ShaderDrawAttachmentDescription SceneDepthAttachmentDescription(bool clear_depth);
+
 struct ShaderDrawPipelineContext {
     const ShaderDrawData& data;
     const SceneMesh&      mesh;

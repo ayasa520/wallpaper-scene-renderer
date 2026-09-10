@@ -1,9 +1,113 @@
 #include "RenderTargetOps.hpp"
 
 #include "Resource.hpp"
+#include "Utils/Logging.h"
+#include "Vulkan/Device.hpp"
+
+#include <cstdlib>
+#include <optional>
 
 namespace wallpaper::vulkan
 {
+namespace
+{
+std::optional<VmaImageParameters> CreateSceneDepthImage(const Device& device, VkExtent3D extent,
+                                                       VkSampleCountFlagBits samples) {
+    VmaImageParameters image;
+    VkImageCreateInfo info {
+        .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType             = VK_IMAGE_TYPE_2D,
+        .format                = VK_FORMAT_D32_SFLOAT,
+        .extent                = extent,
+        .mipLevels             = 1,
+        .arrayLayers           = 1,
+        .samples               = samples,
+        .tiling                = VK_IMAGE_TILING_OPTIMAL,
+        // Scene depth is both an attachment and a source for depth-sampling consumers. Keep
+        // transfer access for stage clears and the existing volumetric depth resolve path.
+        .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    image.extent       = extent;
+    image.mipmap_level = 1;
+    image.samples      = static_cast<uint>(samples);
+
+    VmaAllocationCreateInfo allocation {};
+    allocation.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VVK_CHECK_ACT(return std::nullopt,
+                  vvk::CreateImage(device.vma_allocator(), info, allocation, image.handle));
+    VkImageViewCreateInfo view_info {
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image    = *image.handle,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format   = VK_FORMAT_D32_SFLOAT,
+        .subresourceRange = VkImageSubresourceRange {
+            .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    VVK_CHECK_ACT(return std::nullopt, device.handle().CreateImageView(view_info, image.view));
+    return image;
+}
+} // namespace
+
+VmaImageParameters* AcquireSceneDepthImage(const Device& device, RenderingResources& rr,
+                                          std::string_view target, VkExtent3D extent,
+                                          VkSampleCountFlagBits samples) {
+    const std::string key(target);
+    auto& attachment = rr.model_depth_images[key];
+    auto& depth = attachment.image;
+    const bool missing = !depth.view || !depth.handle;
+    const bool wrong_size = depth.extent.width != extent.width ||
+                            depth.extent.height != extent.height ||
+                            depth.extent.depth != extent.depth;
+    const bool wrong_samples = depth.samples != static_cast<uint>(samples);
+    if (missing || wrong_size || wrong_samples) {
+        // Allocation is shared across draw kinds, not copied into each pass. Resource refresh
+        // drops destination framebuffers before replacing their views; the new allocation starts
+        // uninitialized so the stage clear/layout operation runs on this generation as well.
+        auto replacement = CreateSceneDepthImage(device, extent, samples);
+        if (!replacement.has_value()) {
+            LOG_ERROR("SceneDepthAttachment: cannot create output='%s' extent=[%u,%u] samples=%u",
+                      key.c_str(), extent.width, extent.height, static_cast<unsigned>(samples));
+            return nullptr;
+        }
+        if (std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+            LOG_INFO("SceneDepthAttachmentAllocate: output='%s' "
+                     "old-image=%p old-view=%p old-extent=%ux%ux%u old-samples=%u "
+                     "new-image=%p new-view=%p new-extent=%ux%ux%u new-samples=%u",
+                     key.c_str(),
+                     depth.handle ? reinterpret_cast<void*>(*depth.handle) : nullptr,
+                     depth.view ? reinterpret_cast<void*>(*depth.view) : nullptr,
+                     depth.extent.width, depth.extent.height, depth.extent.depth, depth.samples,
+                     reinterpret_cast<void*>(*replacement->handle),
+                     reinterpret_cast<void*>(*replacement->view),
+                     replacement->extent.width, replacement->extent.height,
+                     replacement->extent.depth, replacement->samples);
+        }
+        depth = std::move(replacement.value());
+        attachment.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        rr.model_depth_resolved.erase(key);
+        rr.model_depth_dirty.erase(key);
+    }
+    if (samples > VK_SAMPLE_COUNT_1_BIT) {
+        auto& resolved = rr.model_depth_resolved[key];
+        const bool res_missing = !resolved.view || !resolved.handle;
+        const bool res_wrong_size = resolved.extent.width != extent.width ||
+                                    resolved.extent.height != extent.height;
+        if (res_missing || res_wrong_size) {
+            auto replacement = CreateSceneDepthImage(device, extent, VK_SAMPLE_COUNT_1_BIT);
+            if (replacement.has_value()) resolved = std::move(replacement.value());
+        }
+    }
+    return &depth;
+}
 
 void ClearRenderTargetColor(vvk::CommandBuffer& cmd, const ImageParameters& image,
                             const VkClearColorValue& color, VkImageLayout final_layout) {

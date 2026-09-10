@@ -50,7 +50,7 @@ struct RenderingResources {
 
     std::shared_ptr<GraphicsPipelineStateCache> pipeline_cache;
 
-    // Main/reflection shader draws and model chunks share one depth buffer per output target.
+    // Main/reflection shader draws, model chunks and glyphs share one depth buffer per output target.
     // Depth storage belongs to that destination, not to a particular material or visible owner.
     // Ordinary effect FBOs remain color-only; masked meshes own separate stencil attachments.
     std::unordered_map<std::string, ModelDepthAttachment> model_depth_images;

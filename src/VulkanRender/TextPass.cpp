@@ -9,6 +9,7 @@
 #include "PassCommon.hpp"
 #include "Msaa.hpp"
 #include "Resource.hpp"
+#include "RenderTargetOps.hpp"
 #include "ShaderDrawCore.hpp"
 #include "WPSceneScriptMedia.hpp"
 
@@ -28,7 +29,8 @@ std::string TextPipelineCompatibilityKey(bool clear_before_draw,
                                          wallpaper::BlendMode blend_mode,
                                          wallpaper::AlphaWritePolicy alpha_write_policy,
                                          VkSampleCountFlagBits sample_count,
-                                         bool resolve_msaa) {
+                                         bool resolve_msaa,
+                                         bool shared_depth) {
     // Text PSOs are shared by render-pass compatibility plus the full GraphicsPipeline descriptor,
     // not by the layer that first requested them. This keeps visibility toggles on the same model
     // as engine-level PSO caches while still letting hidden text release atlas/framebuffer memory.
@@ -38,7 +40,9 @@ std::string TextPipelineCompatibilityKey(bool clear_before_draw,
            "|blend=" + std::to_string(static_cast<int>(blend_mode)) +
            "|alpha-policy=" + std::to_string(static_cast<int>(alpha_write_policy)) +
            "|samples=" + std::to_string(static_cast<int>(sample_count)) +
-           "|resolve=" + (resolve_msaa ? std::string("1") : std::string("0"));
+           "|resolve=" + (resolve_msaa ? std::string("1") : std::string("0")) +
+           "|depth-format=" + std::to_string(static_cast<int>(
+               shared_depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED));
 }
 
 int IntendedTextSampleCount(const wallpaper::Scene* scene, std::string_view output) {
@@ -156,7 +160,7 @@ struct PSInput {
 
 float4 main_ps(PSInput input) : SV_Target0 {
     // Glyph atlas pages use R8 coverage. The shared background texture is white in every channel,
-    // so reading red keeps glyph and background draws on the same dedicated text pipeline.
+    // so reading red keeps glyph and background draws on the same dedicated text shader.
     const float coverage = g_Texture0.Sample(g_Texture0_ww_sampler, input.v_TexCoord).r;
     return float4(input.v_Color.rgb, input.v_Color.a * coverage);
 }
@@ -263,7 +267,7 @@ bool LoadTextPassTexture(const Device&                        device,
     return !out_slots->slots.empty();
 }
 
-bool CreateTextPipelineForPrimitive(const Device&                         device,
+bool CreateTextPipelinesForPrimitive(const Device&                         device,
                                     RenderingResources&                   rr,
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
@@ -271,18 +275,11 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
                                     wallpaper::AlphaWritePolicy           alpha_write_policy,
                                     VkSampleCountFlagBits                 sample_count,
                                     bool                                  resolve_msaa,
+                                    bool                                  shared_depth,
+                                    bool                                  glyph_depth_test,
                                     std::string                           debug_name,
-                                    PipelineParameters&                   pipeline_parameters) {
-    auto render_pass = CreateShaderDrawRenderPass(
-        device.handle(),
-        VK_FORMAT_R8G8B8A8_UNORM,
-        clear_before_draw ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        {},
-        sample_count,
-        resolve_msaa);
-    if (!render_pass.has_value()) return false;
-
+                                    PipelineParameters&                   glyph_pipeline,
+                                    PipelineParameters&                   background_pipeline) {
     const auto compiled_shaders = CompileTextShaders();
     if (!compiled_shaders.has_value()) return false;
 
@@ -336,9 +333,10 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
     pipeline.toDefault();
     pipeline.multisample.rasterizationSamples =
         sample_count > VK_SAMPLE_COUNT_1_BIT ? sample_count : VK_SAMPLE_COUNT_1_BIT;
-    pipeline_parameters.debug_name = std::move(debug_name);
-    pipeline_parameters.cache_key = TextPipelineCompatibilityKey(
-        clear_before_draw, blend_mode, alpha_write_policy, sample_count, resolve_msaa);
+    // Both ordinary translucent and additive glyph coverage are read-only depth consumers.
+    // Enabling owner testing must not turn transparent atlas texels into depth writers.
+    pipeline.depth.depthWriteEnable = false;
+    pipeline.depth.depthCompareOp = VK_COMPARE_OP_GREATER;
     pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -350,7 +348,27 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
         pipeline.addStage(Uni_ShaderSpv(new ShaderSpv(*stage)));
     }
 
-    return pipeline.create(device, *render_pass, pipeline_parameters, rr.pipeline_cache.get());
+    const auto attachment = shared_depth ? SceneDepthAttachmentDescription(false)
+                                         : ShaderDrawAttachmentDescription {};
+    auto create_pipeline = [&](bool depth_test, const std::string& name,
+                               PipelineParameters& parameters) {
+        auto render_pass = CreateShaderDrawRenderPass(
+            device.handle(), VK_FORMAT_R8G8B8A8_UNORM,
+            clear_before_draw ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, attachment, sample_count, resolve_msaa);
+        if (!render_pass.has_value()) return false;
+        pipeline.depth.depthTestEnable = depth_test;
+        parameters.debug_name = name;
+        parameters.cache_key = TextPipelineCompatibilityKey(
+            clear_before_draw, blend_mode, alpha_write_policy, sample_count, resolve_msaa,
+            shared_depth);
+        return pipeline.create(device, *render_pass, parameters, rr.pipeline_cache.get());
+    };
+    if (!create_pipeline(glyph_depth_test, debug_name, glyph_pipeline)) return false;
+    // The opaque background has its own raster-state lifetime. Keep its existing selection
+    // independent from live glyph testing, while using a render-pass-compatible pipeline so
+    // it can draw into the same framebuffer without clearing or replacing shared scene depth.
+    return !glyph_depth_test || create_pipeline(false, debug_name + " background", background_pipeline);
 }
 
 std::array<float, 4> ResolveTextColor(const wallpaper::SceneTextPrimitive& primitive,
@@ -381,6 +399,8 @@ TextPass::TextPass(const Desc& desc)
     m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
+    m_desc.shared_depth        = desc.shared_depth;
+    m_desc.glyph_depth_test    = desc.glyph_depth_test;
     m_desc.camera_override     = desc.camera_override;
     m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
     m_desc.model_space         = desc.model_space;
@@ -409,6 +429,8 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
            m_desc.execute_when_hidden == next->m_desc.execute_when_hidden &&
            m_desc.clear_before_draw == next->m_desc.clear_before_draw &&
            m_desc.alpha_write_policy == next->m_desc.alpha_write_policy &&
+           m_desc.shared_depth == next->m_desc.shared_depth &&
+           m_desc.glyph_depth_test == next->m_desc.glyph_depth_test &&
            m_desc.camera_override == next->m_desc.camera_override &&
            m_desc.use_active_camera_for_parallax == next->m_desc.use_active_camera_for_parallax &&
            m_desc.model_space == next->m_desc.model_space &&
@@ -431,6 +453,8 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.clear_before_draw   = next->m_desc.clear_before_draw;
     m_desc.output              = next->m_desc.output;
     m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
+    m_desc.shared_depth        = next->m_desc.shared_depth;
+    m_desc.glyph_depth_test    = next->m_desc.glyph_depth_test;
     m_desc.camera_override     = next->m_desc.camera_override;
     m_desc.use_active_camera_for_parallax = next->m_desc.use_active_camera_for_parallax;
     m_desc.model_space         = next->m_desc.model_space;
@@ -477,7 +501,7 @@ bool TextPass::refreshTextures(const Device& device) {
     return true;
 }
 
-bool TextPass::recreateFramebuffer(const Device& device) {
+bool TextPass::recreateFramebuffer(const Device& device, RenderingResources& rr) {
     m_desc.framebuffer.reset();
     if (!m_desc.pipeline.pass || m_desc.vk_output.view == VK_NULL_HANDLE ||
         m_desc.vk_output.extent.width == 0 || m_desc.vk_output.extent.height == 0) {
@@ -497,17 +521,34 @@ bool TextPass::recreateFramebuffer(const Device& device) {
                   m_desc.output.c_str());
         return false;
     }
-    std::array<VkImageView, 2> attachments { m_desc.vk_output.view, m_desc.vk_resolve.view };
+    m_desc.depth_image = m_desc.shared_depth
+        ? AcquireSceneDepthImage(device, rr, m_desc.output, m_desc.vk_output.extent, m_desc.sample_count)
+        : nullptr;
+    if (m_desc.shared_depth && m_desc.depth_image == nullptr) return false;
+    std::array<VkImageView, 3> attachments { m_desc.vk_output.view, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    uint32_t attachment_count = 1;
+    if (m_desc.shared_depth) attachments[attachment_count++] = *m_desc.depth_image->view;
+    if (m_desc.resolve_msaa) attachments[attachment_count++] = m_desc.vk_resolve.view;
     VkFramebufferCreateInfo info {
         .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass      = *m_desc.pipeline.pass,
-        .attachmentCount = m_desc.resolve_msaa ? 2u : 1u,
+        .attachmentCount = attachment_count,
         .pAttachments    = attachments.data(),
         .width           = m_desc.vk_output.extent.width,
         .height          = m_desc.vk_output.extent.height,
         .layers          = 1,
     };
-    return device.handle().CreateFramebuffer(info, m_desc.framebuffer) == VK_SUCCESS;
+    const bool created = device.handle().CreateFramebuffer(info, m_desc.framebuffer) == VK_SUCCESS;
+    if (created && std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+        LOG_INFO("SceneTextDepthFramebuffer: layer=%d output='%s' framebuffer=%p "
+                 "color-view=%p depth-view=%p shared-depth=%s glyph-test=%s extent=%ux%u samples=%u",
+                 m_desc.layer_id, m_desc.output.c_str(), reinterpret_cast<void*>(*m_desc.framebuffer),
+                 reinterpret_cast<void*>(attachments[0]),
+                 m_desc.shared_depth ? reinterpret_cast<void*>(attachments[1]) : nullptr,
+                 m_desc.shared_depth ? "true" : "false", m_desc.glyph_depth_test ? "true" : "false",
+                 info.width, info.height, static_cast<unsigned>(m_desc.sample_count));
+    }
+    return created;
 }
 
 bool TextPass::ensureMeshBuffers(SceneMesh& mesh, MeshBuffers& buffers, RenderingResources& rr) {
@@ -622,7 +663,7 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
     const auto debug_name =
         "TextPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
-    if (!CreateTextPipelineForPrimitive(
+    if (!CreateTextPipelinesForPrimitive(
             device,
             rr,
             *primitive,
@@ -631,11 +672,14 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             m_desc.alpha_write_policy,
             m_desc.sample_count,
             m_desc.resolve_msaa,
+            m_desc.shared_depth,
+            m_desc.glyph_depth_test,
             debug_name,
-            m_desc.pipeline)) {
+            m_desc.pipeline,
+            m_desc.background_pipeline)) {
         return;
     }
-    if (!recreateFramebuffer(device)) return;
+    if (!recreateFramebuffer(device, rr)) return;
 
     rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
                                m_desc.ubo_buf,
@@ -690,7 +734,7 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
         "TextPassWarmup[node=" +
         (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
-    return CreateTextPipelineForPrimitive(device,
+    return CreateTextPipelinesForPrimitive(device,
                                           rr,
                                           *primitive,
                                           offscreen_output,
@@ -698,8 +742,11 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
                                           m_desc.alpha_write_policy,
                                           sample_count,
                                           resolve_msaa,
+                                          m_desc.shared_depth,
+                                          m_desc.glyph_depth_test,
                                           debug_name,
-                                          m_desc.pipeline);
+                                          m_desc.pipeline,
+                                          m_desc.background_pipeline);
 }
 
 void TextPass::dropOutputFramebuffers() { m_desc.framebuffer.reset(); }
@@ -774,7 +821,7 @@ void TextPass::refreshResources(Scene& scene, const Device& device, RenderingRes
         previous_output_extent.height != m_desc.vk_output.extent.height;
     const bool output_view_changed = previous_output_view != m_desc.vk_output.view;
     if (output_extent_changed || output_view_changed || !m_desc.framebuffer) {
-        if (!recreateFramebuffer(device)) {
+        if (!recreateFramebuffer(device, rr)) {
             setPrepared(false);
             return;
         }
@@ -874,7 +921,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                                  sizeof(uniforms) });
     };
 
-    auto bind_uniforms = [&]() {
+    auto bind_uniforms = [&](const PipelineParameters& pipeline) {
         VkDescriptorBufferInfo buffer_info {
             rr.dyn_buf->gpuBuf(),
             m_desc.ubo_buf.offset,
@@ -887,10 +934,10 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .pBufferInfo = &buffer_info,
         };
-        rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, write);
+        rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.layout, 0, write);
     };
 
-    auto bind_texture = [&](const ImageSlotsRef& slots) {
+    auto bind_texture = [&](const ImageSlotsRef& slots, const PipelineParameters& pipeline) {
         if (slots.slots.empty()) return;
         const auto& image = slots.getActive();
         VkDescriptorImageInfo image_info {
@@ -905,20 +952,20 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo = &image_info,
         };
-        rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, write);
+        rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.layout, 0, write);
     };
 
     const VkExtent2D output_extent {
         .width = m_desc.vk_output.extent.width,
         .height = m_desc.vk_output.extent.height,
     };
-    std::array<VkClearValue, 2> clear_values { m_desc.clear_value, {} };
+    std::array<VkClearValue, 3> clear_values { m_desc.clear_value, {}, {} };
     VkRenderPassBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = *m_desc.pipeline.pass,
         .framebuffer = *m_desc.framebuffer,
         .renderArea = VkRect2D { .offset = { 0, 0 }, .extent = output_extent },
-        .clearValueCount = m_desc.resolve_msaa ? 2u : 1u,
+        .clearValueCount = 1u + (m_desc.shared_depth ? 1u : 0u) + (m_desc.resolve_msaa ? 1u : 0u),
         .pClearValues = clear_values.data(),
     };
     if (trace_revision) {
@@ -934,7 +981,6 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                  primitive->object.opaquebackground ? "true" : "false");
     }
     rr.command.BeginRenderPass(begin_info, VK_SUBPASS_CONTENTS_INLINE);
-    rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
 
     VkViewport viewport {
         .x = 0.0f,
@@ -948,11 +994,14 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     rr.command.SetViewport(0, viewport);
     rr.command.SetScissor(0, scissor);
 
-    auto draw_mesh = [&](MeshBuffers& buffers, const ImageSlotsRef& texture, const std::array<float, 4>& color) {
+    auto draw_mesh = [&](MeshBuffers& buffers, const ImageSlotsRef& texture,
+                         const std::array<float, 4>& color, const PipelineParameters& pipeline,
+                         bool background) {
         if (buffers.draw_count == 0) return;
+        rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.handle);
         write_uniforms(color);
-        bind_uniforms();
-        bind_texture(texture);
+        bind_uniforms(pipeline);
+        bind_texture(texture, pipeline);
         auto gpu_buf = rr.dyn_buf->gpuBuf();
         for (usize binding_index = 0; binding_index < buffers.vertex_bufs.size(); binding_index++) {
             auto& subref = buffers.vertex_bufs[binding_index];
@@ -967,22 +1016,40 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         } else {
             rr.command.Draw(buffers.draw_count, 1, 0, 0);
         }
+        if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
+            // Record the submitted consumer, not just the owner property's readback. Including
+            // attachment and pipeline identity distinguishes live state replacement from atlas
+            // refresh and proves that main/reflection draws retain their destination's storage.
+            LOG_INFO("SceneTextDepthDraw: layer=%d output='%s' reflection=%s background=%s "
+                     "shared-depth=%s test=%s write=false depth-view=%p pipeline=%p samples=%u count=%u",
+                     m_desc.layer_id, m_desc.output.c_str(), m_desc.reflection_pass ? "true" : "false",
+                     background ? "true" : "false", m_desc.shared_depth ? "true" : "false",
+                     !background && m_desc.glyph_depth_test ? "true" : "false",
+                     m_desc.depth_image != nullptr ? reinterpret_cast<void*>(*m_desc.depth_image->view)
+                                                   : nullptr,
+                     reinterpret_cast<void*>(*pipeline.handle),
+                     static_cast<unsigned>(m_desc.sample_count), buffers.draw_count);
+        }
     };
 
     if (primitive->object.opaquebackground && primitive->background_mesh != nullptr) {
         draw_mesh(m_background_buffers,
                   m_desc.background_texture,
-                  ResolveTextColor(*primitive, true));
+                  ResolveTextColor(*primitive, true),
+                  m_desc.glyph_depth_test ? m_desc.background_pipeline : m_desc.pipeline, true);
     }
 
     for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
         if (page_index >= m_desc.page_textures.size()) break;
         draw_mesh(m_page_buffers[page_index],
                   m_desc.page_textures[page_index],
-                  ResolveTextColor(*primitive, false));
+                  ResolveTextColor(*primitive, false), m_desc.pipeline, false);
     }
 
     rr.command.EndRenderPass();
+    if (m_desc.shared_depth) {
+        rr.model_depth_images.at(m_desc.output).layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    }
     if (trace_revision) m_traced_atlas_version = primitive->atlas_version;
 
     if (m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
@@ -997,6 +1064,7 @@ void TextPass::destory(const Device&, RenderingResources& rr) {
     m_desc.framebuffer.reset();
     m_desc.vk_output = {};
     m_desc.vk_resolve = {};
+    m_desc.depth_image = nullptr;
     m_desc.sample_count = VK_SAMPLE_COUNT_1_BIT;
     m_desc.resolve_msaa = false;
     m_desc.background_texture = {};
