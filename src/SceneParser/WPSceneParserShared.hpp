@@ -48,6 +48,16 @@ struct ParseContext {
     std::unordered_set<int32_t>                                        dependent_parent_ids;
     std::unordered_map<int32_t, std::shared_ptr<wallpaper::SceneNode>> object_nodes;
     std::unordered_map<int32_t, const wallpaper::WPPuppet*>            object_puppets;
+    // A forward source reference has no texture extent while its reader is materialized.
+    // Retain the exact source geometry payload and material until all initial targets exist;
+    // effect/direct draw wrappers may share that payload without sharing a mesh wrapper.
+    struct PendingImageSourceMapping {
+        std::shared_ptr<wallpaper::SceneMesh>     geometry;
+        std::shared_ptr<wallpaper::SceneMaterial> material;
+        int32_t                                 layer_id;
+        bool                                    crop_card_uvs;
+    };
+    std::vector<PendingImageSourceMapping> pending_image_source_mappings;
     // Main-scene model chunks preserve the color produced by preceding chunks. Reflection
     // has its own graph-stage clear and uses these same materials with per-draw load state.
     wallpaper::usize model_pass_count { 0 };

@@ -686,6 +686,40 @@ void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
     mesh.AddVertexArray(std::move(vertex));
 }
 
+void CompleteImageSourceMappings(ParseContext& context) {
+    // Resource metadata and painter order are independent. An earlier reader may sample a
+    // later source's previous contents, but its geometry must already use that source's real
+    // physical/content extent before the first upload. Finish only the mappings deferred by
+    // materialization; do not issue source draws, change layer order or rewrite imported UVs.
+    for (const auto& pending : context.pending_image_source_mappings) {
+        auto& material = *pending.material;
+        const auto& name = material.Texture(0);
+        const auto target = context.scene->renderTargets.find(name);
+        if (target == context.scene->renderTargets.end()) {
+            LOG_ERROR("SceneImageSourceMapping: layer=%d texture='%s' remains unregistered "
+                      "after resource initialization", pending.layer_id, name.c_str());
+            continue;
+        }
+        const auto resolution = array_cast<float>(target->second.ResolutionVector());
+        material.customShader.constValues[WE_GLTEX_RESOLUTION_NAMES[0]] = resolution;
+        const float u = pending.crop_card_uvs ? resolution[2] / resolution[0] : 1.0f;
+        const float v = pending.crop_card_uvs ? resolution[3] / resolution[1] : 1.0f;
+        if (pending.crop_card_uvs) {
+            // Mutate the retained payload in place. Replacing a mesh's payload here would leave
+            // its source/direct consumers pointing at the earlier unit mapping. The shared
+            // revision also lets every later upload consumer observe these completed bytes.
+            pending.geometry->GetVertexArray(0).SetVertex(
+                WE_IN_TEXCOORD, std::array { 0.0f, 0.0f, 0.0f, v, u, 0.0f, u, v });
+            pending.geometry->SetDirty();
+        }
+        LOG_INFO("SceneImageSourceMappingReady: layer=%d texture='%s' "
+                 "physical=[%.0f %.0f] content=[%.0f %.0f] card-uv=[%.6f %.6f] crop=%s",
+                 pending.layer_id, name.c_str(), resolution[0], resolution[1],
+                 resolution[2], resolution[3], u, v, pending.crop_card_uvs ? "true" : "false");
+    }
+    context.pending_image_source_mappings.clear();
+}
+
 
 void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const Scene* scene,
                       const WPShaderInfo& sinfo) {
@@ -2531,12 +2565,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     SceneMesh effct_final_mesh {};
     auto      spMesh = std::make_shared<SceneMesh>();
     auto&     mesh   = *spMesh;
+    const bool source_mapping_pending = IsImageLayerCompositeTex(primary_source_texture) &&
+        !context.scene->renderTargets.contains(primary_source_texture);
 
     {
         const bool primary_texture_is_sprite =
             PrimaryMaterialTextureIsSprite(*context.scene, material);
         std::array<float, 2> mapRate { 1.0f, 1.0f };
-        if (! wpimgobj.nopadding &&
+        if (! wpimgobj.nopadding && !source_mapping_pending &&
             exists(material.customShader.constValues, WE_GLTEX_RESOLUTION_NAMES[0])) {
             const auto& r = material.customShader.constValues.at(WE_GLTEX_RESOLUTION_NAMES[0]);
             const std::array<float, 2> padded_map_rate { r[2] / r[0], r[3] / r[1] };
@@ -2634,6 +2670,21 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         material.blenmode = imgBlendMode;
     }
     mesh.AddMaterial(std::move(material));
+    if (source_mapping_pending) {
+        // Construct the card in its unit UV domain while the source name is unresolved. No draw
+        // can consume this provisional mapping: both cold scene loading and dynamic creation
+        // complete their pending metadata before registering scripts or preparing render passes.
+        // Keep a separate wrapper sharing these exact bytes because source selection can later
+        // select another mesh on the authored node. Only generated cards own this UV mapping;
+        // an imported image/puppet mesh retains its authored coordinates.
+        auto source_geometry = std::make_shared<SceneMesh>();
+        source_geometry->ChangeMeshDataFrom(mesh);
+        context.pending_image_source_mappings.push_back({
+            source_geometry, mesh.SharedMaterial(), wpimgobj.id,
+            !wpimgobj.nopadding &&
+                (hasEffect || (!hasAnimatedPuppetMesh && !hasStaticImageMesh)),
+        });
+    }
     spImgNode->AddMesh(spMesh);
     RegisterUserShaderValueBindings(
         context, wpimgobj.material, shaderInfo, spImgNode.get(), wpimgobj.id, wpimgobj.name);
@@ -3959,6 +4010,7 @@ bool wallpaper::CreateDynamicSceneLayer(
     if (! ParseDynamicSceneObject(context, normalized_object_json, user_properties, &layer_id)) {
         return false;
     }
+    CompleteImageSourceMappings(context);
 
     auto       node_it = context.object_nodes.find(layer_id);
     SceneNode* layer_node =
@@ -4280,6 +4332,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
             context.scene->layerNameToId.emplace(node_name, *object_id);
         }
     }
+
+    CompleteImageSourceMappings(context);
 
     // Script registrations resolve the completed authored-object table, including live transforms
     // and initial JSON, rather than retaining parser-owned drawing-node addresses.
