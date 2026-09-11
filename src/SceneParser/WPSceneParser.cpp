@@ -44,6 +44,7 @@
 #include "wpscene/WPScene.h"
 
 #include "Fs/VFS.h"
+#include "Audio/SoundManager.h"
 
 #include <algorithm>
 #include <iostream>
@@ -4068,7 +4069,8 @@ bool ParseDynamicSceneObject(ParseContext& context, const nlohmann::json& object
         resolve_visibility(object);
         if (context.scene->soundManager == nullptr) return false;
         const auto sound_handle =
-            WPSoundParser::Parse(object, *context.vfs, *context.scene->soundManager);
+            WPSoundParser::Parse(object, *context.vfs, *context.scene->soundManager,
+                                 context.scene->soundPlayback);
         if (sound_handle == 0) return false;
         FillSceneObjectIdentityFor(*context.scene, object);
         context.scene->SetLayerSoundHandle(object.id, sound_handle);
@@ -4354,6 +4356,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
     context.scene->has3dModels  = has_3d_models;
     context.scene->soundManager = &sm;
+    context.scene->soundPlayback = std::make_shared<audio::ScenePlaybackState>();
     // The output framebuffer already exists when a scene loads. Record its extent before objects
     // are materialized so fullscreen layers can size their effect targets from it; the renderer
     // refreshes the same field with the identical extent when it frames the first output.
@@ -4443,7 +4446,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                        },
                        [&context, &sm](wpscene::WPSoundObject& obj) {
                            context.scene->SetLayerSoundHandle(
-                               obj.id, WPSoundParser::Parse(obj, *context.vfs, sm));
+                               obj.id, WPSoundParser::Parse(obj, *context.vfs, sm,
+                                                            context.scene->soundPlayback));
                        },
                        [&context](wpscene::WPLightObject& obj) {
                            ParseLightObj(context, obj);

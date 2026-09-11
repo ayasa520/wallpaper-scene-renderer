@@ -556,6 +556,11 @@ private:
 
             if (! m_scene->first_frame_ok) {
                 m_scene->first_frame_ok = true;
+                // Audio requests may have been mounted on the loading thread several seconds
+                // before this frame. Publish this scene's channels only after the normal script
+                // update and frame submission, preserving their requested gain/playback state.
+                // The scene-owned latch also prevents an old frame from releasing a newer load.
+                m_scene->soundPlayback->Publish();
                 main_handler.sendFirstFrameOk();
             }
         }

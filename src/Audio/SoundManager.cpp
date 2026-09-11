@@ -22,13 +22,39 @@ miniaudio::DeviceDesc ToSSDesc(const SoundStream::Desc& d) {
 
 } // namespace
 
+void ScenePlaybackState::Publish() {
+    // The render thread publishes once, after its first script update and frame submission.
+    // Release/acquire makes those initial channel-property writes visible to the audio thread.
+    // Log before opening the latch so the first decoder read cannot precede this witness.
+    if (miniaudio::TraceSoundMixEnabled()) {
+        LOG_INFO("SceneSoundPlaybackPublish: playback=%p", static_cast<void*>(this));
+    }
+    m_ready.store(true, std::memory_order_release);
+}
+
 class Channel_Impl : public miniaudio::Channel {
 public:
-    Channel_Impl(std::unique_ptr<SoundStream>&& ss, float volume, bool autoplay)
-        : m_ss(std::move(ss)), m_playing(autoplay), m_volume(std::clamp(volume, 0.0f, 1.0f)) {}
+    Channel_Impl(std::unique_ptr<SoundStream>&& ss, std::shared_ptr<ScenePlaybackState> playback,
+                 float volume, bool autoplay)
+        : m_ss(std::move(ss)), m_playback(std::move(playback)), m_playing(autoplay),
+          m_volume(std::clamp(volume, 0.0f, 1.0f)) {}
     virtual ~Channel_Impl() = default;
 
     ma_uint64 NextPcmData(void* pData, ma_uint32 frameCount) override {
+        // Readiness is independent of the authored playing state and gain. A script can inspect,
+        // play or stop this channel during initialization without releasing any PCM, consuming
+        // its intro, or making a not-yet-published stream look like it has reached EOF.
+        if (! m_playback->Ready()) {
+            if (miniaudio::TraceSoundMixEnabled() && ! m_pending_traced) {
+                LOG_INFO("SceneSoundAwaitingFrame: channel=%p playback=%p",
+                         static_cast<void*>(this), static_cast<void*>(m_playback.get()));
+                m_pending_traced = true;
+            }
+            return 0;
+        }
+        // Read controls after acquiring the first-frame publication. The mixer's earlier
+        // IsPlaying() snapshot may precede an initialization script's stop or pause; using
+        // that snapshot here would let one decoded buffer escape after publication.
         if (!m_playing || m_ended) return 0;
         const ma_uint64 frames_read = m_ss->NextPcmData(pData, frameCount);
         if (frames_read == 0) MarkEnded();
@@ -72,10 +98,15 @@ public:
 private:
     miniaudio::DeviceDesc        m_desc;
     std::unique_ptr<SoundStream> m_ss;
-    bool                         m_playing { true };
-    bool                         m_ended { false };
-    bool                         m_detached { false };
-    float                        m_volume { 1.0f };
+    std::shared_ptr<ScenePlaybackState> m_playback;
+    bool                         m_pending_traced { false };
+    // Scripts publish scalar control changes while the callback observes them and marks EOF.
+    // The scene latch orders initial publication; these atomic snapshots also cover later live
+    // gain/control writes, including isPlaying() checks made before the decoder's readiness check.
+    std::atomic<bool>             m_playing { true };
+    std::atomic<bool>             m_ended { false };
+    std::atomic<bool>             m_detached { false };
+    std::atomic<float>            m_volume { 1.0f };
 };
 
 struct BStreamWrapper {
@@ -150,7 +181,9 @@ public:
 SoundManager::SoundManager(): pImpl(std::make_unique<impl>()) {}
 SoundManager::~SoundManager() {}
 
-SoundHandle SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss, float volume, bool autoplay) {
+SoundHandle SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss,
+                                      std::shared_ptr<ScenePlaybackState> playback,
+                                      float volume, bool autoplay) {
     if (! ss) {
         // Dynamic and authored sound layers share this entry point.  A zero handle keeps callers
         // from registering a script-visible layer whose backing audio stream cannot ever play.
@@ -159,14 +192,17 @@ SoundHandle SoundManager::MountStream(std::unique_ptr<SoundStream>&& ss, float v
     }
 
     const SoundHandle handle = pImpl->next_handle++;
-    auto channel = std::make_shared<Channel_Impl>(std::move(ss), volume, autoplay);
+    auto channel = std::make_shared<Channel_Impl>(std::move(ss), playback, volume, autoplay);
     pImpl->channels.emplace(handle, channel);
     if (miniaudio::TraceSoundMixEnabled()) {
-        LOG_INFO("SceneSoundChannelMount: handle=%u channel=%p volume=%.6f autoplay=%s",
+        LOG_INFO("SceneSoundChannelMount: handle=%u channel=%p volume=%.6f autoplay=%s "
+                 "playback=%p ready=%s",
                  handle,
                  static_cast<void*>(channel.get()),
                  channel->Volume(),
-                 autoplay ? "true" : "false");
+                 autoplay ? "true" : "false",
+                 static_cast<void*>(playback.get()),
+                 playback->Ready() ? "true" : "false");
     }
     pImpl->device.MountChannel(std::move(channel));
     return handle;

@@ -36,6 +36,7 @@ struct SceneImageEffect;
 namespace audio
 {
 class SoundManager;
+class ScenePlaybackState;
 }
 
 namespace fs
@@ -363,6 +364,7 @@ public:
 
     std::unique_ptr<ParticleSystem> paritileSys;
     audio::SoundManager*            soundManager { nullptr };
+    std::shared_ptr<audio::ScenePlaybackState> soundPlayback;
     std::array<float, 2>            mousePositionNormalized { 0.5f, 0.5f };
     bool                            cursorLeftDown { false };
 

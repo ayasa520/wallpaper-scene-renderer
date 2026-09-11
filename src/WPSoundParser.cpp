@@ -200,7 +200,8 @@ private:
 };
 
 audio::SoundHandle WPSoundParser::Parse(const wpscene::WPSoundObject& obj, fs::VFS& vfs,
-                                        audio::SoundManager& sm) {
+                                        audio::SoundManager& sm,
+                                        const std::shared_ptr<audio::ScenePlaybackState>& playback) {
     WPSoundStream::Config config { .maxtime = obj.maxtime,
                                    .mintime = obj.mintime,
                                    .volume  = 1.0f,
@@ -211,7 +212,7 @@ audio::SoundHandle WPSoundParser::Parse(const wpscene::WPSoundObject& obj, fs::V
     // thisScene.getLayer(name) can resolve them, while autoplay stays disabled until script calls
     // play() on the selected layer.
     const bool autoplay = obj.visible && ! obj.startsilent;
-    const auto handle   = sm.MountStream(std::move(ss), obj.volume, autoplay);
+    const auto handle   = sm.MountStream(std::move(ss), playback, obj.volume, autoplay);
     LOG_INFO("SceneSoundMount: layer=%d name='%s' handle=%u sounds=%zu volume=%.3f visible=%s "
              "startsilent=%s autoplay=%s playbackmode='%s'",
              obj.id,

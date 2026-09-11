@@ -284,23 +284,31 @@ private:
                     // Trace the gain actually consumed by the mixer, not merely a script's
                     // requested value. A zero-gain looping stream may continue decoding while
                     // contributing no samples. Emit only its first decoded buffer and gain
-                    // transitions; the additional peak scan is opt-in diagnostic work.
+                    // transitions, plus its first audible contribution when an intro begins with
+                    // silence. A positive-gain channel is scanned until that witness exists; muted
+                    // loops do not incur a repeated peak scan. All extra work is opt-in.
                     auto& channel = m_channels[i];
                     if (TraceSoundMixEnabled() &&
                         (! channel.mix_traced || channel.traced_volume != channel_volume ||
-                         channel.traced_master_volume != master_volume)) {
+                         channel.traced_master_volume != master_volume ||
+                         (! channel.audible_traced && effective_volume != 0.0f))) {
                         float source_peak = 0.0f;
                         for (size_t sample = 0; sample < framesSize; sample++) {
                             source_peak = std::max(source_peak, std::abs(pBuffer_float[sample]));
                         }
-                        LOG_INFO("SceneSoundMix: channel=%p volume=%.6f master=%.6f frames=%llu "
-                                 "source_peak=%.6f contribution_peak=%.6f",
-                                 static_cast<void*>(channel.chn.get()),
-                                 channel_volume,
-                                 master_volume,
-                                 static_cast<unsigned long long>(framesReaded),
-                                 source_peak,
-                                 std::abs(effective_volume) * source_peak);
+                        const float contribution_peak = std::abs(effective_volume) * source_peak;
+                        if (! channel.mix_traced || channel.traced_volume != channel_volume ||
+                            channel.traced_master_volume != master_volume || contribution_peak > 0.0f) {
+                            LOG_INFO("SceneSoundMix: channel=%p volume=%.6f master=%.6f frames=%llu "
+                                     "source_peak=%.6f contribution_peak=%.6f",
+                                     static_cast<void*>(channel.chn.get()),
+                                     channel_volume,
+                                     master_volume,
+                                     static_cast<unsigned long long>(framesReaded),
+                                     source_peak,
+                                     contribution_peak);
+                        }
+                        channel.audible_traced = channel.audible_traced || contribution_peak > 0.0f;
                         channel.mix_traced = true;
                         channel.traced_volume = channel_volume;
                         channel.traced_master_volume = master_volume;
@@ -388,6 +396,7 @@ private:
         bool                     end { false };
         std::shared_ptr<Channel> chn;
         bool                    mix_traced { false };
+        bool                    audible_traced { false };
         float                   traced_volume { 0.0f };
         float                   traced_master_volume { 0.0f };
     };

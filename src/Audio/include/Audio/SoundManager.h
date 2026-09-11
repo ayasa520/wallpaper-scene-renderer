@@ -3,6 +3,7 @@
 #include <memory>
 #include <cstdint>
 #include <functional>
+#include <atomic>
 #include "Utils/Logging.h"
 #include "Core/NoCopyMove.hpp"
 
@@ -17,6 +18,19 @@ namespace audio
 {
 
 using SoundHandle = uint32_t;
+
+// Each scene owns its publication latch, and every one of its channels retains the same latch.
+// Parsing can request playback before scripts and rendering are initialized; those requests must
+// not advance a decoder until the first complete frame has applied the scene's initial state.
+// A retiring scene can only publish its own channels, never a newly loading scene's channels.
+class ScenePlaybackState : NoCopy, NoMove {
+public:
+    bool Ready() const { return m_ready.load(std::memory_order_acquire); }
+    void Publish();
+
+private:
+    std::atomic<bool> m_ready { false };
+};
 
 class SoundStream : NoCopy, NoMove {
 public:
@@ -40,7 +54,9 @@ class SoundManager : NoCopy, NoMove {
 public:
     SoundManager();
     ~SoundManager();
-    SoundHandle MountStream(std::unique_ptr<SoundStream>&&, float volume = 1.0f, bool autoplay = true);
+    SoundHandle MountStream(std::unique_ptr<SoundStream>&&,
+                            std::shared_ptr<ScenePlaybackState>,
+                            float volume = 1.0f, bool autoplay = true);
     bool        UnmountStream(SoundHandle);
     bool        Play(SoundHandle);
     bool        Pause(SoundHandle);
