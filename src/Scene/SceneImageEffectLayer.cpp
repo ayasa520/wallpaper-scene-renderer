@@ -11,6 +11,7 @@
 #include "Utils/Logging.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 
@@ -192,15 +193,17 @@ void SceneImageEffectLayer::SetDestinationTargets(std::string first_target,
 }
 
 void SceneImageEffectLayer::RefreshDestinationTargets(
-    Scene& scene, std::optional<std::array<int32_t, 2>> destination_extent) {
+    Scene& scene, std::optional<std::array<int32_t, 2>> destination_extent,
+    std::optional<TextureSample> destination_sampler) {
     // First/last-child callbacks rerun the parent's destination setup against its current
     // ancestry. The parsed source policy distinguishes current card dimensions from loaded
     // texture pixels. A concrete layer with its own destination sizing policy supplies that
-    // extent; a size property write alone still changes geometry without rerunning resource
-    // setup. Copy the descriptor before interning because insertion may rehash the scene target
-    // table.
+    // extent; a primary-texture refresh also supplies its current sampler. A size property write
+    // alone still changes geometry without rerunning resource setup. Copy the descriptor before
+    // interning because insertion may rehash the scene target table.
     auto target = scene.renderTargets.at(m_pingpong_a);
     const std::array<int32_t, 2> previous_extent { target.width, target.height };
+    if (destination_sampler) target.sample = *destination_sampler;
     if (destination_extent.has_value()) {
         target.width = target.mapWidth = (*destination_extent)[0];
         target.height = target.mapHeight = (*destination_extent)[1];
@@ -351,6 +354,72 @@ bool SceneImageEffectLayer::UsesPrelightingSource() const {
     return m_prelighting_source && !UsesDirectDraw() &&
         (VisibleCompositionStepCount() != 0 || m_prelighting_source->sprite ||
          ResolveFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter);
+}
+
+void SceneImageEffectLayer::RefreshPrelightingTexture(Scene& scene) {
+    // This texture-space source belongs to an ordinary image. A composition instead rasterizes
+    // its owner card and children, and fullscreen setup owns an output-framebuffer extent. Neither
+    // is a consumer of this imported-image refresh. Named render targets also retain their
+    // separate source/publication lifecycle; do not walk or resize their dependency graph here.
+    if (!m_prelighting_source || m_owner.Passthrough() || m_fullscreen) return;
+    auto& source = *m_prelighting_source;
+    const auto& material = *m_owner.LayerNode()->Mesh()->Material();
+    if (material.textures.empty()) return;
+    const auto& texture_key = material.Texture(0);
+    const auto texture_it = scene.textures.find(texture_key);
+    if (texture_it == scene.textures.end()) return;
+    const auto& texture = texture_it->second;
+    const std::array<int32_t, 2> allocation { texture.width, texture.height };
+    const std::array<float, 2> content = texture.isSprite
+        ? std::array { texture.spriteAnim.Frames().front().width,
+                       texture.spriteAnim.Frames().front().height }
+        : std::array { static_cast<float>(texture.mapWidth),
+                       static_cast<float>(texture.mapHeight) };
+    const bool card_sized = source.card_sized_destination && !texture.isSprite;
+    const auto extent = card_sized ? ResolveCardDestinationExtent(m_card_size)
+        : std::array { ClampDestinationRenderTargetExtent(static_cast<int32_t>(std::lround(content[0]))),
+                       ClampDestinationRenderTargetExtent(static_cast<int32_t>(std::lround(content[1]))) };
+    const auto& previous_target = scene.renderTargets.at(m_pingpong_a);
+    const auto sampler = DestinationRenderTargetSampler(
+        source.force_point_sampling || texture.sample.magFilter == TextureFilter::NEAREST,
+        previous_target.sample.wrapS == TextureWrap::CLAMP_TO_EDGE);
+
+    // A stable key with unchanged metadata is a pixel-only update. Leave its mesh, source
+    // projection, target history and graph topology alone; the existing selective imported-image
+    // path rebinds only actual texture consumers. A changed key is a material source replacement
+    // even at equal dimensions and therefore reruns this owner's resource setup.
+    if (source.texture_key == texture_key && source.allocation_size == allocation &&
+        source.content_size == content && previous_target.sample == sampler) return;
+
+    LOG_INFO("SceneImageSourceTextureRefresh: layer=%d previous='%s' current='%s' "
+             "allocation=[%d %d]->[%d %d] content=[%.3f %.3f]->[%.3f %.3f] "
+             "texture-card=%s destination=%dx%d card-derived=%s filter=%s",
+             m_owner.Id(), source.texture_key.c_str(), texture_key.c_str(),
+             source.allocation_size[0], source.allocation_size[1], allocation[0], allocation[1],
+             source.content_size[0], source.content_size[1], content[0], content[1],
+             source.texture_card ? "true" : "false", extent[0], extent[1],
+             card_sized ? "true" : "false", TextureFilterName(sampler.magFilter).data());
+    if (source.texture_card && source.allocation_size != allocation) {
+        // Mutate the retained source payload, not the owner's currently selected mesh. Direct
+        // draws keep their authored card/UVs, imported puppet sources keep their auxiliary
+        // coordinates, and reflected/main source consumers share the new payload revision.
+        const float half_width = static_cast<float>(allocation[0]) * 0.5f;
+        const float half_height = static_cast<float>(allocation[1]) * 0.5f;
+        source.mesh->GetVertexArray(0).SetVertex(WE_IN_POSITION, std::array {
+            -half_width, half_height, 0.0f, -half_width, -half_height, 0.0f,
+            half_width, half_height, 0.0f, half_width, -half_height, 0.0f,
+        });
+        source.mesh->SetDirty();
+    }
+    source.texture_key = texture_key;
+    source.allocation_size = allocation;
+    source.content_size = content;
+    m_destination_uses_card_size = card_sized;
+    // Keep texture geometry notification distinct from effect-driven program selection. Do not
+    // replace authored material values, refresh script instances, or change the retained sprite
+    // selector here. Resource setup re-interns destination slots and resizes this owner's FBOs;
+    // graph resolution then installs the corresponding source projection before submission.
+    RefreshDestinationTargets(scene, extent, sampler);
 }
 
 void SceneImageEffectLayer::ResolveOwnerDraw(Scene& scene) {

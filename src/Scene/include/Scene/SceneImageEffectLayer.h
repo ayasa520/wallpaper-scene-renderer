@@ -154,7 +154,16 @@ public:
         std::shared_ptr<SceneShader> ordinary_shader;
         std::shared_ptr<SceneShader> prelighting_shader;
         std::shared_ptr<SceneMesh> mesh;
+        std::string texture_key;
+        std::array<int32_t, 2> allocation_size;
         std::array<float, 2> content_size;
+        // Texture refresh owns only these geometry/resource inputs. The prepared source program
+        // predicates remain separate, and an imported auxiliary stream is never rewritten as a
+        // rectangular card. Retain the model's sizing/sampling policy rather than inferring it
+        // from a destination that may have been created for a different primary texture.
+        bool texture_card { true };
+        bool card_sized_destination { false };
+        bool force_point_sampling { false };
         bool sprite { false };
         bool instanced { false };
     };
@@ -190,7 +199,8 @@ public:
     const std::string& SourceTarget() const;
     void SetDestinationTargets(std::string first_target, std::string second_target);
     void RefreshDestinationTargets(
-        Scene& scene, std::optional<std::array<int32_t, 2>> destination_extent = std::nullopt);
+        Scene& scene, std::optional<std::array<int32_t, 2>> destination_extent = std::nullopt,
+        std::optional<TextureSample> destination_sampler = std::nullopt);
     void SetDestinationUsesCardSize(bool enabled) { m_destination_uses_card_size = enabled; }
     SceneMesh&  SourceMesh() const { return *m_source_mesh; }
     void SetDirectDrawMesh(const SceneMesh& mesh) { m_direct_draw_mesh = &mesh; }
@@ -205,6 +215,7 @@ public:
     const PrelightingSource* GetPrelightingSource() const {
         return m_prelighting_source ? &*m_prelighting_source : nullptr;
     }
+    void RefreshPrelightingTexture(Scene& scene);
     bool UsesPrelightingSource() const;
     void ResolveOwnerDraw(Scene& scene);
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }

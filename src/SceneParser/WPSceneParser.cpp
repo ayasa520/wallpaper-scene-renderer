@@ -1453,7 +1453,12 @@ bool LoadImagePrelightingSource(
         .ordinary_shader = material.customShader.shader,
         .prelighting_shader = prelighting_material.customShader.shader,
         .mesh = std::move(source_mesh),
+        .texture_key = texture_name,
+        .allocation_size = allocation,
         .content_size = content,
+        .texture_card = !skinned,
+        .card_sized_destination = (image.config.passthrough || image.solidlayer) && !image.instanced,
+        .force_point_sampling = image.nointerpolation,
         .sprite = sprite,
         .instanced = image.instanced,
     };

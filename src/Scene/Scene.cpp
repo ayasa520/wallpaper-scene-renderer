@@ -48,6 +48,18 @@ void Scene::SetSystemTextureBinding(const std::string& name, const std::string& 
     MarkRenderGraphTopologyDirty();
 }
 
+void Scene::RefreshImageSourceTextures() {
+    // Resolve material sources after all queued property/texture writes, in authored owner order.
+    // A source metadata change may promote an otherwise resource-only refresh to a topology
+    // rebuild because its destination names changed. Each bridge compares its retained metadata,
+    // so unrelated resource updates and equal-size pixel replacements do not rerun source setup.
+    for (const auto layer_id : layerOrder) {
+        if (auto* layer = FindImageEffectLayer(layer_id)) {
+            layer->RefreshPrelightingTexture(*this);
+        }
+    }
+}
+
 void SceneObject::SetLayerNode(SceneNode* node) {
     m_layer_node = node;
     m_has_layer_node_slot = true;
