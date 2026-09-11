@@ -1376,7 +1376,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         // The native materializer owns nested asset handles; the outer handle still carries
         // this script's workshop context when it names an imported asset.
         << "  function normalizeCreateLayerConfig(value) {\n"
-        << "    if (typeof value === 'string') return createLayerAssetHandle(value);\n"
+        << "    if (typeof value === 'string') return value;\n"
         << "    if (value === null || typeof value !== 'object') return undefined;\n"
         << "    const serialized = JSON.stringify(value, (_key, entry) => {\n"
         << "      if (entry && entry.toConfigString) return entry.toConfigString();\n"
@@ -1419,8 +1419,9 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      return !!__native.destroySceneLayer(layer);\n"
         << "    },\n"
         << "    createLayer(configuration) {\n"
+        << "      const workshopId = typeof __workshopId === 'string' ? __workshopId : '';\n"
         << "      const layerId = "
-           "__native.createSceneLayer(normalizeCreateLayerConfig(configuration));\n"
+           "__native.createSceneLayer(normalizeCreateLayerConfig(configuration), workshopId);\n"
         << "      return layerId > 0 ? createLayerProxy(layerId) : undefined;\n"
         << "    },\n"
         << "    createModelData(configuration) { return __native.createModelData(configuration); },\n"
@@ -1914,6 +1915,22 @@ std::optional<nlohmann::json> MaterializeAssetHandleConfig(const Scene*         
         config["name"]   = file.substr(start);
     }
     return config;
+}
+
+std::optional<nlohmann::json> ParseCreateLayerStringConfig(const Scene* scene,
+                                                           const std::string& text,
+                                                           const std::string& workshop_id) {
+    // A primitive string contains either a complete JSON object or an asset path. Decode it
+    // before JavaScript object serialization can invoke inherited conversion hooks. A parsed
+    // object already contains authored configuration and goes directly to the shared layer
+    // factory, which owns effect and script registration. Asset paths retain the caller's
+    // workshop namespace and use the same materializer as explicit asset handles.
+    auto config = nlohmann::json::parse(text, nullptr, false);
+    if (config.is_object()) return config;
+
+    nlohmann::json asset_handle { { "file", text } };
+    if (! workshop_id.empty()) asset_handle["workshopId"] = workshop_id;
+    return MaterializeAssetHandleConfig(scene, asset_handle);
 }
 
 JSValue ScriptValueToJS(JSContext* context, const WPScriptValue& value) {
@@ -6452,18 +6469,29 @@ JSValue NativeCreateSceneLayer(JSContext* context, JSValueConst, int argc, JSVal
     auto* opaque = GetOpaque(context);
     if (opaque == nullptr || opaque->scene == nullptr || argc < 1) return JS_NewInt32(context, 0);
 
-    auto create_layer_json = JsonFromJS(context, argv[0]);
-    if (! create_layer_json.has_value()) return JS_NewInt32(context, 0);
-
     nlohmann::json normalized_json;
-    if (create_layer_json->is_string() || IsAssetHandleJson(*create_layer_json)) {
-        auto config = MaterializeAssetHandleConfig(opaque->scene, *create_layer_json);
+    if (JS_IsString(argv[0])) {
+        std::string text;
+        std::string workshop_id;
+        if (! ReadJSString(context, argv[0], &text)) return JS_NewInt32(context, 0);
+        if (argc > 1 && ! ReadJSString(context, argv[1], &workshop_id)) {
+            return JS_NewInt32(context, 0);
+        }
+        auto config = ParseCreateLayerStringConfig(opaque->scene, text, workshop_id);
         if (! config.has_value()) return JS_NewInt32(context, 0);
-        normalized_json = *config;
-    } else if (create_layer_json->is_object()) {
-        normalized_json = NormalizeCreateLayerJson(*create_layer_json);
+        normalized_json = std::move(*config);
     } else {
-        return JS_NewInt32(context, 0);
+        auto create_layer_json = JsonFromJS(context, argv[0]);
+        if (! create_layer_json.has_value()) return JS_NewInt32(context, 0);
+        if (IsAssetHandleJson(*create_layer_json)) {
+            auto config = MaterializeAssetHandleConfig(opaque->scene, *create_layer_json);
+            if (! config.has_value()) return JS_NewInt32(context, 0);
+            normalized_json = std::move(*config);
+        } else if (create_layer_json->is_object()) {
+            normalized_json = NormalizeCreateLayerJson(*create_layer_json);
+        } else {
+            return JS_NewInt32(context, 0);
+        }
     }
 
     if (normalized_json.contains("parent")) {
