@@ -900,6 +900,12 @@ void Scene::UpdateModelCameraPath() {
         return;
     }
 
+    // A camera layer temporarily owns the shared view and pauses path playback. Resolve this
+    // frame's effective visibility, including ancestors, rather than the previous active id:
+    // scripts may have hidden or restored a parent just before frame preparation. Neither the
+    // path pose nor its clock changes while any selected camera layer owns the view.
+    if (FindActiveCameraLayer(*this).second != nullptr) return;
+
     auto camera_it = cameras.find(modelPerspectiveCameraName);
     if (camera_it == cameras.end() || !camera_it->second) return;
 
@@ -909,7 +915,8 @@ void Scene::UpdateModelCameraPath() {
     }
     if (total_duration <= 1e-9) return;
 
-    double path_time = std::fmod(std::max(0.0, elapsingTime), total_duration);
+    const double sample_time = modelCameraPathTime;
+    double path_time = std::fmod(std::max(0.0, sample_time), total_duration);
     if (path_time < 0.0) path_time += total_duration;
 
     int32_t active_segment = -1;
@@ -938,6 +945,22 @@ void Scene::UpdateModelCameraPath() {
                                        ToVector3d(sample.center),
                                        ToVector3d(sample.up));
     UpdateLinkedCamera(modelPerspectiveCameraName);
+
+    // Sample before advancing, using the same scaled frame delta supplied to scripts. The first
+    // release therefore publishes time zero, and later releases resume the retained cursor instead
+    // of including time spent under camera-layer ownership. Frame preparation is the sole caller;
+    // visibility setters and repeated camera/uniform consumers must not advance playback again.
+    modelCameraPathTime += frameTime;
+    if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
+        LOG_INFO("SceneCameraPathSample: scene-time=%.6f path-time=%.9f next-time=%.9f "
+                 "segment=%d local-time=%.9f delta=%.9f",
+                 elapsingTime,
+                 sample_time,
+                 modelCameraPathTime,
+                 active_segment,
+                 local_time,
+                 frameTime);
+    }
 
     if (activeModelCameraPathSegment != active_segment) {
         const auto& segment = modelCameraPathSegments[active_segment];

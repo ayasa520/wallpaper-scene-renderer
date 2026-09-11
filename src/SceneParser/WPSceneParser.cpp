@@ -2095,6 +2095,7 @@ void LoadModelCameraPaths(ParseContext& context, const wpscene::WPSceneCamera& a
     scene.modelCameraPathSegments.clear();
     scene.modelCameraPathEnabled       = false;
     scene.activeModelCameraPathSegment = -1;
+    scene.modelCameraPathTime          = 0.0;
 
     if (authored_camera.paths.empty()) return;
 

@@ -378,6 +378,9 @@ public:
     std::vector<CameraPathSegment> modelCameraPathSegments;
     bool                           modelCameraPathEnabled { false };
     int32_t                        activeModelCameraPathSegment { -1 };
+    // Playback time belongs to the path, not the scene: camera-layer ownership pauses it.
+    // Only the frame preparation path sample advances this clock, after publishing the pose.
+    double                         modelCameraPathTime { 0.0 };
 
     i32                  ortho[2] { 1920, 1080 }; // w, h
     // The authored canvas and the physical renderer output are independent. Text bridge
