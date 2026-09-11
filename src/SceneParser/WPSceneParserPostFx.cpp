@@ -397,20 +397,11 @@ bool ConfigureSceneBloomPass(ParseContext& context) {
     if (use_hdr) {
         return ConfigureSceneHdrBloomPass(context);
     }
-    // Build the LDR Bloom node even when the authored user toggle currently disables it, as long
-    // as the scene carries non-zero Bloom settings. Runtime toggles can then update `u_enabled`
-    // in place. Ultra/displayhdr with authored HDR uses the separate HDR chain above.
-    const bool has_ldr_bloom_work = scene.bloom.enabled || scene.bloom.strength > 0.0f;
-    if (! has_ldr_bloom_work) {
-        LOG_INFO("SceneBloomConfig: enabled=%s strength=%.3f threshold=%.3f "
-                 "hdr-requested=%s render-hdr=false active=false",
-                 scene.bloom.enabled ? "true" : "false",
-                 scene.bloom.strength,
-                 scene.bloom.threshold,
-                 scene.bloom.hdr ? "true" : "false");
-        return false;
-    }
-
+    // Prepare the LDR nodes independently of the initial toggle and strength. Scene scripts
+    // can enable Bloom after starting with both disabled and zero strength; their live setters
+    // update these retained materials rather than invoking the parser. The render graph still
+    // excludes the entire chain while Bloom is disabled, so preparation does not allocate its
+    // private GPU targets or add per-frame post-process work until the toggle is enabled.
     ClearSceneBloomGraph(scene);
     const i32 scene_width    = std::max(1, context.ortho_w);
     const i32 scene_height   = std::max(1, context.ortho_h);
