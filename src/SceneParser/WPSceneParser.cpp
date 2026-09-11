@@ -108,7 +108,7 @@ struct ImageDestinationExtent {
 // layer that is not fullscreen and not instanced. Shapes arrive with an already resolved pixel
 // extent. The value is not scaled by the scene camera or the canvas density.
 ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&           context,
-                                                     const wpscene::WPImageObject& image,
+                                                     const ImageDestinationPolicy& policy,
                                                      const SceneMaterial&          material,
                                                      const std::array<float, 2>&   card_size) {
     ImageDestinationExtent result;
@@ -118,7 +118,7 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
         result.uses_card_size = true;
         return result;
     };
-    if (image.fullscreen) {
+    if (policy.fullscreen) {
         const auto output = OutputFramebufferEffectTargetSize(context);
         result.extent     = { static_cast<int32_t>(std::lround(output[0])),
                               static_cast<int32_t>(std::lround(output[1])) };
@@ -130,8 +130,6 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
         return use_card("card-no-texture");
     }
     const auto& texture_name = material.Texture(0);
-    const bool  card_sized_helper =
-        (image.config.passthrough || image.solidlayer) && ! image.instanced;
 
     if (const auto texture_it = context.scene->textures.find(texture_name);
         texture_it != context.scene->textures.end()) {
@@ -146,7 +144,7 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
                 result.extent = { texture.mapWidth, texture.mapHeight };
             }
             result.policy = "sprite-frame";
-        } else if (card_sized_helper) {
+        } else if (policy.card_sized) {
             return use_card("card-passthrough");
         } else {
             result.extent = { texture.mapWidth, texture.mapHeight };
@@ -156,7 +154,7 @@ ImageDestinationExtent ResolveImageDestinationExtent(const ParseContext&        
                target_it != context.scene->renderTargets.end()) {
         const auto& target = target_it->second;
         result.suffix = target.sample.magFilter == TextureFilter::NEAREST ? 'n' : 'b';
-        if (card_sized_helper) return use_card("card-passthrough");
+        if (policy.card_sized) return use_card("card-passthrough");
         result.extent = { target.ContentWidth(), target.ContentHeight() };
         result.policy = "render-target-content";
     } else {
@@ -725,6 +723,30 @@ void CompleteImageSourceMappings(ParseContext& context) {
                  "physical=[%.0f %.0f] content=[%.0f %.0f] card-uv=[%.6f %.6f] crop=%s",
                  pending.layer_id, name.c_str(), resolution[0], resolution[1],
                  resolution[2], resolution[3], u, v, pending.crop_card_uvs ? "true" : "false");
+        if (pending.destination_policy) {
+            // Completing the source wrapper also completes this reader's resource setup.
+            // Reuse the same sizing rules as an immediately available texture, then re-intern
+            // the destination pair and resize authored FBOs before any graph is prepared.
+            // This updates retained bindings without recreating materials, resetting scripts
+            // or moving the source draw ahead of the reader in the authored painter order.
+            auto& layer = *context.scene->FindImageEffectLayer(pending.layer_id);
+            const auto& policy = *pending.destination_policy;
+            const auto resolved = ResolveImageDestinationExtent(
+                context, policy, material, layer.CardSize());
+            const std::array<int32_t, 2> extent {
+                ClampDestinationRenderTargetExtent(resolved.extent[0]),
+                ClampDestinationRenderTargetExtent(resolved.extent[1]),
+            };
+            const auto sampler = DestinationRenderTargetSampler(
+                policy.force_point_sampling || resolved.suffix == 'n', policy.clamp_uvs);
+            layer.SetDestinationUsesCardSize(resolved.uses_card_size);
+            layer.RefreshDestinationTargets(*context.scene, extent, sampler);
+            LOG_INFO("SceneImageSourceDestinationReady: layer=%d texture='%s' extent=%dx%d "
+                     "policy=%s filter=%s wrap=%s",
+                     pending.layer_id, name.c_str(), extent[0], extent[1], resolved.policy,
+                     TextureFilterName(sampler.magFilter).data(),
+                     TextureWrapName(sampler.wrapS).data());
+        }
     }
     context.pending_image_source_mappings.clear();
 }
@@ -2537,6 +2559,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
     // Card/compose-camera size is independent of the source texture's destination extent.
     const std::array<float, 2> effect_source_size = wpimgobj.size;
+    const ImageDestinationPolicy destination_policy {
+        .fullscreen = wpimgobj.fullscreen,
+        .card_sized = (wpimgobj.config.passthrough || wpimgobj.solidlayer) && !wpimgobj.instanced,
+        .force_point_sampling = wpimgobj.nointerpolation,
+        .clamp_uvs = wpimgobj.clampuvs,
+    };
     const bool hasAuthoredPuppet = ! wpimgobj.puppet.empty();
     std::unique_ptr<WPMdl> puppet;
     if (hasAuthoredPuppet) {
@@ -2647,12 +2675,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     // Destination targets and effect FBOs are fixed-size images sized from the source texture
     // content (or the card for texture-less / passthrough helpers), never from the scene camera.
     const ImageDestinationExtent destination_extent =
-        ResolveImageDestinationExtent(context, wpimgobj, material, effect_source_size);
+        ResolveImageDestinationExtent(context, destination_policy, material, effect_source_size);
     // Destination filtering follows the source unless the layer explicitly disables
     // interpolation. Addressing belongs to the destination itself, not to the source file;
     // include both settings in the intern key and use the same sampler for both slots.
     const TextureSample destination_sampler = DestinationRenderTargetSampler(
-        wpimgobj.nointerpolation || destination_extent.suffix == 'n', wpimgobj.clampuvs);
+        destination_policy.force_point_sampling || destination_extent.suffix == 'n',
+        destination_policy.clamp_uvs);
     // Destination setup clamps the selected source extent before either the destination pair or
     // the authored effect FBOs use it.
     const std::array<float, 2> effect_target_resolution {
@@ -2783,6 +2812,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             source_geometry, mesh.SharedMaterial(), wpimgobj.id,
             !wpimgobj.nopadding &&
                 (hasEffect || (!hasAnimatedPuppetMesh && !hasStaticImageMesh)),
+            hasEffect ? std::make_optional(destination_policy) : std::nullopt,
         });
     }
     spImgNode->AddMesh(spMesh);

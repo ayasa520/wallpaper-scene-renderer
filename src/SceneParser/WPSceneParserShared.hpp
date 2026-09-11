@@ -33,6 +33,17 @@
 #include "wpscene/WPImageObject.h"
 #include "wpscene/WPParticleObject.h"
 
+// Destination setup retains authored sizing and sampler choices independently of whether
+// the primary texture has already been registered. Both immediate setup and completion of a
+// forward reference consume this policy, so provisional card dimensions cannot become the
+// permanent resource policy of an ordinary texture-sized image.
+struct ImageDestinationPolicy {
+    bool fullscreen;
+    bool card_sized;
+    bool force_point_sampling;
+    bool clamp_uvs;
+};
+
 struct ParseContext {
     std::shared_ptr<wallpaper::Scene> scene;
     wallpaper::WPShaderValueUpdater*  shader_updater;
@@ -56,6 +67,7 @@ struct ParseContext {
         std::shared_ptr<wallpaper::SceneMaterial> material;
         int32_t                                 layer_id;
         bool                                    crop_card_uvs;
+        std::optional<ImageDestinationPolicy>    destination_policy;
     };
     std::vector<PendingImageSourceMapping> pending_image_source_mappings;
     // Main-scene model chunks preserve the color produced by preceding chunks. Reflection
