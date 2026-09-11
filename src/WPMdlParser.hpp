@@ -86,6 +86,8 @@ struct WPMdl {
     std::vector<Part> parts;
 
     struct MaskBlock {
+        uint64_t              identity { 0 };
+        uint32_t              flags { 0 };
         std::string           material;
         std::vector<uint32_t> clipped_part_indices;
         std::vector<uint32_t> source_part_indices;

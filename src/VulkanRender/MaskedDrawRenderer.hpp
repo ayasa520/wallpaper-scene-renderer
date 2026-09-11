@@ -13,12 +13,13 @@ public:
     bool configure(const Device&, const ShaderDrawData&, const SceneMesh&) override;
     std::vector<std::string_view> resourceTextures(const SceneMesh&) const override;
     bool refreshTextures(Scene&, const Device&, const ShaderDrawData&) override;
-    ShaderDrawAttachmentDescription attachmentDescription() const override;
-    VmaImageParameters* acquireAttachment(const Device&, RenderingResources&,
-                                          const ShaderDrawData&) override;
+    bool refreshFramebuffers(const Device&, RenderingResources&, const ShaderDrawData&) override;
+    void dropFramebuffers() override;
     bool preparePipelines(const Device&, RenderingResources&,
                           const ShaderDrawPipelineContext&) override;
     void updateUniform(StagingBuffer*, std::string_view, const ShaderValue&) override;
+    bool hasUniform(std::string_view) const override;
+    void updateMaterialUniforms(StagingBuffer*, const SceneMaterial&) override;
     void initializeUniforms(StagingBuffer*) override;
     void recordIndexed(const ShaderDrawRecordContext&) override;
     void destroy(RenderingResources&) override;
@@ -26,14 +27,25 @@ public:
     static bool SamePlan(const SceneMesh::MaskedDrawPlan&, const SceneMesh::MaskedDrawPlan&);
 
 private:
-    bool enabled() const { return m_stencil_format != VK_FORMAT_UNDEFINED; }
+    struct Program {
+        MaskedDrawShaderContract contract;
+        std::vector<PipelineParameters> pipelines;
+        std::vector<StagingBufferRef> uniforms;
+    };
 
-    std::vector<ImageSlotsRef>       m_textures;
-    VkFormat                         m_stencil_format { VK_FORMAT_UNDEFINED };
-    PipelineParameters               m_mask_pipeline;
-    PipelineParameters               m_test_pipeline;
-    StagingBufferRef                 m_ubo_buf;
-    std::optional<ShaderReflected::Block> m_uniform_block;
+    bool prepareProgram(const Device&, RenderingResources&, const ShaderDrawPipelineContext&,
+                         const SceneMaterial&, bool mask, Program&);
+
+    std::shared_ptr<const SceneMesh::MaskedDrawMaterials> m_materials;
+    std::vector<ImageSlotsRef> m_textures;
+    std::vector<bool> m_inverted;
+    Program m_mask;
+    Program m_clipped;
+    std::shared_ptr<VmaImageParameters> m_coverage;
+    vvk::Framebuffer m_mask_framebuffer;
+    uint64_t m_uniform_epoch { 0 };
+    uint64_t m_draw_sequence { 0 };
+    uint64_t m_pose_hash { 0 };
 };
 
 } // namespace wallpaper::vulkan

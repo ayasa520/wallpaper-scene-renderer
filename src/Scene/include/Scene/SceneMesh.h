@@ -21,9 +21,18 @@ public:
 		uint32_t indexCount { 0 };
 	};
 	struct MaskedDrawGroup {
+		uint64_t identity { 0 };
 		std::string maskTexture;
+		BlendMode blend { BlendMode::Translucent };
+		bool inverted { false };
 		std::vector<DrawRange> maskRanges;
 		std::vector<DrawRange> contentRanges;
+	};
+	struct MaskedDrawMaterials {
+		static constexpr size_t MaskTextureSlot = 1;
+		static constexpr size_t CoverageTextureSlot = 8;
+		SceneMaterial mask;
+		SceneMaterial clipped;
 	};
 	struct MaskedDrawRange {
 		DrawRange range;
@@ -33,6 +42,10 @@ public:
 		std::vector<DrawRange> unmaskedRanges;
 		std::vector<MaskedDrawGroup> groups;
 		std::vector<MaskedDrawRange> orderedRanges;
+		// Geometry wrappers used by direct drawing and publication share the compiled mask
+		// programs. Each Vulkan invocation still owns its descriptors, uniforms and destination;
+		// sharing these immutable definitions never shares a pose update or a framebuffer.
+		std::shared_ptr<const MaskedDrawMaterials> materials;
 
 		bool empty() const { return groups.empty(); }
 	};
@@ -101,6 +114,9 @@ public:
 	}
 	void SetMaskedDraw(MaskedDrawPlan&& plan) {
 		m_data->maskedDraw = std::move(plan);
+	}
+	void SetMaskedDrawMaterials(std::shared_ptr<const MaskedDrawMaterials> materials) {
+		m_data->maskedDraw.materials = std::move(materials);
 	}
 	void SetSkinning(SkinningInfo info) { m_data->skinning = info; }
 	void AddMaterial(SceneMaterial&& material) {

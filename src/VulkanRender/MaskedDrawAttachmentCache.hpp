@@ -5,6 +5,7 @@
 
 #include <string>
 #include <string_view>
+#include <memory>
 #include <unordered_map>
 
 namespace wallpaper::vulkan
@@ -12,19 +13,15 @@ namespace wallpaper::vulkan
 
 class MaskedDrawAttachmentCache {
 public:
-    VmaImageParameters* acquire(const Device&, std::string_view output, VkExtent3D, VkFormat,
-                                VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
+    std::shared_ptr<VmaImageParameters> acquire(const Device&, std::string_view output, VkExtent3D);
     void clear();
     void abandon();
 
 private:
-    struct Entry {
-        VkFormat              format { VK_FORMAT_UNDEFINED };
-        VkSampleCountFlagBits samples { VK_SAMPLE_COUNT_1_BIT };
-        VmaImageParameters    image;
-    };
-
-    std::unordered_map<std::string, Entry> m_entries;
+    // A resized destination can replace the cache entry while another prepared draw still
+    // owns a framebuffer for the old extent. Keep that image alive until its last framebuffer
+    // is dropped; cache replacement must never destroy an attached image view.
+    std::unordered_map<std::string, std::shared_ptr<VmaImageParameters>> m_entries;
 };
 
 } // namespace wallpaper::vulkan

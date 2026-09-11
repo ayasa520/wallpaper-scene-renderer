@@ -955,7 +955,7 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
         }
     }
 
-    if (mdl.mdlv >= 22) {
+    if (mdl.mdlv >= 23) {
         if (! CanReadBytes(f, sizeof(uint32_t))) {
             LOG_ERROR("puppet mdl mask count is truncated: %.*s",
                       static_cast<int>(path.size()),
@@ -975,8 +975,8 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
             }
 
             WPMdl::MaskBlock mask;
-            f.ReadUint32(); // unknown mask record value
-            const uint32_t reserved_before = f.ReadUint32();
+            const uint64_t identity_low = f.ReadUint32();
+            mask.identity = identity_low | (static_cast<uint64_t>(f.ReadUint32()) << 32);
             if (! ReadBoundedString(f, mask.material) ||
                 ! CanReadBytes(f, sizeof(uint32_t) * 2)) {
                 LOG_ERROR("puppet mdl mask %u material block is truncated: %.*s",
@@ -986,8 +986,8 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
                 return false;
             }
 
-            const uint32_t reserved_after = f.ReadUint32();
-            const uint32_t clipped_count  = f.ReadUint32();
+            mask.flags = f.ReadUint32();
+            const uint32_t clipped_count = f.ReadUint32();
             if (clipped_count > mdl.parts.size() ||
                 ! CanReadBytes(f, static_cast<uint64_t>(clipped_count) * sizeof(uint32_t))) {
                 LOG_ERROR("puppet mdl mask %u has invalid clipped-part count %u: %.*s",
@@ -1042,15 +1042,6 @@ bool ReadPuppetPartsAndMasks(fs::IBinaryStream& f,
                 }
             }
 
-            if (reserved_before != 0 || reserved_after != 0) {
-                LOG_INFO("puppet mdl mask %u has non-zero reserved values: %.*s before=%u "
-                         "after=%u",
-                         mask_index,
-                         static_cast<int>(path.size()),
-                         path.data(),
-                         reserved_before,
-                         reserved_after);
-            }
             mdl.masks.push_back(std::move(mask));
         }
     }
@@ -1961,7 +1952,10 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
         for (size_t group_index = 0; group_index < mdl.masks.size(); group_index++) {
             const auto& mask = mdl.masks[group_index];
             SceneMesh::MaskedDrawGroup group;
+            group.identity = mask.identity;
             group.maskTexture = mask.material;
+            group.blend = (mask.flags & 1u) != 0 ? BlendMode::Additive : BlendMode::Translucent;
+            group.inverted = (mask.flags & 2u) != 0;
             group.maskRanges.reserve(mask.source_part_indices.size());
             for (const auto part_index : mask.source_part_indices) {
                 const auto& part = mdl.parts[part_index];
@@ -2007,11 +2001,13 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
         for (size_t group_index = 0; group_index < masked_draw.groups.size(); group_index++) {
             const auto& group = masked_draw.groups[group_index];
             LOG_INFO("masked draw group: group=%zu texture='%s' mask-ranges=%zu "
-                     "content-ranges=%zu",
+                     "content-ranges=%zu identity=%llu blend=%d inverted=%s",
                      group_index,
                      group.maskTexture.c_str(),
                      group.maskRanges.size(),
-                     group.contentRanges.size());
+                     group.contentRanges.size(),
+                     static_cast<unsigned long long>(group.identity),
+                     static_cast<int>(group.blend), group.inverted ? "true" : "false");
             for (const auto& range : group.maskRanges) {
                 LOG_INFO("masked draw range: group=%zu role=mask first-index=%u "
                          "index-count=%u",

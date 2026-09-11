@@ -12,28 +12,26 @@ namespace
 {
 
 std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& device,
-                                                             VkExtent3D extent,
-                                                             VkFormat format,
-                                                             VkSampleCountFlagBits samples) {
+                                                             VkExtent3D extent) {
     VmaImageParameters image;
     VkImageCreateInfo info {
         .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext                 = nullptr,
         .imageType             = VK_IMAGE_TYPE_2D,
-        .format                = format,
+        .format                = VK_FORMAT_R8_UNORM,
         .extent                = extent,
         .mipLevels             = 1,
         .arrayLayers           = 1,
-        .samples               = samples,
+        .samples               = VK_SAMPLE_COUNT_1_BIT,
         .tiling                = VK_IMAGE_TILING_OPTIMAL,
-        .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .usage                 = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     image.extent       = extent;
     image.mipmap_level = 1;
-    image.samples      = static_cast<uint>(samples);
+    image.samples      = 1;
 
     VmaAllocationCreateInfo allocation_info {};
     allocation_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
@@ -45,10 +43,10 @@ std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& devic
         .pNext    = nullptr,
         .image    = *image.handle,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = format,
+        .format   = VK_FORMAT_R8_UNORM,
         .subresourceRange =
             VkImageSubresourceRange {
-                .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
                 .baseMipLevel   = 0,
                 .levelCount     = 1,
                 .baseArrayLayer = 0,
@@ -56,41 +54,46 @@ std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& devic
             },
     };
     VVK_CHECK_ACT(return std::nullopt, device.handle().CreateImageView(view_info, image.view));
+    VkSamplerCreateInfo sampler_info {
+        .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter    = VK_FILTER_LINEAR,
+        .minFilter    = VK_FILTER_LINEAR,
+        .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod       = 0.0f,
+    };
+    VVK_CHECK_ACT(return std::nullopt, device.handle().CreateSampler(sampler_info, image.sampler));
     return image;
 }
 
 } // namespace
 
-VmaImageParameters* MaskedDrawAttachmentCache::acquire(const Device& device,
-                                                       std::string_view output,
-                                                       VkExtent3D extent,
-                                                       VkFormat format,
-                                                       VkSampleCountFlagBits samples) {
+std::shared_ptr<VmaImageParameters> MaskedDrawAttachmentCache::acquire(
+    const Device& device, std::string_view output, VkExtent3D extent) {
     auto& entry = m_entries[std::string(output)];
-    const bool missing = ! entry.image.view || ! entry.image.handle;
-    const bool wrong_size = entry.image.extent.width != extent.width ||
-                            entry.image.extent.height != extent.height ||
-                            entry.image.extent.depth != extent.depth;
-    if (missing || wrong_size || entry.format != format || entry.samples != samples) {
-        auto replacement = CreateMaskedDrawAttachment(device, extent, format, samples);
+    const bool missing = entry == nullptr;
+    const bool wrong_size = !missing && (entry->extent.width != extent.width ||
+                            entry->extent.height != extent.height ||
+                            entry->extent.depth != extent.depth);
+    if (missing || wrong_size) {
+        auto replacement = CreateMaskedDrawAttachment(device, extent);
         if (! replacement.has_value()) return nullptr;
 
-        // Log only allocation boundaries, never cache hits. This keeps normal frame preparation
-        // quiet while making scene switches and output resizes auditable from run.log: every
-        // replacement must be followed by exactly one cache clear or device-fault abandon.
-        LOG_INFO("MaskedDrawAttachmentCache: %s output='%.*s' extent=[%u,%u,%u] format=%d",
+        // All masks for this destination reuse one single-sample coverage image. Commands
+        // finish consuming it before the next group overwrites it; destination MSAA does not
+        // change the sampled coverage format or allocate an image per puppet part.
+        LOG_INFO("MaskedDrawAttachmentCache: %s output='%.*s' extent=[%u,%u,%u] format=R8",
                  missing ? "create" : "replace",
                  static_cast<int>(output.size()),
                  output.data(),
                  extent.width,
                  extent.height,
-                 extent.depth,
-                 static_cast<int>(format));
-        entry.format  = format;
-        entry.samples = samples;
-        entry.image   = std::move(*replacement);
+                 extent.depth);
+        entry = std::make_shared<VmaImageParameters>(std::move(*replacement));
     }
-    return &entry.image;
+    return entry;
 }
 
 void MaskedDrawAttachmentCache::clear() {
@@ -105,9 +108,10 @@ void MaskedDrawAttachmentCache::abandon() {
         LOG_INFO("MaskedDrawAttachmentCache: abandon entries=%zu", m_entries.size());
     }
     for (auto& [_, entry] : m_entries) {
-        entry.image.sampler.abandon();
-        entry.image.view.abandon();
-        entry.image.handle.abandon();
+        if (entry == nullptr) continue;
+        entry->sampler.abandon();
+        entry->view.abandon();
+        entry->handle.abandon();
     }
     m_entries.clear();
 }

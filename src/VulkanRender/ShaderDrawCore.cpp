@@ -653,7 +653,7 @@ void ApplyExplicitClearPolicy(const wallpaper::vulkan::ShaderDrawData& desc,
              desc.output.c_str());
 }
 
-ShaderDrawRenderState BuildCustomShaderRenderState(
+ShaderDrawRenderState wallpaper::vulkan::BuildShaderDrawRenderState(
     const wallpaper::SceneMaterial& material, wallpaper::vulkan::ShaderDrawData& desc) {
     ShaderDrawRenderState state;
     VkColorComponentFlags   color_mask =
@@ -715,7 +715,7 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
     return state;
 }
 
-void ApplyMaterialPipelineState(const wallpaper::SceneMaterial& material,
+void wallpaper::vulkan::ApplyShaderDrawMaterialPipelineState(const wallpaper::SceneMaterial& material,
                                 const wallpaper::vulkan::ShaderDrawData& desc,
                                 GraphicsPipeline& pipeline) {
     // Source, intermediate and final effect draws all consume the material's own cull state.
@@ -962,12 +962,11 @@ ShaderDrawAttachmentDescription wallpaper::vulkan::SceneDepthAttachmentDescripti
 }
 
 ShaderDrawAttachmentDescription ResolveShaderDrawAttachment(
-    const ShaderDrawData& desc, const ShaderDrawExtension* extension) {
+    const ShaderDrawData& desc) {
     if (desc.shared_depth) {
         return SceneDepthAttachmentDescription(desc.clear_depth);
     }
-    return extension != nullptr ? extension->attachmentDescription()
-                                : ShaderDrawAttachmentDescription {};
+    return {};
 }
 
 bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResources& rr,
@@ -986,12 +985,10 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
                   desc.vk_output.extent.height);
         return false;
     }
-    const auto attachment = ResolveShaderDrawAttachment(desc, extension);
+    const auto attachment = ResolveShaderDrawAttachment(desc);
     if (desc.shared_depth) {
         desc.depth_stencil_image_ref = AcquireSceneDepthImage(
             device, rr, desc.output, desc.vk_output.extent, desc.sample_count);
-    } else if (attachment.enabled() && extension != nullptr) {
-        desc.depth_stencil_image_ref = extension->acquireAttachment(device, rr, desc);
     } else {
         desc.depth_stencil_image_ref = nullptr;
     }
@@ -1041,7 +1038,7 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
                  desc.shared_depth ? "true" : "false", info.width, info.height,
                  static_cast<unsigned>(desc.sample_count));
     }
-    return created;
+    return created && (extension == nullptr || extension->refreshFramebuffers(device, rr, desc));
 }
 
 bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
@@ -1052,7 +1049,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
     // TextureCache image view. Drop it before `Query()` can resize and destroy that output image,
     // otherwise Vulkan sees a framebuffer referencing a dead attachment during minute-rollover
     // text bridge updates.
-    m_desc.fb.reset();
+    dropOutputFramebuffers();
     m_desc.vk_tex_binding.clear();
     if (!m_desc.draw.Valid() || m_desc.draw.Mesh() == nullptr ||
         m_desc.draw.Mesh()->Material() == nullptr ||
@@ -1177,7 +1174,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             }
         }
     }
-    const auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
+    const auto render_state = BuildShaderDrawRenderState(*mesh.Material(), m_desc);
     if (const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
         trace_layer != nullptr && std::to_string(m_desc.layer_id) == trace_layer) {
         const auto& blend = render_state.color_blend;
@@ -1209,7 +1206,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         }
     }
     {
-        const auto attachment = ResolveShaderDrawAttachment(m_desc, m_extension);
+        const auto attachment = ResolveShaderDrawAttachment(m_desc);
         auto opt = CreateShaderDrawRenderPass(device.handle(),
                                               VK_FORMAT_R8G8B8A8_UNORM,
                                               render_state.color_load_op,
@@ -1226,7 +1223,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         pipeline.multisample.rasterizationSamples = m_desc.sample_count;
         pipeline.multisample.alphaToCoverageEnable =
             m_desc.alpha_to_coverage && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT;
-        ApplyMaterialPipelineState(*mesh.Material(), m_desc, pipeline);
+        ApplyShaderDrawMaterialPipelineState(*mesh.Material(), m_desc, pipeline);
         m_desc.pipeline.debug_name =
             "CustomShaderPass[node=" +
             (m_desc.draw.Valid() ? m_desc.draw.Name() : std::string("(null)")) +
@@ -1448,11 +1445,14 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         m_desc.update_dynamic_mesh_op = std::move(update_dyn_buf_op);
     }
 
-    if (! ref.blocks.empty()) {
-        auto  block  = ref.blocks.front();
-        if (! rr.dyn_buf->allocateSubRef(
-                block.size, m_desc.ubo_buf, device.limits().minUniformBufferOffsetAlignment)) {
-            return false;
+    if (!ref.blocks.empty() || m_extension != nullptr) {
+        std::optional<ShaderReflected::Block> block;
+        if (!ref.blocks.empty()) {
+            block = ref.blocks.front();
+            if (!rr.dyn_buf->allocateSubRef(
+                    block->size, m_desc.ubo_buf, device.limits().minUniformBufferOffsetAlignment)) {
+                return false;
+            }
         }
         auto* buf    = rr.dyn_buf;
         auto* bufref = &m_desc.ubo_buf;
@@ -1479,11 +1479,12 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
              textures = &m_desc.textures]() {
                 auto update_unf_op = [block, buf, bufref, extension](
                                          std::string_view name, wallpaper::ShaderValue value) {
-                    UpdateShaderDrawUniform(buf, *bufref, block, name, value);
+                    if (block) UpdateShaderDrawUniform(buf, *bufref, *block, name, value);
                     if (extension != nullptr) extension->updateUniform(buf, name, value);
                 };
                 if (material != nullptr) {
-                    WriteMaterialUniforms(buf, *bufref, block, *material);
+                    if (block) WriteMaterialUniforms(buf, *bufref, *block, *material);
+                    if (extension != nullptr) extension->updateMaterialUniforms(buf, *material);
                 }
                 const ShaderUniformOverrides overrides {
                     .camera_name = camera_override,
@@ -1511,15 +1512,18 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                 }
             };
 
-        auto exists_unf_op = [&block](std::string_view name) {
-            return exists(block.member_map, name);
+        // An extension can consume matrices or pose uniforms that the visible executable
+        // omits. Initialize the updater from the union, then fan out one current-frame value
+        // into each independently reflected layout before the shared staging upload.
+        auto exists_unf_op = [&block, extension](std::string_view name) {
+            return (block && exists(block->member_map, name)) ||
+                (extension != nullptr && extension->hasUniform(name));
         };
         shader_updater->InitUniforms(draw, exists_unf_op);
 
         // memset uniform buf
-        buf->fillBuf(*bufref, 0, bufref->size, 0);
+        if (block) buf->fillBuf(*bufref, 0, bufref->size, 0);
         if (m_extension != nullptr) m_extension->initializeUniforms(buf);
-        WriteMaterialUniforms(buf, *bufref, block, *mesh.Material());
         m_desc.update_op();
     }
     // Bootstrap geometry even when no uniform updater exists. Preserve the uniform-then-mesh
@@ -1597,8 +1601,8 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
                 mesh.Material()->blenmode) == BlendMode::AlphaToCoverage;
         }
     }
-    auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
-    const auto attachment = ResolveShaderDrawAttachment(m_desc, m_extension);
+    auto render_state = BuildShaderDrawRenderState(*mesh.Material(), m_desc);
+    const auto attachment = ResolveShaderDrawAttachment(m_desc);
     auto opt = CreateShaderDrawRenderPass(device.handle(),
                                           VK_FORMAT_R8G8B8A8_UNORM,
                                           render_state.color_load_op,
@@ -1615,7 +1619,7 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
     pipeline.multisample.rasterizationSamples = m_desc.sample_count;
     pipeline.multisample.alphaToCoverageEnable =
         m_desc.alpha_to_coverage && m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT;
-    ApplyMaterialPipelineState(*mesh.Material(), m_desc, pipeline);
+    ApplyShaderDrawMaterialPipelineState(*mesh.Material(), m_desc, pipeline);
     m_desc.pipeline.debug_name =
         "CustomShaderPassWarmup[node=" +
         (m_desc.draw.Valid() ? m_desc.draw.Name() : std::string("(null)")) +
@@ -1684,7 +1688,7 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
         // Drop the framebuffer before TextureCache replaces `_rt_FullFrameBufferMultiSampled`.
         // Keeping a live framebuffer across that resize leaves a destroyed MSAA image attached
         // and the next submit waits on the frame fence forever.
-        m_desc.fb.reset();
+        dropOutputFramebuffers();
     }
     if (! RefreshCustomShaderPassTextures(scene, device, m_desc)) {
         LOG_ERROR("CustomShaderPassRefresh: texture refresh failed node='%s' output='%s'",
@@ -1760,7 +1764,10 @@ bool ShaderDrawCore::refreshImportedTextureBindings(Scene& scene, const Device& 
     return true;
 }
 
-void ShaderDrawCore::dropOutputFramebuffers() { m_desc.fb.reset(); }
+void ShaderDrawCore::dropOutputFramebuffers() {
+    m_desc.fb.reset();
+    if (m_extension != nullptr) m_extension->dropFramebuffers();
+}
 
 void ShaderDrawCore::updateBeforeUpload() {
     if (m_desc.should_execute && ! m_desc.should_execute()) {
@@ -1972,7 +1979,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     m_desc.depth_clear_value.depthStencil = { m_desc.depth_clear, 0 };
     std::array<VkClearValue, 3> clear_values { m_desc.clear_value, m_desc.depth_clear_value, {} };
     uint32_t clear_count = 1;
-    if (ResolveShaderDrawAttachment(m_desc, m_extension).enabled()) clear_count++;
+    if (ResolveShaderDrawAttachment(m_desc).enabled()) clear_count++;
     if (m_desc.resolve_msaa) clear_count++;
     VkRenderPassBeginInfo       pass_begin_info {
         .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,

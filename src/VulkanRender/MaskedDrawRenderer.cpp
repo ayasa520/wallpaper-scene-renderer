@@ -2,30 +2,20 @@
 
 #include "Core/ArrayHelper.hpp"
 #include "Interface/IImageParser.h"
+#include "PassCommon.hpp"
 #include "Utils/Logging.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 
 namespace wallpaper::vulkan
 {
 namespace
 {
 
-std::optional<VkFormat> ResolveMaskedDrawStencilFormat(const Device& device) {
-    constexpr std::array formats {
-        VK_FORMAT_D24_UNORM_S8_UINT,
-        VK_FORMAT_D32_SFLOAT_S8_UINT,
-    };
-    for (const auto format : formats) {
-        const auto properties = device.gpu().GetFormatProperties(format);
-        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) !=
-            0) {
-            return format;
-        }
-    }
-    return std::nullopt;
-}
+using MaskMaterials = SceneMesh::MaskedDrawMaterials;
 
 bool SameRange(const SceneMesh::DrawRange& lhs, const SceneMesh::DrawRange& rhs) {
     return lhs.firstIndex == rhs.firstIndex && lhs.indexCount == rhs.indexCount;
@@ -35,7 +25,7 @@ bool SameRanges(const std::vector<SceneMesh::DrawRange>& lhs,
                 const std::vector<SceneMesh::DrawRange>& rhs) {
     if (lhs.size() != rhs.size()) return false;
     for (size_t i = 0; i < lhs.size(); i++) {
-        if (! SameRange(lhs[i], rhs[i])) return false;
+        if (!SameRange(lhs[i], rhs[i])) return false;
     }
     return true;
 }
@@ -44,120 +34,82 @@ bool SameRanges(const std::vector<SceneMesh::DrawRange>& lhs,
 
 bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& data,
                                    const SceneMesh& mesh) {
-    m_stencil_format = VK_FORMAT_UNDEFINED;
-    m_uniform_block.reset();
-
     const auto& plan = mesh.MaskedDraw();
-    if (plan.empty()) {
-        LOG_ERROR("MaskedDrawPrepare: empty plan node='%s'",
-                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>");
+    if (plan.empty() || plan.materials == nullptr || data.model_pass ||
+        mesh.IndexCount() == 0 || plan.orderedRanges.empty()) {
+        LOG_ERROR("MaskedDrawPrepare: invalid mesh/program contract node='%s' groups=%zu",
+                  data.draw.Name().c_str(), plan.groups.size());
         return false;
     }
-    if (data.model_pass || mesh.IndexCount() == 0 || plan.orderedRanges.empty()) {
-        LOG_ERROR("MaskedDrawPrepare: invalid mesh contract node='%s' model=%s indices=%zu "
-                  "ordered-ranges=%zu groups=%zu",
-                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                  data.model_pass ? "true" : "false",
-                  mesh.IndexCount(),
-                  plan.orderedRanges.size(),
-                  plan.groups.size());
+    const auto features = device.gpu().GetFormatProperties(VK_FORMAT_R8_UNORM).optimalTilingFeatures;
+    constexpr auto required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    if ((features & required) != required) {
+        LOG_ERROR("MaskedDrawPrepare: R8 color coverage unsupported node='%s' features=%u",
+                  data.draw.Name().c_str(), features);
         return false;
     }
-
-    for (size_t group_index = 0; group_index < plan.groups.size(); group_index++) {
-        const auto& group = plan.groups[group_index];
-        if (group.maskTexture.empty() || group.maskRanges.empty() ||
-            group.contentRanges.empty()) {
-            LOG_ERROR("MaskedDrawPrepare: invalid group node='%s' group=%zu texture='%s' "
-                      "mask-ranges=%zu content-ranges=%zu",
-                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                      group_index,
-                      group.maskTexture.c_str(),
-                      group.maskRanges.size(),
-                      group.contentRanges.size());
+    m_materials = plan.materials;
+    m_inverted.clear();
+    for (size_t i = 0; i < plan.groups.size(); ++i) {
+        const auto& group = plan.groups[i];
+        if (group.maskTexture.empty() || group.maskRanges.empty() || group.contentRanges.empty()) {
+            LOG_ERROR("MaskedDrawPrepare: invalid group node='%s' group=%zu texture='%s'",
+                      data.draw.Name().c_str(), i, group.maskTexture.c_str());
             return false;
         }
+        m_inverted.push_back(group.inverted);
     }
     for (const auto& ordered : plan.orderedRanges) {
-        if (ordered.groupIndex < -1 ||
-            (ordered.groupIndex >= 0 &&
-             static_cast<size_t>(ordered.groupIndex) >= plan.groups.size())) {
-            LOG_ERROR("MaskedDrawPrepare: ordered range references invalid group node='%s' "
-                      "group=%d groups=%zu",
-                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                      ordered.groupIndex,
-                      plan.groups.size());
+        if (ordered.groupIndex < -1 || (ordered.groupIndex >= 0 &&
+            static_cast<size_t>(ordered.groupIndex) >= plan.groups.size())) {
+            LOG_ERROR("MaskedDrawPrepare: invalid range group node='%s' group=%d groups=%zu",
+                      data.draw.Name().c_str(), ordered.groupIndex, plan.groups.size());
             return false;
         }
     }
-
-    const auto stencil_format = ResolveMaskedDrawStencilFormat(device);
-    if (! stencil_format.has_value()) {
-        LOG_ERROR("MaskedDrawPrepare: no depth/stencil attachment format node='%s'",
-                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>");
-        return false;
-    }
-    m_stencil_format = *stencil_format;
     return true;
 }
 
-std::vector<std::string_view>
-MaskedDrawRenderer::resourceTextures(const SceneMesh& mesh) const {
+std::vector<std::string_view> MaskedDrawRenderer::resourceTextures(const SceneMesh& mesh) const {
     std::vector<std::string_view> textures;
-    textures.reserve(mesh.MaskedDraw().groups.size());
     for (const auto& group : mesh.MaskedDraw().groups) textures.push_back(group.maskTexture);
     return textures;
 }
 
 bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
                                          const ShaderDrawData& data) {
-    if (!data.draw.Valid() || data.draw.Mesh() == nullptr) {
-        LOG_ERROR("MaskedDrawTexture: missing mesh node='%s'",
-                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>");
-        return false;
-    }
-
     const auto& groups = data.draw.Mesh()->MaskedDraw().groups;
     m_textures.resize(groups.size());
-    for (size_t i = 0; i < groups.size(); i++) {
-        const auto& texture_name = groups[i].maskTexture;
-        if (scene.dirtyImportedTextureKeys.count(texture_name) == 0) {
-            if (auto cached = device.tex_cache().FindTex(texture_name); cached.has_value()) {
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto& name = groups[i].maskTexture;
+        if (scene.dirtyImportedTextureKeys.count(name) == 0) {
+            if (auto cached = device.tex_cache().FindTex(name); cached.has_value()) {
                 m_textures[i] = *cached;
                 continue;
             }
         } else {
-            scene.DropParsedImageCache(texture_name);
+            scene.DropParsedImageCache(name);
         }
-
-        const auto texture_it = scene.textures.find(texture_name);
-        if (texture_it == scene.textures.end() || texture_it->second.isVideo) {
+        const auto texture = scene.textures.find(name);
+        if (texture == scene.textures.end() || texture->second.isVideo) {
             LOG_ERROR("MaskedDrawTexture: invalid imported mask node='%s' group=%zu texture='%s'",
-                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                      i,
-                      texture_name.c_str());
+                      data.draw.Name().c_str(), i, name.c_str());
             return false;
         }
-
-        auto image = scene.GetParsedImageIfReady(texture_name);
-        if (image == nullptr) {
-            image = scene.ParseImageBlockingCached(texture_name);
-        }
+        auto image = scene.GetParsedImageIfReady(name);
+        if (image == nullptr) image = scene.ParseImageBlockingCached(name);
         if (image == nullptr) {
             LOG_ERROR("MaskedDrawTexture: parse failed node='%s' group=%zu texture='%s'",
-                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                      i,
-                      texture_name.c_str());
+                      data.draw.Name().c_str(), i, name.c_str());
             return false;
         }
-
         auto slots = device.tex_cache().CreateTex(*image);
-        scene.DropParsedImageCache(texture_name);
+        scene.DropParsedImageCache(name);
         if (slots.slots.empty()) {
             LOG_ERROR("MaskedDrawTexture: upload failed node='%s' group=%zu texture='%s'",
-                      data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                      i,
-                      texture_name.c_str());
+                      data.draw.Name().c_str(), i, name.c_str());
             return false;
         }
         m_textures[i] = std::move(slots);
@@ -165,375 +117,375 @@ bool MaskedDrawRenderer::refreshTextures(Scene& scene, const Device& device,
     return true;
 }
 
-ShaderDrawAttachmentDescription MaskedDrawRenderer::attachmentDescription() const {
-    if (! enabled()) return {};
-    return ShaderDrawAttachmentDescription {
-        .format           = m_stencil_format,
-        .depth_load_op    = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .depth_store_op   = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .stencil_load_op  = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .stencil_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initial_layout   = VK_IMAGE_LAYOUT_UNDEFINED,
-        .final_layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        .cache_tag        = "masked",
-    };
-}
-
-VmaImageParameters* MaskedDrawRenderer::acquireAttachment(const Device& device,
-                                                          RenderingResources& resources,
-                                                          const ShaderDrawData& data) {
-    auto* stencil_image = resources.masked_draw_attachments.acquire(
-        device, data.output, data.vk_output.extent, m_stencil_format, data.sample_count);
-    if (stencil_image == nullptr) {
-        LOG_ERROR("MaskedDrawAttachment: allocation failed node='%s' output='%s' "
-                  "extent=[%u,%u] format=%d",
-                  data.draw.Valid() ? data.draw.Name().c_str() : "<null>",
-                  data.output.c_str(),
-                  data.vk_output.extent.width,
-                  data.vk_output.extent.height,
-                  static_cast<int>(m_stencil_format));
-    }
-    return stencil_image;
-}
-
-bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResources& resources,
-                                          const ShaderDrawPipelineContext& context) {
-    std::vector<Uni_ShaderSpv> test_spvs;
-    ShaderReflected            test_ref;
-    if (! GenReflect(context.material.customShader.shader->codes, test_spvs, test_ref)) {
-        LOG_ERROR("MaskedDrawPrepare: visible shader reflection failed node='%s'",
-                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>");
-        return false;
-    }
-
-    auto test_pass = CreateShaderDrawRenderPass(device.handle(),
-                                                VK_FORMAT_R8G8B8A8_UNORM,
-                                                context.render_state.color_load_op,
-                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                attachmentDescription(),
-                                                context.data.sample_count,
-                                                context.data.resolve_msaa);
-    if (! test_pass.has_value()) return false;
-
-    GraphicsPipeline test_pipeline;
-    test_pipeline.toDefault();
-    test_pipeline.multisample.rasterizationSamples = context.data.sample_count;
-    test_pipeline.depth.stencilTestEnable = true;
-    test_pipeline.depth.front = VkStencilOpState {
-        .failOp      = VK_STENCIL_OP_KEEP,
-        .passOp      = VK_STENCIL_OP_KEEP,
-        .depthFailOp = VK_STENCIL_OP_KEEP,
-        .compareOp   = VK_COMPARE_OP_EQUAL,
-        .compareMask = 0xff,
-        .writeMask   = 0x00,
-        .reference   = kMaskedDrawStencilReference,
-    };
-    test_pipeline.depth.back = test_pipeline.depth.front;
-    m_test_pipeline.debug_name =
-        "MaskedDrawTest[node=" +
-        (context.data.draw.Valid() ? context.data.draw.Name() : std::string("(null)")) +
-        ",output=" + context.data.output + "]";
-    m_test_pipeline.cache_key = ShaderDrawPipelineCompatibilityKey(
-        context.render_state.color_load_op,
-        false,
-        VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        attachmentDescription(),
-        context.data.sample_count,
-        context.data.resolve_msaa);
-    test_pipeline.addDescriptorSetInfo(spanone { context.descriptor_info })
-        .setColorBlendStates(spanone { context.render_state.color_blend })
-        .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-        .addInputBindingDescription(context.binding_descriptions)
-        .addInputAttributeDescription(context.attribute_descriptions);
-    for (auto& spv : test_spvs) test_pipeline.addStage(std::move(spv));
-    if (! test_pipeline.create(device,
-                               *test_pass,
-                               m_test_pipeline,
-                               resources.pipeline_cache.get())) {
-        return false;
-    }
-
-    const auto bone_count = context.mesh.Skinning().boneCount;
-    if (bone_count == 0) {
-        LOG_ERROR("MaskedDrawPrepare: mesh has no bone count node='%s'",
-                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>");
-        return false;
-    }
-    auto mask_shader_codes = CompileMaskedDrawMaskShaderCodes(bone_count);
-    if (! mask_shader_codes.has_value()) {
-        LOG_ERROR("MaskedDrawPrepare: mask shader compilation failed node='%s' bones=%u",
-                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>",
-                  bone_count);
-        return false;
-    }
-
-    std::vector<Uni_ShaderSpv> mask_spvs;
-    ShaderReflected            mask_ref;
-    if (! GenReflect(*mask_shader_codes, mask_spvs, mask_ref)) {
-        LOG_ERROR("MaskedDrawPrepare: mask shader reflection failed node='%s'",
-                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>");
-        return false;
-    }
-    if (mask_ref.blocks.size() != 1) {
-        LOG_ERROR("MaskedDrawPrepare: expected one mask uniform block node='%s' blocks=%zu",
-                  context.data.draw.Valid() ? context.data.draw.Name().c_str() : "<null>",
-                  mask_ref.blocks.size());
-        return false;
-    }
-
-    DescriptorSetInfo mask_descriptor_info;
-    mask_descriptor_info.push_descriptor = true;
-    mask_descriptor_info.bindings.resize(mask_ref.binding_map.size());
-    std::transform(mask_ref.binding_map.begin(),
-                   mask_ref.binding_map.end(),
-                   mask_descriptor_info.bindings.begin(),
-                   [](const auto& item) { return item.second; });
-
-    std::vector<VkVertexInputBindingDescription> mask_bindings;
-    std::vector<VkVertexInputAttributeDescription> mask_attributes;
-    for (uint32_t stream_index = 0; stream_index < context.mesh.VertexCount(); stream_index++) {
-        const auto& vertex    = context.mesh.GetVertexArray(stream_index);
-        const auto  attrs_map = vertex.GetAttrOffsetMap();
-        mask_bindings.push_back(VkVertexInputBindingDescription {
-            .binding   = stream_index,
-            .stride    = static_cast<uint32_t>(vertex.OneSizeOf()),
-            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
-        });
-        for (const auto& [name, input] : mask_ref.input_location_map) {
-            if (input.location >= kMaskedDrawVertexAttributes.size()) {
-                LOG_ERROR("MaskedDrawPrepare: unexpected mask shader input location=%u "
-                          "name='%s' node='%s'",
-                          input.location,
-                          name.c_str(),
-                          context.data.draw.Valid() ? context.data.draw.Name().c_str()
-                                                       : "<null>");
-                return false;
-            }
-            const auto expected_name = kMaskedDrawVertexAttributes[input.location];
-            const auto attr_it       = attrs_map.find(std::string(expected_name));
-            if (attr_it == attrs_map.end()) {
-                LOG_ERROR("MaskedDrawPrepare: mask shader input '%s' expects attribute '%.*s' "
-                          "node='%s'",
-                          name.c_str(),
-                          static_cast<int>(expected_name.size()),
-                          expected_name.data(),
-                          context.data.draw.Valid() ? context.data.draw.Name().c_str()
-                                                       : "<null>");
-                return false;
-            }
-            mask_attributes.push_back(VkVertexInputAttributeDescription {
-                .location = input.location,
-                .binding  = stream_index,
-                .format   = input.format,
-                .offset   = static_cast<uint32_t>(attr_it->second.offset),
-            });
+bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources& resources,
+                                         const ShaderDrawPipelineContext& context,
+                                         const SceneMaterial& material, bool mask,
+                                         Program& program) {
+    const std::vector<BlendMode> blends = mask ? std::vector {material.blenmode}
+        : std::vector {BlendMode::Translucent, BlendMode::Additive};
+    program.pipelines.resize(blends.size());
+    for (size_t index = 0; index < blends.size(); ++index) {
+        std::vector<Uni_ShaderSpv> stages;
+        if (!ReflectMaskedDrawShaderContract(context.mesh, material, stages, program.contract)) {
+            return false;
         }
+        const auto& contract = program.contract;
+        if ((mask && (contract.texture_bindings[0] < 0 ||
+                      contract.texture_bindings[MaskMaterials::MaskTextureSlot] < 0)) ||
+            (!mask && contract.texture_bindings[MaskMaterials::CoverageTextureSlot] < 0)) {
+            LOG_ERROR("MaskedDrawPrepare: missing coverage sampler node='%s' shader='%s' mask=%s",
+                      context.data.draw.Name().c_str(), material.name.c_str(), mask ? "true" : "false");
+            return false;
+        }
+        for (size_t slot = 0; slot < contract.texture_bindings.size(); ++slot) {
+            if (contract.texture_bindings[slot] < 0 ||
+                (mask && slot == MaskMaterials::MaskTextureSlot) ||
+                (!mask && slot == MaskMaterials::CoverageTextureSlot)) continue;
+            if (slot >= context.data.vk_textures.size() ||
+                context.data.vk_textures[slot].slots.empty()) {
+                LOG_ERROR("MaskedDrawPrepare: missing input node='%s' shader='%s' slot=%zu",
+                          context.data.draw.Name().c_str(), material.name.c_str(), slot);
+                return false;
+            }
+        }
+
+        // The clipped material retains the invocation's destination alpha and raster route,
+        // but the group owns its translucent/additive blend selection. The mask writer has
+        // a separate R8 target and material; it never inherits scene depth or clears color
+        // belonging to an earlier visible range.
+        ShaderDrawData invocation;
+        static_cast<ShaderDrawRequest&>(invocation) = context.data;
+        invocation.sample_count = mask ? VK_SAMPLE_COUNT_1_BIT : context.data.sample_count;
+        invocation.resolve_msaa = !mask && context.data.resolve_msaa;
+        invocation.alpha_to_coverage = !mask && material.alpha_to_coverage;
+        invocation.blend_override = blends[index];
+        invocation.clear_before_draw = false;
+        if (mask) {
+            invocation.depth_test = false;
+            invocation.depth_write = false;
+        }
+        VkPipelineColorBlendAttachmentState blend {};
+        if (mask) {
+            SetBlend(material.blenmode, blend);
+            blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+        } else {
+            blend = BuildShaderDrawRenderState(material, invocation).color_blend;
+        }
+        const auto load = mask ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        auto pass = CreateShaderDrawRenderPass(device.handle(),
+            mask ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, load,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, {},
+            invocation.sample_count, invocation.resolve_msaa);
+        if (!pass) return false;
+
+        GraphicsPipeline pipeline;
+        pipeline.toDefault();
+        pipeline.multisample.rasterizationSamples = invocation.sample_count;
+        pipeline.multisample.alphaToCoverageEnable =
+            invocation.alpha_to_coverage && invocation.sample_count > VK_SAMPLE_COUNT_1_BIT;
+        ApplyShaderDrawMaterialPipelineState(material, invocation, pipeline);
+        pipeline.addDescriptorSetInfo(spanone {contract.descriptors})
+            .setColorBlendStates(spanone {blend})
+            .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+            .addInputBindingDescription(contract.bindings)
+            .addInputAttributeDescription(contract.attributes);
+        for (auto& stage : stages) pipeline.addStage(std::move(stage));
+        auto& prepared = program.pipelines[index];
+        prepared.debug_name = std::string(mask ? "MaskedDrawCoverage" : "MaskedDrawClipped") +
+            "[node=" + context.data.draw.Name() + ",output=" + context.data.output + "]";
+        prepared.cache_key = mask ? "MaskedDrawCoverage|format=r8|load=clear|samples=1"
+            : "MaskedDrawClipped|" + ShaderDrawPipelineCompatibilityKey(load, false,
+                VK_ATTACHMENT_LOAD_OP_DONT_CARE, {}, invocation.sample_count,
+                invocation.resolve_msaa);
+        if (!pipeline.create(device, *pass, prepared, resources.pipeline_cache.get())) return false;
     }
 
-    auto mask_pass = CreateShaderDrawRenderPass(device.handle(),
-                                                VK_FORMAT_R8G8B8A8_UNORM,
-                                                context.render_state.color_load_op,
-                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                attachmentDescription(),
-                                                context.data.sample_count,
-                                                context.data.resolve_msaa);
-    if (! mask_pass.has_value()) return false;
-
-    VkPipelineColorBlendAttachmentState mask_color {};
-    mask_color.colorWriteMask = 0;
-    GraphicsPipeline mask_pipeline;
-    mask_pipeline.toDefault();
-    mask_pipeline.multisample.rasterizationSamples = context.data.sample_count;
-    mask_pipeline.depth.stencilTestEnable = true;
-    mask_pipeline.depth.front = VkStencilOpState {
-        .failOp      = VK_STENCIL_OP_KEEP,
-        .passOp      = VK_STENCIL_OP_REPLACE,
-        .depthFailOp = VK_STENCIL_OP_KEEP,
-        .compareOp   = VK_COMPARE_OP_ALWAYS,
-        .compareMask = 0xff,
-        .writeMask   = 0xff,
-        .reference   = kMaskedDrawStencilReference,
-    };
-    mask_pipeline.depth.back = mask_pipeline.depth.front;
-    m_mask_pipeline.debug_name =
-        "MaskedDrawMask[node=" +
-        (context.data.draw.Valid() ? context.data.draw.Name() : std::string("(null)")) +
-        ",output=" + context.data.output + "]";
-    m_mask_pipeline.cache_key = ShaderDrawPipelineCompatibilityKey(
-        context.render_state.color_load_op,
-        false,
-        VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        attachmentDescription(),
-        context.data.sample_count,
-        context.data.resolve_msaa);
-    mask_pipeline.addDescriptorSetInfo(spanone { mask_descriptor_info })
-        .setColorBlendStates(spanone { mask_color })
-        .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-        .addInputBindingDescription(mask_bindings)
-        .addInputAttributeDescription(mask_attributes);
-    for (auto& spv : mask_spvs) mask_pipeline.addStage(std::move(spv));
-    if (! mask_pipeline.create(device,
-                               *mask_pass,
-                               m_mask_pipeline,
-                               resources.pipeline_cache.get())) {
-        return false;
-    }
-
-    m_uniform_block = mask_ref.blocks.front();
-    if (! resources.dyn_buf->allocateSubRef(
-            m_uniform_block->size,
-            m_ubo_buf,
-            device.limits().minUniformBufferOffsetAlignment)) {
-        return false;
+    if (!program.contract.reflection.blocks.empty()) {
+        // All groups are recorded before the shared staging upload is consumed by the GPU.
+        // Inversion therefore needs one stable uniform range per group, not repeated CPU
+        // writes into an address already referenced by an earlier mask command.
+        program.uniforms.resize(mask ? m_inverted.size() : 1);
+        for (auto& uniform : program.uniforms) {
+            if (!resources.dyn_buf->allocateSubRef(program.contract.reflection.blocks.front().size,
+                    uniform, device.limits().minUniformBufferOffsetAlignment)) return false;
+        }
     }
     return true;
 }
 
-void MaskedDrawRenderer::updateUniform(StagingBuffer* buffer, std::string_view name,
-                                       const ShaderValue& value) {
-    if (! m_uniform_block.has_value() || ! m_ubo_buf) return;
-    UpdateShaderDrawUniform(buffer, m_ubo_buf, *m_uniform_block, name, value);
+bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResources& resources,
+                                           const ShaderDrawPipelineContext& context) {
+    return prepareProgram(device, resources, context, m_materials->mask, true, m_mask) &&
+        prepareProgram(device, resources, context, m_materials->clipped, false, m_clipped);
+}
+
+bool MaskedDrawRenderer::refreshFramebuffers(const Device& device, RenderingResources& resources,
+                                              const ShaderDrawData& data) {
+    dropFramebuffers();
+    m_coverage = resources.masked_draw_attachments.acquire(device, data.output, data.vk_output.extent);
+    if (m_coverage == nullptr) return false;
+    const VkImageView view = *m_coverage->view;
+    VkFramebufferCreateInfo info {
+        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = *m_mask.pipelines.front().pass,
+        .attachmentCount = 1,
+        .pAttachments = &view,
+        .width = data.vk_output.extent.width,
+        .height = data.vk_output.extent.height,
+        .layers = 1,
+    };
+    VVK_CHECK_ACT(return false, device.handle().CreateFramebuffer(info, m_mask_framebuffer));
+    return true;
+}
+
+void MaskedDrawRenderer::dropFramebuffers() {
+    m_mask_framebuffer.reset();
+    m_coverage.reset();
+}
+
+bool MaskedDrawRenderer::hasUniform(std::string_view name) const {
+    return m_mask.contract.hasUniform(name) || m_clipped.contract.hasUniform(name);
 }
 
 void MaskedDrawRenderer::initializeUniforms(StagingBuffer* buffer) {
-    if (! m_ubo_buf) return;
-    buffer->fillBuf(m_ubo_buf, 0, m_ubo_buf.size, 0);
+    for (auto* program : {&m_mask, &m_clipped}) {
+        for (const auto& uniform : program->uniforms) buffer->fillBuf(uniform, 0, uniform.size, 0);
+    }
+}
+
+void MaskedDrawRenderer::updateMaterialUniforms(StagingBuffer* buffer,
+                                                const SceneMaterial& invocation) {
+    const auto write = [&](const Program& program, const auto& values) {
+        if (program.uniforms.empty()) return;
+        const auto& block = program.contract.reflection.blocks.front();
+        for (const auto& [name, value] : values) {
+            for (const auto& uniform : program.uniforms) {
+                UpdateShaderDrawUniform(buffer, uniform, block, name, value);
+            }
+        }
+    };
+    write(m_mask, m_materials->mask.customShader.shader->default_uniforms);
+    write(m_mask, m_materials->mask.customShader.constValues);
+    write(m_clipped, m_materials->clipped.customShader.shader->default_uniforms);
+    write(m_clipped, m_materials->clipped.customShader.constValues);
+    // Per-invocation values include the resolved publication modulation or the current direct
+    // material controls. They override the clipped executable's initial defaults without
+    // mutating a program shared by another draw or advancing its canonical owner pose.
+    write(m_clipped, invocation.customShader.constValues);
+    for (size_t group = 0; group < m_inverted.size(); ++group) {
+        UpdateShaderDrawUniform(buffer, m_mask.uniforms[group],
+            m_mask.contract.reflection.blocks.front(), G_RV0,
+            std::array<float, 4> {m_inverted[group] ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f});
+    }
+    ++m_uniform_epoch;
+}
+
+void MaskedDrawRenderer::updateUniform(StagingBuffer* buffer, std::string_view name,
+                                        const ShaderValue& value) {
+    for (auto* program : {&m_mask, &m_clipped}) {
+        if (!program->contract.hasUniform(name) || (program == &m_mask && name == G_RV0)) continue;
+        for (const auto& uniform : program->uniforms) {
+            UpdateShaderDrawUniform(buffer, uniform, program->contract.reflection.blocks.front(),
+                                    name, value);
+        }
+    }
+    if (name == G_BONES && std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr) {
+        // This diagnostic fingerprints the exact shared pose bytes sent to both programs.
+        // It is not another pose cache and performs no work outside the opt-in trace.
+        m_pose_hash = 14695981039346656037ull;
+        const auto* bytes = reinterpret_cast<const uint8_t*>(value.data());
+        for (size_t i = 0; i < value.size() * sizeof(ShaderValue::value_type); ++i) {
+            m_pose_hash = (m_pose_hash ^ bytes[i]) * 1099511628211ull;
+        }
+    }
 }
 
 void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
-    auto&       data      = context.data;
-    auto&       command   = context.resources.command;
-    const auto& plan      = data.draw.Mesh()->MaskedDraw();
-    const auto& out_extent = data.vk_output.extent;
-
-    const auto push_mask_descriptors = [&](size_t group_index) {
-        const auto& image = m_textures[group_index].getActive();
-        VkDescriptorImageInfo image_info {
-            image.sampler,
-            image.view,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        };
-        VkWriteDescriptorSet image_write {
-            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext           = nullptr,
-            .dstSet          = {},
-            .dstBinding      = kMaskedDrawTextureBinding,
-            .descriptorCount = 1,
-            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo      = &image_info,
-        };
-        command.PushDescriptorSetKHR(
-            VK_PIPELINE_BIND_POINT_GRAPHICS, *m_mask_pipeline.layout, 0, image_write);
-
-        VkDescriptorBufferInfo buffer_info {
-            context.resources.dyn_buf->gpuBuf(),
-            m_ubo_buf.offset,
-            m_ubo_buf.size,
-        };
-        VkWriteDescriptorSet buffer_write {
-            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext           = nullptr,
-            .dstSet          = {},
-            .dstBinding      = kMaskedDrawUniformBinding,
-            .descriptorCount = 1,
-            .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .pBufferInfo     = &buffer_info,
-        };
-        command.PushDescriptorSetKHR(
-            VK_PIPELINE_BIND_POINT_GRAPHICS, *m_mask_pipeline.layout, 0, buffer_write);
+    const auto& data = context.data;
+    auto& command = context.resources.command;
+    const auto& plan = data.draw.Mesh()->MaskedDraw();
+    const auto& extent = data.vk_output.extent;
+    ++m_draw_sequence;
+    const bool trace = std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr &&
+        (m_draw_sequence % 120 == 1 || std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr);
+    const auto trace_range = [&](const char* role, const SceneMesh::DrawRange& range,
+                                  int32_t group, const char* shader) {
+        if (!trace) return;
+        LOG_INFO("MaskedDrawCommand: sequence=%llu time=%.6f uniform-epoch=%llu pose=%016llx "
+                 "layer=%d node='%s' role=%s shader='%s' group=%d first=%u count=%u "
+                 "destination=%p coverage=%p extent=%ux%u samples=%u",
+                 static_cast<unsigned long long>(m_draw_sequence),
+                 data.scene->elapsingTime, static_cast<unsigned long long>(m_uniform_epoch),
+                 static_cast<unsigned long long>(m_pose_hash), data.layer_id,
+                 data.draw.Name().c_str(), role, shader, group, range.firstIndex, range.indexCount,
+                 reinterpret_cast<void*>(data.vk_output.handle),
+                 reinterpret_cast<void*>(*m_coverage->handle), extent.width, extent.height,
+                 static_cast<unsigned>(data.sample_count));
+    };
+    const auto push_descriptors = [&](const Program& program, size_t pipeline_index,
+                                       size_t group_index, bool mask) {
+        const auto layout = *program.pipelines[pipeline_index].layout;
+        for (size_t slot = 0; slot < program.contract.texture_bindings.size(); ++slot) {
+            const auto binding = program.contract.texture_bindings[slot];
+            if (binding < 0) continue;
+            const ImageParameters image =
+                mask && slot == MaskMaterials::MaskTextureSlot ? m_textures[group_index].getActive()
+                : !mask && slot == MaskMaterials::CoverageTextureSlot ? ImageParameters(*m_coverage)
+                : data.vk_textures[slot].getActive();
+            VkDescriptorImageInfo image_info {
+                image.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+            VkWriteDescriptorSet write {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding = static_cast<uint32_t>(binding),
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &image_info,
+            };
+            command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, write);
+        }
+        if (!program.uniforms.empty()) {
+            const auto& uniform = program.uniforms[mask ? group_index : 0];
+            VkDescriptorBufferInfo buffer_info {
+                context.resources.dyn_buf->gpuBuf(), uniform.offset, uniform.size,
+            };
+            VkWriteDescriptorSet write {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding = program.contract.uniform_binding,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &buffer_info,
+            };
+            command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, write);
+        }
     };
 
-    enum class BoundPipeline
-    {
-        Visible,
-        Mask,
-        Clipped,
-    };
-    BoundPipeline bound_pipeline  = BoundPipeline::Visible;
-    int32_t       active_group    = -1;
-
-    // The ordered range schedule preserves the MDLV part order exactly. Drawing all unmasked parts
-    // first would move eyelids, pupils, and other layered parts across one another even though the
-    // same ranges and stencil masks were eventually submitted.
+    enum class BoundPipeline { Visible, Mask, Clipped };
+    auto bound = BoundPipeline::Visible;
+    size_t bound_clipped = 0;
+    int32_t active_group = -1;
+    // Preserve the imported part schedule, including ordinary ranges between clipped ranges.
+    // The scratch mask is consumed immediately. Pre-rendering every group into this shared
+    // image would make earlier content sample the final group's coverage instead of its own.
     for (const auto& ordered : plan.orderedRanges) {
         const auto& range = ordered.range;
         if (range.indexCount == 0) continue;
-
         if (ordered.groupIndex < 0) {
-            if (bound_pipeline != BoundPipeline::Visible) {
+            if (bound != BoundPipeline::Visible) {
                 command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *data.pipeline.handle);
                 context.push_visible_descriptors(*data.pipeline.layout);
-                bound_pipeline = BoundPipeline::Visible;
+                bound = BoundPipeline::Visible;
             }
+            trace_range("visible", range, -1, data.draw.Mesh()->Material()->name.c_str());
             command.DrawIndexed(range.indexCount, 1, range.firstIndex, 0, 0);
             continue;
         }
-
         const auto group_index = static_cast<size_t>(ordered.groupIndex);
+        const auto& group = plan.groups[group_index];
+        const size_t clipped_index = group.blend == BlendMode::Additive ? 1 : 0;
         if (active_group != ordered.groupIndex) {
-            VkClearAttachment clear_attachment {
-                .aspectMask      = VK_IMAGE_ASPECT_STENCIL_BIT,
-                .colorAttachment = 0,
-                .clearValue      = VkClearValue { .depthStencil = { 1.0f, 0 } },
+            command.EndRenderPass();
+            VkClearValue clear {.color = {{group.inverted ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f}}};
+            VkRenderPassBeginInfo begin {
+                .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                .renderPass = *m_mask.pipelines.front().pass,
+                .framebuffer = *m_mask_framebuffer,
+                .renderArea = {{0, 0}, {extent.width, extent.height}},
+                .clearValueCount = 1,
+                .pClearValues = &clear,
             };
-            VkClearRect clear_rect {
-                .rect = VkRect2D {
-                    .offset = { 0, 0 },
-                    .extent = { out_extent.width, out_extent.height },
-                },
-                .baseArrayLayer = 0,
-                .layerCount     = 1,
-            };
-            command.ClearAttachments(spanone { clear_attachment }, spanone { clear_rect });
-
-            command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_mask_pipeline.handle);
-            push_mask_descriptors(group_index);
-            bound_pipeline = BoundPipeline::Mask;
-            for (const auto& mask_range : plan.groups[group_index].maskRanges) {
-                if (mask_range.indexCount == 0) continue;
-                command.DrawIndexed(
-                    mask_range.indexCount, 1, mask_range.firstIndex, 0, 0);
+            command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
+            command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_mask.pipelines.front().handle);
+            push_descriptors(m_mask, 0, group_index, true);
+            if (trace) {
+                LOG_INFO("MaskedDrawInputs: sequence=%llu layer=%d node='%s' group=%zu "
+                         "identity=%llu inverted=%s blend=%d albedo=%p mask=%p "
+                         "mask-uniform-offset=%llu clipped-uniform-offset=%llu",
+                         static_cast<unsigned long long>(m_draw_sequence), data.layer_id,
+                         data.draw.Name().c_str(), group_index,
+                         static_cast<unsigned long long>(group.identity),
+                         group.inverted ? "true" : "false", static_cast<int>(group.blend),
+                         reinterpret_cast<void*>(data.vk_textures[0].getActive().handle),
+                         reinterpret_cast<void*>(m_textures[group_index].getActive().handle),
+                         static_cast<unsigned long long>(m_mask.uniforms[group_index].offset),
+                         static_cast<unsigned long long>(m_clipped.uniforms.empty()
+                             ? 0 : m_clipped.uniforms.front().offset));
             }
+            for (const auto& mask_range : group.maskRanges) {
+                if (mask_range.indexCount == 0) continue;
+                trace_range("mask", mask_range, ordered.groupIndex, m_materials->mask.name.c_str());
+                command.DrawIndexed(mask_range.indexCount, 1, mask_range.firstIndex, 0, 0);
+            }
+            command.EndRenderPass();
+
+            // The render pass transitions coverage to shader-read layout, but its incoming
+            // dependency alone does not publish color writes to the following sampler. Make
+            // that handoff explicit before resuming the enclosing destination with LOAD.
+            // Its framebuffer and sample/resolve configuration stay unchanged, preserving
+            // earlier ranges and uncovered multisample color across every interruption.
+            VkImageMemoryBarrier barrier {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = *m_coverage->handle,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            };
+            command.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, barrier);
+            begin.renderPass = *m_clipped.pipelines[clipped_index].pass;
+            begin.framebuffer = *data.fb;
+            begin.clearValueCount = 0;
+            begin.pClearValues = nullptr;
+            command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
+            bound = BoundPipeline::Mask;
             active_group = ordered.groupIndex;
         }
-
-        if (bound_pipeline != BoundPipeline::Clipped) {
-            command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_test_pipeline.handle);
-            context.push_visible_descriptors(*m_test_pipeline.layout);
-            bound_pipeline = BoundPipeline::Clipped;
+        if (bound != BoundPipeline::Clipped || bound_clipped != clipped_index) {
+            command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  *m_clipped.pipelines[clipped_index].handle);
+            push_descriptors(m_clipped, clipped_index, group_index, false);
+            bound = BoundPipeline::Clipped;
+            bound_clipped = clipped_index;
         }
+        trace_range("clipped", range, ordered.groupIndex, m_materials->clipped.name.c_str());
         command.DrawIndexed(range.indexCount, 1, range.firstIndex, 0, 0);
     }
 }
 
 void MaskedDrawRenderer::destroy(RenderingResources& resources) {
+    dropFramebuffers();
     m_textures.clear();
-    m_uniform_block.reset();
-    if (m_ubo_buf) resources.dyn_buf->unallocateSubRef(m_ubo_buf);
-    m_ubo_buf = {};
+    m_inverted.clear();
+    m_materials.reset();
+    for (auto* program : {&m_mask, &m_clipped}) {
+        for (auto& uniform : program->uniforms) resources.dyn_buf->unallocateSubRef(uniform);
+        program->uniforms.clear();
+        program->contract = {};
+    }
 }
 
 bool MaskedDrawRenderer::SamePlan(const SceneMesh::MaskedDrawPlan& lhs,
                                   const SceneMesh::MaskedDrawPlan& rhs) {
-    if (! SameRanges(lhs.unmaskedRanges, rhs.unmaskedRanges) ||
-        lhs.groups.size() != rhs.groups.size() ||
-        lhs.orderedRanges.size() != rhs.orderedRanges.size()) {
+    if (lhs.materials != rhs.materials || !SameRanges(lhs.unmaskedRanges, rhs.unmaskedRanges) ||
+        lhs.groups.size() != rhs.groups.size() || lhs.orderedRanges.size() != rhs.orderedRanges.size()) {
         return false;
     }
-    for (size_t i = 0; i < lhs.groups.size(); i++) {
-        const auto& lhs_group = lhs.groups[i];
-        const auto& rhs_group = rhs.groups[i];
-        if (lhs_group.maskTexture != rhs_group.maskTexture ||
-            ! SameRanges(lhs_group.maskRanges, rhs_group.maskRanges) ||
-            ! SameRanges(lhs_group.contentRanges, rhs_group.contentRanges)) {
+    for (size_t i = 0; i < lhs.groups.size(); ++i) {
+        const auto& a = lhs.groups[i];
+        const auto& b = rhs.groups[i];
+        if (a.identity != b.identity || a.maskTexture != b.maskTexture ||
+            a.blend != b.blend || a.inverted != b.inverted ||
+            !SameRanges(a.maskRanges, b.maskRanges) || !SameRanges(a.contentRanges, b.contentRanges)) {
             return false;
         }
     }
-    for (size_t i = 0; i < lhs.orderedRanges.size(); i++) {
+    for (size_t i = 0; i < lhs.orderedRanges.size(); ++i) {
         if (lhs.orderedRanges[i].groupIndex != rhs.orderedRanges[i].groupIndex ||
-            ! SameRange(lhs.orderedRanges[i].range, rhs.orderedRanges[i].range)) {
-            return false;
-        }
+            !SameRange(lhs.orderedRanges[i].range, rhs.orderedRanges[i].range)) return false;
     }
     return true;
 }

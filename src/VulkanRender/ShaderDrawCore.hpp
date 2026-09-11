@@ -105,6 +105,10 @@ struct ShaderDrawRenderState {
     VkAttachmentLoadOp                  color_load_op { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
 };
 
+ShaderDrawRenderState BuildShaderDrawRenderState(const SceneMaterial&, ShaderDrawData&);
+void ApplyShaderDrawMaterialPipelineState(const SceneMaterial&, const ShaderDrawData&,
+                                          GraphicsPipeline&);
+
 struct ShaderDrawAttachmentDescription {
     VkFormat            format { VK_FORMAT_UNDEFINED };
     VkAttachmentLoadOp  depth_load_op { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
@@ -156,12 +160,13 @@ public:
     virtual bool configure(const Device&, const ShaderDrawData&, const SceneMesh&) = 0;
     virtual std::vector<std::string_view> resourceTextures(const SceneMesh&) const = 0;
     virtual bool refreshTextures(Scene&, const Device&, const ShaderDrawData&) = 0;
-    virtual ShaderDrawAttachmentDescription attachmentDescription() const = 0;
-    virtual VmaImageParameters* acquireAttachment(const Device&, RenderingResources&,
-                                                  const ShaderDrawData&) = 0;
+    virtual bool refreshFramebuffers(const Device&, RenderingResources&, const ShaderDrawData&) = 0;
+    virtual void dropFramebuffers() = 0;
     virtual bool preparePipelines(const Device&, RenderingResources&,
                                   const ShaderDrawPipelineContext&) = 0;
     virtual void updateUniform(StagingBuffer*, std::string_view, const ShaderValue&) = 0;
+    virtual bool hasUniform(std::string_view) const = 0;
+    virtual void updateMaterialUniforms(StagingBuffer*, const SceneMaterial&) = 0;
     virtual void initializeUniforms(StagingBuffer*) = 0;
     virtual void recordIndexed(const ShaderDrawRecordContext&) = 0;
     virtual void destroy(RenderingResources&) = 0;

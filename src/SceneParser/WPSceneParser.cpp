@@ -1204,12 +1204,15 @@ void SetNeutralPublicationModulation(ShaderValueMap& values) {
     values["g_Brightness"] = 1.0f;
 }
 
+void MergeImageSourceProgramBindings(SceneMaterial&, const SceneMaterial&);
+
 bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer& effect_layer,
                                    std::string_view initial_source, int32_t owner_layer_id,
                                    std::string_view         owner_name,
                                    int32_t                  color_blend_mode,
                                    const WPShaderValueData* final_transform_data = nullptr,
-                                   const WPMdl* puppet = nullptr) {
+                                   const WPMdl* puppet = nullptr,
+                                   const SceneMaterial* clipped_material = nullptr) {
     auto& vfs = *context.vfs;
 
     wpscene::WPMaterial composite_source;
@@ -1255,6 +1258,12 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
                   static_cast<int>(owner_name.size()),
                   owner_name.data());
         return false;
+    }
+    if (clipped_material != nullptr) {
+        // A masked range uses the clipped source executable even when ordinary ranges use
+        // the utility publication program. Retain its extra texture dependencies on this
+        // invocation, without replacing the resolved slot zero or its neutral modulation.
+        MergeImageSourceProgramBindings(composite_material, *clipped_material);
     }
     if (final_transform_data != nullptr) {
         // Publication evaluates the owner's raw transform through the layer binding below.
@@ -1348,6 +1357,64 @@ void MergeImageSourceProgramBindings(SceneMaterial& material, const SceneMateria
             material.textures[slot] = variant.textures[slot];
         }
     }
+}
+
+bool LoadImageMaskedDrawMaterials(
+    ParseContext& context, const wpscene::WPImageObject& image, const WPMdl& puppet,
+    const WPShaderInfo& source_info, SceneMaterial& material,
+    std::shared_ptr<const SceneMesh::MaskedDrawMaterials>& result) {
+    auto programs = std::make_shared<SceneMesh::MaskedDrawMaterials>();
+    auto clipped_source = image.material;
+    WPMdlParser::AddPuppetMatInfo(clipped_source, puppet);
+    clipped_source.combos["CLIPPINGUVS"] = 1;
+    clipped_source.combos["CLIPPINGTARGET"] = 1;
+    constexpr auto coverage_slot = SceneMesh::MaskedDrawMaterials::CoverageTextureSlot;
+    clipped_source.textures.resize(std::max(clipped_source.textures.size(), coverage_slot + 1));
+    clipped_source.textures[coverage_slot].clear();
+    if (clipped_source.usertextures.size() > coverage_slot) {
+        clipped_source.usertextures[coverage_slot] = {};
+    }
+    // Coverage is a draw-local Vulkan image, not a scene texture alias. Compile its sampler
+    // through the clipping combos and bind it when the command executes. Other authored
+    // inputs retain their usual material resolution and render-graph dependencies.
+    WPShaderInfo clipped_info;
+    clipped_info.baseConstSvs = source_info.baseConstSvs;
+    WPShaderValueData clipped_values;
+    if (!LoadMaterial(*context.vfs, clipped_source, context.scene.get(), &programs->clipped,
+                      &clipped_values, context.user_properties, &clipped_info)) {
+        LOG_ERROR("SceneImageMaskedMaterial: layer=%d name='%s' clipped shader load failed",
+                  image.id, image.name.c_str());
+        return false;
+    }
+    LoadConstvalue(programs->clipped, image.material, clipped_info);
+    LoadUserShaderValue(programs->clipped, image.material, clipped_info, context.user_properties);
+
+    wpscene::WPMaterial mask_source;
+    nlohmann::json mask_json;
+    if (!PARSE_JSON(fs::GetFileContent(*context.vfs,
+                                      "/assets/materials/util/clippingmaskimage4.json"), mask_json) ||
+        !mask_source.FromJson(mask_json)) {
+        LOG_ERROR("SceneImageMaskedMaterial: layer=%d name='%s' mask material load failed",
+                  image.id, image.name.c_str());
+        return false;
+    }
+    WPMdlParser::AddPuppetMatInfo(mask_source, puppet);
+    mask_source.textures = {material.Texture(0), puppet.masks.front().material};
+    WPShaderInfo mask_info;
+    mask_info.baseConstSvs = context.global_base_uniforms;
+    WPShaderValueData mask_values;
+    if (!LoadMaterial(*context.vfs, mask_source, context.scene.get(), &programs->mask,
+                      &mask_values, context.user_properties, &mask_info)) {
+        LOG_ERROR("SceneImageMaskedMaterial: layer=%d name='%s' mask shader load failed",
+                  image.id, image.name.c_str());
+        return false;
+    }
+    MergeImageSourceProgramBindings(material, programs->clipped);
+    LOG_INFO("SceneImageMaskedMaterial: layer=%d name='%s' mask='%s' clipped='%s' groups=%zu",
+             image.id, image.name.c_str(), programs->mask.name.c_str(),
+             programs->clipped.name.c_str(), puppet.masks.size());
+    result = std::move(programs);
+    return true;
 }
 
 bool LoadImageDirectPuppetSource(
@@ -2473,7 +2540,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         }
     }
     if (puppet != nullptr) {
-        // Puppet clipping masks are independent imported textures referenced by MDLV0022+
+        // Puppet clipping masks are independent imported textures referenced by MDLV0023+
         // metadata rather than by the visible material JSON. Register them with the same scene
         // texture contract as authored material slots so structural dynamic preparation can stage
         // their bytes before the masked mesh becomes executable.
@@ -2558,6 +2625,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     std::optional<SceneImageEffectLayer::PrelightingSource> prelighting_source;
     if (hasEffect && !LoadImagePrelightingSource(context, wpimgobj, puppet.get(), shaderInfo,
                                                  material, prelighting_source)) return;
+    std::shared_ptr<const SceneMesh::MaskedDrawMaterials> masked_materials;
+    if (hasAnimatedPuppetMesh && !puppet->masks.empty()) {
+        if (!LoadImageMaskedDrawMaterials(context, wpimgobj, *puppet, shaderInfo,
+                                          material, masked_materials)) return;
+        if (prelighting_source) {
+            prelighting_source->mesh->SetMaskedDrawMaterials(masked_materials);
+        }
+    }
     // Destination targets and effect FBOs are fixed-size images sized from the source texture
     // content (or the card for texture-less / passthrough helpers), never from the scene camera.
     const ImageDestinationExtent destination_extent =
@@ -2622,10 +2697,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         if (hasAnimatedPuppetMesh) {
             if (hasEffect) {
                 // The source material already evaluates authored image behavior before the effect
-                // sequence. Publication samples that resolved result with a utility material and
-                // the original skinned mesh; repeating the source shader would process iris
-                // controls, lighting and tint twice. Keep source and publication programs
-                // separate while sharing the same owner and immutable puppet pose.
+                // sequence. Ordinary publication ranges sample that result with a utility
+                // material; masked ranges select their separate clipped executable. Both
+                // consume the original mesh and the same immutable owner pose.
                 GenCardMesh(
                     mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
                 WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
@@ -2667,6 +2741,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                         { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
         }
     }
+    mesh.SetMaskedDrawMaterials(masked_materials);
+    effct_final_mesh.SetMaskedDrawMaterials(masked_materials);
     // A passthrough source cleared to transparent publishes with translucent blending.
     // colorBlendMode 31 takes precedence over that rule; other images retain their authored
     // destination blend independently of the source-pass override below.
@@ -2883,7 +2959,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                                           wpimgobj.name,
                                           wpimgobj.colorBlendMode,
                                           &finalCompositeTransformData,
-                                          hasAnimatedPuppetMesh ? puppet.get() : nullptr);
+                                          hasAnimatedPuppetMesh ? puppet.get() : nullptr,
+                                          masked_materials ? &masked_materials->clipped : nullptr);
         }
         LoadLayerEffects(context, *imgEffectLayer, wpimgobj.effects, effect_target_resolution,
                          baseConstSvs, BuildImageEffectMaterialContract(wpimgobj, *imgEffectLayer),
