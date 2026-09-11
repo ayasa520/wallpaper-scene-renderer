@@ -742,18 +742,31 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         // transform independently of this submitted draw state.
         const bool geometry_space =
             overrides != nullptr && overrides->model_space == ShaderModelSpace::Geometry;
+        std::optional<EffectProjectionSnapshot> layer_snapshot;
+        if (overrides != nullptr && overrides->model_space == ShaderModelSpace::LayerSnapshot) {
+            // Framebuffer initialization replaces the model with the aligned owner while
+            // retaining the incoming destination/camera. Reuse the same snapshot factors
+            // as effect projection rather than rebasing this sample into the private source
+            // or multiplying the composition's inverse-owner raster transform a second time.
+            const auto& source_layer =
+                *m_nodeDataMap.at(draw.DataKey()).effect_layer_projection.layer;
+            layer_snapshot = ResolveEffectProjectionSnapshot(
+                source_layer, effect_snapshot_camera, reflection_snapshot);
+        }
         Matrix4d modelTrans = geometry_space
             ? Matrix4d::Identity()
-            : transformResolver.ResolveRawModelTransform(draw);
+            : (layer_snapshot ? layer_snapshot->layer_model
+                              : transformResolver.ResolveRawModelTransform(draw));
         Vector3d destinationOffset = Vector3d::Zero();
-        const bool composition_draw = !geometry_space && !use_active_camera_for_uniforms &&
+        const bool composition_draw = !geometry_space && !layer_snapshot &&
+            !use_active_camera_for_uniforms &&
             has_named_camera_override && overrides->use_active_camera_for_parallax &&
             camera_node != nullptr;
         // Private material rasterization uses identity destination state; root displacement
         // belongs to the restored scene destination. Composition children also retain identity
         // destination state for the entire child walk. A source's nonzero owner depth must never
         // move its pixels inside a private target.
-        if (!geometry_space && !composition_draw && hasNodeData &&
+        if (!geometry_space && !layer_snapshot && !composition_draw && hasNodeData &&
             (camera == m_scene->activeCamera || use_active_parallax_camera) &&
             m_nodeDataMap.at(draw.DataKey()).AppliesModelParallax()) {
             destinationOffset =
@@ -783,7 +796,8 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         modelTrans = ApplyMeshGeometryTransform(modelTrans, draw.Mesh());
         const Matrix4d destinationTrans =
             Affine3d(Eigen::Translation3d(destinationOffset)).matrix();
-        viewProTrans = viewProTrans * destinationTrans;
+        viewProTrans = layer_snapshot ? layer_snapshot->incoming_view_projection
+                                     : (viewProTrans * destinationTrans).eval();
 
         const auto* model_owner = m_scene->FindSceneObject(draw.LayerId(*m_scene));
         if (model_owner != nullptr && model_owner->Kind() == SceneObjectKind::Model &&

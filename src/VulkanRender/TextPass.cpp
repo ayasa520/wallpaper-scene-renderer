@@ -272,6 +272,7 @@ bool CreateTextPipelinesForPrimitive(const Device&                         devic
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
                                     bool                                  private_source,
+                                    bool                                  clear_before_draw,
                                     wallpaper::AlphaWritePolicy           alpha_write_policy,
                                     VkSampleCountFlagBits                 sample_count,
                                     bool                                  resolve_msaa,
@@ -355,13 +356,13 @@ bool CreateTextPipelinesForPrimitive(const Device&                         devic
                                PipelineParameters& parameters) {
         auto render_pass = CreateShaderDrawRenderPass(
             device.handle(), VK_FORMAT_R8G8B8A8_UNORM,
-            private_source ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            clear_before_draw ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, attachment, sample_count, resolve_msaa);
         if (!render_pass.has_value()) return false;
         pipeline.depth.depthTestEnable = depth_test;
         parameters.debug_name = name;
         parameters.cache_key = TextPipelineCompatibilityKey(
-            private_source, blend_mode, alpha_write_policy, sample_count, resolve_msaa,
+            clear_before_draw, blend_mode, alpha_write_policy, sample_count, resolve_msaa,
             shared_depth);
         return pipeline.create(device, *render_pass, parameters, rr.pipeline_cache.get());
     };
@@ -387,6 +388,7 @@ TextPass::TextPass(const Desc& desc)
     m_desc.execute_when_hidden = desc.execute_when_hidden;
     m_desc.should_execute      = desc.should_execute;
     m_desc.private_source      = desc.private_source;
+    m_desc.clear_before_draw   = desc.clear_before_draw;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
     m_desc.shared_depth        = desc.shared_depth;
@@ -418,6 +420,7 @@ bool TextPass::canReuseForResidency(const VulkanPass& next_pass) const {
     return residencyKey() == next->residencyKey() &&
            m_desc.execute_when_hidden == next->m_desc.execute_when_hidden &&
            m_desc.private_source == next->m_desc.private_source &&
+           m_desc.clear_before_draw == next->m_desc.clear_before_draw &&
            m_desc.alpha_write_policy == next->m_desc.alpha_write_policy &&
            m_desc.shared_depth == next->m_desc.shared_depth &&
            m_desc.glyph_depth_test == next->m_desc.glyph_depth_test &&
@@ -441,6 +444,7 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
     m_desc.should_execute      = next->m_desc.should_execute;
     m_desc.private_source      = next->m_desc.private_source;
+    m_desc.clear_before_draw   = next->m_desc.clear_before_draw;
     m_desc.output              = next->m_desc.output;
     m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
     m_desc.shared_depth        = next->m_desc.shared_depth;
@@ -645,11 +649,10 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
     // Direct text publishes glyphs into the currently inherited destination, including a parent's
     // composition target. Its offscreen name does not make that shared image a text source to
-    // clear. Only BuildOwnerSourcePassOptions' private-source seed owns the clear; source
-    // initialization runs before glyph rasterization in that branch. Keep load/clear independent
-    // from the alpha-write policy, which still follows whether the destination is a composition
-    // attachment. Otherwise even an empty late text layout clears every image child already drawn
-    // into the parent's source.
+    // clear. A private opaque source owns a color clear; a private non-opaque source instead
+    // loads the RGB/zero-alpha initializer already submitted by the graph. Keep load/clear
+    // independent from both private glyph blending and composition alpha accumulation, so
+    // neither the framebuffer seed nor preceding composition children are erased here.
     const auto debug_name =
         "TextPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
@@ -659,6 +662,7 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             *primitive,
             offscreen_output,
             m_desc.private_source,
+            m_desc.clear_before_draw,
             m_desc.alpha_write_policy,
             m_desc.sample_count,
             m_desc.resolve_msaa,
@@ -728,6 +732,7 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
                                           *primitive,
                                           offscreen_output,
                                           m_desc.private_source,
+                                          m_desc.clear_before_draw,
                                           m_desc.alpha_write_policy,
                                           sample_count,
                                           resolve_msaa,
@@ -950,14 +955,14 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         .height = m_desc.vk_output.extent.height,
     };
     std::array<VkClearValue, 3> clear_values {};
-    if (m_desc.private_source && primitive->object.opaquebackground) {
+    if (m_desc.clear_before_draw) {
         // Opaque private sources initialize the complete target, including padding, before
         // glyph rasterization. This is a live color clear, not a blended background quad, and
         // therefore neither reads depth nor initializes the direct background material policy.
         const auto color = primitive->BackgroundColor();
         std::copy(color.begin(), color.end(), clear_values[0].color.float32);
     }
-    if (trace_background && m_desc.private_source) {
+    if (trace_background && m_desc.clear_before_draw) {
         const auto* color = clear_values[0].color.float32;
         LOG_INFO("SceneTextBackgroundClear: layer=%d output='%s' reflection=%s opaque=%s "
                  "color=[%.3f %.3f %.3f %.3f] direct-selection=%s",
@@ -966,6 +971,14 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                  color[0], color[1], color[2], color[3],
                  !primitive->direct_background_depth_test.has_value() ? "unused" :
                      (*primitive->direct_background_depth_test ? "enabled" : "disabled"));
+    }
+    if (m_desc.private_source && std::getenv("WESCENE_TRACE_TEXT_SOURCE") != nullptr) {
+        LOG_INFO("SceneTextSourceInit: layer=%d output='%s' reflection=%s mode=%s "
+                 "image=%p extent=%ux%u atlas=%u pages=%zu",
+                 m_desc.layer_id, m_desc.output.c_str(), m_desc.reflection_pass ? "true" : "false",
+                 m_desc.clear_before_draw ? "opaque-clear" : "framebuffer-load",
+                 reinterpret_cast<void*>(m_desc.vk_output.handle), output_extent.width,
+                 output_extent.height, primitive->atlas_version, primitive->glyph_pages.size());
     }
     VkRenderPassBeginInfo begin_info {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -983,7 +996,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                  "extent=%ux%u clear=%s atlas=%u pages=%zu opaque-background=%s",
                  m_desc.layer_id, node->Name().c_str(), m_desc.output.c_str(),
                  reinterpret_cast<void*>(m_desc.vk_output.handle), output_extent.width,
-                 output_extent.height, m_desc.private_source ? "true" : "false",
+                 output_extent.height, m_desc.clear_before_draw ? "true" : "false",
                  primitive->atlas_version, primitive->glyph_pages.size(),
                  primitive->object.opaquebackground ? "true" : "false");
     }

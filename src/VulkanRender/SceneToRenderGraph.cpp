@@ -711,6 +711,7 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
             // role explicitly into text material/color selection rather than classifying every
             // non-main destination (including reflection and composition) as a private source.
             pdesc.private_source = options.clear_before_draw;
+            pdesc.clear_before_draw = pdesc.private_source && node->Text()->object.opaquebackground;
             pdesc.output = output_key;
             pdesc.camera_override = options.camera_override;
             pdesc.use_active_camera_for_parallax = options.use_active_camera_for_parallax;
@@ -731,6 +732,11 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
             pdesc.glyph_depth_test = pdesc.shared_depth &&
                 node->Text()->object.depthtest == "enabled";
 
+            if (pdesc.private_source && !pdesc.clear_before_draw) {
+                // Glyph blending loads the initializer's exact target version. This is an
+                // attachment dependency, not a texture self-sample or an extra framebuffer copy.
+                builder.read(builder.createTexNode(rg::createTexDesc(output_key, &scene)));
+            }
             auto* output_node =
                 builder.createTexNode(rg::TexNode::Desc { .name = output_key,
                                                           .key = output_key,
@@ -856,9 +862,26 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     // text pass directly from that primitive, keeping the render graph aligned with the same
     // authoritative text object that parser and runtime updates mutate.
     if (node != nullptr && node->Text() != nullptr) {
-        AddTextNodePass(node, output, imgId, extra, node_execute_gate,
-                       BuildOwnerSourcePassOptions(
-                           imgeff, output, inherited_output, route, source_route));
+        auto source_options = BuildOwnerSourcePassOptions(
+            imgeff, output, inherited_output, route, source_route);
+        if (source_options.clear_before_draw && !node->Text()->object.opaquebackground) {
+            // Non-opaque sources replace the complete private target with sampled framebuffer
+            // RGB and zero alpha before glyphs accumulate coverage. The source card's UVs
+            // control raster coverage; its sample coordinates use the incoming aligned owner
+            // snapshot, not the private glyph camera or later composition-child raster I.
+            // This is an ordinary material read of the named full framebuffer, including its
+            // normal resolve/order rules. Do not retarget it to reflection or parent storage.
+            AddDrawPass(*node->Text()->bridge.framebuffer_source, output, imgId, extra,
+                        node_execute_gate, DrawPassOptions {
+                            .camera_override = imgeff->BridgeCameraName(),
+                            .use_active_camera_for_uniforms = true,
+                            .model_space = ShaderModelSpace::LayerSnapshot,
+                            .reflection_pass = route.reflection_pass,
+                            .reflection_raster = route.reflection_raster,
+                            .reflection_snapshot = route.reflection_raster,
+                            .effect_snapshot_camera = source_route.active_compose_source_camera });
+        }
+        AddTextNodePass(node, output, imgId, extra, node_execute_gate, std::move(source_options));
     }
 
     const auto children = OrderedRenderGraphChildren(node, extra);

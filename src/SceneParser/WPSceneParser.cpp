@@ -3084,6 +3084,47 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     context.scene->ApplyLayerVisibility(wpimgobj.id);
 }
 
+static bool ConfigureTextFramebufferSource(ParseContext& context, SceneTextPrimitive& primitive,
+                                            SceneImageEffectLayer& effect_layer,
+                                            const WPShaderValueData& transform_data) {
+    nlohmann::json json;
+    wpscene::WPMaterial source;
+    if (!PARSE_JSON(fs::GetFileContent(*context.vfs,
+                                      "/assets/materials/util/composelayer_clearalpha.json"), json) ||
+        !source.FromJson(json)) {
+        LOG_ERROR("SceneTextFramebufferSource: layer=%d failed to load source material",
+                  primitive.object.id);
+        return false;
+    }
+
+    WPShaderInfo shader_info;
+    shader_info.baseConstSvs = context.global_base_uniforms;
+    SceneMaterial material;
+    WPShaderValueData source_data;
+    if (!LoadMaterial(*context.vfs, source, context.scene.get(), &material, &source_data,
+                      context.user_properties, &shader_info)) {
+        LOG_ERROR("SceneTextFramebufferSource: layer=%d failed to compile source material",
+                  primitive.object.id);
+        return false;
+    }
+    source_data.CopyParallaxContractFrom(transform_data);
+    source_data.SetEffectLayerProjection(&effect_layer);
+
+    auto mesh = std::make_shared<SceneMesh>(true);
+    mesh->ChangeMeshDataFrom(effect_layer.FinalMesh());
+    mesh->AddMaterial(std::move(material));
+    auto phase = std::make_shared<SceneDrawPhase>(effect_layer.Owner());
+    phase->SetName(primitive.object.name + "::framebuffer-source");
+    phase->SetMesh(std::move(mesh));
+    // The named private camera retains source alpha-write ownership. Graph invocation state
+    // independently selects the incoming projection for the material's framebuffer sample;
+    // the stock vertex shader uses UVs, not this projection, to rasterize the complete target.
+    phase->SetProjection(SceneDrawPhase::Space::Layer, primitive.bridge.camera_name);
+    context.shader_updater->SetNodeData(phase.get(), source_data);
+    primitive.bridge.framebuffer_source = std::move(phase);
+    return true;
+}
+
 void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     TextLayerRenderContract render_contract;
     render_contract.has_materialized_authored_effects = ! text_obj.effects.empty();
@@ -3233,6 +3274,13 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                  display_size[1] * 0.5f);
         const auto finalCompositeTransformData = BuildEffectWriterTransformData(
             context, BuildTextEffectFinalCompositeContract(text_obj));
+        // Materialize both private initialization choices with the bridge. An opaque source
+        // starts with a live color clear, but a later background toggle needs this same retained
+        // material without recreating scripts, effect programs or the authored text owner.
+        if (!ConfigureTextFramebufferSource(
+                context, *primitive, *imgEffectLayer, finalCompositeTransformData)) {
+            return;
+        }
         ConfigureEffectFinalComposite(context,
                                       *imgEffectLayer,
                                       primitive->bridge.pingpong_a,

@@ -109,6 +109,10 @@ void CollectResidencyNodeResources(const Scene& scene, SceneNode* node,
     }
 
     if (auto* text = node->Text(); text != nullptr) {
+        if (text->bridge.framebuffer_source) {
+            CollectResidencyMaterialResources(
+                scene, *text->bridge.framebuffer_source->Mesh()->Material(), resources);
+        }
         for (const auto& page : text->layout.glyph_pages) {
             if (!page.texture_key.empty()) resources.static_textures.insert(page.texture_key);
         }

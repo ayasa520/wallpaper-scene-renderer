@@ -3260,7 +3260,14 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
             opaque->property_animations.end());
 
         for (SceneNode* node : destroyed_nodes) {
-            if (auto* updater = GetShaderUpdater(opaque)) updater->RemoveDrawData(node);
+            if (auto* updater = GetShaderUpdater(opaque)) {
+                updater->RemoveDrawData(node);
+                // A text source initializer is owned by its retained bridge, not the node tree.
+                // Retire its uniform record while the primitive still owns that draw identity.
+                if (auto* text = node->Text(); text != nullptr && text->bridge.framebuffer_source) {
+                    updater->RemoveDrawData(*text->bridge.framebuffer_source);
+                }
+            }
             opaque->texture_states.erase(node);
             auto animation_state_it = opaque->animation_layer_states.find(node);
             if (animation_state_it != opaque->animation_layer_states.end()) {

@@ -2895,6 +2895,13 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
                 bridge_ref->SyncResolvedOutputMesh();
             }
         }
+        if (local_bridge_geometry_changed && state.primitive->bridge.framebuffer_source) {
+            // The initializer and publisher use the same logical card, but retain independent
+            // materials and GPU allocations. A layout replacement changes the shared payload
+            // identity, so reconnect the initializer before its next dynamic upload.
+            state.primitive->bridge.framebuffer_source->Mesh()->ChangeMeshDataFrom(
+                bridge_ref->FinalMesh());
+        }
     }
 
     UpdateTextLayerBridgeBackingInternal(scene, layer_id, state, relayout);
@@ -3231,6 +3238,8 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
         return false;
     }
 
+    const bool source_initialization_changed = state.render_contract.RequiresBridge() &&
+        state.primitive->object.opaquebackground != state.object.opaquebackground;
     const auto previous_geometry = CaptureTextLayerSceneGeometry(state);
     // Bridge-resource updates are the permanent cheap path for geometry changes that do not alter
     // shaping results, such as toggling the opaque background. The primitive keeps the existing
@@ -3248,6 +3257,12 @@ bool wallpaper::UpdateTextLayerSceneBridgeResources(Scene& scene, int32_t layer_
     // render-target size. Mark the owning text layer so its TextPass uploads those rebuilt buffers
     // during the next resource refresh instead of discovering them after frame recording starts.
     scene.MarkTextLayerResourcesDirty(layer_id);
+    if (source_initialization_changed) {
+        // Equal-size background toggles still replace the source initializer and the glyph
+        // attachment's load operation. Publish that graph-state change independently of atlas
+        // geometry or destination-name changes; ordinary color updates keep their cheap path.
+        scene.MarkRenderGraphTopologyDirty();
+    }
     return true;
 }
 

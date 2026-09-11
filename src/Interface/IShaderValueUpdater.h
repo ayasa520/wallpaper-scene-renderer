@@ -27,7 +27,10 @@ using ExistsUniformOp = std::function<bool(std::string_view)>;
 
 // Source rasterization selects geometry coordinates while retaining the same authored owner,
 // animation palette and material data. This is draw state, never a second object transform.
-enum class ShaderModelSpace { Object, Geometry };
+// A source initializer samples the framebuffer with the aligned owner and incoming
+// destination snapshot. A composition's later inverse-parent raster I does not enter that
+// snapshot, and the private glyph camera only controls the subsequent glyph draw.
+enum class ShaderModelSpace { Object, Geometry, LayerSnapshot };
 
 struct ShaderUniformOverrides {
     std::string_view camera_name;

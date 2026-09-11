@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "Image.hpp"
+#include "SceneDraw.h"
 #include "SceneMesh.h"
 #include "wpscene/WPTextObject.h"
 
@@ -58,6 +59,11 @@ struct TextSourceBridge {
     std::string camera_name;
     std::string pingpong_a;
     std::string pingpong_b;
+
+    // The initializer is an owner-bound raster phase, not a second text layer. Keep its
+    // material and identity across layout replacement; each graph invocation owns its GPU
+    // bindings while the primitive refreshes the shared, current-size source card.
+    std::shared_ptr<SceneDrawPhase> framebuffer_source;
 
     // The destination extent of the current shaped text box (clamped to the destination minimum).
     // Re-layout selects a new pair by name when this extent changes; earlier entries retain their

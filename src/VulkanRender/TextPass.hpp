@@ -35,6 +35,9 @@ public:
         // A private seed owns source initialization; a direct draw loads the inherited target.
         // Reflection and composition targets do not imply a private text source by themselves.
         bool        private_source { false };
+        // Opaque private sources clear color; non-opaque sources load a preceding framebuffer
+        // initializer. Capture the load choice independently from the private glyph draw role.
+        bool        clear_before_draw { false };
         std::string output;
         std::string camera_override;
         bool use_active_camera_for_parallax { false };
