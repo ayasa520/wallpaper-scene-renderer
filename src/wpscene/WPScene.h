@@ -59,7 +59,11 @@ public:
     float                camerashakeamplitude { 0.5f };
     float                camerashakeroughness { 1.0f };
     float                camerashakespeed { 3.0f };
-    bool                 isOrtho { true };
+    // Scene projection starts perspective. Only an authored orthogonalprojection enables
+    // the canvas camera; otherwise every layer must consume the authored/path camera in
+    // world units. Defaulting to orthographic silently projects ordinary model scenes onto
+    // a pixel-sized canvas after their chunks inherit the shared scene camera.
+    bool                 isOrtho { false };
     Orthogonalprojection orthogonalprojection { 1920, 1080 };
     float                zoom { 1.0f };
     float                fov { 50.0f };
