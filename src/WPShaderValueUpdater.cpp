@@ -80,7 +80,7 @@ Matrix4d DestinationViewProjection(const SceneCamera& camera, bool reflected) {
 }
 
 Matrix4d ModelPerspectiveViewProjection(const Scene& scene, const Matrix4d& incoming_projection,
-                                        Matrix4d destination, int32_t layer_id,
+                                        Matrix4d destination, bool centered_destination, int32_t layer_id,
                                         uint64_t frame_serial, bool reflected, bool trace = true) {
     constexpr double kMinimumFrameFov = 0.1;
     constexpr double kMaximumFrameFov = 179.9;
@@ -103,26 +103,36 @@ Matrix4d ModelPerspectiveViewProjection(const Scene& scene, const Matrix4d& inco
     const double aspect = static_cast<double>(scene.physicalOutputExtent[0]) /
                           static_cast<double>(scene.physicalOutputExtent[1]);
 
-    // SceneCamera's centered orthographic projection already places the viewport anchor in
-    // its view translation. Preserve that X/Y translation and the complete incoming basis,
-    // including root parallax and reflection, and replace only destination Z. In particular,
-    // the signed projection scale is significant: reflection is incoming draw state, not a
-    // second mirror applied after constructing this model's auxiliary projection. Neither
-    // the shared camera nor the frame eye/basis uniforms are modified by this operation.
+    // The ordinary orthographic view already includes the scene's canvas-framing anchor in
+    // its translation. A composition child walk instead supplies identity destination and a
+    // centered private projection, so that invocation still owes the same frame-owned anchor.
+    // Consume it here, in destination space, rather than baking it into the child's model or
+    // inheriting the composition owner's view. The anchor uses canvas units, not the private
+    // target size or physical output pixels, and belongs only to an orthographic scene frame;
+    // a centered child destination in a 3D scene has no such translation to consume.
+    const Vector2d frame_anchor = centered_destination && scene.cameraOrthographic
+        ? Vector2d(scene.ortho[0] * 0.5, scene.ortho[1] * 0.5) : Vector2d::Zero();
     const Vector3d incoming_translation = destination.block<3, 1>(0, 3);
+    destination.block<2, 1>(0, 3) -= frame_anchor;
+    // Preserve all other incoming X/Y displacement and basis, including root parallax and
+    // reflection, and replace only destination Z. The signed projection scale is significant:
+    // reflection is incoming draw state, not a second mirror applied after this projection.
+    // Neither the shared camera nor the frame eye/basis uniforms are modified here.
     destination(2, 3) = -distance;
     const Matrix4d projection = Perspective(angle, aspect, kNearPlane, far_plane);
     if (trace && std::getenv("WESCENE_TRACE_MODEL_PROJECTION") != nullptr) {
         LOG_INFO("SceneModelProjection: frame=%llu layer=%d reflection=%s orthographic=%s "
                  "angle-radians=%.9f incoming-p11=%.9f distance=%.9f aspect=%.9f "
                  "near=%.6f far=%.6f incoming-destination=[%.9f %.9f %.9f] "
-                 "destination=[%.9f %.9f %.9f] p00=%.9f p11=%.9f p22=%.9f p23=%.9f",
+                 "destination=[%.9f %.9f %.9f] p00=%.9f p11=%.9f p22=%.9f p23=%.9f "
+                 "centered-destination=%s frame-anchor=[%.9f %.9f]",
                  static_cast<unsigned long long>(frame_serial), layer_id,
                  reflected ? "true" : "false", scene.cameraOrthographic ? "true" : "false",
                  angle, incoming_projection(1, 1), distance, aspect, kNearPlane, far_plane,
                  incoming_translation.x(), incoming_translation.y(), incoming_translation.z(),
                  destination(0, 3), destination(1, 3), destination(2, 3),
-                 projection(0, 0), projection(1, 1), projection(2, 2), projection(2, 3));
+                 projection(0, 0), projection(1, 1), projection(2, 2), projection(2, 3),
+                 centered_destination ? "true" : "false", frame_anchor.x(), frame_anchor.y());
     }
     return projection * destination;
 }
@@ -376,7 +386,7 @@ Matrix4d WPShaderValueUpdater::ResolveModelViewProjectionForInput(const SceneDra
     // projecting a model with the particle camera or a world-plane shortcut would diverge as
     // soon as a vertex leaves Z=0. Local caches observe preceding script transform writes.
     if (owner.ModelPerspective()) {
-        return ModelPerspectiveViewProjection(*m_scene, camera.GetProjectionMatrix(), destination,
+        return ModelPerspectiveViewProjection(*m_scene, camera.GetProjectionMatrix(), destination, false,
                                                 owner.Id(), m_puppet_frame_serial, false, false);
     }
     return camera.GetProjectionMatrix() * destination;
@@ -788,7 +798,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                 destination = destination * Affine3d(Eigen::Scaling(1.0, -1.0, 1.0)).matrix();
             }
             destination = destination * destinationTrans;
-            viewProTrans = ModelPerspectiveViewProjection(*m_scene, projection, destination,
+            viewProTrans = ModelPerspectiveViewProjection(*m_scene, projection, destination, composition_draw,
                 model_owner->Id(), m_puppet_frame_serial, reflected_destination);
         }
 
