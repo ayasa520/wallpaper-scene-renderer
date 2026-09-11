@@ -596,6 +596,13 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
                              draw.LayerId(scene), draw.Name().c_str(), material->name.c_str(),
                              i, material->textures[i].c_str(), url.c_str());
                 }
+                if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") != nullptr &&
+                    material->userTextureBindings.contains(i)) {
+                    LOG_INFO("SceneMaterialUserTextureBind: layer=%d node='%s' "
+                             "shader='%s' slot=%zu authored='%s' selected='%s'",
+                             draw.LayerId(scene), draw.Name().c_str(), material->name.c_str(),
+                             i, material->textures[i].c_str(), url.c_str());
+                }
                 rg::TexNode* input { nullptr };
                 if (url.empty()) {
                     pdesc.textures.emplace_back("");

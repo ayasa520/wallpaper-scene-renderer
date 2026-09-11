@@ -1,6 +1,7 @@
 #include "Scene.h"
 
 #include "Image.hpp"
+#include "SpecTexs.hpp"
 #include "SceneCamera.h"
 #include "SceneImageEffectLayer.h"
 
@@ -46,6 +47,72 @@ void Scene::SetSystemTextureBinding(const std::string& name, const std::string& 
     // next graph build. Pixel replacement under an unchanged key continues to use the
     // imported-resource path.
     MarkRenderGraphTopologyDirty();
+}
+
+std::shared_ptr<const std::optional<std::string>> Scene::RegisterUserTextureBinding(
+    std::string property, std::string authored_key, std::optional<std::string> selected_key,
+    TextureKeyResolver resolve) {
+    auto selection = std::make_shared<std::optional<std::string>>(std::move(selected_key));
+    m_user_texture_bindings.push_back({ std::move(property), std::move(authored_key),
+                                       selection, std::move(resolve) });
+    return selection;
+}
+
+void Scene::RefreshUserTextureBindings() {
+    for (auto it = m_user_texture_bindings.begin(); it != m_user_texture_bindings.end();) {
+        const auto selection = it->selection.lock();
+        if (!selection) {
+            it = m_user_texture_bindings.erase(it);
+            continue;
+        }
+        const auto* property = LookupUserPropertyString(&userProperties, it->property);
+        std::optional<std::string> next;
+        if (property != nullptr && !property->empty()) next = it->resolve(*this, *property);
+        if (next != *selection) {
+            // Resolve metadata before publishing the selected key. The next source refresh and
+            // graph build must see one coherent image, sampler and extent even when this texture
+            // has never been used in the scene. Empty resets retain each material's own input;
+            // they must not reuse the nondefault selection that happened to be active at load.
+            const auto& key = next ? *next : it->authoredKey;
+            const bool register_texture = !key.empty() && !IsSpecTex(key) &&
+                !renderTargets.contains(key) && !textures.contains(key);
+            if (register_texture) {
+                RegisterTextureFromHeader(key, imageParser->ParseHeader(key));
+            }
+            LOG_INFO("SceneUserTextureChange: property='%s' authored='%s' previous='%s' "
+                     "current='%s' override=%s registered=%s",
+                     it->property.c_str(), it->authoredKey.c_str(),
+                     selection->has_value() ? (**selection).c_str() : it->authoredKey.c_str(),
+                     key.c_str(), next ? "true" : "false", register_texture ? "true" : "false");
+            *selection = std::move(next);
+            // A material selection changes the graph's imported or named-target read, not just
+            // its pixels. Diff the resident graph after all property writes, while keeping the
+            // material, script instances and retained image-source resource policy unchanged.
+            MarkRenderGraphTopologyDirty();
+        }
+        ++it;
+    }
+}
+
+void Scene::RegisterTextureFromHeader(const std::string& name, const ImageHeader& header) {
+    if (textures.contains(name)) return;
+
+    SceneTexture texture;
+    texture.sample    = header.sample;
+    texture.url       = name;
+    texture.format    = header.format;
+    texture.isVideo   = header.isVideoTexture;
+    texture.width     = header.width;
+    texture.height    = header.height;
+    texture.mapWidth  = header.mapWidth;
+    texture.mapHeight = header.mapHeight;
+    texture.mipmapCount   = header.mipmapCount;
+    texture.mipmap_larger = header.mipmap_larger;
+    if (header.isSprite) {
+        texture.isSprite   = true;
+        texture.spriteAnim = header.spriteAnim;
+    }
+    textures.emplace(name, std::move(texture));
 }
 
 void Scene::RefreshImageSourceTextures() {

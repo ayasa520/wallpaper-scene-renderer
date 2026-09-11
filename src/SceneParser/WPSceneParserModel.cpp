@@ -506,6 +506,7 @@ private:
                     // is drawn into reflection, despite the GPU never sampling that slot.
                     material.textures[slot].clear();
                     material.systemTextureBindings.erase(slot);
+                    material.userTextureBindings.erase(slot);
                     LOG_INFO("ModelReflectionSamplerUnused: layer=%d chunk=%zu slot=%zu",
                              model_obj_.id, chunk_index, slot);
                 }

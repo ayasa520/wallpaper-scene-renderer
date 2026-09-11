@@ -752,12 +752,13 @@ void CompleteImageSourceMappings(ParseContext& context) {
 }
 
 
-void ParseSpecTexName(std::string& name, const wpscene::WPMaterial& wpmat, const Scene* scene,
-                      const WPShaderInfo& sinfo) {
+void ParseSpecTexName(std::string& name, const std::string& shader_name, const Scene* scene,
+                      bool has_blendmode) {
+    if (name == "_alias_lightCookie") name = "cookie/flashlight1";
     if (IsSpecTex(name)) {
         if (name == "_rt_FullFrameBuffer") {
             name = SpecTex_Default;
-            if (wpmat.shader == "genericimage2" && ! exists(sinfo.combos, "BLENDMODE")) name = "";
+            if (shader_name == "genericimage2" && !has_blendmode) name = "";
             /*
             if(wpmat.shader == "genericparticle") {
                 name = "_rt_ParticleRefract";
@@ -824,28 +825,6 @@ bool IsMaterialRuntimeRenderTarget(const Scene* scene, const std::string& name) 
     // render-target path instead of probing `/assets/materials/<name>.tex` and logging false VFS
     // errors.
     return scene != nullptr && scene->renderTargets.count(name) != 0;
-}
-
-void RegisterSceneTextureFromHeader(Scene& scene, const std::string& name,
-                                    const ImageHeader& header) {
-    if (scene.textures.count(name) != 0) return;
-
-    SceneTexture texture;
-    texture.sample    = header.sample;
-    texture.url       = name;
-    texture.format    = header.format;
-    texture.isVideo   = header.isVideoTexture;
-    texture.width     = header.width;
-    texture.height    = header.height;
-    texture.mapWidth  = header.mapWidth;
-    texture.mapHeight = header.mapHeight;
-    texture.mipmapCount   = header.mipmapCount;
-    texture.mipmap_larger = header.mipmap_larger;
-    if (header.isSprite) {
-        texture.isSprite   = true;
-        texture.spriteAnim = header.spriteAnim;
-    }
-    scene.textures[name] = std::move(texture);
 }
 
 bool SelectCompiledMaterialDescriptors(SceneMaterialCustomShader& material_shader,
@@ -976,6 +955,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     if (wpmat.usertextures.size() > textures.size()) {
         textures.resize(wpmat.usertextures.size());
     }
+    const auto authored_textures = textures;
     for (usize i = 0; i < wpmat.usertextures.size(); i++) {
         const auto& binding = wpmat.usertextures[i];
         if (binding.empty()) continue;
@@ -1089,11 +1069,41 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         }
     }
 
+    // Retain only the selected program's immutable texture-name policy. Live bindings can use it
+    // after this load context has gone away, without holding material pointers or shader metadata.
+    const auto resolve_texture_key = [shader_name = wpmat.shader,
+                                      has_blendmode = exists(pWPShaderInfo->combos, "BLENDMODE")]
+        (Scene& scene, std::string key) {
+            ParseSpecTexName(key, shader_name, &scene, has_blendmode);
+            return key;
+        };
     for (usize i = 0; i < textures.size(); i++) {
         std::string name = textures.at(i);
-        if (name == "_alias_lightCookie") name = "cookie/flashlight1";
-        ParseSpecTexName(name, wpmat, pScene, *pWPShaderInfo);
-        material.textures.push_back(name);
+        name = resolve_texture_key(*pScene, std::move(name));
+        const auto* binding = i < wpmat.usertextures.size() ? &wpmat.usertextures[i] : nullptr;
+        if (binding != nullptr && !binding->empty() && binding->type != "system") {
+            // The initial override must not replace the material's authored input. Apply shader
+            // defaults to that input independently, so a later empty property resolves exactly
+            // as a cold material with no override. Only the selected texture is loaded now.
+            auto authored = authored_textures.at(i);
+            if (authored.empty()) {
+                for (const auto& [slot, key] : pWPShaderInfo->defTexs) {
+                    if (slot == static_cast<int>(i) && !key.empty()) {
+                        authored = key;
+                        break;
+                    }
+                }
+            }
+            authored = resolve_texture_key(*pScene, std::move(authored));
+            material.textures.push_back(authored);
+            const auto* property = LookupUserPropertyString(user_properties, binding->name);
+            const auto selected = property != nullptr && !property->empty()
+                ? std::optional<std::string>(name) : std::nullopt;
+            material.userTextureBindings.emplace(i, pScene->RegisterUserTextureBinding(
+                binding->name, std::move(authored), selected, resolve_texture_key));
+        } else {
+            material.textures.push_back(name);
+        }
         material.defines.push_back("g_Texture" + std::to_string(i));
         if (name.empty()) {
             continue;
@@ -1132,7 +1142,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
             // EffectiveImportedTextureResolution() so half/auto follow the
             // bind-path GPU extent.
 
-            RegisterSceneTextureFromHeader(*pScene, name, texh);
+            pScene->RegisterTextureFromHeader(name, texh);
             if ((pScene->textures.at(name)).isSprite) {
                 material.hasSprite = true;
                 const auto& f1     = texh.spriteAnim.GetCurFrame();
@@ -1189,6 +1199,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         if (! exists(fragment_unit.preprocess_info.active_tex_slots, i)) {
             material.textures[i].clear();
             material.systemTextureBindings.erase(i);
+            material.userTextureBindings.erase(i);
         }
     }
 
@@ -1381,6 +1392,8 @@ void MergeImageSourceProgramBindings(SceneMaterial& material, const SceneMateria
     material.uniformAliases.insert(variant.uniformAliases.begin(), variant.uniformAliases.end());
     material.systemTextureBindings.insert(variant.systemTextureBindings.begin(),
                                            variant.systemTextureBindings.end());
+    material.userTextureBindings.insert(variant.userTextureBindings.begin(),
+                                         variant.userTextureBindings.end());
     for (size_t slot = 0; slot < variant.textures.size(); ++slot) {
         if (slot >= material.textures.size()) {
             material.textures.push_back(variant.textures[slot]);
@@ -2586,7 +2599,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         for (const auto& mask : puppet->masks) {
             if (context.scene->textures.count(mask.material) != 0) continue;
             const auto& header = context.scene->imageParser->ParseHeader(mask.material);
-            RegisterSceneTextureFromHeader(*context.scene, mask.material, header);
+            context.scene->RegisterTextureFromHeader(mask.material, header);
         }
     }
     const bool hasAnimatedPuppetMesh =

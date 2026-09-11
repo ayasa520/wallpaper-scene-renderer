@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,6 +33,7 @@ class ParticleSubSystem;
 class IShaderValueUpdater;
 class IImageParser;
 struct Image;
+struct ImageHeader;
 struct SceneImageEffect;
 namespace audio
 {
@@ -273,6 +275,12 @@ public:
     void                    ClearParsedImageCache();
     std::shared_ptr<const std::string> GetSystemTextureBinding(const std::string& name);
     void SetSystemTextureBinding(const std::string& name, const std::string& texture_key);
+    using TextureKeyResolver = std::function<std::string(Scene&, std::string)>;
+    std::shared_ptr<const std::optional<std::string>> RegisterUserTextureBinding(
+        std::string property, std::string authored_key, std::optional<std::string> selected_key,
+        TextureKeyResolver resolve);
+    void RefreshUserTextureBindings();
+    void RegisterTextureFromHeader(const std::string& name, const ImageHeader& header);
 
     std::unordered_map<std::string, SceneTexture>      textures;
     std::unordered_map<std::string, SceneRenderTarget> renderTargets;
@@ -612,6 +620,17 @@ private:
     bool ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible);
 
     std::unordered_map<std::string, std::shared_ptr<std::string>> m_system_texture_bindings;
+
+    struct UserTextureBinding {
+        std::string property;
+        std::string authoredKey;
+        std::weak_ptr<std::optional<std::string>> selection;
+        TextureKeyResolver resolve;
+    };
+    // Only material consumers own a selection. A discarded program variant or destroyed owner
+    // must not keep receiving texture updates; copied resident materials share its live handle.
+    // The resolver carries the parser's immutable key policy, independently of material lifetime.
+    std::vector<UserTextureBinding> m_user_texture_bindings;
 
     struct PendingParsedImageRequest {
         std::future<std::shared_ptr<Image>>    future;

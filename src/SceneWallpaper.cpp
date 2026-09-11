@@ -445,7 +445,7 @@ private:
     MHANDLER_CMD(APPLY_USER_PROPERTIES) {
         std::shared_ptr<UserPropertyMap> user_properties;
         if (! msg->findObject("value", &user_properties)) return;
-        if (! m_scene || ! m_scene->scriptHost) return;
+        if (! m_scene) return;
 
         if (user_properties) {
             m_scene->userProperties = *user_properties;
@@ -455,7 +455,10 @@ private:
         LOG_INFO("SceneWallpaper: render thread applying live user-properties count=%zu keys=%s",
                  m_scene->userProperties.size(),
                  DescribeUserPropertyKeysForLog(m_scene->userProperties).c_str());
-        m_scene->scriptHost->ApplyUserProperties(m_scene->userProperties, false);
+        m_scene->RefreshUserTextureBindings();
+        if (m_scene->scriptHost) {
+            m_scene->scriptHost->ApplyUserProperties(m_scene->userProperties, false);
+        }
     }
     MHANDLER_CMD(APPLY_MEDIA_STATE) {
         std::shared_ptr<WPSceneScriptMediaState> media_state;

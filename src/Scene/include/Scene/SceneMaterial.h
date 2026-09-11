@@ -61,6 +61,7 @@ public:
         : name(std::move(o.name)),
           textures(std::move(o.textures)),
           systemTextureBindings(std::move(o.systemTextureBindings)),
+          userTextureBindings(std::move(o.userTextureBindings)),
           defines(std::move(o.defines)),
           uniformAliases(std::move(o.uniformAliases)),
           hasSprite(o.hasSprite),
@@ -80,9 +81,18 @@ public:
     // handles also keep copied materials in sync without rewriting effect ping-pong templates or
     // retaining material pointers.
     Map<usize, std::shared_ptr<const std::string>> systemTextureBindings;
+    // An absent user override selects this material's authored input, including its current
+    // effect-local target mapping. A present override may resolve to an empty key when the
+    // selected program does not admit that sampler. Material copies share this distinction
+    // without keeping a pointer to an owner or parser, or freezing a ping-pong target name.
+    Map<usize, std::shared_ptr<const std::optional<std::string>>> userTextureBindings;
     std::vector<std::string> defines;
 
     const std::string& Texture(usize slot) const {
+        if (const auto binding = userTextureBindings.find(slot);
+            binding != userTextureBindings.end() && binding->second->has_value()) {
+            return **binding->second;
+        }
         const auto binding = systemTextureBindings.find(slot);
         if (binding != systemTextureBindings.end() && !binding->second->empty()) {
             return *binding->second;
