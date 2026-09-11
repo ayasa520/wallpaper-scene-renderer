@@ -19,13 +19,17 @@ public:
     // `output_extent` is the live output framebuffer size at load. Fullscreen layers sample that
     // framebuffer, so their effect targets are allocated at this pixel size; {0, 0} means no live
     // output is known and the authored canvas is used instead.
+    // Host post-processing quality is a load-time input as well: authored and dynamically
+    // created materials must compile the same program family before their descriptors and
+    // script-visible controls are registered. It is independent of authored bloom settings.
     std::shared_ptr<Scene> Parse(std::string_view   scene_id,
                                  const std::string&,
                                  fs::VFS&,
                                  audio::SoundManager&,
                                  const UserPropertyMap*  user_properties,
                                  double                  text_render_scale = 1.0,
-                                 std::array<uint32_t, 2> output_extent    = { 0u, 0u });
+                                 std::array<uint32_t, 2> output_extent    = { 0u, 0u },
+                                 int32_t                 postprocessing_quality = 1);
     std::shared_ptr<Scene> Parse(std::string_view scene_id, const std::string&, fs::VFS&, audio::SoundManager&) override;
 };
 

@@ -881,12 +881,6 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         pWPShaderInfo  = upWPShaderInfo.get();
     }
 
-    // Scene materials compile their HDR shader variant only when the wallpaper actually renders
-    // into an HDR swapchain (display HDR). Ultra post-processing on a standard-range output keeps
-    // the LDR material variant: the HDR variant's g_Brightness multiply and CombineLighting
-    // overbright term would wash out lit surfaces that the standard-range chain then blooms.
-    // Vivid currently always renders standard-range, so the combo stays off.
-
     SceneMaterialCustomShader materialShader;
 
     auto& shader = materialShader.shader;
@@ -1035,6 +1029,13 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         pWPShaderInfo->combos[el.first] = std::to_string(el.second);
     }
 
+    // This host-owned compile flag is not a request for HDR bloom or float output storage.
+    // Inject it after authored combinations so every ordinary material loader, including
+    // script-created layers and private effect materials, sees the same selected family.
+    // The combo list is part of the prepared-shader key; the selected executable also owns
+    // descriptor membership, rather than mutating controls on an already compiled program.
+    if (pScene->UsesHdrMaterials()) pWPShaderInfo->combos["HDR"] = "1";
+
     if (lighting_v1 && pScene != nullptr) {
         if (pScene->shadows.quality != 0 && SceneHasShadowLights(*pScene)) {
             pWPShaderInfo->combos["LIGHTS_SHADOW_MAPPING"]         = "1";
@@ -1140,6 +1141,14 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     if (! WPShaderParser::CompileToSpv(
             pScene->scene_id, sd_units, shader->codes, vfs, pWPShaderInfo, texinfos)) {
         return std::nullopt;
+    }
+
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        const auto hdr = pWPShaderInfo->combos.find("HDR");
+        LOG_INFO("SceneMaterialQuality: shader='%s' postprocessing=%d host-hdr=%s hdr-combo='%s'",
+                 wpmat.shader.c_str(), pScene->bloom.quality,
+                 pScene->UsesHdrMaterials() ? "true" : "false",
+                 hdr != pWPShaderInfo->combos.end() ? hdr->second.c_str() : "unset");
     }
 
     material.blenmode = ParseBlendMode(wpmat.blending);
@@ -4207,7 +4216,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                                             fs::VFS& vfs, audio::SoundManager& sm,
                                             const UserPropertyMap*  user_properties,
                                             double                  text_render_scale,
-                                            std::array<uint32_t, 2> output_extent) {
+                                            std::array<uint32_t, 2> output_extent,
+                                            int32_t                 postprocessing_quality) {
     nlohmann::json json;
     if (! PARSE_JSON(buf, json)) return nullptr;
 
@@ -4335,6 +4345,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
 
     InitContext(context, vfs, sc, scene_id);
+    context.scene->bloom.quality = postprocessing_quality;
     for (const auto& obj : wp_objs) {
         // Every authored object becomes exactly one SceneObject in parse order before per-type
         // materialization runs. Visibility only controls draw execution.

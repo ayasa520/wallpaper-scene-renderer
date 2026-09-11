@@ -106,6 +106,14 @@ public:
         int                        built_quality { -1 };
     };
 
+    // Material program selection follows host quality independently of scene bloom metadata
+    // and the output surface's storage format. Both ultra and display-HDR select this shader
+    // family; choosing it does not allocate floating-point targets or change presentation.
+    static constexpr bool HdrMaterialsForQuality(int32_t postprocessing_quality) {
+        return postprocessing_quality >= 2;
+    }
+    bool UsesHdrMaterials() const { return HdrMaterialsForQuality(bloom.quality); }
+
     enum class ParsedImageRequestState
     {
         Ready,

@@ -31,6 +31,7 @@
 #include <malloc.h>
 #include <atomic>
 #include <future>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -232,6 +233,8 @@ private:
 private:
     bool m_inited { false };
     bool m_render_ready { false };
+    bool m_staged_scene_load { false };
+    std::optional<bool> m_loaded_material_hdr;
 
     std::string                              m_assets;
     std::string                              m_source;
@@ -925,6 +928,7 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
     if (msg->findString("property", &property)) {
         if (property == PROPERTY_SOURCE) {
             msg->findString("value", &m_source);
+            m_staged_scene_load = false;
             LOG_INFO("source: %s load-user-properties=%zu hrbigb2=%s",
                      m_source.c_str(),
                      m_user_properties.size(),
@@ -972,6 +976,23 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             int32_t quality { 1 };
             if (msg->findInt32("value", &quality)) {
                 m_postprocessing_quality = std::clamp(quality, 0, 3);
+                // A staged project load commits its complete settings at PROPERTY_SOURCE.
+                // Do not reparse the outgoing project with the incoming project's properties
+                // while that transaction is still being assembled by the producer.
+                if (m_staged_scene_load) return;
+                const bool material_hdr = Scene::HdrMaterialsForQuality(m_postprocessing_quality);
+                if (m_loaded_material_hdr.has_value() && *m_loaded_material_hdr != material_hdr) {
+                    // HDR is a compile-time material choice, including descriptor membership.
+                    // Crossing that choice reconstructs the scene through its existing load/
+                    // retirement boundary; changing bloom quality within one shader family
+                    // keeps the current scene, scripts and dynamic layer owners alive.
+                    LOG_INFO("SceneWallpaper: postprocessing quality=%d material-hdr=%s "
+                             "previous-material-hdr=%s (reload scene materials)",
+                             m_postprocessing_quality, material_hdr ? "true" : "false",
+                             *m_loaded_material_hdr ? "true" : "false");
+                    loadScene();
+                    return;
+                }
                 auto nmsg =
                     CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_SET_POSTPROCESSING);
                 nmsg->setInt32("value", m_postprocessing_quality);
@@ -1026,6 +1047,7 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
             // next PROPERTY_SOURCE will parse the new scene with these values,
             // while the outgoing render scene avoids a live ApplyUserProperties
             // pass that can create a visible switch-only intermediate state.
+            m_staged_scene_load = true;
             std::shared_ptr<UserPropertyMap> user_properties;
             if (msg->findObject("value", &user_properties) && user_properties) {
                 m_user_properties = *user_properties;
@@ -1170,11 +1192,12 @@ void MainHandler::loadScene() {
                                      *m_sound_manager,
                                      &m_user_properties,
                                      m_render_handler->textRenderScale(),
-                                     m_render_handler->outputExtent());
+                                     m_render_handler->outputExtent(),
+                                     m_postprocessing_quality);
         scene->reflectionsEnabled = m_reflections_enabled;
         scene->volumetrics.quality = m_volumetrics_quality;
         scene->shadows.quality     = m_shadows_quality;
-        scene->bloom.quality       = m_postprocessing_quality;
+        m_loaded_material_hdr     = scene->UsesHdrMaterials();
         scene->msaa.quality        = m_antialiasing_quality;
         scene->textureResolution.quality = m_texture_resolution_quality;
         ConfigureSceneMsaa(*scene);
