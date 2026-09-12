@@ -565,16 +565,15 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
                          output_key.c_str());
             }
             // A material cannot create a depth attachment for a color-only effect target. Scene
-            // destinations share the same attachment as models, while masked meshes retain their
-            // independent stencil attachment. Capture effective booleans now: comparing live
+            // destinations share the same attachment as models, including masked meshes whose
+            // coverage uses separate color-only storage. Capture effective booleans now: comparing live
             // material pointers during residency would observe the new value in both generations.
             // A resolved-color post-process can use the same logical output name as the scene,
             // but not the same attachments. It remains single-sample and color-only, leaving the
             // traversal's shared depth intact for all model/image/effect draws in that stage.
             pdesc.shared_depth = !options.resolved_scene_color &&
                 (material->modelRenderState.has_value() ||
-                 (draw.Mesh()->MaskedDraw().empty() &&
-                  (output_key == SpecTex_Default || output_key == SpecTex_Reflection)));
+                 output_key == SpecTex_Default || output_key == SpecTex_Reflection);
             const auto blend = options.blend_override.value_or(material->blenmode);
             pdesc.depth_test = pdesc.shared_depth &&
                 options.depth_test_override.value_or(material->depthTest);

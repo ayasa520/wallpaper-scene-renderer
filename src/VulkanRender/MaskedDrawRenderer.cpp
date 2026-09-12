@@ -171,10 +171,11 @@ bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources
             }
         }
 
-        // The clipped material retains the invocation's destination alpha and raster route,
-        // but the group owns its translucent/additive blend selection. The mask writer has
-        // a separate R8 target and material; it never inherits scene depth or clears color
-        // belonging to an earlier visible range.
+        // The clipped program keeps the invocation's destination and alpha route, but selects
+        // testing from its own authored material. A publication utility can disable its own
+        // testing without disabling clipped content. Each group selects translucent/additive
+        // blending, so this content never writes depth. The independent R8 writer has no depth
+        // attachment; neither program clears color or depth belonging to earlier visible ranges.
         ShaderDrawData invocation;
         static_cast<ShaderDrawRequest&>(invocation) = context.data;
         invocation.sample_count = mask ? VK_SAMPLE_COUNT_1_BIT : context.data.sample_count;
@@ -182,10 +183,12 @@ bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources
         invocation.alpha_to_coverage = !mask && material.alpha_to_coverage;
         invocation.blend_override = blends[index];
         invocation.clear_before_draw = false;
-        if (mask) {
-            invocation.depth_test = false;
-            invocation.depth_write = false;
-        }
+        invocation.shared_depth = !mask && context.data.shared_depth;
+        invocation.depth_test_override.reset();
+        invocation.depth_write_override.reset();
+        invocation.depth_test = invocation.shared_depth && material.depthTest;
+        invocation.depth_write = false;
+        invocation.clear_depth = false;
         VkPipelineColorBlendAttachmentState blend {};
         if (mask) {
             SetBlend(material.blenmode, blend);
@@ -194,9 +197,14 @@ bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources
             blend = BuildShaderDrawRenderState(material, invocation).color_blend;
         }
         const auto load = mask ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        // Every resumed clipped pass must match the enclosing framebuffer's attachments and
+        // sample count. LOAD preserves scene depth across coverage and parent-composite passes,
+        // while private color-only destinations keep their original attachment layout.
+        const auto attachment = invocation.shared_depth ? SceneDepthAttachmentDescription(false)
+            : ShaderDrawAttachmentDescription {};
         auto pass = CreateShaderDrawRenderPass(device.handle(),
             mask ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, load,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, {},
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, attachment,
             invocation.sample_count, invocation.resolve_msaa);
         if (!pass) return false;
 
@@ -217,9 +225,27 @@ bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources
             "[node=" + context.data.draw.Name() + ",output=" + context.data.output + "]";
         prepared.cache_key = mask ? "MaskedDrawCoverage|format=r8|load=clear|samples=1"
             : "MaskedDrawClipped|" + ShaderDrawPipelineCompatibilityKey(load, false,
-                VK_ATTACHMENT_LOAD_OP_DONT_CARE, {}, invocation.sample_count,
+                VK_ATTACHMENT_LOAD_OP_DONT_CARE, attachment, invocation.sample_count,
                 invocation.resolve_msaa);
         if (!pipeline.create(device, *pass, prepared, resources.pipeline_cache.get())) return false;
+        if (std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr) {
+            LOG_INFO("MaskedDrawPipeline: layer=%d node='%s' role=%s blend=%d pipeline=%p "
+                     "render-pass=%p shared-depth=%s test=%s write=%s compare=%u "
+                     "depth-format=%u depth-load=%u depth-store=%u samples=%u resolve=%s",
+                     context.data.layer_id, context.data.draw.Name().c_str(),
+                     mask ? "mask" : "clipped", static_cast<int>(blends[index]),
+                     reinterpret_cast<void*>(*prepared.handle),
+                     reinterpret_cast<void*>(*prepared.pass),
+                     invocation.shared_depth ? "true" : "false",
+                     pipeline.depth.depthTestEnable ? "true" : "false",
+                     pipeline.depth.depthWriteEnable ? "true" : "false",
+                     static_cast<unsigned>(pipeline.depth.depthCompareOp),
+                     static_cast<unsigned>(attachment.format),
+                     static_cast<unsigned>(attachment.depth_load_op),
+                     static_cast<unsigned>(attachment.depth_store_op),
+                     static_cast<unsigned>(invocation.sample_count),
+                     invocation.resolve_msaa ? "true" : "false");
+        }
     }
 
     if (!program.contract.reflection.blocks.empty()) {
@@ -344,12 +370,13 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
     const bool trace = std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr &&
         (m_draw_sequence % 120 == 1 || std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr);
     const auto trace_range = [&](const char* role, const SceneMesh::DrawRange& range,
-                                  int32_t group, const char* shader,
+                                  int32_t group, const char* shader, VkPipeline pipeline,
                                   const VmaImageParameters* target = nullptr) {
         if (!trace) return;
         LOG_INFO("MaskedDrawCommand: sequence=%llu time=%.6f uniform-epoch=%llu pose=%016llx "
                  "layer=%d node='%s' role=%s shader='%s' group=%d first=%u count=%u "
-                 "destination=%p coverage=%p extent=%ux%u samples=%u attachment=%p",
+                 "destination=%p coverage=%p extent=%ux%u samples=%u attachment=%p "
+                 "pipeline=%p framebuffer=%p depth-view=%p",
                  static_cast<unsigned long long>(m_draw_sequence),
                  data.scene->elapsingTime, static_cast<unsigned long long>(m_uniform_epoch),
                  static_cast<unsigned long long>(m_pose_hash), data.layer_id,
@@ -357,7 +384,12 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
                  reinterpret_cast<void*>(data.vk_output.handle),
                  reinterpret_cast<void*>(*m_coverage->handle), extent.width, extent.height,
                  static_cast<unsigned>(data.sample_count),
-                 reinterpret_cast<void*>(target != nullptr ? *target->handle : data.vk_output.handle));
+                 reinterpret_cast<void*>(target != nullptr ? *target->handle : data.vk_output.handle),
+                 reinterpret_cast<void*>(pipeline),
+                 reinterpret_cast<void*>(target == nullptr ? *data.fb
+                     : target == m_coverage.get() ? *m_mask_framebuffer : *m_intermediate_framebuffer),
+                 target == nullptr && data.depth_stencil_image_ref != nullptr
+                     ? reinterpret_cast<void*>(*data.depth_stencil_image_ref->view) : nullptr);
     };
     const auto push_descriptors = [&](const Program& program, size_t pipeline_index,
                                        size_t group_index, bool mask) {
@@ -413,7 +445,8 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
                 context.push_visible_descriptors(*data.pipeline.layout);
                 bound = BoundPipeline::Visible;
             }
-            trace_range("visible", range, -1, data.draw.Mesh()->Material()->name.c_str());
+            trace_range("visible", range, -1, data.draw.Mesh()->Material()->name.c_str(),
+                        *data.pipeline.handle);
             command.DrawIndexed(range.indexCount, 1, range.firstIndex, 0, 0);
             continue;
         }
@@ -465,7 +498,8 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
                 for (const auto& mask_range : source_group.maskRanges) {
                     if (mask_range.indexCount == 0) continue;
                     trace_range("mask", mask_range, static_cast<int32_t>(source_index),
-                                m_materials->mask.name.c_str(), target.get());
+                                m_materials->mask.name.c_str(), *m_mask.pipelines.front().handle,
+                                target.get());
                     command.DrawIndexed(mask_range.indexCount, 1, mask_range.firstIndex, 0, 0);
                 }
                 command.EndRenderPass();
@@ -489,8 +523,9 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
             if (group.coverageGroups.size() > 1) PublishCoverage(context.resources, *m_coverage);
 
             // Resume the same destination with LOAD. Its framebuffer, sample/resolve state
-            // and bound puppet geometry survive the full-target composite, preserving earlier
-            // visible ranges and uncovered multisample color through every mask interruption.
+            // and bound puppet geometry survive the full-target composite. The resumed pass
+            // loads the same scene depth as well as color, preserving earlier occluders and
+            // uncovered multisample color through every mask interruption.
             VkRenderPassBeginInfo begin {
                 .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                 .renderPass = *m_clipped.pipelines[clipped_index].pass,
@@ -498,6 +533,17 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
                 .renderArea = {{0, 0}, {extent.width, extent.height}},
             };
             command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
+            if (trace) {
+                LOG_INFO("MaskedDrawResume: sequence=%llu layer=%d node='%s' group=%zu "
+                         "render-pass=%p framebuffer=%p depth-view=%p samples=%u",
+                         static_cast<unsigned long long>(m_draw_sequence), data.layer_id,
+                         data.draw.Name().c_str(), group_index,
+                         reinterpret_cast<void*>(begin.renderPass),
+                         reinterpret_cast<void*>(begin.framebuffer),
+                         data.depth_stencil_image_ref != nullptr
+                             ? reinterpret_cast<void*>(*data.depth_stencil_image_ref->view) : nullptr,
+                         static_cast<unsigned>(data.sample_count));
+            }
             bound = BoundPipeline::Mask;
             active_group = ordered.groupIndex;
         }
@@ -508,7 +554,8 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
             bound = BoundPipeline::Clipped;
             bound_clipped = clipped_index;
         }
-        trace_range("clipped", range, ordered.groupIndex, m_materials->clipped.name.c_str());
+        trace_range("clipped", range, ordered.groupIndex, m_materials->clipped.name.c_str(),
+                    *m_clipped.pipelines[clipped_index].handle);
         command.DrawIndexed(range.indexCount, 1, range.firstIndex, 0, 0);
     }
 }
