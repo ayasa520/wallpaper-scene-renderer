@@ -1164,7 +1164,13 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "  function createEffectMaterialProxy(nodeId, effectIndex, materialIndex = 0) {\n"
         << "    if (!__native.hasEffectMaterial(nodeId, effectIndex, materialIndex)) return "
            "undefined;\n"
-        << "    return new Proxy({}, {\n"
+        << "    // Publish the material's descriptor names as configurable own slots. Values "
+           "stay on the native pass; ordinary object enumeration supplies unique names and "
+           "numeric index ordering without copying uniforms into the script object.\n"
+        << "    const names = __native.getEffectMaterialPropertyNames(nodeId, effectIndex, "
+           "materialIndex);\n"
+        << "    const target = Object.fromEntries(names.map(name => [name, undefined]));\n"
+        << "    return new Proxy(target, {\n"
         << "      get(_target, prop) {\n"
         << "        if (typeof prop !== 'string') return undefined;\n"
         << "        return __native.getEffectMaterialProperty(nodeId, effectIndex, "
@@ -1179,6 +1185,17 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        if (typeof prop !== 'string') return false;\n"
         << "        return !!__native.hasEffectMaterialMember(nodeId, effectIndex, "
            "materialIndex, prop);\n"
+        << "      },\n"
+        << "      getOwnPropertyDescriptor(target, prop) {\n"
+        << "        if (typeof prop !== 'string') return undefined;\n"
+        << "        const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);\n"
+        << "        if (descriptor === undefined) return undefined;\n"
+        << "        // A descriptor is a snapshot of the current native value. Exposing "
+           "JavaScript accessor functions or the slot's placeholder would change both "
+           "descriptor-driven scripts and ordinary own-property copies.\n"
+        << "        descriptor.value = __native.getEffectMaterialProperty(nodeId, effectIndex, "
+           "materialIndex, prop);\n"
+        << "        return descriptor;\n"
         << "      }\n"
         << "    });\n"
         << "  }\n"
@@ -3781,6 +3798,10 @@ const ShaderValue* FindRuntimeMaterialUniformValue(const SceneMaterial& material
     return FindMaterialUniformValue(material, alias->second);
 }
 
+constexpr std::string_view kEffectMaterialRasterProperties[] {
+    "blending", "cullmode", "alphawriting", "depthtest", "depthwrite",
+};
+
 constexpr std::pair<std::string_view, BlendMode> kMaterialBlendingModes[] {
     { "normal", BlendMode::Normal },
     { "translucent", BlendMode::Translucent },
@@ -6041,6 +6062,45 @@ JSValue NativeHasEffectMaterial(JSContext* context, JSValueConst, int argc, JSVa
 }
 
 JSValue
+NativeGetEffectMaterialPropertyNames(JSContext* context, JSValueConst, int argc,
+                                     JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 3) return JS_NewArray(context);
+
+    int32_t layer_id       = 0;
+    int32_t effect_index   = 0;
+    int32_t material_index = 0;
+    if (JS_ToInt32(context, &layer_id, argv[0]) != 0 ||
+        JS_ToInt32(context, &effect_index, argv[1]) != 0 ||
+        JS_ToInt32(context, &material_index, argv[2]) != 0 || effect_index < 0 ||
+        material_index < 0) {
+        return JS_NewArray(context);
+    }
+
+    const auto target = FindEffectMaterialTarget(opaque,
+                                                 layer_id,
+                                                 static_cast<uint32_t>(effect_index),
+                                                 static_cast<uint32_t>(material_index));
+    JSValue names = JS_NewArray(context);
+    if (!target.has_value()) return names;
+
+    // Membership comes from the same compiled aliases and retained value storage used by
+    // has/get/set. Raw shader symbols, inactive declarations and unrelated defaults must not
+    // become own properties merely because a script enumerates the material. Static and
+    // shader descriptors share one namespace; constructing the script object's own slots
+    // coalesces collisions while its live value lookup retains the shader alias's precedence.
+    uint32_t index = 0;
+    const auto append = [&](std::string_view name) {
+        JS_SetPropertyUint32(context, names, index++, JS_NewStringLen(context, name.data(), name.size()));
+    };
+    for (const auto name : kEffectMaterialRasterProperties) append(name);
+    for (const auto& [name, uniform_name] : target->material->uniformAliases) {
+        if (FindMaterialUniformValue(*target->material, uniform_name) != nullptr) append(name);
+    }
+    return names;
+}
+
+JSValue
 NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
     auto* opaque = GetOpaque(context);
     if (opaque == nullptr || opaque->scene == nullptr || argc < 4) return JS_FALSE;
@@ -6068,9 +6128,9 @@ NativeHasEffectMaterialMember(JSContext* context, JSValueConst, int argc, JSValu
     // Unknown names remain absent instead of silently accepting misspelled controls.
     return JS_NewBool(context,
                       FindRuntimeMaterialUniformValue(*target->material, property_name) != nullptr ||
-                          property_name == "blending" || property_name == "cullmode" ||
-                          property_name == "alphawriting" || property_name == "depthtest" ||
-                          property_name == "depthwrite");
+                          std::any_of(std::begin(kEffectMaterialRasterProperties),
+                                      std::end(kEffectMaterialRasterProperties),
+                                      [&](std::string_view name) { return name == property_name; }));
 }
 
 JSValue
@@ -8440,6 +8500,11 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
                       m_impl->native_bridge,
                       "hasEffectMaterial",
                       JS_NewCFunction(context, NativeHasEffectMaterial, "hasEffectMaterial", 3));
+    JS_SetPropertyStr(
+        context,
+        m_impl->native_bridge,
+        "getEffectMaterialPropertyNames",
+        JS_NewCFunction(context, NativeGetEffectMaterialPropertyNames, "getEffectMaterialPropertyNames", 3));
     JS_SetPropertyStr(
         context,
         m_impl->native_bridge,
