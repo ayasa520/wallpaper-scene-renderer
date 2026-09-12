@@ -76,6 +76,7 @@ void WPPuppet::prepared() {
     }
 
     m_final_affines.resize(bones.size());
+    m_bone_local_affines.resize(bones.size());
     m_bone_model_affines.resize(bones.size());
 }
 
@@ -147,6 +148,11 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         if (i < runtime.bone_overrides.size() && runtime.bone_overrides[i].enabled) {
             affine = runtime.bone_overrides[i].local_transform;
         }
+        // Keep the evaluated local frame before composing its parent. Script component
+        // writes must start from these exact values: recovering local space by inverting
+        // the model-space parent feeds multiplication roundoff back into every later write.
+        // The model and skinning palettes still derive from this same evaluated pose.
+        m_bone_local_affines[i] = affine;
         affine = parent * affine;
         m_bone_model_affines[i] = affine;
     }
@@ -169,6 +175,10 @@ uint32_t WPPuppet::FindBoneIndex(std::string_view name) const noexcept {
         if (bones[i].name == name) return i;
     }
     return 0xFFFFFFFFu;
+}
+
+const Affine3f& WPPuppet::BoneLocalTransform(uint32_t index) const noexcept {
+    return m_bone_local_affines[index];
 }
 
 const Affine3f& WPPuppet::BoneModelTransform(uint32_t index) const noexcept {

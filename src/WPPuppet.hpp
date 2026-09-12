@@ -170,10 +170,12 @@ public:
     void                             prepared();
     const Attachment*                FindAttachment(std::string_view name) const noexcept;
     uint32_t                         FindBoneIndex(std::string_view name) const noexcept;
+    const Eigen::Affine3f&           BoneLocalTransform(uint32_t index) const noexcept;
     const Eigen::Affine3f&           BoneModelTransform(uint32_t index) const noexcept;
 
 private:
     std::vector<Eigen::Affine3f> m_final_affines;
+    std::vector<Eigen::Affine3f> m_bone_local_affines;
     std::vector<Eigen::Affine3f> m_bone_model_affines;
 };
 

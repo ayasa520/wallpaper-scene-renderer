@@ -3636,6 +3636,23 @@ Eigen::Affine3f ComposeAffine(const Eigen::Vector3f& translation, const Eigen::V
     return affine;
 }
 
+std::array<double, 3> LocalBoneEulerAngles(const Eigen::Affine3f& affine) {
+    // Local bone queries expose radians from the retained basis itself. Select the Z
+    // angle first, then recover Y and X from that orientation; normalizing columns or
+    // selecting another equivalent Euler branch changes the observable script values.
+    // In particular, a negative Z rotation must remain negative on ordinary readback.
+    const Eigen::Matrix3f linear = affine.linear();
+    const float z = std::atan2(linear(1, 0), linear(0, 0));
+    const float y = std::atan2(-linear(2, 0),
+                              std::sqrt(linear(2, 1) * linear(2, 1) +
+                                        linear(2, 2) * linear(2, 2)));
+    const float sine = std::sin(z);
+    const float cosine = std::cos(z);
+    const float x = std::atan2(sine * linear(0, 2) - cosine * linear(1, 2),
+                              cosine * linear(1, 1) - sine * linear(0, 1));
+    return { static_cast<double>(x), static_cast<double>(y), static_cast<double>(z) };
+}
+
 void DecomposeAffine(const Eigen::Affine3f& affine, Eigen::Vector3f& translation,
                      Eigen::Vector3f& rotation, Eigen::Vector3f& scale) {
     Eigen::Matrix3f linear = affine.linear();
@@ -3683,12 +3700,7 @@ std::optional<Eigen::Affine3f> GetBoneLocalTransform(const WPSceneScriptHost::Op
                                                      SceneNode* node, uint32_t bone_index) {
     const auto* puppet = AdvanceNodePuppetForScriptQuery(opaque, node);
     if (puppet == nullptr || bone_index >= puppet->bones.size()) return std::nullopt;
-
-    const auto& bone       = puppet->bones[bone_index];
-    const auto& bone_model = puppet->BoneModelTransform(bone_index);
-    if (bone.noParent()) return bone_model;
-    if (bone.parent >= puppet->bones.size()) return std::nullopt;
-    return puppet->BoneModelTransform(bone.parent).inverse() * bone_model;
+    return puppet->BoneLocalTransform(bone_index);
 }
 
 bool SetBoneLocalTransform(const WPSceneScriptHost::Opaque* opaque, SceneNode* node,
@@ -6959,9 +6971,7 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         if (! bone_index.has_value()) return JS_UNDEFINED;
         const auto transform = GetBoneLocalTransform(opaque, node, *bone_index);
         return transform.has_value()
-                   ? Vec3ToJS(context,
-                              ConvertEulerArrayScale(AffineEulerAngles(*transform),
-                                                     kSceneScriptRadiansToDegrees))
+                   ? Vec3ToJS(context, LocalBoneEulerAngles(*transform))
                    : JS_UNDEFINED;
     }
     if (command == "getLocalBoneOrigin") {
@@ -7011,20 +7021,18 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         const auto current_transform = GetBoneLocalTransform(opaque, node, *bone_index);
         if (! angles.has_value() || ! current_transform.has_value()) return JS_FALSE;
 
-        const auto runtime_angles = ConvertFloat3Scale(*angles, kSceneScriptDegreesToRadians);
         std::array<float, 3> angle_values {};
-        if (! runtime_angles.tryGet(&angle_values)) return JS_FALSE;
+        if (! angles->tryGet(&angle_values)) return JS_FALSE;
 
-        Eigen::Vector3f translation {};
-        Eigen::Vector3f rotation {};
-        Eigen::Vector3f scale {};
-        DecomposeAffine(*current_transform, translation, rotation, scale);
-        rotation = Eigen::Vector3f(angle_values[0], angle_values[1], angle_values[2]);
-
+        // A local angle assignment replaces the unit rotation basis in radians. Reusing
+        // decomposed column lengths would retain old scale/shear and accumulate roundoff
+        // when a script repeatedly assigns the same pose. Translation remains independent.
+        const Eigen::Vector3f rotation(angle_values[0], angle_values[1], angle_values[2]);
         return JS_NewBool(
             context,
             SetBoneLocalTransform(
-                opaque, node, *bone_index, ComposeAffine(translation, rotation, scale)));
+                opaque, node, *bone_index,
+                ComposeAffine(current_transform->translation(), rotation, Eigen::Vector3f::Ones())));
     }
     if (command == "setLocalBoneOrigin") {
         if (argc < 4) return JS_FALSE;
@@ -7038,16 +7046,11 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         std::array<float, 3> origin_values {};
         if (! origin->tryGet(&origin_values)) return JS_FALSE;
 
-        Eigen::Vector3f translation {};
-        Eigen::Vector3f rotation {};
-        Eigen::Vector3f scale {};
-        DecomposeAffine(*current_transform, translation, rotation, scale);
-        translation = Eigen::Vector3f(origin_values[0], origin_values[1], origin_values[2]);
-
-        return JS_NewBool(
-            context,
-            SetBoneLocalTransform(
-                opaque, node, *bone_index, ComposeAffine(translation, rotation, scale)));
+        // Position owns only the three translation components. Decomposing and rebuilding
+        // the basis here would also alter rotation, scale and shear on a position-only write.
+        Eigen::Affine3f transform = *current_transform;
+        transform.translation() = Eigen::Vector3f(origin_values[0], origin_values[1], origin_values[2]);
+        return JS_NewBool(context, SetBoneLocalTransform(opaque, node, *bone_index, transform));
     }
     if (command == "applyBonePhysicsImpulse") {
         if (argc < 4) return JS_FALSE;
