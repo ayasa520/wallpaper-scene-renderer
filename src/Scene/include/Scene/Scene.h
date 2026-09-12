@@ -62,9 +62,8 @@ public:
     };
 
     struct CameraPathSegment {
-        // Camera paths retain pose and zoom on one scene-owned timeline. The perspective view
-        // and orthographic projection consume their respective sampled components, while an
-        // active camera layer pauses that shared playback state.
+        // Camera paths retain pose and zoom on one scene-owned timeline. Both frame projections
+        // consume the selected pose, while an active camera layer pauses the shared playback.
         std::string name;
         double      duration { 0.0 };
         std::vector<CameraPathKeyframe> keyframes;
@@ -393,8 +392,10 @@ public:
     // Playback time belongs to the path, not the scene: camera-layer ownership pauses it.
     // Only the frame preparation path sample advances this clock, after publishing the pose.
     double                         modelCameraPathTime { 0.0 };
-    // Retain the last path sample while a camera layer owns the frame. Only orthographic
-    // projection consumes this scalar; perspective paths continue to select their view pose.
+    // Keep the sampled pose outside either mutable frame camera. A selected layer can replace
+    // either view without losing the path state needed by a later release or another consumer.
+    // Orthographic projection additionally consumes the scalar from that same sample.
+    CameraPose                     cameraPathPose;
     float                          cameraPathZoom { 1.0f };
 
     i32                  ortho[2] { 1920, 1080 }; // w, h

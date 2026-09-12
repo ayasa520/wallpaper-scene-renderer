@@ -19,8 +19,8 @@ Vector3d SceneCamera::GetPosition() const {
 
 Vector3d SceneCamera::GetDirection() const {
 	if (m_hasExplicitView) {
-		// 3D camera paths author eye/center/up directly. Returning the explicit direction keeps
-		// model-only camera uniforms synchronized with the same view matrix used for rendering.
+		// Camera paths author eye/center/up directly. Returning the explicit direction keeps
+		// frame uniforms synchronized with the same selected basis used for rendering.
 		Vector3d direction = m_explicitCenter - m_explicitEye;
 		if (direction.norm() > 1e-9) return direction.normalized();
 		return -Vector3d::UnitZ();
@@ -50,12 +50,13 @@ void SceneCamera::CalculateViewProjectionMatrix() {
 	// CalculateViewMatrix
 	{
 		if (m_hasExplicitView) {
-			// The model camera can be driven by Wallpaper Engine path keyframes without converting
-			// through Euler scene-node state. This explicit branch is inert for 2D cameras because
-			// only the model parser calls SetExplicitView().
+			// Path poses retain their authored look-at basis without an Euler-node conversion.
+			// Centering a canvas belongs after that look-at, in destination space: adding the
+			// same offset to eye/center would rotate the framing translation with the path basis.
 			m_viewMat = LookAt(m_explicitEye + m_shakeOffset,
 			                  m_explicitCenter + m_shakeOffset,
 			                  m_explicitUp);
+			m_viewMat.block<3, 1>(0, 3) += m_explicitViewOffset;
 		} else if(m_node) {
 			Affine3d nodeTrans(m_node->GetLocalTrans());
 			Vector3d eye = nodeTrans * Vector3d::Zero() + m_shakeOffset;
@@ -115,10 +116,12 @@ void SceneCamera::AttatchNode(std::shared_ptr<SceneNode> node) {
 
 void SceneCamera::SetExplicitView(const Eigen::Vector3d& eye,
                                   const Eigen::Vector3d& center,
-                                  const Eigen::Vector3d& up) {
+                                  const Eigen::Vector3d& up,
+                                  const Eigen::Vector3d& destination_offset) {
 	m_explicitEye = eye;
 	m_explicitCenter = center;
 	m_explicitUp = up;
+	m_explicitViewOffset = destination_offset;
 	m_hasExplicitView = true;
 	Update();
 }

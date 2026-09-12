@@ -1027,9 +1027,10 @@ void Scene::UpdateModelCameraPath() {
         return;
     }
 
-    // Publish zoom alongside the pose before any projection consumer runs. The pose uses the
-    // model camera; the scalar is shared with orthographic frame selection and fill-mode framing.
-    // Neither publication advances the cursor, and camera-layer ownership retains both values.
+    // Publish the full sample before either frame projection consumes it. The separate retained
+    // pose survives camera-layer selection; the perspective camera also supplies auxiliary
+    // consumers. Neither publication advances the cursor, and layer ownership retains both.
+    cameraPathPose = { .eye = sample.eye, .center = sample.center, .up = sample.up };
     cameraPathZoom = sample.zoom;
     camera_it->second->SetExplicitView(ToVector3d(sample.eye),
                                        ToVector3d(sample.center),
@@ -1142,11 +1143,19 @@ void Scene::UpdateCameraShake() {
 
 Eigen::Vector3f Scene::FrameEyePosition() const {
     // Lighting uniforms and volume containment share the frame eye, independently of any private
-    // raster camera. The orthographic camera node already carries the canvas half-size in X/Y;
-    // the frame eye's Z stays at 2000 without moving that camera's projection.
+    // raster camera. A node-driven orthographic camera already carries the canvas half-size in
+    // X/Y. A path camera keeps its raw eye for look-at and centers the destination separately, so
+    // only that selected path needs the canvas adjustment here. The frame eye's fixed Z never
+    // replaces the eye used to construct the actual view matrix.
     constexpr float kOrthographicSceneEyeZ = 2000.0f;
     Eigen::Vector3f eye = activeCamera->GetPosition().cast<float>();
-    if (cameraOrthographic) eye.z() = kOrthographicSceneEyeZ;
+    if (cameraOrthographic) {
+        if (activeCameraLayerId == 0 && modelCameraPathEnabled) {
+            eye.x() += static_cast<float>(ortho[0]) * 0.5f;
+            eye.y() += static_cast<float>(ortho[1]) * 0.5f;
+        }
+        eye.z() = kOrthographicSceneEyeZ;
+    }
     return eye;
 }
 
@@ -1204,17 +1213,14 @@ void Scene::UpdateActiveCameraLayer() {
                 yaxis.normalize();
                 camera.SetExplicitView(eye, eye - zaxis, yaxis);
             }
-        } else if (camera_layer == nullptr && !modelCameraPathEnabled) {
-            // With no layer or path, copy authored eye/center/up into the effective pose every
-            // frame. This camera contains the previously selected view, so merely leaving it
-            // unchanged preserves a hidden layer's translation, direction and roll. Restore all
-            // three independent authored vectors, not a pose captured from a camera that a layer
-            // may already have changed. When a path is enabled, PrepareFrame's
-            // UpdateModelCameraPath has already supplied its current sample; layer removal must
-            // retain that sample.
-            camera.SetExplicitView(ToVector3d(authoredCameraPose.eye),
-                                   ToVector3d(authoredCameraPose.center),
-                                   ToVector3d(authoredCameraPose.up));
+        } else if (camera_layer == nullptr) {
+            // Selection may also run from a visibility setter before the next playback tick.
+            // Restore all three vectors from scene-owned state so layer release cannot retain
+            // the hidden layer's view or advance the path just to reconstruct its current pose.
+            const auto& pose = modelCameraPathEnabled ? cameraPathPose : authoredCameraPose;
+            camera.SetExplicitView(ToVector3d(pose.eye),
+                                   ToVector3d(pose.center),
+                                   ToVector3d(pose.up));
         }
 
         // Every frame selects the layer's FOV when a camera layer is active, otherwise the latest
@@ -1273,10 +1279,26 @@ void Scene::UpdateActiveCameraLayer() {
     }
     if (camera_it == cameras.end() || !camera_it->second || !camera_node) return;
 
-    camera_it->second->AttatchNode(camera_node);
+    auto& camera = *camera_it->second;
+    if (camera_layer == nullptr && modelCameraPathEnabled) {
+        // Orthographic paths use the same sampled look-at as the perspective frame. The
+        // symmetric canvas projection additionally needs its anchor in destination space,
+        // after the look-at basis, while lighting keeps the separately adjusted frame eye.
+        camera.SetExplicitView(ToVector3d(cameraPathPose.eye),
+                               ToVector3d(cameraPathPose.center),
+                               ToVector3d(cameraPathPose.up),
+                               Eigen::Vector3d(-static_cast<double>(ortho[0]) * 0.5,
+                                               -static_cast<double>(ortho[1]) * 0.5,
+                                               0.0));
+    } else {
+        // Attaching a node retains explicit-view state. Clear the path's view mode when a
+        // layer takes over, or its node pose would remain hidden behind the old path sample.
+        camera.ClearExplicitView();
+        camera.AttatchNode(camera_node);
+    }
     ApplyCameraProjectionState(*this,
                                camera_name,
-                               *camera_it->second,
+                               camera,
                                zoom,
                                fov,
                                next_layer_id);

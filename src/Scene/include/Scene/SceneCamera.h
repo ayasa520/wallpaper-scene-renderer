@@ -51,7 +51,8 @@ public:
     void SetFarClip(double value) { m_farClip = value; }
     void SetExplicitView(const Eigen::Vector3d& eye,
                          const Eigen::Vector3d& center,
-                         const Eigen::Vector3d& up);
+                         const Eigen::Vector3d& up,
+                         const Eigen::Vector3d& destination_offset = Eigen::Vector3d::Zero());
     void ClearExplicitView() { m_hasExplicitView = false; }
     // Scene camerashake adds the same translation to eye and center. Keep it off the authored
     // node/path pose so fill-mode framing and camera-layer origins stay stable.
@@ -90,6 +91,7 @@ public:
         m_explicitEye = cam.m_explicitEye;
         m_explicitCenter = cam.m_explicitCenter;
         m_explicitUp = cam.m_explicitUp;
+        m_explicitViewOffset = cam.m_explicitViewOffset;
         m_hasExplicitOrthoRect = cam.m_hasExplicitOrthoRect;
         m_orthoLeft = cam.m_orthoLeft;
         m_orthoRight = cam.m_orthoRight;
@@ -112,6 +114,9 @@ private:
     Eigen::Vector3d m_explicitEye { Eigen::Vector3d::Zero() };
     Eigen::Vector3d m_explicitCenter { -Eigen::Vector3d::UnitZ() };
     Eigen::Vector3d m_explicitUp { Eigen::Vector3d::UnitY() };
+    // Canvas framing translates the completed look-at destination, independently of the
+    // authored eye and basis. Linked cameras retain that framing without changing frame uniforms.
+    Eigen::Vector3d m_explicitViewOffset { Eigen::Vector3d::Zero() };
     bool   m_hasExplicitOrthoRect { false };
     double m_orthoLeft { -0.5 };
     double m_orthoRight { 0.5 };

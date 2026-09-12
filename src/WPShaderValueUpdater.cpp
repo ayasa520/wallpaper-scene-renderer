@@ -1217,9 +1217,8 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
     if (info.has_EYE_POSITION) {
         // Image prelighting and the following effect passes consume the eye selected for the
         // scene frame. Their local raster cameras can change M/VP/MVP, but cannot replace that
-        // world-space eye. Scene's orthographic camera already includes the canvas half-size in
-        // X/Y, while perspective cameras retain the authored/path/layer position on all three
-        // axes.
+        // world-space eye. Scene resolves orthographic canvas framing independently of path
+        // look-at state, while perspective cameras retain the selected position on all axes.
         Vector3f eye = m_scene->FrameEyePosition();
         // The reflected walk changes this same frame eye. It is not a raster-camera replacement
         // and must not leak into the following ordinary pass.
@@ -1227,11 +1226,13 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         updateOp(G_EYE_POSITION, std::array<float, 3> { eye.x(), eye.y(), eye.z() });
 
         if ((std::getenv("WESCENE_TRACE_EYE_POSITION") != nullptr ||
-             std::getenv("WESCENE_TRACE_REFLECTION") != nullptr) && m_puppet_frame_serial <= 2) {
+             std::getenv("WESCENE_TRACE_REFLECTION") != nullptr) &&
+            (m_puppet_frame_serial <= 2 ||
+             std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr)) {
             const auto raster_eye = camera->GetPosition();
             LOG_INFO("SceneEyePositionDraw: frame=%llu layer=%d node='%s' material='%s' "
                      "raster-camera='%.*s' reflection=%s orthographic=%s eye=[%.6f %.6f %.6f] "
-                     "raster-eye=[%.6f %.6f %.6f]",
+                     "raster-eye=[%.6f %.6f %.6f] time=%.6f",
                      static_cast<unsigned long long>(m_puppet_frame_serial),
                      draw.LayerId(*m_scene), draw.Name().c_str(),
                      material != nullptr ? material->name.c_str() : "",
@@ -1239,7 +1240,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                      reflection_pass ? "true" : "false",
                      m_scene->cameraOrthographic ? "true" : "false",
                      eye.x(), eye.y(), eye.z(),
-                     raster_eye.x(), raster_eye.y(), raster_eye.z());
+                     raster_eye.x(), raster_eye.y(), raster_eye.z(), m_scene->elapsingTime);
         }
     }
 

@@ -2132,6 +2132,7 @@ void LoadModelCameraPaths(ParseContext& context, const wpscene::WPSceneCamera& a
     scene.modelCameraPathEnabled       = false;
     scene.activeModelCameraPathSegment = -1;
     scene.modelCameraPathTime          = 0.0;
+    scene.cameraPathPose               = scene.authoredCameraPose;
     scene.cameraPathZoom               = 1.0f;
 
     if (authored_camera.paths.empty()) return;
@@ -2191,14 +2192,15 @@ void LoadModelCameraPaths(ParseContext& context, const wpscene::WPSceneCamera& a
     scene.modelCameraPathEnabled = ! scene.modelCameraPathSegments.empty();
     if (scene.modelCameraPathEnabled) {
         const auto& first     = scene.modelCameraPathSegments.front().keyframes.front();
-        // Initial projection setup can precede the first playback tick. Seed its zoom from
-        // the same first keyframe as the view, while leaving the independent cursor at zero.
+        // Initial graph/uniform preparation can precede the first playback tick. Seed the
+        // shared pose and zoom together, while leaving the independent cursor at zero.
+        scene.cameraPathPose = { .eye = first.eye, .center = first.center, .up = first.up };
         scene.cameraPathZoom = first.zoom;
         auto        camera_it = scene.cameras.find(std::string(kSceneModelPerspectiveCameraName));
         if (camera_it != scene.cameras.end() && camera_it->second) {
-            // Seed frame zero on the model-only camera. The legacy 2D `global_perspective` camera
-            // is intentionally not touched here, because 2D particle scenes depend on its old
-            // screen center transform.
+            // Seed the world-unit perspective view as well as the retained sample. The canvas
+            // frame selects its own view below; its auxiliary particle projection has a separate
+            // screen-centered camera and does not own path playback.
             camera_it->second->SetExplicitView(
                 Vector3d(first.eye[0], first.eye[1], first.eye[2]),
                 Vector3d(first.center[0], first.center[1], first.center[2]),
@@ -2266,10 +2268,9 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
     scene.cameras[std::string(kSceneModelPerspectiveCameraName)] = std::make_shared<SceneCamera>(
         (float)context.ortho_w / (float)context.ortho_h, general.nearz, general.farz, general.fov);
     auto model_camera_node = std::make_shared<SceneNode>();
-    // 3D model support must not reuse `global_perspective`: existing 2D particle systems and
-    // camera-layer scenes already depend on that camera's historical centered-at-screen transform.
-    // The authored scene camera is therefore installed under a model-only name and consumed only by
-    // WPModelObject materialization and model camera-path playback.
+    // Keep the world-unit perspective view separate from the canvas-centered auxiliary particle
+    // projection. Scene mode selects the frame camera; orthographic paths publish their retained
+    // pose independently to the canvas view without changing that auxiliary camera's origin.
     scene.cameras[std::string(kSceneModelPerspectiveCameraName)]->AttatchNode(model_camera_node);
     scene.cameras[std::string(kSceneModelPerspectiveCameraName)]->SetExplicitView(eye, center, up);
     scene.modelPerspectiveCameraName = std::string(kSceneModelPerspectiveCameraName);
@@ -2294,6 +2295,10 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
                  center.x(),
                  center.y(),
                  center.z());
+    } else if (scene.modelCameraPathEnabled) {
+        // Publish the seeded path before object materialization can prepare frame uniforms.
+        // Camera-layer registration later performs the same selection and may take ownership.
+        scene.UpdateActiveCameraLayer();
     }
 }
 
