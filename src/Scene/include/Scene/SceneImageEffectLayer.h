@@ -14,6 +14,7 @@
 #include "Type.hpp"
 #include "WPPuppet.hpp"
 #include "SceneDraw.h"
+#include "SceneImageSource.h"
 
 namespace wallpaper
 {
@@ -154,7 +155,6 @@ public:
         bool card_sized_destination;
         bool force_point_sampling;
         bool clamp_uvs;
-        bool crop_card_uvs;
     };
 
     struct PrelightingSource {
@@ -220,14 +220,12 @@ public:
     const PrelightingSource* GetPrelightingSource() const {
         return m_prelighting_source ? &*m_prelighting_source : nullptr;
     }
-    void SetSourceTexture(const Scene& scene, std::shared_ptr<SceneMaterial> material,
-                           SourceTexturePolicy policy);
-    void RememberSourceTextureMetadata(const Scene& scene);
-    std::string_view SourceTextureName() const;
-    const std::array<float, 2>& SourceTextureContentSize() const {
-        return m_source_texture->metadata.content_size;
+    void SetSourceTexturePolicy(SourceTexturePolicy policy) {
+        m_source_texture_policy = policy;
     }
-    void RefreshSourceTexture(Scene& scene);
+    const std::array<float, 2>& SourceTextureContentSize() const;
+    void RefreshSourceTexture(Scene& scene, const SceneImageSource::Metadata& previous,
+                               const SceneImageSource::Metadata& next);
     bool UsesPrelightingSource() const;
     void ResolveOwnerDraw(Scene& scene);
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
@@ -326,24 +324,6 @@ private:
         uint32_t fit;
     };
 
-    struct SourceTextureMetadata {
-        std::string texture_key;
-        std::array<int32_t, 2> allocation_size {};
-        std::array<float, 2> content_size {};
-        TextureSample sample {};
-        bool sprite { false };
-        bool operator==(const SourceTextureMetadata&) const = default;
-    };
-
-    struct SourceTextureState {
-        std::shared_ptr<SceneMaterial> material;
-        SourceTexturePolicy policy;
-        SourceTextureMetadata metadata;
-    };
-
-    static std::optional<SourceTextureMetadata> ResolveSourceTextureMetadata(
-        const Scene& scene, std::string_view texture_name);
-
     SceneObject& m_owner;
     std::string m_pingpong_a;
     std::string m_pingpong_b;
@@ -373,10 +353,9 @@ private:
     std::vector<EffectRenderTarget> m_effect_render_targets;
     //    std::vector<float> m_size;
     std::unique_ptr<SceneMesh> m_source_mesh;
-    // Image bridges observe their material's primary source even when no prelighting program
-    // exists or every effect is hidden. Snapshot values describe the last resource setup, not
-    // the last draw; ordinary image pixels can change without invalidating this metadata.
-    std::optional<SourceTextureState> m_source_texture;
+    // The owner observes its primary texture; this bridge retains only destination policy and
+    // private source resources, independently of generated display-card geometry.
+    SourceTexturePolicy m_source_texture_policy {};
     std::optional<PrelightingSource> m_prelighting_source;
     std::optional<DirectPuppetSource> m_direct_puppet_source;
     std::unique_ptr<SceneMesh> m_final_mesh;

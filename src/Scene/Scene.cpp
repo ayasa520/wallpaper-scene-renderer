@@ -4,6 +4,7 @@
 #include "SpecTexs.hpp"
 #include "SceneCamera.h"
 #include "SceneImageEffectLayer.h"
+#include "SceneImageSource.h"
 
 #include "Fs/VFS.h"
 #include "Interface/IImageParser.h"
@@ -120,26 +121,28 @@ void Scene::RefreshImageSourceTextures() {
     // Named sources can occur after their readers in the authored draw list. Prepare the
     // source descriptors before dependent image setup so one graph compilation sees coherent
     // dimensions and filtering. This walk performs no draws and never changes painter order.
-    std::vector<SceneImageEffectLayer*> layers;
-    std::unordered_map<std::string, SceneImageEffectLayer*> publishers;
+    std::vector<SceneImageSource*> sources;
+    std::unordered_map<std::string, SceneImageSource*> publishers;
     for (const auto layer_id : layerOrder) {
-        if (auto* layer = FindImageEffectLayer(layer_id)) {
-            layers.push_back(layer);
-            if (layer->DeclaredFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter) {
-                publishers.emplace(GenImageLayerCompositeTex(layer_id), layer);
-            }
+        const auto* owner = FindSceneObject(layer_id);
+        if (owner == nullptr || !owner->ImageSource()) continue;
+        auto* source = owner->ImageSource().get();
+        sources.push_back(source);
+        if (const auto& layer = owner->ImageEffectLayer(); layer &&
+            layer->DeclaredFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter) {
+            publishers.emplace(GenImageLayerCompositeTex(layer_id), source);
         }
     }
-    std::unordered_set<SceneImageEffectLayer*> visited;
-    const auto refresh = [&](const auto& self, SceneImageEffectLayer* layer) -> void {
+    std::unordered_set<SceneImageSource*> visited;
+    const auto refresh = [&](const auto& self, SceneImageSource* source) -> void {
         // Shared sources are prepared once per resource boundary. Mark entry before following
         // source references so a repeated reference cannot recursively re-enter owner setup.
-        if (!visited.insert(layer).second) return;
-        const auto source = publishers.find(std::string(layer->SourceTextureName()));
-        if (source != publishers.end()) self(self, source->second);
-        layer->RefreshSourceTexture(*this);
+        if (!visited.insert(source).second) return;
+        const auto publisher = publishers.find(std::string(source->TextureName()));
+        if (publisher != publishers.end()) self(self, publisher->second);
+        source->Refresh(*this);
     };
-    for (auto* layer : layers) refresh(refresh, layer);
+    for (auto* source : sources) refresh(refresh, source);
 }
 
 void SceneObject::SetLayerNode(SceneNode* node) {

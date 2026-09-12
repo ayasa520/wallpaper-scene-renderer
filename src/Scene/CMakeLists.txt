@@ -8,6 +8,7 @@ SceneCamera.cpp
 SceneDestinationTarget.cpp
 SceneDraw.cpp
 SceneImageEffectLayer.cpp
+SceneImageSource.cpp
 SceneIndexArray.cpp
 SceneModelData.cpp
 SceneNode.cpp

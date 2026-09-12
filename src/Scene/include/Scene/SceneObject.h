@@ -17,6 +17,7 @@ namespace wallpaper
 class Scene;
 class SceneNode;
 class SceneImageEffectLayer;
+class SceneImageSource;
 class SceneLight;
 class SceneModelData;
 class ParticleSubSystem;
@@ -187,6 +188,13 @@ public:
         m_image_effect_layer = std::move(effect_layer);
     }
 
+    // Primary-image metadata has the owner's lifetime independently of its effect bridge.
+    // Direct images and temporarily hidden effects retain the same texture observer.
+    const std::shared_ptr<SceneImageSource>& ImageSource() const { return m_image_source; }
+    void SetImageSource(std::shared_ptr<SceneImageSource> source) {
+        m_image_source = std::move(source);
+    }
+
     // The concrete layer registers its setup operation after materialization. Hierarchy edits
     // dispatch through the owner, independent of passthrough and without teaching Scene about
     // parser-side text layout or shape material controls. Identity-only prepass entries have no
@@ -317,6 +325,7 @@ private:
     SceneNode* m_layer_node { nullptr };
 
     std::shared_ptr<SceneImageEffectLayer> m_image_effect_layer;
+    std::shared_ptr<SceneImageSource>      m_image_source;
     ResourceSetupCallback                m_resource_setup { nullptr };
 
     std::vector<SceneLight*>        m_runtime_lights;

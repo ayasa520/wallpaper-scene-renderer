@@ -15,6 +15,7 @@
 #include "Scene/ShadowAtlas.hpp"
 #include "Scene/LightingV1.hpp"
 #include "Scene/SceneImageEffectLayer.h"
+#include "Scene/SceneImageSource.h"
 #include "Scene/SceneTexture.h"
 
 #include "WPShaderParser.hpp"
@@ -723,6 +724,11 @@ void CompleteImageSourceMappings(ParseContext& context) {
                  "physical=[%.0f %.0f] content=[%.0f %.0f] card-uv=[%.6f %.6f] crop=%s",
                  pending.layer_id, name.c_str(), resolution[0], resolution[1],
                  resolution[2], resolution[3], u, v, pending.crop_card_uvs ? "true" : "false");
+        // Source dimensions may have been unresolved while this owner was constructed. Complete
+        // its display size before selecting card-derived destinations or remembering the source
+        // descriptor, including direct images without an effect bridge.
+        context.scene->FindSceneObject(pending.layer_id)->ImageSource()->CompleteInitialTexture(
+            *context.scene);
         if (pending.destination_policy) {
             // Completing the source wrapper also completes this reader's resource setup.
             // Reuse the same sizing rules as an immediately available texture, then re-intern
@@ -741,10 +747,6 @@ void CompleteImageSourceMappings(ParseContext& context) {
                 policy.force_point_sampling || resolved.suffix == 'n', policy.clamp_uvs);
             layer.SetDestinationUsesCardSize(resolved.uses_card_size);
             layer.RefreshDestinationTargets(*context.scene, extent, sampler);
-            // Cold completion establishes the observer's initial resource state. Subsequent
-            // same-name source replacements are compared with this completed descriptor, not
-            // the unresolved card that existed while the reader was first materialized.
-            layer.RememberSourceTextureMetadata(*context.scene);
             LOG_INFO("SceneImageSourceDestinationReady: layer=%d texture='%s' extent=%dx%d "
                      "policy=%s filter=%s wrap=%s",
                      pending.layer_id, name.c_str(), extent[0], extent[1], resolved.policy,
@@ -2579,8 +2581,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     bool hasEffect = hasAuthoredEffect || has_shader_color_blend ||
         is_offscreen_dependency_source || wpimgobj.config.passthrough;
     const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
-    // Card/compose-camera size is independent of the source texture's destination extent.
-    const std::array<float, 2> effect_source_size = wpimgobj.size;
     const ImageDestinationPolicy destination_policy {
         .fullscreen = wpimgobj.fullscreen,
         .card_sized = (wpimgobj.config.passthrough || wpimgobj.solidlayer) && !wpimgobj.instanced,
@@ -2622,7 +2622,6 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
                                                 Vector3f(wpimgobj.scale.data()),
                                                 Vector3f(wpimgobj.angles.data()),
                                                 wpimgobj.name);
-    LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
     spImgNode->ID() = wpimgobj.id;
 
     SceneMaterial     material;
@@ -2673,6 +2672,26 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         source_sampler = ResolvePrimaryMaterialSampler(*context.scene, material);
         if (!material.textures.empty()) primary_source_texture = material.Texture(0);
     }
+    // Ordinary autosize consumes the selected primary texture after user bindings resolve.
+    // Allocation dimensions describe GPU storage; authored/model size is only the provisional
+    // display size until this materialization boundary. Imported meshes and utility owners keep
+    // their distinct sizing contracts, and sprite geometry is selected by its own frame state.
+    const bool source_autosize = wpimgobj.autosize && !wpimgobj.fullscreen &&
+        !wpimgobj.config.passthrough && !wpimgobj.projectlayer && !hasAuthoredPuppet;
+    auto source_metadata = SceneImageSource::ResolveMetadata(
+        *context.scene, primary_source_texture);
+    if (source_autosize && source_metadata && !source_metadata->sprite) {
+        LOG_INFO("SceneImageAutosizeInitial: layer=%d texture='%s' previous=[%.3f %.3f] "
+                 "size=[%.3f %.3f] allocation=[%d %d]",
+                 wpimgobj.id, primary_source_texture.c_str(), wpimgobj.size[0], wpimgobj.size[1],
+                 source_metadata->content_size[0], source_metadata->content_size[1],
+                 source_metadata->allocation_size[0], source_metadata->allocation_size[1]);
+        wpimgobj.size = source_metadata->content_size;
+        context.scene->FindSceneObject(wpimgobj.id)->ImageRuntimeState()->size = wpimgobj.size;
+    }
+    LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+    // Card/compose-camera size is independent of the source texture's destination extent.
+    const std::array<float, 2> effect_source_size = wpimgobj.size;
     std::optional<SceneImageEffectLayer::DirectPuppetSource> direct_puppet_source;
     if (hasEffect && puppet && puppet->HasImageSkinning() &&
         !puppet->HasImagePrivateChunk() &&
@@ -2838,6 +2857,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         });
     }
     spImgNode->AddMesh(spMesh);
+    auto& image_owner = context.scene->EnsureSceneObject(wpimgobj.id);
+    image_owner.SetImageSource(std::make_shared<SceneImageSource>(
+        image_owner, spImgNode, mesh, SceneImageSource::Policy {
+            .observe_changes = !wpimgobj.fullscreen && !wpimgobj.config.passthrough,
+            .autosize = source_autosize,
+            .crop_card_uvs = !wpimgobj.nopadding &&
+                (hasEffect || (!hasAnimatedPuppetMesh && !hasStaticImageMesh)),
+        }, std::move(source_metadata)));
     RegisterUserShaderValueBindings(
         context, wpimgobj.material, shaderInfo, spImgNode.get(), wpimgobj.id, wpimgobj.name);
 
@@ -2932,11 +2959,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             scene.EnsureSceneObject(wpimgobj.id), wpimgobj.size[0], wpimgobj.size[1],
             effect_ppong_a, effect_ppong_b);
         imgEffectLayer->SetDestinationUsesCardSize(destination_extent.uses_card_size);
-        imgEffectLayer->SetSourceTexture(scene, mesh.SharedMaterial(), {
+        imgEffectLayer->SetSourceTexturePolicy({
             .card_sized_destination = destination_policy.card_sized,
             .force_point_sampling = destination_policy.force_point_sampling,
             .clamp_uvs = destination_policy.clamp_uvs,
-            .crop_card_uvs = !wpimgobj.nopadding,
         });
         {
             // Fullscreen image-effect layers are postprocess-style framebuffer passes. Remember
