@@ -1883,6 +1883,47 @@ bool WPMdlParser::Parse(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
     return ReadPuppetSkeletonAndAnimations(f, path, mdl);
 }
 
+namespace
+{
+
+std::vector<int32_t> ResolvePuppetMaskParents(const std::vector<WPMdl::MaskBlock>& masks) {
+    std::vector<int32_t> parents(masks.size(), -1);
+    for (size_t index = 0; index < masks.size(); ++index) {
+        const auto& sources = masks[index].source_part_indices;
+        if (sources.empty()) continue;
+
+        // A mask inherits the first authored group that clips all of its source parts.
+        // Resolve membership from the complete part lists, independently of the order in
+        // which visible parts are drawn or the parent records appear in the asset.
+        for (size_t candidate = 0; candidate < masks.size(); ++candidate) {
+            if (candidate == index) continue;
+            const auto& clipped = masks[candidate].clipped_part_indices;
+            if (std::all_of(sources.begin(), sources.end(), [&](uint32_t part) {
+                    return std::find(clipped.begin(), clipped.end(), part) != clipped.end();
+                })) {
+                parents[index] = static_cast<int32_t>(candidate);
+                break;
+            }
+        }
+
+        // Parent assignment is incremental: a later record can close a cycle through an
+        // earlier one. Detach the link being assigned, leaving the preceding assignments
+        // intact. Building all links before this check would choose a different break point.
+        std::vector<bool> visited(masks.size(), false);
+        for (int32_t parent = parents[index]; parent >= 0; parent = parents[parent]) {
+            if (visited[parent]) {
+                parents[index] = -1;
+                LOG_INFO("masked draw parent cycle detached: group=%zu", index);
+                break;
+            }
+            visited[parent] = true;
+        }
+    }
+    return parents;
+}
+
+} // namespace
+
 void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
     const bool skinned = (mdl.vertex_flag & kStaticSkinnedAttributeMask) != 0;
     const bool has_normal = (mdl.vertex_flag & kVertexNormalMask) != 0;
@@ -1947,6 +1988,7 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
         // Resolve MDLV part indices at the parser boundary. Renderer code receives only concrete
         // index ranges and a stable authored draw schedule, so it never needs to understand MDLV
         // part tables or rebuild a range-to-mask lookup during Vulkan pass preparation.
+        const auto parents = ResolvePuppetMaskParents(mdl.masks);
         std::vector<int32_t> group_by_part(mdl.parts.size(), -1);
         masked_draw.groups.reserve(mdl.masks.size());
         for (size_t group_index = 0; group_index < mdl.masks.size(); group_index++) {
@@ -1956,6 +1998,10 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
             group.maskTexture = mask.material;
             group.blend = (mask.flags & 1u) != 0 ? BlendMode::Additive : BlendMode::Translucent;
             group.inverted = (mask.flags & 2u) != 0;
+            for (int32_t parent = parents[group_index]; parent >= 0; parent = parents[parent]) {
+                group.coverageGroups.push_back(static_cast<uint32_t>(parent));
+            }
+            group.coverageGroups.push_back(static_cast<uint32_t>(group_index));
             group.maskRanges.reserve(mask.source_part_indices.size());
             for (const auto part_index : mask.source_part_indices) {
                 const auto& part = mdl.parts[part_index];
@@ -2001,13 +2047,20 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
         for (size_t group_index = 0; group_index < masked_draw.groups.size(); group_index++) {
             const auto& group = masked_draw.groups[group_index];
             LOG_INFO("masked draw group: group=%zu texture='%s' mask-ranges=%zu "
-                     "content-ranges=%zu identity=%llu blend=%d inverted=%s",
+                     "content-ranges=%zu identity=%llu blend=%d inverted=%s ancestors=%zu",
                      group_index,
                      group.maskTexture.c_str(),
                      group.maskRanges.size(),
                      group.contentRanges.size(),
                      static_cast<unsigned long long>(group.identity),
-                     static_cast<int>(group.blend), group.inverted ? "true" : "false");
+                     static_cast<int>(group.blend), group.inverted ? "true" : "false",
+                     group.coverageGroups.size() - 1);
+            if (std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr) {
+                for (size_t step = 0; step < group.coverageGroups.size(); ++step) {
+                    LOG_INFO("masked draw ancestry: group=%zu step=%zu source-group=%u",
+                             group_index, step, group.coverageGroups[step]);
+                }
+            }
             for (const auto& range : group.maskRanges) {
                 LOG_INFO("masked draw range: group=%zu role=mask first-index=%u "
                          "index-count=%u",

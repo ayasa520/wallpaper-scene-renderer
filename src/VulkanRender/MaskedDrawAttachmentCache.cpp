@@ -71,8 +71,9 @@ std::optional<VmaImageParameters> CreateMaskedDrawAttachment(const Device& devic
 } // namespace
 
 std::shared_ptr<VmaImageParameters> MaskedDrawAttachmentCache::acquire(
-    const Device& device, std::string_view output, VkExtent3D extent) {
-    auto& entry = m_entries[std::string(output)];
+    const Device& device, std::string_view output, VkExtent3D extent, Role role) {
+    auto& images = m_entries[std::string(output)];
+    auto& entry = role == Role::Accumulated ? images.accumulated : images.intermediate;
     const bool missing = entry == nullptr;
     const bool wrong_size = !missing && (entry->extent.width != extent.width ||
                             entry->extent.height != extent.height ||
@@ -81,16 +82,17 @@ std::shared_ptr<VmaImageParameters> MaskedDrawAttachmentCache::acquire(
         auto replacement = CreateMaskedDrawAttachment(device, extent);
         if (! replacement.has_value()) return nullptr;
 
-        // All masks for this destination reuse one single-sample coverage image. Commands
-        // finish consuming it before the next group overwrites it; destination MSAA does not
-        // change the sampled coverage format or allocate an image per puppet part.
-        LOG_INFO("MaskedDrawAttachmentCache: %s output='%.*s' extent=[%u,%u,%u] format=R8",
+        // Groups reuse accumulated coverage and allocate the intermediate only when a
+        // parent chain needs it. Each intermediate is consumed before the next writer;
+        // neither chain depth nor destination MSAA requires an image per puppet part.
+        LOG_INFO("MaskedDrawAttachmentCache: %s output='%.*s' extent=[%u,%u,%u] format=R8 role=%s",
                  missing ? "create" : "replace",
                  static_cast<int>(output.size()),
                  output.data(),
                  extent.width,
                  extent.height,
-                 extent.depth);
+                 extent.depth,
+                 role == Role::Accumulated ? "accumulated" : "intermediate");
         entry = std::make_shared<VmaImageParameters>(std::move(*replacement));
     }
     return entry;
@@ -107,11 +109,13 @@ void MaskedDrawAttachmentCache::abandon() {
     if (! m_entries.empty()) {
         LOG_INFO("MaskedDrawAttachmentCache: abandon entries=%zu", m_entries.size());
     }
-    for (auto& [_, entry] : m_entries) {
-        if (entry == nullptr) continue;
-        entry->sampler.abandon();
-        entry->view.abandon();
-        entry->handle.abandon();
+    for (auto& [_, images] : m_entries) {
+        for (auto* entry : {images.accumulated.get(), images.intermediate.get()}) {
+            if (entry == nullptr) continue;
+            entry->sampler.abandon();
+            entry->view.abandon();
+            entry->handle.abandon();
+        }
     }
     m_entries.clear();
 }

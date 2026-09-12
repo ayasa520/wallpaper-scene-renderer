@@ -27,6 +27,10 @@ public:
 		bool inverted { false };
 		std::vector<DrawRange> maskRanges;
 		std::vector<DrawRange> contentRanges;
+		// Coverage writers run from the immediate parent through its ancestors, followed by
+		// this group. The parser resolves and orders the chain once; draw invocations keep
+		// their own pose, uniforms and scratch images while sharing this immutable schedule.
+		std::vector<uint32_t> coverageGroups;
 	};
 	struct MaskedDrawMaterials {
 		static constexpr size_t MaskTextureSlot = 1;

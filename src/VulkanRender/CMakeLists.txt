@@ -9,6 +9,7 @@ VolumetricsSingleFillPass.cpp
 ShadowAtlasPass.cpp
 ShaderDrawCore.cpp
 MaskedDrawAttachmentCache.cpp
+MaskedDrawComposite.cpp
 MaskedDrawRenderer.cpp
 MaskedDrawShaderContract.cpp
 MaskedMeshPass.cpp

@@ -30,6 +30,25 @@ bool SameRanges(const std::vector<SceneMesh::DrawRange>& lhs,
     return true;
 }
 
+void PublishCoverage(RenderingResources& resources, const VmaImageParameters& image) {
+    // Mask and composite render passes finish in shader-read layout. Publish their color
+    // writes before a later fragment program samples the image. Incoming render-pass
+    // dependencies separately order subsequent attachment loads/clears after those reads.
+    VkImageMemoryBarrier barrier {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = *image.handle,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    resources.command.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, barrier);
+}
+
 } // namespace
 
 bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& data,
@@ -51,6 +70,9 @@ bool MaskedDrawRenderer::configure(const Device& device, const ShaderDrawData& d
         return false;
     }
     m_materials = plan.materials;
+    m_has_parents = std::any_of(plan.groups.begin(), plan.groups.end(), [](const auto& group) {
+        return group.coverageGroups.size() > 1;
+    });
     m_inverted.clear();
     for (size_t i = 0; i < plan.groups.size(); ++i) {
         const auto& group = plan.groups[i];
@@ -216,15 +238,18 @@ bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources
 bool MaskedDrawRenderer::preparePipelines(const Device& device, RenderingResources& resources,
                                            const ShaderDrawPipelineContext& context) {
     return prepareProgram(device, resources, context, m_materials->mask, true, m_mask) &&
-        prepareProgram(device, resources, context, m_materials->clipped, false, m_clipped);
+        prepareProgram(device, resources, context, m_materials->clipped, false, m_clipped) &&
+        (!m_has_parents || m_composite.prepare(device, resources));
 }
 
 bool MaskedDrawRenderer::refreshFramebuffers(const Device& device, RenderingResources& resources,
                                               const ShaderDrawData& data) {
     dropFramebuffers();
-    m_coverage = resources.masked_draw_attachments.acquire(device, data.output, data.vk_output.extent);
+    using Role = MaskedDrawAttachmentCache::Role;
+    m_coverage = resources.masked_draw_attachments.acquire(device, data.output,
+        data.vk_output.extent, Role::Accumulated);
     if (m_coverage == nullptr) return false;
-    const VkImageView view = *m_coverage->view;
+    VkImageView view = *m_coverage->view;
     VkFramebufferCreateInfo info {
         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass = *m_mask.pipelines.front().pass,
@@ -235,12 +260,22 @@ bool MaskedDrawRenderer::refreshFramebuffers(const Device& device, RenderingReso
         .layers = 1,
     };
     VVK_CHECK_ACT(return false, device.handle().CreateFramebuffer(info, m_mask_framebuffer));
+    if (m_has_parents) {
+        m_intermediate = resources.masked_draw_attachments.acquire(device, data.output,
+            data.vk_output.extent, Role::Intermediate);
+        if (m_intermediate == nullptr) return false;
+        view = *m_intermediate->view;
+        VVK_CHECK_ACT(return false,
+                      device.handle().CreateFramebuffer(info, m_intermediate_framebuffer));
+    }
     return true;
 }
 
 void MaskedDrawRenderer::dropFramebuffers() {
     m_mask_framebuffer.reset();
+    m_intermediate_framebuffer.reset();
     m_coverage.reset();
+    m_intermediate.reset();
 }
 
 bool MaskedDrawRenderer::hasUniform(std::string_view name) const {
@@ -309,18 +344,20 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
     const bool trace = std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr &&
         (m_draw_sequence % 120 == 1 || std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr);
     const auto trace_range = [&](const char* role, const SceneMesh::DrawRange& range,
-                                  int32_t group, const char* shader) {
+                                  int32_t group, const char* shader,
+                                  const VmaImageParameters* target = nullptr) {
         if (!trace) return;
         LOG_INFO("MaskedDrawCommand: sequence=%llu time=%.6f uniform-epoch=%llu pose=%016llx "
                  "layer=%d node='%s' role=%s shader='%s' group=%d first=%u count=%u "
-                 "destination=%p coverage=%p extent=%ux%u samples=%u",
+                 "destination=%p coverage=%p extent=%ux%u samples=%u attachment=%p",
                  static_cast<unsigned long long>(m_draw_sequence),
                  data.scene->elapsingTime, static_cast<unsigned long long>(m_uniform_epoch),
                  static_cast<unsigned long long>(m_pose_hash), data.layer_id,
                  data.draw.Name().c_str(), role, shader, group, range.firstIndex, range.indexCount,
                  reinterpret_cast<void*>(data.vk_output.handle),
                  reinterpret_cast<void*>(*m_coverage->handle), extent.width, extent.height,
-                 static_cast<unsigned>(data.sample_count));
+                 static_cast<unsigned>(data.sample_count),
+                 reinterpret_cast<void*>(target != nullptr ? *target->handle : data.vk_output.handle));
     };
     const auto push_descriptors = [&](const Program& program, size_t pipeline_index,
                                        size_t group_index, bool mask) {
@@ -385,61 +422,81 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
         const size_t clipped_index = group.blend == BlendMode::Additive ? 1 : 0;
         if (active_group != ordered.groupIndex) {
             command.EndRenderPass();
-            VkClearValue clear {.color = {{group.inverted ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f}}};
+            // The parser supplies immediate-parent-to-outer order, with the current mask
+            // last. Every writer needs its own clear and source-alpha blend before its
+            // result participates in the product. Combining raw writer fragments directly
+            // in accumulated coverage would change translucent and inverted masks.
+            for (size_t stage = 0; stage < group.coverageGroups.size(); ++stage) {
+                const auto source_index = group.coverageGroups[stage];
+                const auto& source_group = plan.groups[source_index];
+                auto& target = stage == 0 ? m_coverage : m_intermediate;
+                VkClearValue clear {
+                    .color = {{source_group.inverted ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f}},
+                };
+                VkRenderPassBeginInfo mask_begin {
+                    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                    .renderPass = *m_mask.pipelines.front().pass,
+                    .framebuffer = stage == 0 ? *m_mask_framebuffer : *m_intermediate_framebuffer,
+                    .renderArea = {{0, 0}, {extent.width, extent.height}},
+                    .clearValueCount = 1,
+                    .pClearValues = &clear,
+                };
+                command.BeginRenderPass(mask_begin, VK_SUBPASS_CONTENTS_INLINE);
+                command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      *m_mask.pipelines.front().handle);
+                push_descriptors(m_mask, 0, source_index, true);
+                if (trace) {
+                    LOG_INFO("MaskedDrawInputs: sequence=%llu layer=%d node='%s' group=%u "
+                             "identity=%llu inverted=%s blend=%d albedo=%p mask=%p "
+                             "mask-uniform-offset=%llu clipped-uniform-offset=%llu "
+                             "consumer-group=%zu stage=%zu attachment=%p",
+                             static_cast<unsigned long long>(m_draw_sequence), data.layer_id,
+                             data.draw.Name().c_str(), source_index,
+                             static_cast<unsigned long long>(source_group.identity),
+                             source_group.inverted ? "true" : "false",
+                             static_cast<int>(source_group.blend),
+                             reinterpret_cast<void*>(data.vk_textures[0].getActive().handle),
+                             reinterpret_cast<void*>(m_textures[source_index].getActive().handle),
+                             static_cast<unsigned long long>(m_mask.uniforms[source_index].offset),
+                             static_cast<unsigned long long>(m_clipped.uniforms.empty()
+                                 ? 0 : m_clipped.uniforms.front().offset),
+                             group_index, stage, reinterpret_cast<void*>(*target->handle));
+                }
+                for (const auto& mask_range : source_group.maskRanges) {
+                    if (mask_range.indexCount == 0) continue;
+                    trace_range("mask", mask_range, static_cast<int32_t>(source_index),
+                                m_materials->mask.name.c_str(), target.get());
+                    command.DrawIndexed(mask_range.indexCount, 1, mask_range.firstIndex, 0, 0);
+                }
+                command.EndRenderPass();
+                PublishCoverage(context.resources, *target);
+
+                if (stage != 0) {
+                    m_composite.record(context.resources, *m_mask_framebuffer, extent,
+                                       ImageParameters(*m_intermediate));
+                    if (trace) {
+                        LOG_INFO("MaskedDrawComposite: sequence=%llu layer=%d node='%s' group=%zu "
+                                 "source-group=%u stage=%zu intermediate=%p coverage=%p "
+                                 "extent=%ux%u",
+                                 static_cast<unsigned long long>(m_draw_sequence), data.layer_id,
+                                 data.draw.Name().c_str(), group_index, source_index, stage,
+                                 reinterpret_cast<void*>(*m_intermediate->handle),
+                                 reinterpret_cast<void*>(*m_coverage->handle),
+                                 extent.width, extent.height);
+                    }
+                }
+            }
+            if (group.coverageGroups.size() > 1) PublishCoverage(context.resources, *m_coverage);
+
+            // Resume the same destination with LOAD. Its framebuffer, sample/resolve state
+            // and bound puppet geometry survive the full-target composite, preserving earlier
+            // visible ranges and uncovered multisample color through every mask interruption.
             VkRenderPassBeginInfo begin {
                 .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                .renderPass = *m_mask.pipelines.front().pass,
-                .framebuffer = *m_mask_framebuffer,
+                .renderPass = *m_clipped.pipelines[clipped_index].pass,
+                .framebuffer = *data.fb,
                 .renderArea = {{0, 0}, {extent.width, extent.height}},
-                .clearValueCount = 1,
-                .pClearValues = &clear,
             };
-            command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
-            command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_mask.pipelines.front().handle);
-            push_descriptors(m_mask, 0, group_index, true);
-            if (trace) {
-                LOG_INFO("MaskedDrawInputs: sequence=%llu layer=%d node='%s' group=%zu "
-                         "identity=%llu inverted=%s blend=%d albedo=%p mask=%p "
-                         "mask-uniform-offset=%llu clipped-uniform-offset=%llu",
-                         static_cast<unsigned long long>(m_draw_sequence), data.layer_id,
-                         data.draw.Name().c_str(), group_index,
-                         static_cast<unsigned long long>(group.identity),
-                         group.inverted ? "true" : "false", static_cast<int>(group.blend),
-                         reinterpret_cast<void*>(data.vk_textures[0].getActive().handle),
-                         reinterpret_cast<void*>(m_textures[group_index].getActive().handle),
-                         static_cast<unsigned long long>(m_mask.uniforms[group_index].offset),
-                         static_cast<unsigned long long>(m_clipped.uniforms.empty()
-                             ? 0 : m_clipped.uniforms.front().offset));
-            }
-            for (const auto& mask_range : group.maskRanges) {
-                if (mask_range.indexCount == 0) continue;
-                trace_range("mask", mask_range, ordered.groupIndex, m_materials->mask.name.c_str());
-                command.DrawIndexed(mask_range.indexCount, 1, mask_range.firstIndex, 0, 0);
-            }
-            command.EndRenderPass();
-
-            // The render pass transitions coverage to shader-read layout, but its incoming
-            // dependency alone does not publish color writes to the following sampler. Make
-            // that handoff explicit before resuming the enclosing destination with LOAD.
-            // Its framebuffer and sample/resolve configuration stay unchanged, preserving
-            // earlier ranges and uncovered multisample color across every interruption.
-            VkImageMemoryBarrier barrier {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = *m_coverage->handle,
-                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-            };
-            command.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, barrier);
-            begin.renderPass = *m_clipped.pipelines[clipped_index].pass;
-            begin.framebuffer = *data.fb;
-            begin.clearValueCount = 0;
-            begin.pClearValues = nullptr;
             command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
             bound = BoundPipeline::Mask;
             active_group = ordered.groupIndex;
@@ -458,6 +515,8 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
 
 void MaskedDrawRenderer::destroy(RenderingResources& resources) {
     dropFramebuffers();
+    m_composite.destroy();
+    m_has_parents = false;
     m_textures.clear();
     m_inverted.clear();
     m_materials.reset();
@@ -479,6 +538,7 @@ bool MaskedDrawRenderer::SamePlan(const SceneMesh::MaskedDrawPlan& lhs,
         const auto& b = rhs.groups[i];
         if (a.identity != b.identity || a.maskTexture != b.maskTexture ||
             a.blend != b.blend || a.inverted != b.inverted ||
+            a.coverageGroups != b.coverageGroups ||
             !SameRanges(a.maskRanges, b.maskRanges) || !SameRanges(a.contentRanges, b.contentRanges)) {
             return false;
         }

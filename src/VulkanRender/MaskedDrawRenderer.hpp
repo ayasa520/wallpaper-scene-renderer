@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MaskedDrawShaderContract.hpp"
+#include "MaskedDrawComposite.hpp"
 #include "ShaderDrawCore.hpp"
 
 #include <optional>
@@ -41,8 +42,12 @@ private:
     std::vector<bool> m_inverted;
     Program m_mask;
     Program m_clipped;
+    MaskedDrawComposite m_composite;
+    bool m_has_parents { false };
     std::shared_ptr<VmaImageParameters> m_coverage;
+    std::shared_ptr<VmaImageParameters> m_intermediate;
     vvk::Framebuffer m_mask_framebuffer;
+    vvk::Framebuffer m_intermediate_framebuffer;
     uint64_t m_uniform_epoch { 0 };
     uint64_t m_draw_sequence { 0 };
     uint64_t m_pose_hash { 0 };
