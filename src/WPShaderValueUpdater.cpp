@@ -790,7 +790,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             // The prelighting source appends this local translation to incoming I. Its
             // independent AM upload below retains the raw owner transform. In particular, the
             // private source's texture-space placement must never reach scripts or bones.
-            const auto& size = layer->GetPrelightingSource()->content_size;
+            const auto& size = layer->SourceTextureContentSize();
             modelTrans = (modelTrans * Affine3d(Translation3d(
                 size[0] * 0.5, size[1] * 0.5, 0.0)).matrix()).eval();
         }
@@ -1050,8 +1050,9 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         Matrix4d alternate_model = snapshot.layer_model;
         if (source.instanced) {
             const auto& card = layer->EffectMatrixSize();
-            alternate_model.col(0) *= card[0] / source.content_size[0];
-            alternate_model.col(1) *= card[1] / source.content_size[1];
+            const auto& content = layer->SourceTextureContentSize();
+            alternate_model.col(0) *= card[0] / content[0];
+            alternate_model.col(1) *= card[1] / content[1];
         }
         if (info.has_AM) updateOp(G_AM, ToDxcCBufferMatrixUniform(alternate_model));
         if (info.has_ANM) {

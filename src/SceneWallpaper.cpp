@@ -356,9 +356,9 @@ private:
         if (! m_scene || ! m_scene->renderGraphDirty) return;
 
         const auto started_at                = std::chrono::steady_clock::now();
-        // Imported allocations are already current at this frame boundary. Refresh their source
-        // geometry and destination metadata before deciding whether descriptors alone suffice:
-        // a same-key dimension change can require new destination slots and source projection.
+        // Imported allocations are already current at this frame boundary. Refresh source
+        // metadata and then its named-source readers before deciding whether descriptors alone
+        // suffice: a same-key dimension change can require new destination slots and projection.
         // No GPU work is submitted between these CPU updates and the graph's resource handoff.
         m_scene->RefreshImageSourceTextures();
         const bool requires_topology_rebuild = m_rg == nullptr || m_scene->renderGraphTopologyDirty;

@@ -741,6 +741,10 @@ void CompleteImageSourceMappings(ParseContext& context) {
                 policy.force_point_sampling || resolved.suffix == 'n', policy.clamp_uvs);
             layer.SetDestinationUsesCardSize(resolved.uses_card_size);
             layer.RefreshDestinationTargets(*context.scene, extent, sampler);
+            // Cold completion establishes the observer's initial resource state. Subsequent
+            // same-name source replacements are compared with this completed descriptor, not
+            // the unresolved card that existed while the reader was first materialized.
+            layer.RememberSourceTextureMetadata(*context.scene);
             LOG_INFO("SceneImageSourceDestinationReady: layer=%d texture='%s' extent=%dx%d "
                      "policy=%s filter=%s wrap=%s",
                      pending.layer_id, name.c_str(), extent[0], extent[1], resolved.policy,
@@ -1565,12 +1569,7 @@ bool LoadImagePrelightingSource(
         .ordinary_shader = material.customShader.shader,
         .prelighting_shader = prelighting_material.customShader.shader,
         .mesh = std::move(source_mesh),
-        .texture_key = texture_name,
-        .allocation_size = allocation,
-        .content_size = content,
         .texture_card = !skinned,
-        .card_sized_destination = (image.config.passthrough || image.solidlayer) && !image.instanced,
-        .force_point_sampling = image.nointerpolation,
         .sprite = sprite,
         .instanced = image.instanced,
     };
@@ -2928,6 +2927,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             scene.EnsureSceneObject(wpimgobj.id), wpimgobj.size[0], wpimgobj.size[1],
             effect_ppong_a, effect_ppong_b);
         imgEffectLayer->SetDestinationUsesCardSize(destination_extent.uses_card_size);
+        imgEffectLayer->SetSourceTexture(scene, mesh.SharedMaterial(), {
+            .card_sized_destination = destination_policy.card_sized,
+            .force_point_sampling = destination_policy.force_point_sampling,
+            .clamp_uvs = destination_policy.clamp_uvs,
+            .crop_card_uvs = !wpimgobj.nopadding,
+        });
         {
             // Fullscreen image-effect layers are postprocess-style framebuffer passes. Remember
             // that authored shape here so ResolveEffect() can keep their final shader on the

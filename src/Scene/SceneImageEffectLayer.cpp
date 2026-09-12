@@ -356,64 +356,110 @@ bool SceneImageEffectLayer::UsesPrelightingSource() const {
          ResolveFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter);
 }
 
-void SceneImageEffectLayer::RefreshPrelightingTexture(Scene& scene) {
-    // This texture-space source belongs to an ordinary image. A composition instead rasterizes
-    // its owner card and children, and fullscreen setup owns an output-framebuffer extent. Neither
-    // is a consumer of this imported-image refresh. Named render targets also retain their
-    // separate source/publication lifecycle; do not walk or resize their dependency graph here.
-    if (!m_prelighting_source || m_owner.Passthrough() || m_fullscreen) return;
-    auto& source = *m_prelighting_source;
-    const auto& material = *m_owner.LayerNode()->Mesh()->Material();
-    if (material.textures.empty()) return;
-    const auto& texture_key = material.Texture(0);
-    const auto texture_it = scene.textures.find(texture_key);
-    if (texture_it == scene.textures.end()) return;
-    const auto& texture = texture_it->second;
-    const std::array<int32_t, 2> allocation { texture.width, texture.height };
-    const std::array<float, 2> content = texture.isSprite
-        ? std::array { texture.spriteAnim.Frames().front().width,
-                       texture.spriteAnim.Frames().front().height }
-        : std::array { static_cast<float>(texture.mapWidth),
-                       static_cast<float>(texture.mapHeight) };
-    const bool card_sized = source.card_sized_destination && !texture.isSprite;
+std::optional<SceneImageEffectLayer::SourceTextureMetadata>
+SceneImageEffectLayer::ResolveSourceTextureMetadata(
+    const Scene& scene, std::string_view texture_name) {
+    SourceTextureMetadata result;
+    result.texture_key = texture_name;
+    if (const auto it = scene.textures.find(result.texture_key); it != scene.textures.end()) {
+        const auto& texture = it->second;
+        result.allocation_size = { texture.width, texture.height };
+        result.content_size = texture.isSprite
+            ? std::array { texture.spriteAnim.Frames().front().width,
+                           texture.spriteAnim.Frames().front().height }
+            : std::array { static_cast<float>(texture.mapWidth),
+                           static_cast<float>(texture.mapHeight) };
+        result.sample = texture.sample;
+        result.sprite = texture.isSprite;
+    } else if (const auto it = scene.renderTargets.find(result.texture_key);
+               it != scene.renderTargets.end()) {
+        const auto& target = it->second;
+        result.allocation_size = { target.width, target.height };
+        result.content_size = { static_cast<float>(target.ContentWidth()),
+                                static_cast<float>(target.ContentHeight()) };
+        result.sample = target.sample;
+    } else {
+        return std::nullopt;
+    }
+    return result;
+}
+
+void SceneImageEffectLayer::SetSourceTexture(
+    const Scene& scene, std::shared_ptr<SceneMaterial> material, SourceTexturePolicy policy) {
+    m_source_texture.emplace(SourceTextureState { std::move(material), policy, {} });
+    RememberSourceTextureMetadata(scene);
+}
+
+std::string_view SceneImageEffectLayer::SourceTextureName() const {
+    if (!m_source_texture || m_source_texture->material->textures.empty()) return {};
+    return m_source_texture->material->Texture(0);
+}
+
+void SceneImageEffectLayer::RememberSourceTextureMetadata(const Scene& scene) {
+    if (!m_source_texture) return;
+    if (auto metadata = ResolveSourceTextureMetadata(scene, SourceTextureName())) {
+        m_source_texture->metadata = std::move(*metadata);
+    }
+}
+
+void SceneImageEffectLayer::RefreshSourceTexture(Scene& scene) {
+    // Ordinary retained images consume both imported textures and named targets. Composition
+    // and fullscreen layers retain their separate resource-setup boundaries. Copy metadata out
+    // of the scene tables before updating destinations, since interning can rehash those tables.
+    if (!m_source_texture || m_owner.Passthrough() || m_fullscreen) return;
+    auto next = ResolveSourceTextureMetadata(scene, SourceTextureName());
+    if (!next) return;
+    auto& source = *m_source_texture;
+    const auto& previous = source.metadata;
+
+    // Stable metadata describes a pixel-only update. Preserve the current graph and target
+    // history in that case. A different source key or allocation/content/sampler descriptor
+    // reruns resource setup even when an authored point override hides the filtering change.
+    if (previous == *next) return;
+    const auto& allocation = next->allocation_size;
+    const auto& content = next->content_size;
+    const bool card_sized = source.policy.card_sized_destination && !next->sprite;
     const auto extent = card_sized ? ResolveCardDestinationExtent(m_card_size)
         : std::array { ClampDestinationRenderTargetExtent(static_cast<int32_t>(std::lround(content[0]))),
                        ClampDestinationRenderTargetExtent(static_cast<int32_t>(std::lround(content[1]))) };
-    const auto& previous_target = scene.renderTargets.at(m_pingpong_a);
     const auto sampler = DestinationRenderTargetSampler(
-        source.force_point_sampling || texture.sample.magFilter == TextureFilter::NEAREST,
-        previous_target.sample.wrapS == TextureWrap::CLAMP_TO_EDGE);
-
-    // A stable key with unchanged metadata is a pixel-only update. Leave its mesh, source
-    // projection, target history and graph topology alone; the existing selective imported-image
-    // path rebinds only actual texture consumers. A changed key is a material source replacement
-    // even at equal dimensions and therefore reruns this owner's resource setup.
-    if (source.texture_key == texture_key && source.allocation_size == allocation &&
-        source.content_size == content && previous_target.sample == sampler) return;
+        source.policy.force_point_sampling || next->sample.magFilter == TextureFilter::NEAREST,
+        source.policy.clamp_uvs);
+    const bool texture_card = m_prelighting_source && m_prelighting_source->texture_card;
 
     LOG_INFO("SceneImageSourceTextureRefresh: layer=%d previous='%s' current='%s' "
              "allocation=[%d %d]->[%d %d] content=[%.3f %.3f]->[%.3f %.3f] "
-             "texture-card=%s destination=%dx%d card-derived=%s filter=%s",
-             m_owner.Id(), source.texture_key.c_str(), texture_key.c_str(),
-             source.allocation_size[0], source.allocation_size[1], allocation[0], allocation[1],
-             source.content_size[0], source.content_size[1], content[0], content[1],
-             source.texture_card ? "true" : "false", extent[0], extent[1],
-             card_sized ? "true" : "false", TextureFilterName(sampler.magFilter).data());
-    if (source.texture_card && source.allocation_size != allocation) {
+             "texture-card=%s destination=%dx%d card-derived=%s filter=%s wrap=%s",
+             m_owner.Id(), previous.texture_key.c_str(), next->texture_key.c_str(),
+             previous.allocation_size[0], previous.allocation_size[1], allocation[0], allocation[1],
+             previous.content_size[0], previous.content_size[1], content[0], content[1],
+             texture_card ? "true" : "false", extent[0], extent[1],
+             card_sized ? "true" : "false", TextureFilterName(sampler.magFilter).data(),
+             TextureWrapName(sampler.wrapS).data());
+    if (texture_card && previous.allocation_size != allocation) {
         // Mutate the retained source payload, not the owner's currently selected mesh. Direct
         // draws keep their authored card/UVs, imported puppet sources keep their auxiliary
         // coordinates, and reflected/main source consumers share the new payload revision.
         const float half_width = static_cast<float>(allocation[0]) * 0.5f;
         const float half_height = static_cast<float>(allocation[1]) * 0.5f;
-        source.mesh->GetVertexArray(0).SetVertex(WE_IN_POSITION, std::array {
+        m_prelighting_source->mesh->GetVertexArray(0).SetVertex(WE_IN_POSITION, std::array {
             -half_width, half_height, 0.0f, -half_width, -half_height, 0.0f,
             half_width, half_height, 0.0f, half_width, -half_height, 0.0f,
         });
-        source.mesh->SetDirty();
+        m_prelighting_source->mesh->SetDirty();
     }
-    source.texture_key = texture_key;
-    source.allocation_size = allocation;
-    source.content_size = content;
+    if (source.policy.crop_card_uvs && !next->sprite &&
+        (previous.allocation_size != allocation || previous.content_size != content)) {
+        // Source/direct cards share this retained payload. Update their content mapping without
+        // replacing it or touching final imported geometry; all upload consumers observe the
+        // same new revision, including a direct draw while the authored effects are hidden.
+        const float u = content[0] / static_cast<float>(allocation[0]);
+        const float v = content[1] / static_cast<float>(allocation[1]);
+        m_source_mesh->GetVertexArray(0).SetVertex(
+            WE_IN_TEXCOORD, std::array { 0.0f, 0.0f, 0.0f, v, u, 0.0f, u, v });
+        m_source_mesh->SetDirty();
+    }
+    source.metadata = std::move(*next);
     m_destination_uses_card_size = card_sized;
     // Keep texture geometry notification distinct from effect-driven program selection. Do not
     // replace authored material values, refresh script instances, or change the retained sprite
@@ -475,7 +521,7 @@ void SceneImageEffectLayer::ResolveOwnerDraw(Scene& scene) {
                  ? "true" : "false",
              source.sprite ? "true" : "false", source.instanced ? "true" : "false",
              mesh.Skinning().boneCount != 0 ? "true" : "false",
-             source.content_size[0], source.content_size[1], SourceTarget().c_str(),
+             SourceTextureContentSize()[0], SourceTextureContentSize()[1], SourceTarget().c_str(),
              m_bridge_camera_name.c_str());
 }
 

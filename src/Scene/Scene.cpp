@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <future>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace wallpaper 
@@ -116,15 +117,29 @@ void Scene::RegisterTextureFromHeader(const std::string& name, const ImageHeader
 }
 
 void Scene::RefreshImageSourceTextures() {
-    // Resolve material sources after all queued property/texture writes, in authored owner order.
-    // A source metadata change may promote an otherwise resource-only refresh to a topology
-    // rebuild because its destination names changed. Each bridge compares its retained metadata,
-    // so unrelated resource updates and equal-size pixel replacements do not rerun source setup.
+    // Named sources can occur after their readers in the authored draw list. Prepare the
+    // source descriptors before dependent image setup so one graph compilation sees coherent
+    // dimensions and filtering. This walk performs no draws and never changes painter order.
+    std::vector<SceneImageEffectLayer*> layers;
+    std::unordered_map<std::string, SceneImageEffectLayer*> publishers;
     for (const auto layer_id : layerOrder) {
         if (auto* layer = FindImageEffectLayer(layer_id)) {
-            layer->RefreshPrelightingTexture(*this);
+            layers.push_back(layer);
+            if (layer->DeclaredFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter) {
+                publishers.emplace(GenImageLayerCompositeTex(layer_id), layer);
+            }
         }
     }
+    std::unordered_set<SceneImageEffectLayer*> visited;
+    const auto refresh = [&](const auto& self, SceneImageEffectLayer* layer) -> void {
+        // Shared sources are prepared once per resource boundary. Mark entry before following
+        // source references so a repeated reference cannot recursively re-enter owner setup.
+        if (!visited.insert(layer).second) return;
+        const auto source = publishers.find(std::string(layer->SourceTextureName()));
+        if (source != publishers.end()) self(self, source->second);
+        layer->RefreshSourceTexture(*this);
+    };
+    for (auto* layer : layers) refresh(refresh, layer);
 }
 
 void SceneObject::SetLayerNode(SceneNode* node) {

@@ -22,6 +22,7 @@ class SceneNode;
 class SceneObject;
 class SceneMesh;
 class Scene;
+struct SceneMaterial;
 struct SceneShader;
 
 std::string_view FinalOutputCapabilityName(FinalOutputCapability capability);
@@ -146,6 +147,16 @@ private:
 
 class SceneImageEffectLayer {
 public:
+    struct SourceTexturePolicy {
+        // These authored choices outlive both initial source registration and later target
+        // replacement. Source filtering may change while destination addressing stays owned by
+        // the image; generated source cards and imported final meshes also have distinct UVs.
+        bool card_sized_destination;
+        bool force_point_sampling;
+        bool clamp_uvs;
+        bool crop_card_uvs;
+    };
+
     struct PrelightingSource {
         // Source variants change the executable and vertex stream while retaining the authored
         // material controls. Keep those programs beside the source geometry; live constants,
@@ -154,16 +165,10 @@ public:
         std::shared_ptr<SceneShader> ordinary_shader;
         std::shared_ptr<SceneShader> prelighting_shader;
         std::shared_ptr<SceneMesh> mesh;
-        std::string texture_key;
-        std::array<int32_t, 2> allocation_size;
-        std::array<float, 2> content_size;
-        // Texture refresh owns only these geometry/resource inputs. The prepared source program
-        // predicates remain separate, and an imported auxiliary stream is never rewritten as a
-        // rectangular card. Retain the model's sizing/sampling policy rather than inferring it
-        // from a destination that may have been created for a different primary texture.
+        // Program selection is independent of source metadata observation. Only this generated
+        // texture-space card follows allocation changes; an imported auxiliary stream retains
+        // its authored coordinates.
         bool texture_card { true };
-        bool card_sized_destination { false };
-        bool force_point_sampling { false };
         bool sprite { false };
         bool instanced { false };
     };
@@ -215,7 +220,14 @@ public:
     const PrelightingSource* GetPrelightingSource() const {
         return m_prelighting_source ? &*m_prelighting_source : nullptr;
     }
-    void RefreshPrelightingTexture(Scene& scene);
+    void SetSourceTexture(const Scene& scene, std::shared_ptr<SceneMaterial> material,
+                           SourceTexturePolicy policy);
+    void RememberSourceTextureMetadata(const Scene& scene);
+    std::string_view SourceTextureName() const;
+    const std::array<float, 2>& SourceTextureContentSize() const {
+        return m_source_texture->metadata.content_size;
+    }
+    void RefreshSourceTexture(Scene& scene);
     bool UsesPrelightingSource() const;
     void ResolveOwnerDraw(Scene& scene);
     SceneMesh&  FinalMesh() const { return *m_final_mesh; }
@@ -314,6 +326,24 @@ private:
         uint32_t fit;
     };
 
+    struct SourceTextureMetadata {
+        std::string texture_key;
+        std::array<int32_t, 2> allocation_size {};
+        std::array<float, 2> content_size {};
+        TextureSample sample {};
+        bool sprite { false };
+        bool operator==(const SourceTextureMetadata&) const = default;
+    };
+
+    struct SourceTextureState {
+        std::shared_ptr<SceneMaterial> material;
+        SourceTexturePolicy policy;
+        SourceTextureMetadata metadata;
+    };
+
+    static std::optional<SourceTextureMetadata> ResolveSourceTextureMetadata(
+        const Scene& scene, std::string_view texture_name);
+
     SceneObject& m_owner;
     std::string m_pingpong_a;
     std::string m_pingpong_b;
@@ -343,6 +373,10 @@ private:
     std::vector<EffectRenderTarget> m_effect_render_targets;
     //    std::vector<float> m_size;
     std::unique_ptr<SceneMesh> m_source_mesh;
+    // Image bridges observe their material's primary source even when no prelighting program
+    // exists or every effect is hidden. Snapshot values describe the last resource setup, not
+    // the last draw; ordinary image pixels can change without invalidating this metadata.
+    std::optional<SourceTextureState> m_source_texture;
     std::optional<PrelightingSource> m_prelighting_source;
     std::optional<DirectPuppetSource> m_direct_puppet_source;
     std::unique_ptr<SceneMesh> m_final_mesh;
