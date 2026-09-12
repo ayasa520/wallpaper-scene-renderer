@@ -830,6 +830,8 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     if (!m_desc.pipeline.handle || !m_desc.framebuffer) return;
     if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) return;
 
+    const bool hdr_color = m_desc.scene->UsesHdrMaterials();
+
     // Log the first actual draw of each layout revision when investigating disappearing text.
     // Preparation alone cannot establish that an atlas, target and transform reached a draw.
     static const bool trace_destination = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr;
@@ -959,18 +961,19 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         // Opaque private sources initialize the complete target, including padding, before
         // glyph rasterization. This is a live color clear, not a blended background quad, and
         // therefore neither reads depth nor initializes the direct background material policy.
-        const auto color = primitive->BackgroundColor();
+        const auto color = primitive->BackgroundColor(hdr_color);
         std::copy(color.begin(), color.end(), clear_values[0].color.float32);
     }
     if (trace_background && m_desc.clear_before_draw) {
         const auto* color = clear_values[0].color.float32;
         LOG_INFO("SceneTextBackgroundClear: layer=%d output='%s' reflection=%s opaque=%s "
-                 "color=[%.3f %.3f %.3f %.3f] direct-selection=%s",
+                 "color=[%.3f %.3f %.3f %.3f] direct-selection=%s brightness=%.3f host-hdr=%s",
                  m_desc.layer_id, m_desc.output.c_str(), m_desc.reflection_pass ? "true" : "false",
                  primitive->object.opaquebackground ? "true" : "false",
                  color[0], color[1], color[2], color[3],
                  !primitive->direct_background_depth_test.has_value() ? "unused" :
-                     (*primitive->direct_background_depth_test ? "enabled" : "disabled"));
+                     (*primitive->direct_background_depth_test ? "enabled" : "disabled"),
+                 primitive->object.backgroundbrightness, hdr_color ? "true" : "false");
     }
     if (m_desc.private_source && std::getenv("WESCENE_TRACE_TEXT_SOURCE") != nullptr) {
         LOG_INFO("SceneTextSourceInit: layer=%d output='%s' reflection=%s mode=%s "
@@ -1052,15 +1055,16 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         if (trace_background) {
             LOG_INFO("SceneTextColorDraw: layer=%d output='%s' background=%s private-source=%s "
                      "ubo-offset=%llu color=[%.3f %.3f %.3f %.3f] brightness=%.3f blend=%s "
-                     "indexed=%s count=%u",
+                     "indexed=%s count=%u host-hdr=%s",
                      m_desc.layer_id, m_desc.output.c_str(), background ? "true" : "false",
                      m_desc.private_source ? "true" : "false",
                      static_cast<unsigned long long>(uniform_buffer.offset),
                      color[0], color[1], color[2], color[3],
-                     primitive->object.backgroundbrightness,
+                     background ? primitive->object.backgroundbrightness : primitive->object.brightness,
                      !m_desc.private_source && primitive->object.colorBlendMode == 31
                          ? "additive" : "translucent",
-                     buffers.index_buf ? "true" : "false", buffers.draw_count);
+                     buffers.index_buf ? "true" : "false", buffers.draw_count,
+                     hdr_color ? "true" : "false");
         }
     };
 
@@ -1080,7 +1084,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         const bool depth_test = m_desc.shared_depth && *primitive->direct_background_depth_test;
         draw_mesh(m_background_buffers,
                   m_desc.background_texture,
-                  primitive->BackgroundColor(),
+                  primitive->BackgroundColor(hdr_color),
                   depth_test == m_desc.glyph_depth_test ? m_desc.pipeline : m_desc.background_pipeline,
                   true, depth_test);
     }
@@ -1089,7 +1093,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         if (page_index >= m_desc.page_textures.size()) break;
         draw_mesh(m_page_buffers[page_index],
                   m_desc.page_textures[page_index],
-                  primitive->ForegroundColor(), m_desc.pipeline, false, m_desc.glyph_depth_test);
+                  primitive->ForegroundColor(hdr_color), m_desc.pipeline, false, m_desc.glyph_depth_test);
     }
 
     rr.command.EndRenderPass();

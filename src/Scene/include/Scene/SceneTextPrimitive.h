@@ -116,18 +116,22 @@ public:
     // Layout replacement carries this value forward, while a newly created owner starts empty.
     std::optional<bool> direct_background_depth_test;
 
-    // Standard-range text uses the current owner RGB and alpha. Foreground brightness is
-    // an HDR modulation and remains separate from this color on the renderer's standard-range
-    // output. Glyph draws and authored effect uniforms consume this same source state.
-    [[nodiscard]] std::array<float, 4> ForegroundColor() const {
-        return { object.color[0], object.color[1], object.color[2], object.alpha };
+    // Host material quality selects brightness modulation independently of the destination's
+    // storage format. Resolve current owner RGB at submission so glyphs and authored effect
+    // uniforms consume the same value after live property edits or layout replacement. Alpha
+    // remains the owner's opacity; brightness affects only RGB and never mutates raw properties.
+    [[nodiscard]] std::array<float, 4> ForegroundColor(bool hdr) const {
+        const float factor = hdr ? object.brightness : 1.0f;
+        return { object.color[0] * factor, object.color[1] * factor,
+                 object.color[2] * factor, object.alpha };
     }
 
-    // Background brightness, like foreground brightness, is an HDR-only modulation. Both direct
-    // background draws and private source clears consume the same current standard-range color.
-    [[nodiscard]] std::array<float, 4> BackgroundColor() const {
-        return { object.backgroundcolor[0], object.backgroundcolor[1], object.backgroundcolor[2],
-                 object.alpha };
+    // Direct background draws and opaque private clears stage the same background color.
+    // Its brightness is independent of the foreground's, while both retain the owner alpha.
+    [[nodiscard]] std::array<float, 4> BackgroundColor(bool hdr) const {
+        const float factor = hdr ? object.backgroundbrightness : 1.0f;
+        return { object.backgroundcolor[0] * factor, object.backgroundcolor[1] * factor,
+                 object.backgroundcolor[2] * factor, object.alpha };
     }
 
     [[nodiscard]] std::array<float, 2> VisibleDisplaySize() const { return layout.visible_display_size; }

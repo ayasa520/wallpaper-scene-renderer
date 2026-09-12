@@ -610,7 +610,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
     if (color_data != nullptr && color_data->text_color_owner != nullptr &&
         (info.has_ALPHA || info.has_COLOR || info.has_COLOR4)) {
         const auto& primitive = *color_data->text_color_owner->Text();
-        const auto color = primitive.ForegroundColor();
+        const auto color = primitive.ForegroundColor(m_scene->UsesHdrMaterials());
         // These engine uniforms carry the current glyph source state through every authored
         // material command. Write them after material controls have been populated, so an absent
         // control cannot leave a zero color in the buffer. Resolve the owner on each submission
@@ -622,12 +622,13 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         if (info.has_COLOR4) updateOp("g_Color4", color);
         if (std::getenv("WESCENE_TRACE_TEXT_COLOR") != nullptr) {
             LOG_INFO("SceneTextEffectColor: frame=%llu layer=%d node='%s' reflection=%s "
-                     "rgba=[%.6f %.6f %.6f %.6f] brightness=%.6f uniforms=[%d %d %d]",
+                     "rgba=[%.6f %.6f %.6f %.6f] brightness=%.6f uniforms=[%d %d %d] host-hdr=%s",
                      static_cast<unsigned long long>(m_puppet_frame_serial),
                      draw.LayerId(*m_scene), draw.Name().c_str(),
                      overrides != nullptr && overrides->reflection_pass ? "true" : "false",
                      color[0], color[1], color[2], color[3], primitive.object.brightness,
-                     info.has_ALPHA, info.has_COLOR, info.has_COLOR4);
+                     info.has_ALPHA, info.has_COLOR, info.has_COLOR4,
+                     m_scene->UsesHdrMaterials() ? "true" : "false");
         }
     }
 
