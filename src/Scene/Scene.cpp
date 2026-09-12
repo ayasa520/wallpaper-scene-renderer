@@ -218,6 +218,12 @@ bool ResolveCameraPathSample(const Scene::CameraPathSegment& segment,
         out.eye = LerpArray3(lhs.eye, rhs.eye, ratio);
         out.center = LerpArray3(lhs.center, rhs.center, ratio);
         out.up = LerpArray3(lhs.up, rhs.up, ratio);
+        // Zoom uses cubic Hermite interpolation with both endpoint tangents equal to half
+        // the scalar difference. Keep this independent of the pose interpolation: it is a
+        // projection parameter, sampled from the same retained path time as the view pose.
+        const float t = static_cast<float>(ratio);
+        const float weight = 0.5f * t + 1.5f * t * t - t * t * t;
+        out.zoom = lhs.zoom + (rhs.zoom - lhs.zoom) * weight;
         return true;
     }
 
@@ -1006,8 +1012,10 @@ void Scene::UpdateModelCameraPath() {
         return;
     }
 
-    // Camera path playback is bound to the model-only camera name installed by WPModelObject
-    // parsing. This deliberately avoids `global_perspective`, which is a legacy 2D particle camera.
+    // Publish zoom alongside the pose before any projection consumer runs. The pose uses the
+    // model camera; the scalar is shared with orthographic frame selection and fill-mode framing.
+    // Neither publication advances the cursor, and camera-layer ownership retains both values.
+    cameraPathZoom = sample.zoom;
     camera_it->second->SetExplicitView(ToVector3d(sample.eye),
                                        ToVector3d(sample.center),
                                        ToVector3d(sample.up));
@@ -1020,13 +1028,14 @@ void Scene::UpdateModelCameraPath() {
     modelCameraPathTime += frameTime;
     if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
         LOG_INFO("SceneCameraPathSample: scene-time=%.6f path-time=%.9f next-time=%.9f "
-                 "segment=%d local-time=%.9f delta=%.9f",
+                 "segment=%d local-time=%.9f delta=%.9f zoom=%.9f",
                  elapsingTime,
                  sample_time,
                  modelCameraPathTime,
                  active_segment,
                  local_time,
-                 frameTime);
+                 frameTime,
+                 cameraPathZoom);
     }
 
     if (activeModelCameraPathSegment != active_segment) {
@@ -1138,6 +1147,17 @@ Eigen::Vector3f Scene::ResolveCameraLayerNodeTranslation(
     };
 }
 
+double Scene::ResolveOrthographicCameraZoom() {
+    // Scene zoom and camera zoom are independent factors. Resolve the same effective layer
+    // selection for immediate property updates and later framebuffer/aspect framing, so neither
+    // consumer can replace the scene factor or discard the path sample. This is a read of the
+    // current sample only: repeated projection work must never advance path playback.
+    auto [layer_id, layer] = FindActiveCameraLayer(*this);
+    const double selected_zoom = !cameraOrthographic ? 1.0
+        : layer != nullptr ? layer->zoom : modelCameraPathEnabled ? cameraPathZoom : 1.0;
+    return SanitizeCameraZoom(defaultGlobalCameraZoom * selected_zoom, layer_id);
+}
+
 void Scene::UpdateActiveCameraLayer() {
     auto [next_layer_id, camera_layer] = FindActiveCameraLayer(*this);
 
@@ -1219,13 +1239,12 @@ void Scene::UpdateActiveCameraLayer() {
 
     std::string camera_name = "global";
     std::shared_ptr<SceneNode> camera_node = defaultGlobalCameraNode;
-    double zoom = defaultGlobalCameraZoom;
+    const double zoom = ResolveOrthographicCameraZoom();
     float fov = 50.0f;
 
     if (camera_layer != nullptr) {
         camera_name = camera_layer->camera_name.empty() ? "global" : camera_layer->camera_name;
         camera_node = camera_layer->node;
-        zoom = camera_layer->zoom;
         fov = camera_layer->fov;
     }
 

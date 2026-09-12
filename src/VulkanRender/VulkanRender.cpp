@@ -1231,14 +1231,10 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
     auto&  gCam    = *scene.cameras.at("global");
     auto&  gPerCam = *scene.cameras.at("global_perspective");
 
-    // Camera-layer animation mutates the same shared "global" camera object that fill mode uses to
-    // adapt a 16:9 project to the monitor aspect. Preserve the live zoom value here so the render
-    // side remains the single source of truth for framebuffer-relative width/height while authored
-    // zoom still narrows that already aspect-correct view.
-    double active_global_zoom = scene.defaultGlobalCameraZoom;
-    if (!std::isfinite(active_global_zoom) || active_global_zoom <= 0.0001) {
-        active_global_zoom = 1.0;
-    }
+    // Fill mode rebuilds the shared orthographic camera after frame selection, including on
+    // resize. Reuse the scene's general-times-selected zoom rather than selecting another raw
+    // factor here; otherwise framing overwrites the path/layer projection prepared this frame.
+    const double active_global_zoom = scene.ResolveOrthographicCameraZoom();
 
     // Perspective camera layers can animate FOV directly. Keep that authored value when the active
     // layer explicitly targets the shared perspective camera. Otherwise use the scene's authored
@@ -1250,13 +1246,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
         if (const auto* active_layer_state =
                 scene.FindCameraLayerState(scene.activeCameraLayerId)) {
             const auto& active_layer = *active_layer_state;
-            if (active_layer.camera_name.empty() || active_layer.camera_name == "global") {
-                if (std::isfinite(active_layer.zoom) && active_layer.zoom > 0.0001) {
-                    active_global_zoom = active_layer.zoom;
-                } else {
-                    active_global_zoom = 1.0;
-                }
-            } else if (active_layer.camera_name == "global_perspective" &&
+            if (active_layer.camera_name == "global_perspective" &&
                        std::isfinite(active_layer.fov) && active_layer.fov > 0.0001f) {
                 use_active_global_perspective_fov = true;
                 active_global_perspective_fov = active_layer.fov;
@@ -1348,7 +1338,8 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
         LOG_INFO("SceneProjectionFrame: time=%.6f orthographic=%s layer=%d "
                  "owner=%s raw-fov=%.6f raw-override=%.6f raw-near=%.6f raw-far=%.6f "
                  "perspective=%s fov=%.6f near=%.6f far=%.6f aspect=%.6f "
-                 "p00=%.9f p11=%.9f p22=%.9f p23=%.9f auxiliary-fov=%.6f",
+                 "p00=%.9f p11=%.9f p22=%.9f p23=%.9f auxiliary-fov=%.6f "
+                 "general-zoom=%.9f framed-zoom=%.9f path-zoom=%.9f",
                  scene.elapsingTime,
                  scene.cameraOrthographic ? "true" : "false",
                  scene.activeCameraLayerId,
@@ -1357,7 +1348,8 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
                  raw.fov, raw.perspectiveOverrideFov, raw.nearClip, raw.farClip,
                  camera.IsPerspective() ? "true" : "false",
                  camera.Fov(), camera.NearClip(), camera.FarClip(), camera.Aspect(),
-                 matrix(0, 0), matrix(1, 1), matrix(2, 2), matrix(2, 3), gPerCam.Fov());
+                 matrix(0, 0), matrix(1, 1), matrix(2, 2), matrix(2, 3), gPerCam.Fov(),
+                 scene.defaultGlobalCameraZoom, active_global_zoom, scene.cameraPathZoom);
 
         // A correct layer id/FOV alone does not establish pose restoration. Record
         // the selected eye, direction, up and actual post-framing view together so

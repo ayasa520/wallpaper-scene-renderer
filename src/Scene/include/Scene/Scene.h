@@ -58,12 +58,13 @@ public:
         std::array<float, 3> eye { 0.0f, 0.0f, 1.0f };
         std::array<float, 3> center { 0.0f, 0.0f, 0.0f };
         std::array<float, 3> up { 0.0f, 1.0f, 0.0f };
+        float zoom { 1.0f };
     };
 
     struct CameraPathSegment {
-        // Wallpaper Engine 3D camera paths are scene-level timelines, not 2D camera layers. The
-        // parser stores them here but binds playback to a model-only camera name, so ordinary 2D
-        // scenes never have their `global` or `global_perspective` camera semantics changed.
+        // Camera paths retain pose and zoom on one scene-owned timeline. The perspective view
+        // and orthographic projection consume their respective sampled components, while an
+        // active camera layer pauses that shared playback state.
         std::string name;
         double      duration { 0.0 };
         std::vector<CameraPathKeyframe> keyframes;
@@ -230,6 +231,7 @@ public:
     void ApplyLayerVisibility(int32_t layer_id);
     void ApplyAllLayerVisibility();
     void UpdateModelCameraPath();
+    double ResolveOrthographicCameraZoom();
     void UpdateCameraShake();
     Eigen::Vector3f FrameEyePosition() const;
     DirectionalShadowView ShadowCascadeView() const {
@@ -391,6 +393,9 @@ public:
     // Playback time belongs to the path, not the scene: camera-layer ownership pauses it.
     // Only the frame preparation path sample advances this clock, after publishing the pose.
     double                         modelCameraPathTime { 0.0 };
+    // Retain the last path sample while a camera layer owns the frame. Only orthographic
+    // projection consumes this scalar; perspective paths continue to select their view pose.
+    float                          cameraPathZoom { 1.0f };
 
     i32                  ortho[2] { 1920, 1080 }; // w, h
     // The authored canvas and the physical renderer output are independent. Text bridge

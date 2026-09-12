@@ -2123,6 +2123,7 @@ bool ParseModelCameraPathKeyframe(const nlohmann::json& json, Scene::CameraPathK
     GET_JSON_NAME_VALUE_NOWARN(json, "eye", keyframe.eye);
     GET_JSON_NAME_VALUE_NOWARN(json, "center", keyframe.center);
     GET_JSON_NAME_VALUE_NOWARN(json, "up", keyframe.up);
+    GET_JSON_NAME_VALUE_NOWARN(json, "zoom", keyframe.zoom);
     return true;
 }
 
@@ -2132,6 +2133,7 @@ void LoadModelCameraPaths(ParseContext& context, const wpscene::WPSceneCamera& a
     scene.modelCameraPathEnabled       = false;
     scene.activeModelCameraPathSegment = -1;
     scene.modelCameraPathTime          = 0.0;
+    scene.cameraPathZoom               = 1.0f;
 
     if (authored_camera.paths.empty()) return;
 
@@ -2190,6 +2192,9 @@ void LoadModelCameraPaths(ParseContext& context, const wpscene::WPSceneCamera& a
     scene.modelCameraPathEnabled = ! scene.modelCameraPathSegments.empty();
     if (scene.modelCameraPathEnabled) {
         const auto& first     = scene.modelCameraPathSegments.front().keyframes.front();
+        // Initial projection setup can precede the first playback tick. Seed its zoom from
+        // the same first keyframe as the view, while leaving the independent cursor at zero.
+        scene.cameraPathZoom = first.zoom;
         auto        camera_it = scene.cameras.find(std::string(kSceneModelPerspectiveCameraName));
         if (camera_it != scene.cameras.end() && camera_it->second) {
             // Seed frame zero on the model-only camera. The legacy 2D `global_perspective` camera
