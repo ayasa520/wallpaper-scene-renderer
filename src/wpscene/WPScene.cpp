@@ -3,14 +3,26 @@
 using namespace wallpaper::wpscene;
 
 bool Orthogonalprojection::FromJson(const nlohmann::json& json) {
-    if(json.is_null()) return false;
-	if(json.contains("auto")) {
-		GET_JSON_NAME_VALUE(json, "auto", auto_);
-	}
-	else {
-		GET_JSON_NAME_VALUE(json, "width", width);
-		GET_JSON_NAME_VALUE(json, "height", height);
-	}
+    if (!json.is_object()) return false;
+
+    // Projection configuration has a literal schema: only boolean true requests an
+    // automatic canvas. False and differently typed auto entries still allow an
+    // explicit numeric pair; they must not hide authored width and height.
+    auto_ = wallpaper::ReadJsonLiteralBoolean(json, "auto", false);
+    if (auto_) return true;
+
+    const auto width_value = json.find("width");
+    const auto height_value = json.find("height");
+    if (width_value == json.end() || !width_value->is_number() ||
+        height_value == json.end() || !height_value->is_number()) {
+        return false;
+    }
+
+    // Admit both numeric values before storing either dimension. Generic property
+    // expansion would also accept wrappers or mix one authored dimension with a
+    // default. The integer canvas conversion precedes the scene's zero-size gate.
+    width = width_value->get<int32_t>();
+    height = height_value->get<int32_t>();
     return true;
 }
 
@@ -63,14 +75,14 @@ bool WPSceneGeneral::FromJson(const nlohmann::json& json) {
 	GET_JSON_NAME_VALUE_NOWARN(json, "perspectiveoverridefov", perspectiveoverridefov);
 	GET_JSON_NAME_VALUE_NOWARN(json, "nearz", nearz);
 	GET_JSON_NAME_VALUE_NOWARN(json, "farz", farz);
-    if(json.contains("orthogonalprojection")) {
-        const auto& ortho = json.at("orthogonalprojection");
-        if(ortho.is_null())
-            isOrtho = false;
-        else {
-            isOrtho = true;
-            orthogonalprojection.FromJson(ortho);
-        }
+    // Perspective remains selected unless a complete typed configuration requests
+    // orthographic mode. Test the converted dimensions, so a fractional value that
+    // truncates to zero cannot select a canvas projection with a zero dimension.
+    isOrtho = false;
+    if (const auto ortho = json.find("orthogonalprojection");
+        ortho != json.end() && orthogonalprojection.FromJson(*ortho)) {
+        isOrtho = orthogonalprojection.auto_ ||
+                  (orthogonalprojection.width != 0 && orthogonalprojection.height != 0);
     }
     return true;
 }
