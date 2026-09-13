@@ -1358,17 +1358,27 @@ std::string BuildPersistentScript(std::string_view script_source) {
         // inherited hooks and turns vector or material values into unrelated JSON objects.
         // The native materializer owns nested asset handles; the outer handle still carries
         // this script's workshop context when it names an imported asset.
+        // Configuration conversion owns exceptions from its getters and hooks. A failed
+        // conversion must not enter native materialization or interrupt the calling script's
+        // subsequent work. Keep that outcome distinct from a successful undefined result,
+        // whose text still belongs to the native string-configuration dispatch. Other
+        // non-object results likewise retain their serialized text, including JSON quotes.
         << "  function normalizeCreateLayerConfig(value) {\n"
         << "    if (typeof value === 'string') return value;\n"
         << "    if (value === null || typeof value !== 'object') return undefined;\n"
-        << "    const serialized = JSON.stringify(value, (_key, entry) => {\n"
-        << "      if (entry && entry.toConfigString) return entry.toConfigString();\n"
-        << "      return entry;\n"
-        << "    });\n"
-        << "    if (serialized === undefined) return undefined;\n"
+        << "    let serialized;\n"
+        << "    try {\n"
+        << "      serialized = JSON.stringify(value, (_key, entry) => {\n"
+        << "        if (entry && entry.toConfigString) return entry.toConfigString();\n"
+        << "        return entry;\n"
+        << "      });\n"
+        << "    } catch {\n"
+        << "      return undefined;\n"
+        << "    }\n"
+        << "    if (serialized === undefined) return String(serialized);\n"
         << "    const normalized = JSON.parse(serialized);\n"
         << "    if (normalized === null || typeof normalized !== 'object' || "
-           "Array.isArray(normalized)) return undefined;\n"
+           "Array.isArray(normalized)) return serialized;\n"
         << "    const keys = Object.keys(normalized);\n"
         << "    if (keys.length === 1 && keys[0] === 'file' && "
            "typeof normalized.file === 'string') return createLayerAssetHandle(normalized.file);\n"
@@ -1402,10 +1412,12 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      return !!__native.destroySceneLayer(layer);\n"
         << "    },\n"
         << "    createLayer(configuration) {\n"
+        << "      const normalized = normalizeCreateLayerConfig(configuration);\n"
+        << "      if (normalized === undefined) return null;\n"
         << "      const workshopId = typeof __workshopId === 'string' ? __workshopId : '';\n"
         << "      const layerId = "
-           "__native.createSceneLayer(normalizeCreateLayerConfig(configuration), workshopId);\n"
-        << "      return layerId > 0 ? createLayerProxy(layerId) : undefined;\n"
+           "__native.createSceneLayer(normalized, workshopId);\n"
+        << "      return layerId > 0 ? createLayerProxy(layerId) : null;\n"
         << "    },\n"
         << "    createModelData(configuration) { return __native.createModelData(configuration); },\n"
         << "    destroyModelData(model) { return __native.destroyModelData(model); },\n"
