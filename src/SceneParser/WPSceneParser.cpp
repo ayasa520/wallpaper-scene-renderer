@@ -2229,9 +2229,11 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
     scene.cameras.at("effect")->AttatchNode(context.effect_camera_node);
     scene.sceneGraph->AppendChild(context.effect_camera_node);
 
-    // global camera
-    scene.cameras["global"] = std::make_shared<SceneCamera>((context.ortho_w / (i32)general.zoom),
-                                                            (context.ortho_h / (i32)general.zoom),
+    // Construct the canvas camera from its authored extent. Scene zoom is floating-point
+    // projection state and is applied by camera selection below; narrowing it into an integer
+    // divisor here loses fractional values and prevents sub-unit zoom from loading any scene.
+    scene.cameras["global"] = std::make_shared<SceneCamera>(context.ortho_w,
+                                                            context.ortho_h,
                                                             -5000.0f,
                                                             5000.0f);
     scene.activeCamera      = scene.cameras.at("global").get();
@@ -2297,10 +2299,26 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
                  center.x(),
                  center.y(),
                  center.z());
-    } else if (scene.modelCameraPathEnabled) {
-        // Publish the seeded path before object materialization can prepare frame uniforms.
-        // Camera-layer registration later performs the same selection and may take ownership.
+    } else {
+        // Resolve the retained scene factor and any seeded path through the same projection
+        // path used by later camera updates. Do this before object materialization can prepare
+        // frame uniforms, including scenes without a path. Camera-layer registration later
+        // performs the same selection and may take ownership.
         scene.UpdateActiveCameraLayer();
+    }
+
+    if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
+        const auto& camera = *scene.activeCamera;
+        const auto projection = camera.GetProjectionMatrix();
+        LOG_INFO("SceneCameraInitialization: orthographic=%s general-zoom=%.9f "
+                 "path-zoom=%.9f width=%.9f height=%.9f p00=%.9f p11=%.9f",
+                 scene.cameraOrthographic ? "true" : "false",
+                 scene.defaultGlobalCameraZoom,
+                 scene.cameraPathZoom,
+                 camera.Width(),
+                 camera.Height(),
+                 projection(0, 0),
+                 projection(1, 1));
     }
 }
 
