@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,6 +62,7 @@ public:
         : name(std::move(o.name)),
           textures(std::move(o.textures)),
           systemTextureBindings(std::move(o.systemTextureBindings)),
+          systemTextureReferences(std::move(o.systemTextureReferences)),
           userTextureBindings(std::move(o.userTextureBindings)),
           defines(std::move(o.defines)),
           uniformAliases(std::move(o.uniformAliases)),
@@ -81,6 +83,15 @@ public:
     // handles also keep copied materials in sync without rewriting effect ping-pong templates or
     // retaining material pointers.
     Map<usize, std::shared_ptr<const std::string>> systemTextureBindings;
+    struct TextureReference {
+        std::array<float, 2> size;
+        bool keepAspect;
+    };
+    // A system image changes the sampled resource without redefining the material's reference
+    // dimensions. Keep that authored sizing information beside the binding, so material copies
+    // retain it while the shared system value changes. keepAspect explicitly selects the current
+    // image dimensions instead. Neither choice changes the texture's physical or logical extent.
+    Map<usize, TextureReference> systemTextureReferences;
     // An absent user override selects this material's authored input, including its current
     // effect-local target mapping. A present override may resolve to an empty key when the
     // selected program does not admit that sampler. Material copies share this distinction

@@ -3,6 +3,7 @@
 #include "Scene.h"
 #include "SceneCamera.h"
 #include "SceneImageEffectLayer.h"
+#include "SceneMaterial.h"
 #include "SceneMesh.h"
 #include "SceneNode.h"
 #include "SceneObject.h"
@@ -47,6 +48,36 @@ std::optional<SceneImageSource::Metadata> SceneImageSource::ResolveMetadata(
     } else {
         return std::nullopt;
     }
+    result.display_size = result.content_size;
+    return result;
+}
+
+std::optional<SceneImageSource::Metadata> SceneImageSource::ResolveMetadata(
+    const Scene& scene, const SceneMaterial& material) {
+    if (material.textures.empty()) return std::nullopt;
+    auto result = ResolveMetadata(scene, material.Texture(0));
+    if (!result) return result;
+
+    // System replacements carry a material reference size independently of the primary
+    // texture's sampling metadata. Resolve active slots in authored order: the last successful
+    // replacement supplies the material size. An absent system value has no size override, and
+    // a keepAspect binding deliberately uses its selected image's dimensions. Retaining both
+    // sizes in this snapshot lets autosize update display geometry without resizing the private
+    // texture-space card, changing source UVs, or losing same-key resource refresh detection.
+    for (usize slot = 0; slot < material.textures.size(); ++slot) {
+        const auto reference = material.systemTextureReferences.find(slot);
+        if (reference == material.systemTextureReferences.end()) continue;
+        const auto binding = material.systemTextureBindings.find(slot);
+        if (binding == material.systemTextureBindings.end() || binding->second->empty()) continue;
+        const auto selected = ResolveMetadata(scene, material.Texture(slot));
+        if (!selected) continue;
+        result->display_size = reference->second.keepAspect
+            ? std::array {
+                static_cast<float>(static_cast<uint16_t>(static_cast<int32_t>(selected->content_size[0]))),
+                static_cast<float>(static_cast<uint16_t>(static_cast<int32_t>(selected->content_size[1]))),
+            }
+            : reference->second.size;
+    }
     return result;
 }
 
@@ -57,13 +88,14 @@ std::string_view SceneImageSource::TextureName() const {
 void SceneImageSource::ApplyAutosize(Scene& scene, const Metadata& metadata) {
     if (!m_policy.autosize || metadata.sprite) return;
     auto& state = *m_owner.ImageRuntimeState();
-    const auto& size = metadata.content_size;
+    const auto& size = metadata.display_size;
     if (state.size == size) return;
 
     LOG_INFO("SceneImageAutosize: layer=%d texture='%s' previous=[%.3f %.3f] "
-             "size=[%.3f %.3f] allocation=[%d %d]",
+             "size=[%.3f %.3f] allocation=[%d %d] content=[%.3f %.3f]",
              m_owner.Id(), metadata.texture_key.c_str(), state.size[0], state.size[1],
-             size[0], size[1], metadata.allocation_size[0], metadata.allocation_size[1]);
+             size[0], size[1], metadata.allocation_size[0], metadata.allocation_size[1],
+             metadata.content_size[0], metadata.content_size[1]);
     // Generated display cards share these bytes with their direct/source consumers. Their
     // logical size does not resize the private texture-space card or an imported mesh, and the
     // authored origin remains the pivot while alignment follows the new display dimensions.
@@ -98,7 +130,7 @@ void SceneImageSource::ApplyAutosize(Scene& scene, const Metadata& metadata) {
 }
 
 void SceneImageSource::CompleteInitialTexture(Scene& scene) {
-    if (auto metadata = ResolveMetadata(scene, TextureName())) {
+    if (auto metadata = ResolveMetadata(scene, *m_material)) {
         // Forward references complete after every owner has materialized. Apply their initial
         // logical size before destination setup remembers this descriptor as the applied state.
         ApplyAutosize(scene, *metadata);
@@ -108,7 +140,7 @@ void SceneImageSource::CompleteInitialTexture(Scene& scene) {
 
 void SceneImageSource::Refresh(Scene& scene) {
     if (!m_policy.observe_changes) return;
-    auto next = ResolveMetadata(scene, TextureName());
+    auto next = ResolveMetadata(scene, *m_material);
     if (!next || m_metadata == *next) return;
 
     // A changed key or descriptor is a texture setup boundary. Copy it before destination

@@ -59,11 +59,15 @@ bool WPUserTextureBinding::FromJson(const nlohmann::json& json) {
 
     GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
     GET_JSON_NAME_VALUE_NOWARN(json, "type", type);
+    if (const auto entry = json.find("keepaspect"); entry != json.end() && entry->is_boolean()) {
+        keepaspect = entry->get<bool>();
+    }
     return ! name.empty();
 }
 
 
 void WPMaterialPass::Update(const WPMaterialPass& p) {
+    if (!p.usertexturereference.is_null()) usertexturereference = p.usertexturereference;
     int32_t i = -1;
     for(const auto& el:p.textures) {
         i++;
@@ -94,6 +98,7 @@ void WPMaterialPass::Update(const WPMaterialPass& p) {
 }
 
 void WPMaterial::MergePass(const WPMaterialPass& p) {
+    if (!p.usertexturereference.is_null()) usertexturereference = p.usertexturereference;
     int32_t i = -1;
     for(const auto& el:p.textures) {
         i++;
@@ -124,6 +129,9 @@ void WPMaterial::MergePass(const WPMaterialPass& p) {
 }
 
 bool WPMaterialPass::FromJson(const nlohmann::json& json) {
+    if (const auto entry = json.find("usertexturereference"); entry != json.end()) {
+        usertexturereference = *entry;
+    }
     if(json.contains("textures")) {
         for(const auto& jT:json.at("textures")) {
             std::string tex;
@@ -181,6 +189,9 @@ bool WPMaterial::FromJson(const nlohmann::json& json) {
         return false;
     }
     const auto jContent = json.at("passes").at(0);
+    if (const auto entry = jContent.find("usertexturereference"); entry != jContent.end()) {
+        usertexturereference = *entry;
+    }
     if(!jContent.contains("shader")) {
         LOG_ERROR("material no shader");
         return false;

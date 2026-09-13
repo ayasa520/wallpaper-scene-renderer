@@ -691,6 +691,14 @@ private:
             m_scene->scriptHost->ResizeScreen(static_cast<int32_t>(m_output_width),
                                               static_cast<int32_t>(m_output_height));
 
+            // Initial media replay happens after the parser has sized image owners and their
+            // private targets from authored textures. Resolve those changed sources before the
+            // first graph is warmed or compiled, using the same dependency-ordered setup as a
+            // later media update. Otherwise graph compilation binds the new image but clears
+            // its pending refresh with old display geometry, source cards and target extents.
+            // Unchanged descriptors remain inert, preserving script-authored sizes and history.
+            m_scene->RefreshImageSourceTextures();
+
             if (m_rg) m_render->clearLastRenderGraph(true);
             {
                 auto warmup_rg = sceneToPipelineWarmupRenderGraph(*m_scene);

@@ -25,6 +25,7 @@ public:
         std::string texture_key;
         std::array<int32_t, 2> allocation_size {};
         std::array<float, 2> content_size {};
+        std::array<float, 2> display_size {};
         TextureSample sample {};
         bool sprite { false };
         bool operator==(const Metadata&) const = default;
@@ -42,6 +43,7 @@ public:
     ~SceneImageSource();
 
     static std::optional<Metadata> ResolveMetadata(const Scene& scene, std::string_view name);
+    static std::optional<Metadata> ResolveMetadata(const Scene& scene, const SceneMaterial& material);
     std::string_view TextureName() const;
     const Metadata& TextureMetadata() const { return m_metadata; }
     void CompleteInitialTexture(Scene& scene);

@@ -867,6 +867,33 @@ bool SelectCompiledMaterialDescriptors(SceneMaterialCustomShader& material_shade
     return true;
 }
 
+std::optional<std::array<float, 2>> ResolveSystemTextureReferenceSize(
+    const Scene& scene, const wpscene::WPMaterial& material, std::string_view authored_texture) {
+    std::array<int32_t, 2> size {};
+    const auto& reference = material.usertexturereference;
+    if (reference.is_object()) {
+        const auto width = reference.find("width");
+        const auto height = reference.find("height");
+        if (width != reference.end() && width->is_number() &&
+            height != reference.end() && height->is_number()) {
+            size = { width->get<int32_t>(), height->get<int32_t>() };
+        }
+    }
+    // Both explicit dimensions must remain nonzero after integer conversion. Otherwise the
+    // material takes its authored texture's logical size, including sprite reference geometry.
+    // Keep the material's two 16-bit dimensions separate from the full-resolution texture
+    // descriptor: media artwork resolution must not silently become the layer's display size.
+    if (size[0] == 0 || size[1] == 0) {
+        const auto metadata = SceneImageSource::ResolveMetadata(scene, authored_texture);
+        if (!metadata) return std::nullopt;
+        size = { static_cast<int32_t>(metadata->content_size[0]),
+                 static_cast<int32_t>(metadata->content_size[1]) };
+    }
+    if (size[0] == 0 || size[1] == 0) return std::nullopt;
+    return std::array { static_cast<float>(static_cast<uint16_t>(size[0])),
+                        static_cast<float>(static_cast<uint16_t>(size[1])) };
+}
+
 // LoadMaterial is shared with WPSceneParserPostFx.cpp (declared in
 // WPSceneParserShared.hpp), so it needs external linkage; the anonymous
 // namespace resumes right after it.
@@ -1205,7 +1232,21 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         if (! exists(fragment_unit.preprocess_info.active_tex_slots, i)) {
             material.textures[i].clear();
             material.systemTextureBindings.erase(i);
+            material.systemTextureReferences.erase(i);
             material.userTextureBindings.erase(i);
+        } else if (material.systemTextureBindings.contains(i)) {
+            if (const auto size = ResolveSystemTextureReferenceSize(*pScene, wpmat, material.textures[i])) {
+                const bool keep_aspect = wpmat.usertextures.at(i).keepaspect;
+                material.systemTextureReferences.emplace(i, SceneMaterial::TextureReference {
+                    .size = *size, .keepAspect = keep_aspect,
+                });
+                if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
+                    LOG_INFO("SceneMaterialSystemTextureReference: shader='%s' slot=%u "
+                             "authored='%s' reference=[%.3f %.3f] keep-aspect=%s",
+                             wpmat.shader.c_str(), i, material.textures[i].c_str(),
+                             (*size)[0], (*size)[1], keep_aspect ? "true" : "false");
+                }
+            }
         }
     }
 
@@ -1398,6 +1439,8 @@ void MergeImageSourceProgramBindings(SceneMaterial& material, const SceneMateria
     material.uniformAliases.insert(variant.uniformAliases.begin(), variant.uniformAliases.end());
     material.systemTextureBindings.insert(variant.systemTextureBindings.begin(),
                                            variant.systemTextureBindings.end());
+    material.systemTextureReferences.insert(variant.systemTextureReferences.begin(),
+                                             variant.systemTextureReferences.end());
     material.userTextureBindings.insert(variant.userTextureBindings.begin(),
                                          variant.userTextureBindings.end());
     for (size_t slot = 0; slot < variant.textures.size(); ++slot) {
@@ -2697,14 +2740,14 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     const bool source_autosize = wpimgobj.autosize && !wpimgobj.fullscreen &&
         !wpimgobj.config.passthrough && !wpimgobj.projectlayer && !hasAuthoredPuppet;
     auto source_metadata = SceneImageSource::ResolveMetadata(
-        *context.scene, primary_source_texture);
+        *context.scene, material);
     if (source_autosize && source_metadata && !source_metadata->sprite) {
         LOG_INFO("SceneImageAutosizeInitial: layer=%d texture='%s' previous=[%.3f %.3f] "
                  "size=[%.3f %.3f] allocation=[%d %d]",
                  wpimgobj.id, primary_source_texture.c_str(), wpimgobj.size[0], wpimgobj.size[1],
-                 source_metadata->content_size[0], source_metadata->content_size[1],
+                 source_metadata->display_size[0], source_metadata->display_size[1],
                  source_metadata->allocation_size[0], source_metadata->allocation_size[1]);
-        wpimgobj.size = source_metadata->content_size;
+        wpimgobj.size = source_metadata->display_size;
         context.scene->FindSceneObject(wpimgobj.id)->ImageRuntimeState()->size = wpimgobj.size;
     }
     LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });

@@ -24,6 +24,7 @@ public:
     bool        empty() const noexcept { return name.empty(); }
     std::string name;
     std::string type;
+    bool        keepaspect { false };
 };
 
 class WPMaterialPass {
@@ -32,6 +33,7 @@ public:
     void                                                Update(const WPMaterialPass&);
     std::vector<std::string>                            textures;
     std::vector<WPUserTextureBinding>                   usertextures;
+    nlohmann::json                                     usertexturereference;
     std::unordered_map<std::string, int32_t>            combos;
     // The shader declaration owns each material property's type. Preserve the complete JSON
     // until that declaration is available: a numeric scalar can initialize a vector, and the
@@ -60,6 +62,7 @@ public:
     std::string                                         depthwrite { "enabled" };
     std::vector<std::string>                            textures;
     std::vector<WPUserTextureBinding>                   usertextures;
+    nlohmann::json                                     usertexturereference;
     std::unordered_map<std::string, int32_t>            combos;
     // Cold uniform decoding and dynamic registration consume the same raw record, after the
     // material has loaded its shader metadata. Neither may infer a type from JSON value length.
@@ -70,10 +73,10 @@ public:
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPassBindItem, name, index);
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPUserTextureBinding, name, type);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPUserTextureBinding, name, type, keepaspect);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPass, bind, target, textures, usertextures, combos,
-                                   constantshadervalues, usershadervalues, compose);
+                                   constantshadervalues, usershadervalues, compose, usertexturereference);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterial, blending, shader, textures, usertextures, combos,
-                                   constantshadervalues, usershadervalues);
+                                   constantshadervalues, usershadervalues, usertexturereference);
 } // namespace wpscene
 } // namespace wallpaper
