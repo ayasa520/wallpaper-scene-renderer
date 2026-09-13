@@ -60,6 +60,7 @@ add_library(
   WPShaderParser.cpp
   SceneParser/WPSceneParser.cpp
   ScriptHost/WPSceneScriptHost.cpp
+  ScriptHost/WPSceneScriptHostMaterialObject.cpp
   ScriptHost/WPSceneScriptHostModelData.cpp
   ScriptHost/WPSceneScriptHostModelRefresh.cpp
   ScriptHost/WPSceneScriptHostResidency.cpp

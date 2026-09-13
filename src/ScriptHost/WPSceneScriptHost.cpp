@@ -630,17 +630,10 @@ void NormalizeScriptWhitespace(std::string& source) {
 std::string StripScriptModuleSyntax(std::string source) {
     NormalizeScriptWhitespace(source);
 
+    // Explicit strict directives belong to their authored function bodies. Preserve
+    // them and identical text inside string literals when adapting module syntax;
+    // removing raw substrings changes both assignment behavior and ordinary data.
     std::string::size_type pos = 0;
-    while ((pos = source.find("'use strict';", pos)) != std::string::npos) {
-        source.erase(pos, 13);
-    }
-
-    pos = 0;
-    while ((pos = source.find("\"use strict\";", pos)) != std::string::npos) {
-        source.erase(pos, 13);
-    }
-
-    pos = 0;
     while ((pos = source.find("export ", pos)) != std::string::npos) {
         source.erase(pos, 7);
     }
@@ -1158,46 +1151,19 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      }\n"
         << "    });\n"
         << "  }\n"
-        << "  // Effect material proxies route authored WE material properties through native "
-           "alias resolution, so script names like raythreshold can update GLSL uniforms such "
-           "as g_Threshold on the matching post-process pass.\n"
-        << "  function createEffectMaterialProxy(nodeId, effectIndex, materialIndex = 0) {\n"
+        << "  function createEffectMaterialObject(nodeId, effectIndex, materialIndex = 0) {\n"
         << "    if (!__native.hasEffectMaterial(nodeId, effectIndex, materialIndex)) return "
            "undefined;\n"
-        << "    // Publish the material's descriptor names as configurable own slots. Values "
-           "stay on the native pass; ordinary object enumeration supplies unique names and "
-           "numeric index ordering without copying uniforms into the script object.\n"
+        << "    // Install material callbacks independently of ordinary object properties. "
+           "Deleting or replacing an alias changes this object's dispatch, while another "
+           "material handle can still read and update the underlying pass.\n"
         << "    const names = __native.getEffectMaterialPropertyNames(nodeId, effectIndex, "
            "materialIndex);\n"
-        << "    const target = Object.fromEntries(names.map(name => [name, undefined]));\n"
-        << "    return new Proxy(target, {\n"
-        << "      get(_target, prop) {\n"
-        << "        if (typeof prop !== 'string') return undefined;\n"
-        << "        return __native.getEffectMaterialProperty(nodeId, effectIndex, "
-           "materialIndex, prop);\n"
-        << "      },\n"
-        << "      set(_target, prop, value) {\n"
-        << "        if (typeof prop !== 'string') return false;\n"
-        << "        return !!__native.setEffectMaterialProperty(nodeId, effectIndex, "
-           "materialIndex, prop, value);\n"
-        << "      },\n"
-        << "      has(_target, prop) {\n"
-        << "        if (typeof prop !== 'string') return false;\n"
-        << "        return !!__native.hasEffectMaterialMember(nodeId, effectIndex, "
-           "materialIndex, prop);\n"
-        << "      },\n"
-        << "      getOwnPropertyDescriptor(target, prop) {\n"
-        << "        if (typeof prop !== 'string') return undefined;\n"
-        << "        const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);\n"
-        << "        if (descriptor === undefined) return undefined;\n"
-        << "        // A descriptor is a snapshot of the current native value. Exposing "
-           "JavaScript accessor functions or the slot's placeholder would change both "
-           "descriptor-driven scripts and ordinary own-property copies.\n"
-        << "        descriptor.value = __native.getEffectMaterialProperty(nodeId, effectIndex, "
-           "materialIndex, prop);\n"
-        << "        return descriptor;\n"
-        << "      }\n"
-        << "    });\n"
+        << "    return __native.createMaterialObject(names,\n"
+        << "      prop => __native.getEffectMaterialProperty(nodeId, effectIndex, "
+           "materialIndex, prop),\n"
+        << "      (prop, value) => __native.setEffectMaterialProperty(nodeId, effectIndex, "
+           "materialIndex, prop, value));\n"
         << "  }\n"
         << "  function createEffectProxy(nodeId, effectIndex, instanceId = 0) {\n"
         << "    if (!__native.hasEffect(nodeId, effectIndex)) return undefined;\n"
@@ -1210,7 +1176,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "          return animationId > 0 ? createTimelineAnimation(animationId) : undefined;\n"
         << "        };\n"
         << "        if (prop === 'getMaterial') return (materialIndex = 0) => "
-           "createEffectMaterialProxy(nodeId, effectIndex, materialIndex);\n"
+           "createEffectMaterialObject(nodeId, effectIndex, materialIndex);\n"
         << "        return __native.getEffectProperty(nodeId, effectIndex, prop);\n"
         << "      },\n"
         << "      set(_target, prop, value) {\n"
@@ -8457,6 +8423,7 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     m_impl->native_bridge           = JS_NewObject(context);
     m_impl->user_properties_object  = JS_NewObject(context);
     RegisterSceneModelDataBindings(*m_impl);
+    RegisterSceneMaterialObjectBindings(*m_impl);
     m_impl->user_properties = m_scene != nullptr ? m_scene->userProperties : UserPropertyMap {};
     m_impl->dispatched_user_properties  = m_impl->user_properties;
     m_impl->general_settings            = BuildInitialGeneralSettings();

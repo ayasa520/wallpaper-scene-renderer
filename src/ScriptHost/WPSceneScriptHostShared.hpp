@@ -150,6 +150,7 @@ struct WPSceneScriptHost::Opaque {
     JSValue                                      native_bridge { JS_UNDEFINED };
     JSValue                                      user_properties_object { JS_UNDEFINED };
     JSClassID                                    model_data_class { JS_INVALID_CLASS_ID };
+    JSClassID                                    material_object_class { JS_INVALID_CLASS_ID };
     SceneScriptExecutionPhase                    execution_phase { SceneScriptExecutionPhase::Callback };
     uint32_t                                     next_instance_id { 1 };
     uint32_t                                     next_property_animation_id { 1 };
@@ -212,6 +213,7 @@ private:
 };
 
 void RegisterSceneModelDataBindings(WPSceneScriptHost::Opaque& opaque);
+void RegisterSceneMaterialObjectBindings(WPSceneScriptHost::Opaque& opaque);
 void ProcessPendingSceneModelRefresh(WPSceneScriptHost::Opaque& opaque);
 void FreeScriptInstance(JSContext* context, ScriptInstance& instance);
 void ResortSceneLayerTree(const WPSceneScriptHost::Opaque& opaque);
