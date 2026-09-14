@@ -3,6 +3,7 @@
 #include "Scene/Scene.h"
 #include "Resource.hpp"
 #include "RenderTargetOps.hpp"
+#include "RenderCommandTrace.hpp"
 #include "Utils/Logging.h"
 
 #include <cstdlib>
@@ -79,6 +80,12 @@ void PrePass::execute(const Device&, RenderingResources& rr) {
         }
     }
     const auto depth_action = PrepareSceneModelDepth(rr, m_desc.result, scene.clearEnabled);
+    TraceRenderCommand(rr, "clear", scene.clearEnabled ? "recorded" : "preserved",
+                       m_desc.result, m_desc.vk_result);
+    if (m_desc.has_msaa) {
+        TraceRenderCommand(rr, "clear", scene.clearEnabled ? "recorded" : "preserved",
+                           SpecTex_DefaultMS, m_desc.vk_msaa);
+    }
     if (std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr) {
         LOG_INFO("SceneStageClear: target='%.*s' clear-enabled=%s color-action=%s "
                  "color=[%.6f %.6f %.6f %.6f] model-depth=%s msaa=%s",

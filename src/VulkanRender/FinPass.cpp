@@ -1,6 +1,7 @@
 #include "FinPass.hpp"
 #include "Vulkan/Shader.hpp"
 #include "Resource.hpp"
+#include "RenderCommandTrace.hpp"
 #include "PassCommon.hpp"
 #include "Msaa.hpp"
 
@@ -245,6 +246,7 @@ void FinPass::executeImage(const Device& device, RenderingResources& rr,
     auto& dst = m_desc.vk_present;
     if (!(src.handle && dst.handle) || src.extent.width == 0 || src.extent.height == 0 ||
         dst.extent.width == 0 || dst.extent.height == 0) {
+        TraceRenderCommand(rr, "present", "missing-image", "present", dst);
         return;
     }
 
@@ -370,6 +372,12 @@ void FinPass::executeImage(const Device& device, RenderingResources& rr,
                         {},
                         {},
                         std::array { in_bar, out_bar });
+    const auto command = TraceRenderCommand(rr, src_w == dst_w && src_h == dst_h ? "present-copy"
+                                                                              : "present-blit",
+                                            "recorded", "present", dst);
+    // executeImage can present a selected intermediate output. Its physical source is
+    // authoritative; the graph's usual result name would mislabel that diagnostic read.
+    TraceRenderCommandInput(rr, command, "present-source", "present-source", src, true);
 }
 void FinPass::destory(const Device&, RenderingResources& rr) {
     setPrepared(false);

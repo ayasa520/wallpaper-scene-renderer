@@ -24,6 +24,7 @@
 #include "CopyPass.hpp"
 #include "CustomShaderPass.hpp"
 #include "Resource.hpp"
+#include "RenderCommandTrace.hpp"
 #include "Vulkan/Util.hpp"
 
 #include "Core/ArrayHelper.hpp"
@@ -766,6 +767,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin swapchain frame command buffer"))
         return;
+    BeginRenderCommandTrace(rr);
     // A topology change prepares all new passes before this command is recorded. Their static
     // vertex/index subranges still need uploading before any draw in the new graph consumes them;
     // record those writes here rather than submitting a separate compile-time upload and WaitIdle.
@@ -798,6 +800,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     if (!checkVkResult(m_device->present_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit swapchain frame"))
         return;
+    TraceRenderCommandFrame(rr, "submitted");
     for (const auto& callback : m_frame_submitted_callbacks) callback();
     VkPresentInfoKHR present_info {
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -990,6 +993,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
+    BeginRenderCommandTrace(rr);
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=command-begin-complete");
     const bool gpu_profile_frame = gpuProfilerActive();
     if (gpu_profile_frame) {
@@ -1094,6 +1098,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
+    TraceRenderCommandFrame(rr, "submitted");
     for (const auto& callback : m_frame_submitted_callbacks) callback();
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=submit-complete");
     if (gpu_profile_frame && m_gpu_profiler.used >= 2) {

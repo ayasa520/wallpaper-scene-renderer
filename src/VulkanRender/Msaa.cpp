@@ -2,6 +2,7 @@
 
 #include "PassCommon.hpp"
 #include "Resource.hpp"
+#include "RenderCommandTrace.hpp"
 #include "Utils/Logging.h"
 
 #include <array>
@@ -130,6 +131,8 @@ bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingRes
                         {},
                         after_resolve);
 
+    const auto command = TraceRenderCommand(rr, "compose-resolve", "recorded", def_name, *resolved);
+    TraceRenderCommandInput(rr, command, "resolve-source", ms_name, *ms, true);
     rr.msaa_compose_dirty = false;
     return true;
 }

@@ -9,6 +9,7 @@
 #include "PassCommon.hpp"
 #include "Msaa.hpp"
 #include "Resource.hpp"
+#include "RenderCommandTrace.hpp"
 #include "RenderTargetOps.hpp"
 #include "ShaderDrawCore.hpp"
 #include "WPSceneScriptMedia.hpp"
@@ -823,12 +824,28 @@ void TextPass::refreshResources(Scene& scene, const Device& device, RenderingRes
 }
 
 void TextPass::execute(const Device& device, RenderingResources& rr) {
-    if (m_desc.should_execute && !m_desc.should_execute()) return;
+    const auto trace_text = [&](const char* kind, const char* result, uint32_t count = 0) {
+        return TraceRenderCommand(rr, kind, result, m_desc.output, m_desc.vk_output,
+                                  m_desc.layer_id, m_desc.reflection_pass, count);
+    };
+    if (m_desc.should_execute && !m_desc.should_execute()) {
+        trace_text("text", "execution-gate");
+        return;
+    }
     auto* node = m_desc.node;
     auto* primitive = node != nullptr ? node->Text() : nullptr;
-    if (primitive == nullptr) return;
-    if (!m_desc.pipeline.handle || !m_desc.framebuffer) return;
-    if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) return;
+    if (primitive == nullptr) {
+        trace_text("text", "missing-primitive");
+        return;
+    }
+    if (!m_desc.pipeline.handle || !m_desc.framebuffer) {
+        trace_text("text", "unprepared");
+        return;
+    }
+    if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) {
+        trace_text("text", "owner-hidden");
+        return;
+    }
 
     const bool hdr_color = m_desc.scene->UsesHdrMaterials();
 
@@ -846,11 +863,15 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         // graph rebuild. Refreshing the bound atlas images lazily here keeps the dedicated text
         // pass on the new scene-owned source of truth instead of depending on parser-time texture
         // registration.
-        if (!refreshTextures(device)) return;
+        if (!refreshTextures(device)) {
+            trace_text("text", "texture-refresh-failed");
+            return;
+        }
     }
 
     if (primitive->background_mesh != nullptr &&
         !ensureMeshBuffers(*primitive->background_mesh, m_background_buffers, rr)) {
+        trace_text("text", "background-upload-failed");
         return;
     }
     if (m_page_buffers.size() != primitive->glyph_pages.size()) {
@@ -859,6 +880,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     }
     for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
         if (!ensureMeshBuffers(*primitive->glyph_pages[page_index].mesh, m_page_buffers[page_index], rr)) {
+            trace_text("text", "glyph-upload-failed");
             return;
         }
     }
@@ -1004,6 +1026,14 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                  primitive->object.opaquebackground ? "true" : "false");
     }
     rr.command.BeginRenderPass(begin_info, VK_SUBPASS_CONTENTS_INLINE);
+    // An empty layout can still clear its complete private source. Keep attachment
+    // initialization separate from glyph draws, and record LOAD as a retained-content
+    // read so it cannot be mistaken for an overwrite during target-lifetime audits.
+    const auto begin_command = trace_text(m_desc.clear_before_draw ? "text-clear" : "text-load",
+                                         "recorded");
+    if (!m_desc.clear_before_draw) {
+        TraceRenderCommandInput(rr, begin_command, "attachment", m_desc.output, m_desc.vk_output, true);
+    }
 
     VkViewport viewport {
         .x = 0.0f,
@@ -1037,6 +1067,12 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
             rr.command.DrawIndexed(buffers.draw_count, 1, 0, 0, 0);
         } else {
             rr.command.Draw(buffers.draw_count, 1, 0, 0);
+        }
+        const auto command = trace_text(background ? "text-background" : "text-glyph",
+                                        "draw", buffers.draw_count);
+        if (!texture.slots.empty()) {
+            TraceRenderCommandInput(rr, command, "sampler",
+                background ? "background" : "glyph-atlas", texture.getActive(), true, 1);
         }
         if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
             // Record the submitted consumer, not just the owner property's readback. Including
@@ -1097,6 +1133,11 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     }
 
     rr.command.EndRenderPass();
+    if (m_desc.resolve_msaa) {
+        const auto command = TraceRenderCommand(rr, "text-resolve", "recorded", m_desc.output,
+            m_desc.vk_resolve, m_desc.layer_id, m_desc.reflection_pass);
+        TraceRenderCommandInput(rr, command, "resolve-source", m_desc.output, m_desc.vk_output, true);
+    }
     if (m_desc.shared_depth) {
         rr.model_depth_images.at(m_desc.output).layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     }

@@ -3,6 +3,7 @@
 #include "PassCommon.hpp"
 #include "Resource.hpp"
 #include "RenderTargetOps.hpp"
+#include "RenderCommandTrace.hpp"
 #include "Utils/Logging.h"
 
 #include <cstdlib>
@@ -55,11 +56,14 @@ void ClearPass::refreshResources(Scene& scene, const Device& device, RenderingRe
 }
 
 void ClearPass::execute(const Device&, RenderingResources& rr) {
-    if (m_desc.should_execute && !m_desc.should_execute())
+    if (m_desc.should_execute && !m_desc.should_execute()) {
+        TraceRenderCommand(rr, "clear", "execution-gate", m_desc.target, m_desc.vk_target);
         return;
+    }
 
     auto& img = m_desc.vk_target;
     if (!img.handle) {
+        TraceRenderCommand(rr, "clear", "missing-image", m_desc.target, img);
         setPrepared(false);
         return;
     }
@@ -74,6 +78,9 @@ void ClearPass::execute(const Device&, RenderingResources& rr) {
         ClearRenderTargetColor(rr.command, img, clear_value.color,
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
+    // Trace the already evaluated decision; visibility and clear callbacks can observe
+    // live scene state and must never be invoked a second time just for diagnostics.
+    TraceRenderCommand(rr, "clear", clear_color ? "recorded" : "preserved", m_desc.target, img);
 
     // A live disabled clear preserves both attachments. A freshly allocated model depth
     // still needs an attachment layout before LOAD, even when no content clear is requested.

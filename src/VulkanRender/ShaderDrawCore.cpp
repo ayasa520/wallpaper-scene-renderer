@@ -10,6 +10,7 @@
 #include "Utils/Logging.h"
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
+#include "RenderCommandTrace.hpp"
 #include "RenderTargetOps.hpp"
 #include "PassCommon.hpp"
 #include "Msaa.hpp"
@@ -1799,20 +1800,33 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     // A named target can connect otherwise unrelated owners. Select both its producer and
     // consumers in the same process so the trace can compare actual GPU image identities,
     // execution gates and ordering without changing the render graph or reading pixels.
-    const bool trace_draw = (trace_layer != nullptr &&
+    const bool trace_draw = rr.trace_render_commands || (trace_layer != nullptr &&
         std::to_string(m_desc.layer_id) == trace_layer) ||
         (trace_target != nullptr && (m_desc.output == trace_target ||
             std::find(m_desc.textures.begin(), m_desc.textures.end(), trace_target) !=
                 m_desc.textures.end()));
     if (trace_draw) ++m_trace_draw_sequence;
     const auto trace_result = [&](const char* result) {
+        if (rr.trace_render_commands) {
+            const bool recorded_draw = std::string_view(result) == "draw" && m_desc.draw_count > 0;
+            const auto command = TraceRenderCommand(rr, "shader", result, m_desc.output,
+                m_desc.vk_output, m_desc.layer_id, m_desc.reflection_pass, m_desc.draw_count);
+            for (size_t index = 0; index < m_desc.vk_textures.size(); ++index) {
+                const auto& slots = m_desc.vk_textures[index];
+                if (slots.slots.empty()) continue;
+                const int binding = m_desc.vk_tex_binding[index];
+                TraceRenderCommandInput(rr, command, "sampler", m_desc.textures[index],
+                    slots.getActive(), recorded_draw && binding >= 0, binding);
+            }
+        }
         // Pass-begin profiling also includes skipped draws. Log the execution decision and exact
         // bound images at sparse checkpoints so an absent element can be traced without guessing
         // from visibility flags or flooding every frame with descriptor and geometry metadata.
         // A one-frame media transition needs consecutive decisions rather than sparse
         // checkpoints. This opt-in keeps the existing layer/target filter and adds the
         // scene clock so resource generations can be matched to SceneMediaDispatch.
-        const bool trace_every_frame = std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr;
+        const bool trace_every_frame = rr.trace_render_commands ||
+            std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr;
         if (!trace_draw || (!trace_every_frame && m_trace_draw_sequence != 1 &&
                             m_trace_draw_sequence != 121 && m_trace_draw_sequence != 601)) return;
         LOG_INFO("SceneShaderDrawExecute: sequence=%llu time=%.6f layer=%d node='%s' result=%s "
@@ -1881,8 +1895,6 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // prevents temporary render targets from staying pinned only because no draw was recorded.
         return;
     }
-
-    trace_result("draw");
 
     if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;
         scene != nullptr && ShaderDrawSamplesResolvedDefault(m_desc.textures)) {
@@ -1995,6 +2007,10 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         .pClearValues    = clear_values.data(),
     };
     cmd.BeginRenderPass(pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+    if (m_desc.clear_before_draw) {
+        TraceRenderCommand(rr, "shader-clear", "recorded", m_desc.output, m_desc.vk_output,
+                           m_desc.layer_id, m_desc.reflection_pass);
+    }
 
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
     VkViewport viewport {
@@ -2063,6 +2079,16 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     }
 
     cmd.EndRenderPass();
+
+    // Successful draw records follow any on-demand input resolve and attachment clear.
+    // The shared frame trace therefore reflects recording order across different pass
+    // types, including the resolve attachment written when this render pass ends.
+    trace_result("draw");
+    if (m_desc.resolve_msaa) {
+        const auto command = TraceRenderCommand(rr, "shader-resolve", "recorded", m_desc.output,
+            m_desc.vk_resolve, m_desc.layer_id, m_desc.reflection_pass);
+        TraceRenderCommandInput(rr, command, "resolve-source", m_desc.output, m_desc.vk_output, true);
+    }
 
     if (m_desc.shared_depth) {
         rr.model_depth_images.at(m_desc.output).layout =

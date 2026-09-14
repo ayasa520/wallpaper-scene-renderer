@@ -31,6 +31,12 @@ struct RenderingResources {
     Scene* scene { nullptr };
     bool   msaa_compose_dirty { false };
 
+    // Command diagnostics follow the renderer lifetime rather than graph/pass objects,
+    // which can be replaced while the same physical targets remain live across frames.
+    bool     trace_render_commands { false };
+    uint64_t trace_render_frame { 0 };
+    uint64_t trace_render_command { 0 };
+
     vvk::CommandBuffer command;
 
     vvk::Semaphore sem_swap_wait_image;

@@ -3,6 +3,7 @@
 #include "Utils/Logging.h"
 #include "Utils/AutoDeletor.hpp"
 #include "Resource.hpp"
+#include "RenderCommandTrace.hpp"
 #include "PassCommon.hpp"
 #include "Msaa.hpp"
 
@@ -98,10 +99,15 @@ void CopyPass::refreshResources(Scene& scene, const Device& device, RenderingRes
 }
 
 void CopyPass::execute(const Device& device, RenderingResources& rr) {
+    const auto trace_copy = [&](const char* result, bool recorded) {
+        const auto command = TraceRenderCommand(rr, "copy", result, m_desc.dst, m_desc.vk_dst);
+        TraceRenderCommandInput(rr, command, "copy-source", m_desc.src, m_desc.vk_src, recorded);
+    };
     if (m_desc.should_execute && !m_desc.should_execute()) {
         // The render graph still declares this copy as an ordering edge, but runtime visibility can
         // make the actual transfer unnecessary for the current frame. Returning here is what keeps
         // visible toggles cheap and avoids rebuilding the graph just to skip one effect branch.
+        trace_copy("execution-gate", false);
         releaseFinalReadTexs(device);
         return;
     }
@@ -118,6 +124,7 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
         // A prepared copy with missing image handles cannot record a GPU read, but the frame has
         // still reached this pass's final-reader boundary. Release the graph-owned keys before the
         // diagnostic assert so non-assert builds do not pin reusable render targets indefinitely.
+        trace_copy("missing-image", false);
         releaseFinalReadTexs(device);
         assert(src.handle && dst.handle);
         return;
@@ -215,6 +222,10 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
     if (dst.mipmap_level > 1) {
         device.tex_cache().RecGenerateMipmaps(cmd, dst);
     }
+
+    // Record physical bindings after the transfer and before returning the source key
+    // to the shared pool. Preparation and a skipped transfer are not resource reads.
+    trace_copy("recorded", true);
 
     // CopyPass participates in the same temporary-resource lifetime contract as shader passes:
     // a key becomes reusable only after the command buffer has recorded the transfer that reads it.
