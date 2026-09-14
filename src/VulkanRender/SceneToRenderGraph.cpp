@@ -220,6 +220,7 @@ struct DrawPassOptions {
     bool        use_active_camera_for_parallax { false };
     bool        premultiplied_source_blend { false };
     bool        use_active_camera_for_uniforms { false };
+    bool        suppress_destination_parallax { false };
     ShaderModelSpace model_space { ShaderModelSpace::Object };
     bool        reflection_pass { false };
     bool        reflection_raster { false };
@@ -311,7 +312,7 @@ static EffectSourceRoutingDecision ResolveEffectSourceRouting(SceneNode* node,
                                                               const TraversalRoute& route) {
     EffectSourceRoutingDecision decision;
 
-    // copybackground alone selects the owner-card contribution of a non-fullscreen composition.
+    // copybackground alone selects the owner-card contribution of a passthrough composition.
     // Empty children and private dependency ownership do not authorize an extra framebuffer draw
     // after its transparent clear.
     decision.owner_node_samples_framebuffer = DrawMaterialSamplesFramebuffer(node);
@@ -349,6 +350,15 @@ static DrawPassOptions BuildOwnerSourcePassOptions(
     const bool evaluate_framebuffer_source_with_active_camera =
         source_route.owner_node_samples_framebuffer &&
         !source_route.owner_node_uses_perspective_camera;
+    // An ordinary passthrough source draws its raw owner with frame matrices, independently
+    // of which textures its shader samples. The source target's extent only sizes storage;
+    // its attached child camera must not replace this source projection. Root sources retain
+    // the current reflected destination and layer displacement. A nested source instead uses
+    // the saved frame destination before reflection and per-layer parallax, while keeping the
+    // current frame eye. Child rasterization and effect/final snapshots select their own state
+    // after this source draw and must not inherit this temporary frame selection.
+    const bool owner_source_uses_frame_matrices = imgeff != nullptr &&
+        imgeff->Owner().Passthrough() && !imgeff->IsFullscreen();
 
     // Owner-source emission is the one place where source routing affects actual pass state. Keep
     // these side effects grouped so future route types can extend the pass contract without adding
@@ -356,7 +366,7 @@ static DrawPassOptions BuildOwnerSourcePassOptions(
     //
     // - Composition source routes write child layers into a parent-local source target. Their alpha
     //   policy comes from the parent composition layer's copybackground contract.
-    // - An owner material that samples the live framebuffer normally evaluates world geometry
+    // - Other owner materials that sample the live framebuffer normally evaluate world geometry
     //   against the active scene camera, including while writing a private source target. The
     //   composelayer vertex shader separately turns authored texture coordinates into the fullscreen
     //   output quad, so using the private effect camera for both roles creates the cursor-following
@@ -379,7 +389,8 @@ static DrawPassOptions BuildOwnerSourcePassOptions(
         .use_active_camera_for_parallax = source_route.use_compose_camera_override,
         .premultiplied_source_blend = route.premultiplied_source_blend,
         .use_active_camera_for_uniforms =
-            evaluate_framebuffer_source_with_active_camera,
+            owner_source_uses_frame_matrices || evaluate_framebuffer_source_with_active_camera,
+        .suppress_destination_parallax = owner_source_uses_frame_matrices && route.compose_source,
         // Ordinary source materials rasterize their geometry with identity I. Passthrough retains
         // its owner matrix. Neither choice mutates the authored transform or gives a source
         // camera to the owner's descendants.
@@ -387,8 +398,10 @@ static DrawPassOptions BuildOwnerSourcePassOptions(
             ? ShaderModelSpace::Geometry : ShaderModelSpace::Object,
         .reflection_pass = route.reflection_pass,
         .reflection_raster = route.reflection_raster &&
-            (imgeff == nullptr || imgeff->IsFullscreen() ||
-             evaluate_framebuffer_source_with_active_camera),
+            (owner_source_uses_frame_matrices
+                 ? !route.compose_source
+                 : (imgeff == nullptr || imgeff->IsFullscreen() ||
+                    evaluate_framebuffer_source_with_active_camera)),
         .reflection_snapshot = route.reflection_raster,
         .effect_snapshot_camera = source_route.active_compose_source_camera,
     };
@@ -541,6 +554,7 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
             pdesc.clear_before_draw = output_key != SpecTex_Default && options.clear_before_draw;
             pdesc.camera_override = options.camera_override;
             pdesc.use_active_camera_for_uniforms = options.use_active_camera_for_uniforms;
+            pdesc.suppress_destination_parallax = options.suppress_destination_parallax;
             pdesc.model_space = options.model_space;
             pdesc.reflection_pass = options.reflection_pass;
             pdesc.reflection_raster = options.reflection_raster;
@@ -913,7 +927,8 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             const AlphaWritePolicy child_compose_source_alpha_write_policy =
                 child_compose_source_route && imgeff != nullptr &&
                     source_route.proxy_children_contribute_to_effect_source
-                    ? imgeff->CompositionChildAlphaWritePolicy()
+                    ? imgeff->CompositionChildAlphaWritePolicy(
+                          route.compose_source_alpha_write_policy)
                     : route.compose_source_alpha_write_policy;
             ToGraphPass(child.node,
                         output,
@@ -1033,18 +1048,18 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             };
             for (auto& effect_node : eff->nodes) {
                 emit_commands();
-                // An authored final writer restores the enclosing composition's camera and alpha
-                // state, just like the owner's neutral publisher. Private intermediate and puppet
-                // surface draws retain their own camera. Otherwise removing the extra publication
-                // pass would send this ordinary child through the scene camera while writing the
-                // parent's texture.
+                // A layer-space final writer restores the enclosing composition's camera.
+                // Fullscreen final writers instead keep the unit-quad camera, even when their
+                // resolved destination is the enclosing composition's source texture.
                 const bool uses_composition_camera = effect_node.uses_owner_transform &&
                     route.compose_source;
-                // Explicit shape FBO draws retain the incoming camera/owner I just like other
-                // shape records, but they do not inherit the enclosing composition's alpha
-                // accumulation rule. Target/viewport selection is distinct from raster matrices.
-                const bool composition_writer = uses_composition_camera &&
-                    !effect_node.output_is_fbo;
+                // Alpha accumulation belongs to the destination, independently of the raster
+                // camera. A fullscreen final material must retain the parent's coverage policy
+                // so its RGB survives the parent's later translucent publication. Match the
+                // resolved inherited target to exclude private/intermediate outputs; explicit
+                // FBO materials keep their own alpha policy even when they use owner matrices.
+                const bool composition_writer = route.compose_source &&
+                    !effect_node.output_is_fbo && effect_node.output == inherited_output;
                 const bool composition_camera = uses_composition_camera &&
                     !source_route.active_compose_source_camera.empty();
                 // Effect material nodes are private render-graph passes. They can carry a camera

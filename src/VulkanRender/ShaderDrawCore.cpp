@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 using namespace wallpaper::vulkan;
@@ -105,6 +106,7 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc)
     m_desc.camera_override     = desc.camera_override;
     m_desc.use_active_camera_for_uniforms = desc.use_active_camera_for_uniforms;
     m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
+    m_desc.suppress_destination_parallax = desc.suppress_destination_parallax;
     m_desc.model_space = desc.model_space;
     m_desc.reflection_pass = desc.reflection_pass;
     m_desc.reflection_raster = desc.reflection_raster;
@@ -192,6 +194,8 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
                next.m_desc.use_active_camera_for_uniforms &&
            m_desc.use_active_camera_for_parallax ==
                next.m_desc.use_active_camera_for_parallax &&
+           m_desc.suppress_destination_parallax ==
+               next.m_desc.suppress_destination_parallax &&
            m_desc.model_space == next.m_desc.model_space &&
            m_desc.reflection_pass == next.m_desc.reflection_pass &&
            m_desc.reflection_raster == next.m_desc.reflection_raster &&
@@ -227,6 +231,7 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.camera_override = next.m_desc.camera_override;
     m_desc.use_active_camera_for_uniforms = next.m_desc.use_active_camera_for_uniforms;
     m_desc.use_active_camera_for_parallax = next.m_desc.use_active_camera_for_parallax;
+    m_desc.suppress_destination_parallax = next.m_desc.suppress_destination_parallax;
     m_desc.model_space = next.m_desc.model_space;
     m_desc.reflection_pass = next.m_desc.reflection_pass;
     m_desc.reflection_raster = next.m_desc.reflection_raster;
@@ -1472,15 +1477,32 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
              camera_override = m_desc.camera_override,
              use_active_camera_for_uniforms = m_desc.use_active_camera_for_uniforms,
              use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax,
+             suppress_destination_parallax = m_desc.suppress_destination_parallax,
              model_space = m_desc.model_space,
              reflection_pass = m_desc.reflection_pass,
              reflection_raster = m_desc.reflection_raster,
              reflection_snapshot = m_desc.reflection_snapshot,
              effect_snapshot_camera = m_desc.effect_snapshot_camera,
+             uniform_writes = &m_trace_uniform_writes,
              textures = &m_desc.textures]() {
-                auto update_unf_op = [block, buf, bufref, extension](
+                const bool trace_uniforms =
+                    std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr &&
+                    std::getenv("WESCENE_TRACE_RENDER_UNIFORMS") != nullptr;
+                uniform_writes->clear();
+                auto update_unf_op = [block, buf, bufref, extension, trace_uniforms, uniform_writes](
                                          std::string_view name, wallpaper::ShaderValue value) {
                     if (block) UpdateShaderDrawUniform(buf, *bufref, *block, name, value);
+                    if (trace_uniforms && block) {
+                        const auto member = block->member_map.find(name);
+                        if (member != block->member_map.end()) {
+                            // Record only writes admitted by the visible executable's layout.
+                            // Extension-only uniforms use separate buffers and cannot establish
+                            // what this draw consumed. Keep reflected and packed sizes distinct
+                            // so compact matrices and strided arrays retain their upload meaning.
+                            uniform_writes->push_back({std::string(name), value,
+                                member->second.offset, member->second.size});
+                        }
+                    }
                     if (extension != nullptr) extension->updateUniform(buf, name, value);
                 };
                 if (material != nullptr) {
@@ -1492,6 +1514,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     .use_camera_override = !camera_override.empty(),
                     .use_active_camera_for_uniforms = use_active_camera_for_uniforms,
                     .use_active_camera_for_parallax = use_active_camera_for_parallax,
+                    .suppress_destination_parallax = suppress_destination_parallax,
                     .model_space = model_space,
                     .reflection_pass = reflection_pass,
                     .reflection_raster = reflection_raster,
@@ -1817,6 +1840,26 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
                 const int binding = m_desc.vk_tex_binding[index];
                 TraceRenderCommandInput(rr, command, "sampler", m_desc.textures[index],
                     slots.getActive(), recorded_draw && binding >= 0, binding);
+            }
+            if (recorded_draw) {
+                for (const auto& write : m_trace_uniform_writes) {
+                    std::string values;
+                    for (size_t index = 0; index < write.value.size(); ++index) {
+                        char component[32];
+                        // Nine significant decimal digits round-trip every uploaded float.
+                        // Preserve the packed order, including matrix padding, rather than
+                        // transposing values into a presentation-specific matrix convention.
+                        std::snprintf(component, sizeof(component), "%.9g", write.value[index]);
+                        if (!values.empty()) values += ' ';
+                        values += component;
+                    }
+                    LOG_INFO("SceneRenderCommandUniform: frame=%llu command=%llu name='%s' "
+                             "offset=%zu reflected-bytes=%zu packed-bytes=%zu values=[%s]",
+                             static_cast<unsigned long long>(rr.trace_render_frame),
+                             static_cast<unsigned long long>(command), write.name.c_str(),
+                             write.offset, write.reflected_size,
+                             write.value.size() * sizeof(ShaderValue::value_type), values.c_str());
+                }
             }
         }
         // Pass-begin profiling also includes skipped draws. Log the execution decision and exact

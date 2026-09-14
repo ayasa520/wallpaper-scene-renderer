@@ -33,6 +33,11 @@ struct TextLayoutResult {
     std::array<float, 2> logical_size { 0.0f, 0.0f };
     std::array<float, 2> logical_source_size { 0.0f, 0.0f };
 
+    // Horizontal anchors use the shaped layout's unpadded width in scene units. Retain it
+    // independently of the padded card and backing resolution so background/effect padding
+    // cannot move the owner's draw matrix, effect snapshots, or private publication.
+    float alignment_width { 0.0f };
+
     // Glyph-only text can expose cropped glyph bounds as visible geometry, but placement still
     // belongs to `logical_size`. The cropped visible quad starts from its measured local offset from
     // that logical rectangle; WPTextLayer resolves the final mesh center from these crop metrics and

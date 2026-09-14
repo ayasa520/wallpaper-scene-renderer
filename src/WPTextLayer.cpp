@@ -1855,6 +1855,7 @@ bool GenerateTextLayoutImage(fs::VFS& vfs, wpscene::WPTextObject& object,
                                     cropped_display_size[0],
                                     cropped_display_size[1]);
     out_image->logical_size = full_display_size;
+    out_image->alignment_width = static_cast<float>(bounds_width);
     out_image->logical_source_size = {
         static_cast<float>(raster_width),
         static_cast<float>(raster_height),
@@ -1900,7 +1901,14 @@ Eigen::Vector3f AlignmentOffset(std::string_view alignment, std::array<float, 2>
 }
 
 std::array<float, 2> ResolveTextPlacementDisplaySize(const TextLayerRuntimeState& state) {
-    if (state.primitive != nullptr) return state.primitive->layout.logical_size;
+    if (state.primitive != nullptr) {
+        const auto& layout = state.primitive->layout;
+        // Horizontal placement follows the shaped width rather than the padded background or
+        // effect card. Keeping that metric in the canonical layout also makes a relayout update
+        // the node anchor when its shaped width changes without changing its padded card size.
+        // Vertical placement is a separate layout metric and does not consume this width.
+        return { layout.alignment_width, layout.logical_size[1] };
+    }
     return state.object.size;
 }
 
@@ -2646,6 +2654,7 @@ TextLayoutResult BuildCanonicalTextLayoutResult(
     const TextRasterLayoutResult& generated) {
     TextLayoutResult result;
     result.logical_size = generated.logical_size;
+    result.alignment_width = generated.alignment_width;
     result.logical_source_size = generated.logical_source_size;
     result.glyph_display_size = generated.glyph_display_size;
     result.glyph_source_size = generated.glyph_source_size;
@@ -3015,7 +3024,7 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
                  "logical-display=[%.3f %.3f] logical-source=[%.3f %.3f] "
                  "glyph-display=[%.3f %.3f] glyph-source=[%.3f %.3f] "
                  "glyph-offset=[%.3f %.3f] display-offset=[%.3f %.3f] "
-                 "source-crop=[%.3f %.3f %.3f %.3f]",
+                 "source-crop=[%.3f %.3f %.3f %.3f] alignment-width=%.3f",
                  object.id,
                  object.name.c_str(),
                  render_contract.RequiresBridge() ? "true" : "false",
@@ -3046,7 +3055,8 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
                  layout.glyph_source_crop[0],
                  layout.glyph_source_crop[1],
                  layout.glyph_source_crop[2],
-                 layout.glyph_source_crop[3]);
+                 layout.glyph_source_crop[3],
+                 layout.alignment_width);
     }
 
     *out_primitive = std::move(primitive);

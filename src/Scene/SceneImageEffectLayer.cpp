@@ -265,10 +265,12 @@ bool SceneImageEffectLayer::CopyBackground() const {
 SceneImageEffectLayer::SourcePolicy SceneImageEffectLayer::SourceContributionPolicy() const {
     if (UsesShapeDraw()) return SourcePolicy::None;
     if (!m_owner.Passthrough()) return SourcePolicy::OwnerNode;
-    // Fullscreen keeps its framebuffer source. Other compositions choose the background card or
-    // transparent clear from the owner's current copybackground property, independently of child
-    // count and dependency publication.
-    if (m_fullscreen || CopyBackground()) return SourcePolicy::OwnerNodeAndProxyChildren;
+    // Passthrough source admission follows copybackground independently of raster size. A
+    // fullscreen composition preserves incoming child matrices, but still starts from transparent
+    // when background copying is disabled. Sampling the owner's framebuffer in that state would
+    // publish unrelated scene content again. Child count and private publication do not change
+    // which source contributions belong to this composition.
+    if (CopyBackground()) return SourcePolicy::OwnerNodeAndProxyChildren;
     return SourcePolicy::ProxyChildrenOnly;
 }
 

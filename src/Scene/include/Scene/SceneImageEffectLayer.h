@@ -287,8 +287,13 @@ public:
     void AddEffectRenderTarget(std::string name, uint32_t scale, uint32_t fit);
     bool ResizeEffectRenderTargets(Scene& scene, std::array<float, 2> source_extent);
     bool        CopyBackground() const;
-    AlphaWritePolicy CompositionChildAlphaWritePolicy() const {
-        return CopyBackground() ? AlphaWritePolicy::Preserve : AlphaWritePolicy::Max;
+    AlphaWritePolicy CompositionChildAlphaWritePolicy(AlphaWritePolicy enclosing_policy) const {
+        // A copied background does not start an alpha accumulation scope, but its children
+        // still participate in any enclosing transparent composition. Keep that inherited
+        // policy until this child traversal finishes. A transparent source adds MAX for its
+        // own children; the caller's separate route retains the enclosing policy for siblings
+        // and the owner's final draw after this scope ends.
+        return CopyBackground() ? enclosing_policy : AlphaWritePolicy::Max;
     }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
     void SetTransparentCompositionBlend(BlendMode blend) {

@@ -36,6 +36,9 @@ struct TextRasterLayoutResult {
     };
     // `logical_size` describes the authored text box in scene/display units.
     std::array<float, 2>   logical_size { 0.0f, 0.0f };
+    // Preserve the completed shaped width before adding card padding or scaling the backing
+    // texture. Canonical layout and live node placement consume this horizontal anchor extent.
+    float                  alignment_width { 0.0f };
     // `logical_source_size` tracks the full logical backing resolution even when the glyph bitmap
     // itself is cropped smaller. We keep this around so the runtime can still reconstruct the
     // authored text-box bounds when the optional opaque background becomes visible.

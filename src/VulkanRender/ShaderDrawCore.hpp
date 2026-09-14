@@ -3,6 +3,7 @@
 #include "Interface/IShaderValueUpdater.h"
 #include "Resource.hpp"
 #include "Scene/Scene.h"
+#include "Scene/SceneShader.h"
 #include "SpriteAnimation.hpp"
 #include "Vulkan/Device.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
@@ -11,6 +12,7 @@
 #include "Vulkan/StagingBuffer.hpp"
 #include "VulkanPass.hpp"
 
+#include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
@@ -45,6 +47,7 @@ struct ShaderDrawRequest {
     std::string              camera_override;
     bool                     use_active_camera_for_uniforms { false };
     bool                     use_active_camera_for_parallax { false };
+    bool                     suppress_destination_parallax { false };
     ShaderModelSpace         model_space { ShaderModelSpace::Object };
     bool                     reflection_pass { false };
     bool                     reflection_raster { false };
@@ -198,6 +201,13 @@ public:
     const ShaderDrawData& data() const { return m_desc; }
 
 private:
+    struct TracedUniformWrite {
+        std::string name;
+        ShaderValue value;
+        std::size_t offset;
+        std::size_t reflected_size;
+    };
+
     ShaderDrawData       m_desc;
     // Keep the draw identity by value. A topology diff can retire the source node or the
     // object's publication resources before querying the old pass. The copied generation
@@ -209,6 +219,11 @@ private:
     SceneCullMode        m_material_cull { SceneCullMode::None };
     SceneAlphaWriting    m_material_alpha_writing { SceneAlphaWriting::Default };
     uint64_t             m_trace_draw_sequence { 0 };
+    // Uniform updates precede the shared staging upload and may also run during graph
+    // preparation. Retain optional per-pass writes until the actual draw is recorded,
+    // so diagnostics can associate current values with a submitted command instead of
+    // mistaking warmup or a repeated scene clock for another rendered invocation.
+    std::vector<TracedUniformWrite> m_trace_uniform_writes;
     ShaderDrawExtension* m_extension { nullptr };
 };
 

@@ -763,11 +763,14 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             !use_active_camera_for_uniforms &&
             has_named_camera_override && overrides->use_active_camera_for_parallax &&
             camera_node != nullptr;
+        const bool suppress_destination_parallax =
+            overrides != nullptr && overrides->suppress_destination_parallax;
         // Private material rasterization uses identity destination state; root displacement
         // belongs to the restored scene destination. Composition children also retain identity
         // destination state for the entire child walk. A source's nonzero owner depth must never
         // move its pixels inside a private target.
-        if (!geometry_space && !layer_snapshot && !composition_draw && hasNodeData &&
+        if (!geometry_space && !layer_snapshot && !composition_draw &&
+            !suppress_destination_parallax && hasNodeData &&
             (camera == m_scene->activeCamera || use_active_parallax_camera) &&
             m_nodeDataMap.at(draw.DataKey()).AppliesModelParallax()) {
             destinationOffset =

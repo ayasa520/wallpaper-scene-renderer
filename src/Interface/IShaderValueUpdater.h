@@ -40,6 +40,9 @@ struct ShaderUniformOverrides {
     // against the live active camera without permanently changing the node's authored camera.
     bool             use_active_camera_for_uniforms { false };
     bool             use_active_camera_for_parallax { false };
+    // A saved frame destination predates each layer's parallax displacement. Keep that
+    // selection local to this draw while retaining the raw owner and current frame eye.
+    bool             suppress_destination_parallax { false };
     ShaderModelSpace model_space { ShaderModelSpace::Object };
     // Frame vectors remain reflected inside private source/effect draws. Raster projection
     // follows the current destination, while effect snapshots follow the owner's incoming
