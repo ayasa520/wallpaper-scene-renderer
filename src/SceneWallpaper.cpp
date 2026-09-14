@@ -582,7 +582,7 @@ private:
         bool enabled { true };
         if (! msg->findBool("value", &enabled) || ! m_scene) return;
         if (m_scene->reflectionsEnabled == enabled) return;
-        m_scene->reflectionsEnabled = enabled;
+        m_scene->SetReflectionsEnabled(enabled);
         // Enabling the reflected invocation changes the ordered effect-command stream before
         // the main draw. Rebuild its bindings while retaining the registered reflection target.
         m_scene->MarkRenderGraphTopologyDirty();
@@ -1210,7 +1210,7 @@ void MainHandler::loadScene() {
                                      m_render_handler->textRenderScale(),
                                      m_render_handler->outputExtent(),
                                      m_postprocessing_quality);
-        scene->reflectionsEnabled = m_reflections_enabled;
+        scene->SetReflectionsEnabled(m_reflections_enabled);
         scene->volumetrics.quality = m_volumetrics_quality;
         scene->shadows.quality     = m_shadows_quality;
         m_loaded_material_hdr     = scene->UsesHdrMaterials();

@@ -79,6 +79,10 @@ public:
 
     std::optional<ImageParameters> Query(std::string_view key, TextureKey content_hash,
                                          bool persist = false);
+    // A generation identifies a physical allocation for the lifetime of this cache.
+    // Pass recreation and pooled reuse retain it; replacement assigns a new value even
+    // if the driver reuses a handle. Query must establish the key before this lookup.
+    uint64_t RenderTargetGeneration(std::string_view key) const;
 
     void RecordUploads(vvk::CommandBuffer&);
     void RetireCompletedUploads();
@@ -114,11 +118,13 @@ private:
         bool               persist { false };
         TextureKey         content_key;
         TexHash            content_hash { 0 };
+        uint64_t           generation { 0 };
         VmaImageParameters image;
         Set<std::string>   query_keys;
     };
     std::vector<std::unique_ptr<QueryTex>> m_query_texs;
     Map<std::string, QueryTex*>            m_query_map;
+    uint64_t                              m_render_target_generation { 0 };
     std::vector<TextureCachePendingImageUpload>       m_pending_image_uploads;
     std::vector<TextureCachePendingImageUpload>       m_inflight_image_uploads;
     std::vector<TextureCachePendingRenderTargetClear> m_pending_render_target_clears;

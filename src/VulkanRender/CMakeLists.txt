@@ -3,6 +3,7 @@ set(LIB_NAME wpVulkanRender)
 add_library(${LIB_NAME}
 STATIC
 ClearPass.cpp
+MipHistoryPass.cpp
 CopyPass.cpp
 CustomShaderPass.cpp
 VolumetricsSingleFillPass.cpp

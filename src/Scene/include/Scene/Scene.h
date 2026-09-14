@@ -411,6 +411,14 @@ public:
     // The reflection quality setting gates the mirrored producer pass that populates
     // _rt_Reflection. The render target stays registered when receivers exist.
     bool                 reflectionsEnabled { true };
+    void SetReflectionsEnabled(bool enabled) {
+        // Keep disable events even when quality is re-enabled before another frame is
+        // submitted. An existing mip history still needs its requested reset before
+        // either traversal can sample it; graph construction must not consume the event.
+        if (reflectionsEnabled && !enabled) ++m_reflection_disable_revision;
+        reflectionsEnabled = enabled;
+    }
+    uint64_t ReflectionDisableRevision() const { return m_reflection_disable_revision; }
     // A graph containing FBO swaps plans command bindings from the admitted owner sequence.
     // Parent or owner visibility changes must rebuild that plan before the next submission,
     // even when two invocations cancel their swaps and leave persistent history unchanged.
@@ -625,6 +633,7 @@ public:
 private:
     bool ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible);
 
+    uint64_t m_reflection_disable_revision { 0 };
     std::unordered_map<std::string, std::shared_ptr<std::string>> m_system_texture_bindings;
 
     struct UserTextureBinding {

@@ -27,9 +27,19 @@ struct ModelDepthAttachment {
     VkImageLayout layout { VK_IMAGE_LAYOUT_UNDEFINED };
 };
 
+struct MipHistoryState {
+    // This state follows the physical texture, independently of graph/pass residency.
+    // Preparation may register a new allocation and its pending creation clear, but
+    // only a submitted clear advances the applied revision or consumes that request.
+    uint64_t generation { 0 };
+    uint64_t submitted_disable_revision { 0 };
+    bool     creation_clear_pending { false };
+};
+
 struct RenderingResources {
     Scene* scene { nullptr };
     bool   msaa_compose_dirty { false };
+    MipHistoryState mip_history;
 
     // Command diagnostics follow the renderer lifetime rather than graph/pass objects,
     // which can be replaced while the same physical targets remain live across frames.

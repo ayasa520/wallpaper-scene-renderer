@@ -574,6 +574,7 @@ void VulkanRender::Impl::destroy() {
 }
 
 bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
+    rr.mip_history = {};
     rr.command = m_render_cmd;
     VVK_CHECK_BOOL_RE(m_device->handle().CreateFence(
         VkFenceCreateInfo {

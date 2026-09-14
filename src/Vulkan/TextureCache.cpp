@@ -1069,6 +1069,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             } else {
                 if (auto opt = CreateTex(content_hash); opt.has_value()) {
                     query->image        = std::move(opt.value());
+                    query->generation   = ++m_render_target_generation;
                     query->content_key  = content_hash;
                     query->content_hash = tex_hash;
                     query->share_ready  = false;
@@ -1113,10 +1114,15 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
     query.persist = persist;
     if (auto opt = CreateTex(content_hash); opt.has_value()) {
         query.image = std::move(opt.value());
+        query.generation = ++m_render_target_generation;
         queue_initial_clear(query.image);
         return query.image;
     }
     return std::nullopt;
+}
+
+uint64_t TextureCache::RenderTargetGeneration(std::string_view key) const {
+    return m_query_map.at(std::string(key))->generation;
 }
 
 void TextureCache::MarkShareReady(std::string_view key) {

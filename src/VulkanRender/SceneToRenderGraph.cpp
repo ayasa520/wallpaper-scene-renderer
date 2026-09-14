@@ -121,6 +121,20 @@ static TexNode::Desc createTexDesc(std::string path, const Scene* scene = nullpt
                                                                       : TexNode::TexType::Imported };
 }
 
+void addMipHistoryPass(RenderGraph& rgraph, Scene& scene) {
+    auto submission = std::make_shared<vulkan::MipHistoryPass::Submission>();
+    rgraph.addPass<vulkan::MipHistoryPass>(
+        "mip_history", PassNode::Type::Clear,
+        [&scene, submission](RenderGraphBuilder& builder, vulkan::MipHistoryPass::Desc& desc) {
+            auto* target = builder.createTexNode(
+                createTexDesc(std::string(WE_MIP_MAPPED_FRAME_BUFFER), &scene), true);
+            builder.write(target);
+            desc.target = target->key();
+            desc.submission = submission;
+        });
+    rgraph.onFrameSubmitted([submission]() { submission->Commit(); });
+}
+
 void addShadowAtlasPass(RenderGraph& rgraph, Scene* scene) {
     rgraph.addPass<vulkan::ShadowAtlasPass>(
         "shadow_atlas",
@@ -634,10 +648,16 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
                     desc.type = ! rg::IsRuntimeRenderTarget(&scene, url)
                         ? rg::TexNode::TexType::Imported
                         : rg::TexNode::TexType::Temp;
+                    if (url == WE_MIP_MAPPED_FRAME_BUFFER && !extra.use_mipmap_framebuffer) {
+                        // Discover admission from the selected sampler and install its first
+                        // writer before creating the read edge. Adding initialization after
+                        // the walk would create a later version and leave cold consumers ahead
+                        // of the clear; scenes without a reader allocate no mip history here.
+                        rg::addMipHistoryPass(rgraph, scene);
+                        extra.use_mipmap_framebuffer = true;
+                    }
                     input     = builder.createTexNode(desc);
                     if (rg::IsRuntimeRenderTarget(&scene, url)) builder.markVirtualWrite(input);
-                    if (sstart_with(url, WE_MIP_MAPPED_FRAME_BUFFER))
-                        extra.use_mipmap_framebuffer = true;
                 }
 
                 if (url == output_key) {
@@ -1268,7 +1288,8 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                                             .type = rg::TexNode::TexType::Temp },
                         rg::TexNode::Desc { .name = WE_MIP_MAPPED_FRAME_BUFFER.data(),
                                             .key  = WE_MIP_MAPPED_FRAME_BUFFER.data(),
-                                            .type = rg::TexNode::TexType::Temp });
+                                            .type = rg::TexNode::TexType::Temp },
+                        [&scene]() { return scene.reflectionsEnabled; });
     }
 
     if (scene.volumetrics.active && !scene.volumetrics.lights.empty()) {
