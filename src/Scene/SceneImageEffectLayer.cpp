@@ -590,6 +590,10 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
         // its authored materials for future visibility changes, but resolve the live chain from
         // only the visible sequence so its final geometry and matrix segment remain consistent.
         if (!eff->LocalVisible()) continue;
+        // An empty visible effect contributes to the initial source-slot parity, but it never
+        // binds a destination or completes an ordered record. Keep the current input pair so
+        // later effects and private publication consume the image that was actually written.
+        if (eff->nodes.empty() && eff->commands.empty()) continue;
         // Each compose marker advances the pair within this effect. Resolve material inputs and
         // commands at their authored positions so `previous` follows the last completed step;
         // resolving every binding at effect entry would make later steps resample the old input.
@@ -684,6 +688,10 @@ void SceneImageEffectLayer::ResolveEffectMatrixPhases(bool keep_final_private) {
             for (auto& command : effect->commands) command.uses_final_destination = false;
             continue;
         }
+        // Phase selection counts executed completions. An empty visible entry vector leaves
+        // its initial counted step outstanding; consuming it here would move a later material
+        // into the enclosing destination before that material's private work is complete.
+        if (effect->nodes.empty() && effect->commands.empty()) continue;
         i32 position = 0;
         const auto advance_commands_at = [&](i32 boundary) {
             for (auto& command : effect->commands) {
