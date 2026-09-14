@@ -38,6 +38,7 @@ std::array<std::string, 2> ResolveSceneDestinationRenderTargets(
 
 // Named-RT lookup keys only the string. A hit returns the existing resource without applying the
 // later caller's dimensions; a miss registers `target` under `name`.
+// The shared storage remains persistent when any caller requires retained contents.
 const SceneRenderTarget& InternNamedRenderTarget(Scene& scene, const std::string& name,
                                                  SceneRenderTarget target);
 

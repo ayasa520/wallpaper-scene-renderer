@@ -144,6 +144,12 @@ const SceneRenderTarget& InternNamedRenderTarget(Scene& scene, const std::string
     // `try_emplace` makes the first-registration rule explicit and prevents a later hidden
     // language branch from silently replacing the descriptor shared by an earlier branch.
     const auto [it, inserted] = scene.renderTargets.try_emplace(name, target);
+    // Storage retention is a requirement of every user of the shared name, independent
+    // of which declaration supplied its dimensions. A seed-only effect can register a
+    // transient target before a feedback effect requests the same image. Once any caller
+    // needs retained contents, neither final-reader release nor a later transient
+    // declaration may return that image to the reusable pool between submissions.
+    it->second.allowReuse = it->second.allowReuse && target.allowReuse;
     if (! inserted &&
         (it->second.width != target.width || it->second.height != target.height ||
          it->second.ContentWidth() != target.ContentWidth() ||

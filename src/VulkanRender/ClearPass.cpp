@@ -18,6 +18,20 @@ std::string ClearPass::residencyKey() const {
     return "ClearPass|target=" + m_desc.target;
 }
 
+void ClearPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
+    const auto& next = static_cast<const ClearPass&>(next_pass);
+    // Residency matching preserves the target identity, but a rebuilt graph can assign
+    // this clear to a different traversal. For example, removing the reflected walk can
+    // hand its resident clear to the main walk, whose execution must remain independent
+    // of reflection enablement. Replace every graph-owned clear decision while retaining
+    // the prepared image; the normal resource refresh binds this graph's target image.
+    m_desc.clear_value              = next.m_desc.clear_value;
+    m_desc.should_execute           = next.m_desc.should_execute;
+    m_desc.use_scene_clear_color     = next.m_desc.use_scene_clear_color;
+    m_desc.should_clear_color        = next.m_desc.should_clear_color;
+    m_desc.should_clear_model_depth  = next.m_desc.should_clear_model_depth;
+}
+
 bool ClearPass::referencesRenderTarget(std::string_view render_target) const {
     return m_desc.target == render_target;
 }

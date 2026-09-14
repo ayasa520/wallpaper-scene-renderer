@@ -83,11 +83,16 @@ void RenderGraphBuilder::markVirtualWrite(TexNode* tex) {
 TexNode* RenderGraphBuilder::createTexNode(const TexNode::Desc& desc, bool write) {
     TexNode* node {nullptr};
     if(exists(m_rg.m_key_texnode, desc.key)) {
-        auto* old = m_rg.getTexNode(m_rg.m_key_texnode.at(desc.key));
-        if( write && old->writer() != nullptr) {
+        if(write) {
+            // An existing node can represent retained contents read before this frame's
+            // first writer. Those reads must keep their original generation even when it
+            // has no graph-local writer. Reusing that node would make an earlier feedback
+            // copy depend on a later draw, potentially closing a cycle through both walks.
+            // Every new write therefore gets a successor; write() orders it after the
+            // preceding generation's readers before any of those contents are replaced.
             node = createNewTexNode(desc);
         } else {
-            node = old;
+            node = m_rg.getTexNode(m_rg.m_key_texnode.at(desc.key));
         }
     } else {
         node = createNewTexNode(desc);
