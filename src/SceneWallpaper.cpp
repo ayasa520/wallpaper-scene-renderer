@@ -757,11 +757,20 @@ private:
             ok = false;
         }
         if (ok) {
+            const bool extent_changed = m_output_width != request->width ||
+                                        m_output_height != request->height;
             m_output_width  = request->width;
             m_output_height = request->height;
-            if (m_scene && m_scene->scriptHost) {
-                m_scene->scriptHost->ResizeScreen(static_cast<int32_t>(m_output_width),
-                                                  static_cast<int32_t>(m_output_height));
+            if (m_scene && extent_changed) {
+                // Resize callbacks observe the new screen-target metadata and
+                // projection through the existing scene. Refresh GPU bindings on
+                // the next draw after these callbacks have finished, preserving
+                // fixed targets, script state and the current camera-path cursor.
+                m_render->resizeSceneOutput(*m_scene, m_fillmode);
+                if (m_scene->scriptHost) {
+                    m_scene->scriptHost->ResizeScreen(static_cast<int32_t>(m_output_width),
+                                                      static_cast<int32_t>(m_output_height));
+                }
             }
         }
         request->result.set_value(ok);

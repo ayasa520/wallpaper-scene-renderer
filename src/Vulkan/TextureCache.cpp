@@ -80,6 +80,20 @@ void TraceTextureUpload(const char* action, std::string_view key, const ImagePar
              image.mipmap_level, static_cast<int>(old_layout));
 }
 
+void TraceRenderTargetAllocation(const char* action, std::string_view key,
+                                 const ImageParameters& image, uint64_t generation,
+                                 bool persistent) {
+    if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") == nullptr) return;
+    // A numeric image handle may recur after retirement. Record the allocation's
+    // generation when a key is created, replaced or assigned shared storage so
+    // retained history can be joined to the actual submitted image lifetime.
+    LOG_INFO("TextureRenderTargetAllocation: action=%s key='%.*s' generation=%llu "
+             "image=%p extent=%ux%u persistent=%s",
+             action, static_cast<int>(key.size()), key.data(),
+             static_cast<unsigned long long>(generation), reinterpret_cast<void*>(image.handle),
+             image.extent.width, image.extent.height, persistent ? "true" : "false");
+}
+
 constexpr uint32_t kDefaultDmabufFourcc = DRM_FORMAT_ABGR8888;
 constexpr VkFormatFeatureFlags2 kRequiredDmabufFeatures =
     static_cast<VkFormatFeatureFlags2>(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) |
@@ -1078,6 +1092,8 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
                     query->query_keys.insert(key_string);
                     m_query_map[key_string] = query;
                     queue_initial_clear(query->image);
+                    TraceRenderTargetAllocation("replace", key, query->image, query->generation,
+                                                query->persist);
                     return query->image;
                 }
                 return std::nullopt;
@@ -1100,6 +1116,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
 
         m_query_map[key_string] = &(*query);
 
+        TraceRenderTargetAllocation("share", key, query->image, query->generation, query->persist);
         return query->image;
     }
 
@@ -1116,6 +1133,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
         query.image = std::move(opt.value());
         query.generation = ++m_render_target_generation;
         queue_initial_clear(query.image);
+        TraceRenderTargetAllocation("create", key, query.image, query.generation, query.persist);
         return query.image;
     }
     return std::nullopt;

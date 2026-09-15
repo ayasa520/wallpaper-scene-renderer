@@ -162,7 +162,7 @@ struct VulkanRender::Impl {
     bool drainOffscreenFrame();
     int  m_compiled_msaa_samples { -1 };
     void dropCompiledPassFramebuffers();
-    void setRenderTargetSize(Scene&, rg::RenderGraph&);
+    void setRenderTargetSize(Scene&);
     bool isDeviceFaultResult(VkResult) const;
     bool checkVkResult(VkResult, const char* operation);
     void abandonDeviceOwnedResourcesAfterFault();
@@ -270,6 +270,14 @@ void VulkanRender::warmupRenderGraphPipelines(Scene& scene, rg::RenderGraph& rg)
 void VulkanRender::refreshImportedTextures(Scene& scene) {
     pImpl->refreshImportedTextures(scene);
 };
+void VulkanRender::resizeSceneOutput(Scene& scene, wallpaper::FillMode fill) {
+    // Publish output-dependent scene metadata before the retained script host
+    // receives its resize event. The next ordinary draw refreshes affected GPU
+    // state after callback mutations; none of this advances scene or path time.
+    pImpl->UpdateCameraFillMode(scene, fill);
+    pImpl->setRenderTargetSize(scene);
+    scene.MarkRenderGraphResourcesDirty();
+}
 void VulkanRender::UpdateCameraFillMode(Scene& scene, wallpaper::FillMode fill) {
     pImpl->UpdateCameraFillMode(scene, fill);
 };
@@ -705,6 +713,12 @@ bool VulkanRender::Impl::reconfigureOffscreenExport(
                                                 export_drm_fourcc,
                                                 export_drm_modifiers,
                                                 memory_preference);
+    if (ok) {
+        // Framebuffer sizing, projection and the final output pass all consume
+        // this extent. Publish it only after the exported generation is ready so
+        // the retained scene cannot prepare against a failed replacement size.
+        m_device->set_out_extent(VkExtent2D { width, height });
+    }
     LOG_INFO("HanabiScene Vulkan: offscreen export reconfigure %s size=%ux%u "
              "fourcc=0x%08x modifier-count=%zu first-modifier=0x%016llx memory=%s",
              ok ? "succeeded" : "failed",
@@ -1164,7 +1178,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     }
 }
 
-void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) {
+void VulkanRender::Impl::setRenderTargetSize(Scene& scene) {
     SyncSceneMsaa(scene, *m_device);
     auto& ext = m_device->out_extent();
     for (auto& item : scene.renderTargets) {
@@ -1544,7 +1558,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     m_pass_loaded = false;
 
     if (refresh_resources_only && !m_passes.empty()) {
-        setRenderTargetSize(scene, rg);
+        setRenderTargetSize(scene);
 
         const auto dirty_render_targets = scene.dirtyRenderTargetKeys;
         const auto dirty_imported_textures = scene.dirtyImportedTextureResourceKeys;
@@ -1690,7 +1704,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
 
     m_passes.push_back(m_finpass.get());
 
-    setRenderTargetSize(scene, rg);
+    setRenderTargetSize(scene);
 
     std::size_t reused_refreshed_count = 0;
     std::size_t refreshed_count = 0;
@@ -1713,7 +1727,12 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     }
     for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
         auto* p = m_passes[pass_index];
-        if (p != nullptr && reused_passes.count(p) != 0 && p->prepared()) {
+        // The final presentation pass is renderer-owned, outside graph residency. A topology
+        // change can coincide with output replacement, so refresh this retained pass alongside
+        // reused graph passes. It must bind the current scene result image while preserving its
+        // fullscreen pipeline and mesh, even when every graph-owned pass is newly constructed.
+        if (p != nullptr && p->prepared() &&
+            (reused_passes.count(p) != 0 || p == m_finpass.get())) {
             p->refreshResources(scene, *m_device, m_rendering_resources);
             reused_refreshed_count++;
         }
@@ -1768,7 +1787,7 @@ void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGrap
     const auto started_at = std::chrono::steady_clock::now();
     auto       nodes      = rg.topologicalOrder();
 
-    setRenderTargetSize(scene, rg);
+    setRenderTargetSize(scene);
 
     std::size_t pipeline_passes = 0;
     std::size_t warmed_passes   = 0;
