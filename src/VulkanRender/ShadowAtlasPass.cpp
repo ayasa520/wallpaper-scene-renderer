@@ -347,7 +347,54 @@ bool ShadowAtlasPass::ensureFramebuffer(const Device& device) {
 
 void ShadowAtlasPass::releaseCasters() {
     m_draws.clear();
+    // Caster refresh and pass destruction run after the preceding submission completes.
+    // Release the ranges without touching their nodes: topology removal may already have
+    // destroyed those nodes, while the pass still owns its final submitted allocations.
+    for (auto& caster : m_casters) {
+        if (caster.vertex_buffer) m_dyn_buf->unallocateSubRef(caster.vertex_buffer);
+        if (caster.index_buffer) m_dyn_buf->unallocateSubRef(caster.index_buffer);
+    }
     m_casters.clear();
+}
+
+bool ShadowAtlasPass::updateCasterGeometry(CasterMesh& caster) {
+    const auto& mesh = *caster.node->Mesh();
+    const auto revision = mesh.DataRevision();
+    if (caster.uploaded_mesh_revision == revision) return true;
+
+    // Every caster owns its upload ranges, even when multiple owners share CPU geometry.
+    // Observe the payload revision independently of the dirty flag consumed by color draws.
+    // The renderer completes the previous submission before this pre-upload hook, so a
+    // larger or removed range can retire here without invalidating an in-flight draw.
+    auto upload = [&](StagingBufferRef& range, std::span<const uint8_t> bytes) {
+        if (bytes.empty()) {
+            if (range) m_dyn_buf->unallocateSubRef(range);
+            return true;
+        }
+        if (range && range.size < bytes.size()) m_dyn_buf->unallocateSubRef(range);
+        if (! range &&
+            ! m_dyn_buf->allocateSubRef(bytes.size(), range, sizeof(uint32_t))) return false;
+        return m_dyn_buf->writeToBuf(range, bytes);
+    };
+
+    const auto& vertex = mesh.GetVertexArray(0);
+    if (! upload(caster.vertex_buffer,
+                 { reinterpret_cast<const uint8_t*>(vertex.Data()), vertex.DataSizeOf() })) return false;
+
+    const auto index_count = mesh.LogicalIndexCount();
+    const auto index_bytes = static_cast<size_t>(index_count) * mesh.IndexElementBytes();
+    std::span<const uint8_t> indices;
+    if (index_bytes > 0) {
+        indices = { reinterpret_cast<const uint8_t*>(mesh.GetIndexArray(0).Data()), index_bytes };
+    }
+    if (! upload(caster.index_buffer, indices)) return false;
+
+    caster.vertex_count = static_cast<uint32_t>(vertex.VertexCount());
+    caster.index_count = index_count;
+    caster.index_element_bytes = mesh.IndexElementBytes();
+    caster.indexed = index_count > 0;
+    caster.uploaded_mesh_revision = revision;
+    return true;
 }
 
 void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, RenderingResources& rr) {
@@ -377,12 +424,17 @@ void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, Renderi
             }
         }
 
-        auto gpu = rr.immutable_meshes.getOrCreate(device, mesh);
-        if (! gpu || gpu->vertices.empty() || ! gpu->vertices.front()) return;
-
         CasterMesh caster;
+        // Only file payloads have a permanent uploaded representation. Generated geometry
+        // remains CPU-owned and can publish new bytes without changing its shared identity;
+        // stage those bytes from updateBeforeUpload before any shadow command is recorded.
+        caster.pooled_geometry = ! mesh.FileImmutable();
+        if (! caster.pooled_geometry) {
+            caster.mesh = rr.immutable_meshes.getOrCreate(device, mesh);
+            if (! caster.mesh || caster.mesh->vertices.empty() ||
+                ! caster.mesh->vertices.front()) return;
+        }
         caster.node             = &node;
-        caster.mesh             = std::move(gpu);
         caster.stride           = static_cast<uint32_t>(vertex.OneSizeOf());
         caster.position_offset  = static_cast<uint32_t>(position_it->second.offset);
         caster.bone_count       = bone_count;
@@ -395,7 +447,8 @@ void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, Renderi
         caster.vertex_count     = static_cast<uint32_t>(vertex.VertexCount());
         caster.index_element_bytes = mesh.IndexElementBytes();
         caster.index_count      = mesh.LogicalIndexCount();
-        caster.indexed          = caster.mesh->has_index && caster.index_count > 0;
+        caster.indexed          = caster.index_count > 0 &&
+                                  (caster.pooled_geometry || caster.mesh->has_index);
         m_casters.push_back(std::move(caster));
     });
 }
@@ -570,8 +623,15 @@ void ShadowAtlasPass::refreshResources(Scene& scene, const Device& device, Rende
 }
 
 void ShadowAtlasPass::updateBeforeUpload() {
-    rebuildDrawList();
     if (m_dyn_buf == nullptr) return;
+    for (auto& caster : m_casters) {
+        if (caster.pooled_geometry && ! updateCasterGeometry(caster)) {
+            LOG_ERROR("ShadowAtlas: geometry upload failed node='%s'", caster.node->Name().c_str());
+            m_draws.clear();
+            return;
+        }
+    }
+    rebuildDrawList();
 
     VkDeviceSize bytes = 0;
     for (auto& draw : m_draws) {
@@ -635,8 +695,17 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
     for (const auto& draw : m_draws) {
         if (draw.caster_index >= m_casters.size()) continue;
         const auto& caster = m_casters[draw.caster_index];
-        if (! caster.mesh || caster.mesh->vertices.empty()) continue;
-        VkBuffer gpu = caster.mesh->vertices.front().handle();
+        VkBuffer gpu;
+        VkDeviceSize vertex_offset;
+        if (caster.pooled_geometry) {
+            if (! caster.vertex_buffer || caster.vertex_count == 0) continue;
+            gpu = m_dyn_buf->gpuBuf();
+            vertex_offset = caster.vertex_buffer.offset;
+        } else {
+            if (! caster.mesh || caster.mesh->vertices.empty()) continue;
+            gpu = caster.mesh->vertices.front().handle();
+            vertex_offset = 0;
+        }
         if (gpu == VK_NULL_HANDLE) continue;
         if (! ensurePipeline(device, rr, caster)) continue;
         const auto pipeline_key = ShadowVertexLayoutKey(caster.stride,
@@ -691,13 +760,16 @@ void ShadowAtlasPass::execute(const Device& device, RenderingResources& rr) {
                                             write);
         }
 
-        const VkDeviceSize off = 0;
-        rr.command.BindVertexBuffers(0, 1, &gpu, &off);
-        if (caster.indexed && caster.mesh->has_index) {
+        rr.command.BindVertexBuffers(0, 1, &gpu, &vertex_offset);
+        if (caster.indexed) {
             const VkIndexType index_type = caster.index_element_bytes == 4
                                                ? VK_INDEX_TYPE_UINT32
                                                : VK_INDEX_TYPE_UINT16;
-            rr.command.BindIndexBuffer(caster.mesh->index.handle(), 0, index_type);
+            const VkBuffer index_buffer = caster.pooled_geometry
+                                              ? m_dyn_buf->gpuBuf()
+                                              : caster.mesh->index.handle();
+            const VkDeviceSize index_offset = caster.pooled_geometry ? caster.index_buffer.offset : 0;
+            rr.command.BindIndexBuffer(index_buffer, index_offset, index_type);
             rr.command.DrawIndexed(caster.index_count, 1, 0, 0, 0);
         } else {
             rr.command.Draw(caster.vertex_count, 1, 0, 0);

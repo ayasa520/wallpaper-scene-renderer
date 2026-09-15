@@ -51,6 +51,10 @@ private:
     struct CasterMesh {
         SceneNode*                        node { nullptr };
         std::shared_ptr<ImmutableMeshGpu> mesh;
+        StagingBufferRef                   vertex_buffer;
+        StagingBufferRef                   index_buffer;
+        uint64_t                          uploaded_mesh_revision { 0 };
+        bool                              pooled_geometry { false };
         uint32_t                          stride { 0 };
         uint32_t                          position_offset { 0 };
         uint32_t                          blend_indices_offset { 0 };
@@ -87,6 +91,7 @@ private:
     bool ensureFramebuffer(const Device&);
     void collectCasters(Scene&, const Device&, RenderingResources&);
     void releaseCasters();
+    bool updateCasterGeometry(CasterMesh&);
     void rebuildDrawList();
 
     Desc               m_desc;

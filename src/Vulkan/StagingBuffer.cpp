@@ -275,7 +275,7 @@ void StagingBuffer::unallocateSubRef(StagingBufferRef& ref) {
 
 VkResult StagingBuffer::mapStageBuf() { return m_stage_buf.handle.MapMemory(&m_stage_raw); }
 
-bool StagingBuffer::writeToBuf(const StagingBufferRef& ref, std::span<uint8_t> data,
+bool StagingBuffer::writeToBuf(const StagingBufferRef& ref, std::span<const uint8_t> data,
                                size_t offset) {
     CHECK_REF(ref, return false);
 

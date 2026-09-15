@@ -38,7 +38,7 @@ public:
 
     bool allocateSubRef(VkDeviceSize size, StagingBufferRef&, VkDeviceSize alignment = 1);
     void unallocateSubRef(StagingBufferRef&);
-    bool writeToBuf(const StagingBufferRef&, std::span<uint8_t>, size_t offset = 0);
+    bool writeToBuf(const StagingBufferRef&, std::span<const uint8_t>, size_t offset = 0);
     bool fillBuf(const StagingBufferRef& ref, size_t offset, size_t size, uint8_t c);
 
     bool recordUpload(vvk::CommandBuffer&);
