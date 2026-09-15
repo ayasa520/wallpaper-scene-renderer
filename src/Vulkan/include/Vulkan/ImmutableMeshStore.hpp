@@ -4,9 +4,9 @@
 #include "Parameters.hpp"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 namespace wallpaper
@@ -54,19 +54,23 @@ struct ImmutableMeshGpu {
     bool                            has_index { false };
 };
 
-// Static file meshes each own exact-size VB/IB pairs. The store de-duplicates by the mesh
-// storage object so a color pass and the shadow atlas bind the same GPU buffers after the
-// host vertex bytes have been dropped.
+// Static file meshes each own exact-size VB/IB pairs. Shared payload ownership identifies
+// storage so color and shadow passes bind the same buffers after host bytes are dropped.
+// Weak keys retain that identity until retirement without extending the payload lifetime.
 class ImmutableMeshStore : NoCopy, NoMove {
 public:
     std::shared_ptr<ImmutableMeshGpu> getOrCreate(const Device&, const SceneMesh&);
     void                              recordUploads(vvk::CommandBuffer&);
     void                              retireStaging();
+    // The caller must complete all submitted mesh uses before releasing dead entries.
+    // Visibility and the number of active draw passes do not determine payload lifetime.
+    void                              retireUnused();
     void                              clear();
     void                              abandon() noexcept;
 
 private:
-    std::unordered_map<const void*, std::shared_ptr<ImmutableMeshGpu>> m_meshes;
+    std::map<std::weak_ptr<const void>, std::shared_ptr<ImmutableMeshGpu>, std::owner_less<>>
+        m_meshes;
 };
 
 } // namespace vulkan

@@ -834,6 +834,7 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         return;
     m_device->tex_cache().RetireCompletedUploads();
     rr.immutable_meshes.retireStaging();
+    rr.immutable_meshes.retireUnused();
     if (rr.scene != nullptr) ReleaseUploadedFileMeshCpu(*rr.scene);
     if (!checkVkResult(rr.fence_frame.Reset(), "reset swapchain frame fence"))
         return;
@@ -842,9 +843,10 @@ void VulkanRender::Impl::drawFrameSwapchain() {
 /*
  * Deferred completion point of the previous offscreen submit. Runs at the
  * start of the next frame and before any operation that destroys or rewrites
- * GPU resources the in-flight submission may still reference. Staging
- * retirement lives here because it frees the buffers the deferred submission
- * reads; the pixel content of every published frame is unchanged.
+ * GPU resources the in-flight submission may still reference.
+ * Staging and unowned mesh retirement live here because both can free buffers
+ * the deferred submission reads. Live payload owners retain their mesh storage,
+ * including while hidden or between compiled draw passes.
  */
 bool VulkanRender::Impl::drainOffscreenFrame() {
     if (!m_offscreen_fence_pending) return true;
@@ -854,6 +856,7 @@ bool VulkanRender::Impl::drainOffscreenFrame() {
         return false;
     m_device->tex_cache().RetireCompletedUploads();
     rr.immutable_meshes.retireStaging();
+    rr.immutable_meshes.retireUnused();
     if (!checkVkResult(rr.fence_frame.Reset(), "reset deferred offscreen fence"))
         return false;
     return true;
@@ -1162,6 +1165,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=fence-wait-complete");
         m_device->tex_cache().RetireCompletedUploads();
         rr.immutable_meshes.retireStaging();
+        rr.immutable_meshes.retireUnused();
         if (!checkVkResult(rr.fence_frame.Reset(), "reset offscreen frame fence"))
             return;
     }

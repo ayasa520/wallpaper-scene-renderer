@@ -134,7 +134,10 @@ public:
 	// shared small static pool because they are authored at runtime and can be resized.
 	bool FileImmutable() const { return m_data->file_immutable; }
 	void SetFileImmutable(bool v) { m_data->file_immutable = v; }
-	const void* GpuStorageKey() const { return m_data.get(); }
+	// GPU storage follows the shared payload owner across mesh wrappers. A weak owner
+	// distinguishes a later allocation at the same address without keeping removed
+	// geometry alive; dropping uploaded CPU bytes leaves this ownership intact.
+	std::weak_ptr<const void> GpuStorageOwner() const { return m_data; }
 
 	bool HasBounds() const { return m_data->bounds_valid; }
 	const Eigen::Vector3f& BoundsMin() const { return m_data->bounds_min; }

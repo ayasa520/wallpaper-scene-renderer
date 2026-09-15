@@ -345,7 +345,10 @@ bool ShadowAtlasPass::ensureFramebuffer(const Device& device) {
     return true;
 }
 
-void ShadowAtlasPass::releaseCasters() { m_casters.clear(); }
+void ShadowAtlasPass::releaseCasters() {
+    m_draws.clear();
+    m_casters.clear();
+}
 
 void ShadowAtlasPass::collectCasters(Scene& scene, const Device& device, RenderingResources& rr) {
     releaseCasters();
@@ -536,7 +539,7 @@ void ShadowAtlasPass::prepare(Scene& scene, const Device& device, RenderingResou
     setPrepared();
 }
 
-void ShadowAtlasPass::refreshResources(Scene& scene, const Device& device, RenderingResources&) {
+void ShadowAtlasPass::refreshResources(Scene& scene, const Device& device, RenderingResources& rr) {
     m_desc.scene = &scene;
     if (scene.renderTargets.count(m_desc.target) == 0) {
         setPrepared(false);
@@ -551,6 +554,19 @@ void ShadowAtlasPass::refreshResources(Scene& scene, const Device& device, Rende
     m_desc.vk_target = opt.value();
     m_fb.reset();
     m_fb_extent = {};
+
+    // Target residency keeps this pass across scene topology changes, but its caster
+    // nodes belong to the current scene graph. Removed nodes have already been released
+    // when this hook runs. Replace the complete caster list before the next draw-list
+    // rebuild, preserving shared buffers for surviving payloads and preparing any new
+    // vertex layouts. The renderer has completed the preceding submission before refresh.
+    collectCasters(scene, device, rr);
+    for (const auto& caster : m_casters) {
+        if (! ensurePipeline(device, rr, caster)) {
+            setPrepared(false);
+            return;
+        }
+    }
 }
 
 void ShadowAtlasPass::updateBeforeUpload() {
@@ -695,7 +711,6 @@ void ShadowAtlasPass::destory(const Device&, RenderingResources&) {
     clearReleaseTexs();
     m_fb.reset();
     m_fb_extent = {};
-    m_draws.clear();
     if (m_dyn_buf != nullptr && m_ubo_buf) m_dyn_buf->unallocateSubRef(m_ubo_buf);
     releaseCasters();
     m_pipelines.clear();

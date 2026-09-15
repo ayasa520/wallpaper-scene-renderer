@@ -127,10 +127,9 @@ void ImmutableGpuBuffer::abandon() noexcept {
 std::shared_ptr<ImmutableMeshGpu> ImmutableMeshStore::getOrCreate(const Device& device,
                                                                   const SceneMesh& mesh) {
     if (mesh.VertexCount() == 0) return nullptr;
-    const void* key = mesh.GpuStorageKey();
-    if (key == nullptr) return nullptr;
+    const auto owner = mesh.GpuStorageOwner();
 
-    if (auto it = m_meshes.find(key); it != m_meshes.end()) return it->second;
+    if (auto it = m_meshes.find(owner); it != m_meshes.end()) return it->second;
     if (! mesh.HasCpuPayload()) return nullptr;
 
     auto gpu = std::make_shared<ImmutableMeshGpu>();
@@ -161,7 +160,7 @@ std::shared_ptr<ImmutableMeshGpu> ImmutableMeshStore::getOrCreate(const Device& 
         }
     }
 
-    m_meshes.emplace(key, gpu);
+    m_meshes.emplace(owner, gpu);
     return gpu;
 }
 
@@ -179,6 +178,13 @@ void ImmutableMeshStore::retireStaging() {
         for (auto& vertex : mesh->vertices) vertex.retireStaging();
         if (mesh->has_index) mesh->index.retireStaging();
     }
+}
+
+void ImmutableMeshStore::retireUnused() {
+    // A live payload can be hidden or temporarily have no compiled draw while its CPU
+    // bytes have already been released. Retain its GPU storage until the last actual
+    // payload owner disappears, independently of pass references and allocator addresses.
+    std::erase_if(m_meshes, [](const auto& entry) { return entry.first.expired(); });
 }
 
 void ImmutableMeshStore::clear() { m_meshes.clear(); }
