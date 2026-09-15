@@ -1,4 +1,6 @@
 #pragma once
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string_view>
 #include <functional>
@@ -62,9 +64,19 @@ public:
 
     void play();
     void pause();
-    void requestFrame();
+    // Posts one draw. Returns false when a draw is already outstanding (the request is dropped,
+    // matching the periodic timer's latest-frame contract).
+    bool requestFrame();
     void mouseInput(double x, double y);
     void mouseLeftButton(bool down);
+
+    // Lockstep capture support (see Core/Determinism.hpp). flush() returns once every message
+    // queued on the main and render loopers at call time has been handled; sceneLoaded() reports
+    // whether the render thread has installed the parsed scene; publishedFrameCount() counts
+    // frames made visible to the exported swapchain so a consumer can prove none were skipped.
+    bool     flush(std::chrono::milliseconds timeout);
+    bool     sceneLoaded() const;
+    uint64_t publishedFrameCount() const;
 
     void setPropertyBool(std::string_view, bool);
     void setPropertyInt32(std::string_view, int32_t);

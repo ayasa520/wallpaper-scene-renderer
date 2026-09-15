@@ -1485,9 +1485,13 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
              effect_snapshot_camera = m_desc.effect_snapshot_camera,
              uniform_writes = &m_trace_uniform_writes,
              textures = &m_desc.textures]() {
+                // Uniform writes are collected for the log (both trace variables set) and for
+                // the structural frame dump whenever a dump directory is configured; the dump
+                // decides per draw whether it consumes them.
                 const bool trace_uniforms =
-                    std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr &&
-                    std::getenv("WESCENE_TRACE_RENDER_UNIFORMS") != nullptr;
+                    (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr &&
+                     std::getenv("WESCENE_TRACE_RENDER_UNIFORMS") != nullptr) ||
+                    FrameTraceDump::Configured();
                 uniform_writes->clear();
                 auto update_unf_op = [block, buf, bufref, extension, trace_uniforms, uniform_writes](
                                          std::string_view name, wallpaper::ShaderValue value) {
@@ -1823,14 +1827,14 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
     // A named target can connect otherwise unrelated owners. Select both its producer and
     // consumers in the same process so the trace can compare actual GPU image identities,
     // execution gates and ordering without changing the render graph or reading pixels.
-    const bool trace_draw = rr.trace_render_commands || (trace_layer != nullptr &&
+    const bool trace_draw = RenderCommandTraceActive(rr) || (trace_layer != nullptr &&
         std::to_string(m_desc.layer_id) == trace_layer) ||
         (trace_target != nullptr && (m_desc.output == trace_target ||
             std::find(m_desc.textures.begin(), m_desc.textures.end(), trace_target) !=
                 m_desc.textures.end()));
     if (trace_draw) ++m_trace_draw_sequence;
     const auto trace_result = [&](const char* result) {
-        if (rr.trace_render_commands) {
+        if (RenderCommandTraceActive(rr)) {
             const bool recorded_draw = std::string_view(result) == "draw" && m_desc.draw_count > 0;
             const auto command = TraceRenderCommand(rr, "shader", result, m_desc.output,
                 m_desc.vk_output, m_desc.layer_id, m_desc.reflection_pass, m_desc.draw_count);
@@ -1843,6 +1847,9 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
             }
             if (recorded_draw) {
                 for (const auto& write : m_trace_uniform_writes) {
+                    rr.frame_trace_dump.addUniform(command, write.name, write.offset,
+                        write.reflected_size, write.value.data(), write.value.size());
+                    if (!rr.trace_render_commands) continue;
                     std::string values;
                     for (size_t index = 0; index < write.value.size(); ++index) {
                         char component[32];

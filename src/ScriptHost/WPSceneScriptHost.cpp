@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <limits>
 #include <optional>
@@ -20,6 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "Core/Determinism.hpp"
 #include "Scene/Scene.h"
 #include "Scene/include/Scene/SceneImageEffectLayer.h"
 #include "Scene/include/Scene/SceneMaterial.h"
@@ -2011,14 +2013,73 @@ std::optional<WPScriptValue> UserPropertyToScriptValue(const UserPropertyValue& 
     return std::nullopt;
 }
 
-double ComputeTimeOfDay() {
-    using clock         = std::chrono::system_clock;
-    const auto now_time = clock::to_time_t(clock::now());
-    const auto local    = std::localtime(&now_time);
-    if (local == nullptr) return 0.0;
+// Calendar clock behind engine.timeOfDay. `scene_runtime_seconds` is the scene clock; under a
+// fixed epoch (lockstep capture) the calendar clock is that epoch advanced by the scene clock,
+// so day/night bindings still move but identically on every run.
+std::time_t CalendarNow(double scene_runtime_seconds) {
+    if (const auto epoch = determinism::FixedEpoch()) {
+        return static_cast<std::time_t>(std::floor(*epoch + std::max(0.0, scene_runtime_seconds)));
+    }
+    using clock = std::chrono::system_clock;
+    return clock::to_time_t(clock::now());
+}
 
-    const auto seconds = ((local->tm_hour * 60) + local->tm_min) * 60 + local->tm_sec;
+double ComputeTimeOfDay(double scene_runtime_seconds) {
+    const std::time_t now_time = CalendarNow(scene_runtime_seconds);
+    std::tm           local {};
+    if (localtime_r(&now_time, &local) == nullptr) return 0.0;
+
+    const auto seconds = ((local.tm_hour * 60) + local.tm_min) * 60 + local.tm_sec;
     return static_cast<double>(seconds) / (24.0 * 60.0 * 60.0);
+}
+
+// Global-scope script installed before any wallpaper script when a fixed epoch or a random seed
+// is configured. It replaces the three built-ins whose values come from the process clock or the
+// hardware entropy source with versions fed by the scene clock and a seeded generator:
+//   Date / Date.now      -> fixed epoch + scene clock (milliseconds, from __wesceneClockMs)
+//   performance.now      -> scene clock in milliseconds
+//   Math.random          -> mulberry32 sequence from the configured seed
+// The host refreshes __wesceneClockMs on the global object every frame.
+std::string BuildDeterministicPrelude(std::optional<double> epoch_seconds,
+                                      std::optional<uint64_t> seed) {
+    std::ostringstream script;
+    script << "(function() {\n";
+    script << "  globalThis.__wesceneClockMs = 0;\n";
+    if (epoch_seconds) {
+        script << "  const __epochMs = " << std::fixed << std::setprecision(3)
+               << (*epoch_seconds * 1000.0) << ";\n"
+               << "  const __now = () => __epochMs + (globalThis.__wesceneClockMs || 0);\n"
+               << "  const __RealDate = Date;\n"
+               << "  function __SceneDate(...args) {\n"
+               << "    if (!new.target) return new __RealDate(__now()).toString();\n"
+               << "    if (args.length === 0) return new __RealDate(__now());\n"
+               << "    return new __RealDate(...args);\n"
+               << "  }\n"
+               << "  __SceneDate.prototype = __RealDate.prototype;\n"
+               << "  Object.setPrototypeOf(__SceneDate, __RealDate);\n"
+               << "  __SceneDate.now = __now;\n"
+               << "  __SceneDate.parse = __RealDate.parse;\n"
+               << "  __SceneDate.UTC = __RealDate.UTC;\n"
+               << "  globalThis.Date = __SceneDate;\n"
+               // performance.now is installed non-writable; the performance global itself is
+               // replaceable, so swap the whole object.
+               << "  globalThis.performance = {\n"
+               << "    now: () => (globalThis.__wesceneClockMs || 0),\n"
+               << "    timeOrigin: __epochMs\n"
+               << "  };\n";
+    }
+    if (seed) {
+        script << "  let __rng = " << static_cast<uint32_t>(*seed & 0xffffffffu) << " >>> 0;\n"
+               << "  Math.random = function() {\n"
+               << "    __rng = (__rng + 0x6D2B79F5) >>> 0;\n"
+               << "    let t = __rng;\n"
+               << "    t = Math.imul(t ^ (t >>> 15), t | 1);\n"
+               << "    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);\n"
+               << "    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;\n"
+               << "  };\n";
+    }
+    script << "})();\n";
+    return script.str();
 }
 
 } // namespace
@@ -8426,6 +8487,20 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     JSContext* context = m_impl->runtime.context;
     JS_SetContextOpaque(context, m_impl);
 
+    if (determinism::FixedEpoch() || determinism::RandomSeed()) {
+        // Install the pinned Date/performance/Math.random replacements before any wallpaper
+        // script is compiled so every script observes the same built-ins from its first statement.
+        const std::string prelude =
+            BuildDeterministicPrelude(determinism::FixedEpoch(), determinism::RandomSeed());
+        JSValue result = JS_Eval(context,
+                                 prelude.c_str(),
+                                 prelude.size(),
+                                 "<scene-script-deterministic-prelude>",
+                                 JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(result)) LogQuickJSException(context, "deterministic-prelude");
+        JS_FreeValue(context, result);
+    }
+
     m_impl->shared                  = JS_NewObject(context);
     m_impl->engine_base             = JS_NewObject(context);
     m_impl->console                 = JS_NewObject(context);
@@ -8695,7 +8770,7 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
         context, m_impl->engine_base, "frametime", JS_NewFloat64(context, 1.0 / 60.0));
     JS_SetPropertyStr(context, m_impl->engine_base, "runtime", JS_NewFloat64(context, 0.0));
     JS_SetPropertyStr(
-        context, m_impl->engine_base, "timeOfDay", JS_NewFloat64(context, ComputeTimeOfDay()));
+        context, m_impl->engine_base, "timeOfDay", JS_NewFloat64(context, ComputeTimeOfDay(0.0)));
     JS_SetPropertyStr(
         context, m_impl->engine_base, "AUDIO_RESOLUTION_16", JS_NewInt32(context, 16));
     JS_SetPropertyStr(
@@ -8962,8 +9037,19 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
         context, m_impl->engine_base, "frametime", JS_NewFloat64(context, frame_time));
     JS_SetPropertyStr(
         context, m_impl->engine_base, "runtime", JS_NewFloat64(context, m_impl->runtime_seconds));
-    JS_SetPropertyStr(
-        context, m_impl->engine_base, "timeOfDay", JS_NewFloat64(context, ComputeTimeOfDay()));
+    JS_SetPropertyStr(context,
+                      m_impl->engine_base,
+                      "timeOfDay",
+                      JS_NewFloat64(context, ComputeTimeOfDay(m_impl->runtime_seconds)));
+    if (determinism::FixedEpoch()) {
+        // Feed the pinned Date/performance replacements installed by the deterministic prelude.
+        JSValue global = JS_GetGlobalObject(context);
+        JS_SetPropertyStr(context,
+                          global,
+                          "__wesceneClockMs",
+                          JS_NewFloat64(context, m_impl->runtime_seconds * 1000.0));
+        JS_FreeValue(context, global);
+    }
     UpdateInputState(m_impl);
     UpdateAudioBufferBindings(m_impl);
     UpdatePropertyAnimations(m_impl, frame_time);

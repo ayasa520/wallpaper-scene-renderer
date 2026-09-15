@@ -156,6 +156,8 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
         return false;
     if(!FromFileJson(jEffect, vfs))
         return false;
+    // Parse-time mechanism marker for log-driven tooling: which effect resources a scene uses.
+    LOG_INFO("SceneEffectParsed: id=%d file='%s' passes=%zu", id, filePath.c_str(), passes.size());
 
     if(json.contains("passes")) {
         const auto& jPasses = json.at("passes");

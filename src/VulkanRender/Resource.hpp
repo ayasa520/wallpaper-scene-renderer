@@ -1,5 +1,6 @@
 #pragma once
 #include "Core/NoCopyMove.hpp"
+#include "FrameTraceDump.hpp"
 #include "MaskedDrawAttachmentCache.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
 #include "Vulkan/ImmutableMeshStore.hpp"
@@ -46,6 +47,10 @@ struct RenderingResources {
     bool     trace_render_commands { false };
     uint64_t trace_render_frame { 0 };
     uint64_t trace_render_command { 0 };
+    // Draws recorded since renderer init, counted whether or not tracing is on. Selects the
+    // draws the structural trace dump writes; matches the embedding's lockstep draw count.
+    uint64_t       draw_index { 0 };
+    FrameTraceDump frame_trace_dump;
 
     vvk::CommandBuffer command;
 

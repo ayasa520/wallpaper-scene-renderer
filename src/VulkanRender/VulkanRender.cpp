@@ -815,7 +815,8 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     if (!checkVkResult(m_device->present_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit swapchain frame"))
         return;
-    TraceRenderCommandFrame(rr, "submitted");
+    EndRenderCommandTrace(rr, m_device->out_extent().width, m_device->out_extent().height,
+                          m_device->tex_cache().GetTrackedImageCount());
     for (const auto& callback : m_frame_submitted_callbacks) callback();
     VkPresentInfoKHR present_info {
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -1116,7 +1117,8 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
-    TraceRenderCommandFrame(rr, "submitted");
+    EndRenderCommandTrace(rr, m_device->out_extent().width, m_device->out_extent().height,
+                          m_device->tex_cache().GetTrackedImageCount());
     for (const auto& callback : m_frame_submitted_callbacks) callback();
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=submit-complete");
     if (gpu_profile_frame && m_gpu_profiler.used >= 2) {

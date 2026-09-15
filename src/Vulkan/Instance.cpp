@@ -1,8 +1,11 @@
 #include "Instance.hpp"
 #include "Device.hpp"
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include "Utils/Logging.h"
@@ -13,10 +16,25 @@ using namespace wallpaper::vulkan;
 
 constexpr std::array<InstanceLayer, 0> base_inst_layers {};
 
+// Golden-frame test runs opt into the Khronos validation layer (WESCENE_VK_VALIDATION=1) so
+// synchronization and lifetime mistakes that never show up in pixels still fail the run.
+constexpr std::array validation_inst_layers { InstanceLayer { false, "VK_LAYER_KHRONOS_validation" } };
+
 constexpr std::array base_inst_exts { Extension { true, VK_EXT_DEBUG_UTILS_EXTENSION_NAME } };
 
 namespace
 {
+
+bool ValidationRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("WESCENE_VK_VALIDATION");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return requested;
+}
+
+std::atomic<uint64_t> g_validation_error_count { 0 };
+std::atomic<uint64_t> g_validation_warning_count { 0 };
 
 VkBool32 DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
                                      VkDebugUtilsMessageTypeFlagsEXT             messageType,
@@ -25,8 +43,15 @@ VkBool32 DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT     
     VkBool32 result = VK_FALSE;
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
         result |= VK_TRUE;
+        ++g_validation_error_count;
 
         std::printf("validation layer: %s\n", pCallbackData->pMessage);
+    } else if (ValidationRequested() &&
+               messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        // Warnings are only surfaced when the layer was explicitly requested; without it the
+        // loader emits none and the counter stays zero.
+        ++g_validation_warning_count;
+        std::printf("validation layer warning: %s\n", pCallbackData->pMessage);
     }
     return result;
 }
@@ -174,7 +199,13 @@ void Instance::setSurface(VkSurfaceKHR sf) {
 bool Instance::supportExt(std::string_view name) const { return exists(m_extensions, name); }
 bool Instance::supportLayer(std::string_view name) const { return exists(m_layers, name); }
 
-void Instance::Destroy() {}
+void Instance::Destroy() {
+    if (ValidationRequested()) {
+        LOG_INFO("VulkanValidationSummary: errors=%llu warnings=%llu",
+                 static_cast<unsigned long long>(g_validation_error_count.load()),
+                 static_cast<unsigned long long>(g_validation_warning_count.load()));
+    }
+}
 
 void Instance::Abandon() {
     // Device-lost recovery may intentionally leak the Vulkan instance and its
@@ -207,7 +238,15 @@ bool Instance::Create(Instance& inst, std::span<const Extension> instExts,
     }
 
     EnumateLayers(inst.m_layers, inst.m_dld);
-    std::array test_layers_array { std::span<const InstanceLayer>(base_inst_layers), instLayers };
+    const std::span<const InstanceLayer> optional_layers =
+        ValidationRequested() ? std::span<const InstanceLayer>(validation_inst_layers)
+                              : std::span<const InstanceLayer>(base_inst_layers);
+    if (ValidationRequested()) {
+        LOG_INFO("vulkan validation layer requested: %s",
+                 inst.supportLayer(validation_inst_layers[0].name) ? "available" : "NOT INSTALLED");
+    }
+    std::array test_layers_array { std::span<const InstanceLayer>(base_inst_layers),
+                                   optional_layers, instLayers };
     for (auto& test_layers : test_layers_array) {
         for (auto& layer : test_layers) {
             bool ok = inst.supportLayer(layer.name);

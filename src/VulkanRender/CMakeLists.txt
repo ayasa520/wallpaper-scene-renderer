@@ -15,6 +15,7 @@ MaskedDrawRenderer.cpp
 MaskedDrawShaderContract.cpp
 MaskedMeshPass.cpp
 FinPass.cpp
+FrameTraceDump.cpp
 Msaa.cpp
 PrePass.cpp
 RenderTargetOps.cpp

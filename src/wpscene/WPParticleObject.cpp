@@ -269,5 +269,16 @@ bool WPParticleObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     nlohmann::json jParticle;
     if (! PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + particle), jParticle)) return false;
     if (! particleObj.FromJson(jParticle, vfs)) return false;
+    // Parse-time mechanism marker: lets log-driven tooling see which scenes carry particle
+    // systems without depending on a particular render-pass log line.
+    LOG_INFO("SceneParticleSystemParsed: id=%d name='%s' file='%s' maxcount=%u emitters=%zu "
+             "initializers=%zu operators=%zu",
+             id,
+             name.c_str(),
+             particle.c_str(),
+             particleObj.maxcount,
+             particleObj.emitters.size(),
+             particleObj.initializers.size(),
+             particleObj.operators.size());
     return true;
 }

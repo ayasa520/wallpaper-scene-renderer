@@ -70,27 +70,39 @@ void FrameTimer::FrameEnd() {
         // inserts avoidable idle time. Queue the next frame immediately, but only after releasing
         // the outstanding gate so pointer messages already waiting on the render looper stay ahead
         // of the new draw. RequestFrame's compare-exchange also resolves a concurrent timer tick
-        // without ever allowing two queued/in-flight draws.
+        // without ever allowing two queued/in-flight draws. An externally driven timer is never
+        // Running(), so the embedding keeps exclusive control over the draw count.
         RequestFrame();
     }
 }
 
-void FrameTimer::RequestFrame() {
-    if (! m_callback) return;
+bool FrameTimer::RequestFrame() {
+    if (! m_callback) return false;
 
     bool expected = false;
     if (! m_frame_outstanding.compare_exchange_strong(expected,
                                                        true,
                                                        std::memory_order_acq_rel,
                                                        std::memory_order_acquire)) {
-        return;
+        return false;
     }
     m_callback();
+    return true;
 }
 
 void FrameTimer::SetCallback(const std::function<void()>& cb) {
     if (! Running()) m_callback = cb;
 }
-void FrameTimer::Run() { m_timer.Start(); }
+void FrameTimer::SetExternallyDriven(bool driven) {
+    m_externally_driven.store(driven, std::memory_order_release);
+    if (driven) m_timer.Stop();
+}
+bool FrameTimer::ExternallyDriven() const {
+    return m_externally_driven.load(std::memory_order_acquire);
+}
+void FrameTimer::Run() {
+    if (ExternallyDriven()) return;
+    m_timer.Start();
+}
 void FrameTimer::Stop() { m_timer.Stop(); }
 bool FrameTimer::Running() const { return m_timer.Running(); }

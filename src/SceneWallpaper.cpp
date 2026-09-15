@@ -1,6 +1,7 @@
 #include "SceneWallpaper.hpp"
 #include "SceneWallpaperSurface.hpp"
 
+#include "Core/Determinism.hpp"
 #include "Utils/Logging.h"
 #include "Looper/Looper.hpp"
 
@@ -189,6 +190,7 @@ public:
         CMD_SET_PROPERTY,
         CMD_STOP,
         CMD_FIRST_FRAME,
+        CMD_FLUSH,
         CMD_NO
     };
 
@@ -212,6 +214,7 @@ public:
                 CASE_CMD(RENDER_READY);
                 CASE_CMD(STOP);
                 CASE_CMD(FIRST_FRAME);
+                CASE_CMD(FLUSH);
             default: break;
             }
         }
@@ -229,6 +232,7 @@ private:
     MHANDLER_CMD(SET_PROPERTY);
     MHANDLER_CMD(STOP);
     MHANDLER_CMD(FIRST_FRAME);
+    MHANDLER_CMD(FLUSH);
 
 private:
     bool m_inited { false };
@@ -287,6 +291,7 @@ public:
         CMD_RECONFIGURE_OFFSCREEN_EXPORT,
         CMD_STOP,
         CMD_DRAW,
+        CMD_FLUSH,
         CMD_NO
     };
     MainHandler& main_handler;
@@ -332,6 +337,7 @@ public:
                 CASE_CMD(SET_OFFSCREEN_READY_CALLBACK);
                 CASE_CMD(RECONFIGURE_OFFSCREEN_EXPORT);
                 CASE_CMD(INIT_VULKAN);
+                CASE_CMD(FLUSH);
             default: break;
             }
         }
@@ -340,6 +346,12 @@ public:
     ExSwapchain* exSwapchain() const { return m_render->exSwapchain(); }
 
     bool renderInited() const { return m_render->inited(); }
+
+    // True once CMD_SET_SCENE has installed the parsed scene, run script initialization and
+    // compiled the first render graph, i.e. the next draw renders real content. Cleared by the
+    // main handler before it posts a replacement scene.
+    bool sceneLoaded() const { return m_scene_loaded.load(std::memory_order_acquire); }
+    void markSceneUnloaded() { m_scene_loaded.store(false, std::memory_order_release); }
 
     double textRenderScale() const {
         // Text stays in the authored letter box. Desktop render scale is applied when the
@@ -495,8 +507,23 @@ private:
     MHANDLER_CMD(DRAW) {
         frame_timer.FrameBegin();
         if (m_rg) {
-            const double frame_time = frame_timer.IdeaTime() * m_speed;
+            // Lockstep capture owns the clock: every draw advances the scene by the configured
+            // fixed step so frame N always shows the same scene time, independent of how long the
+            // GPU or the harness took. Production keeps the measured-duration clock.
+            const bool   lockstep   = determinism::LockstepEnabled();
+            const double frame_time = (lockstep ? determinism::FixedFrameTime(
+                                                      1.0 / std::max<double>(
+                                                                1.0, frame_timer.RequiredFps()))
+                                                : frame_timer.IdeaTime()) *
+                                      m_speed;
             m_scene->PassFrameTime(frame_time);
+            if (lockstep) {
+                ++m_lockstep_draw_count;
+                LOG_INFO("SceneLockstep: draw=%llu scene-time=%.6f dt=%.6f",
+                         static_cast<unsigned long long>(m_lockstep_draw_count),
+                         m_scene->elapsingTime,
+                         frame_time);
+            }
             // Scene camerashake is a view-space translation of the authored camera. Apply it after
             // the clock advances and before scripts/parallax/fill-mode read camera position.
             m_scene->UpdateCameraShake();
@@ -568,6 +595,14 @@ private:
             }
         }
         frame_timer.FrameEnd();
+    }
+    MHANDLER_CMD(FLUSH) {
+        // Second half of the two-looper barrier: by the time this message is dequeued, every
+        // message the main looper forwarded ahead of it (property, media, audio and playback
+        // state) and every message posted directly to this looper before the barrier was
+        // requested (pointer input, scene install) has been handled.
+        std::shared_ptr<std::promise<void>> barrier;
+        if (msg->findObject("barrier", &barrier) && barrier) barrier->set_value();
     }
     MHANDLER_CMD(SET_FILLMODE) {
         int32_t value;
@@ -656,6 +691,11 @@ private:
     }
     MHANDLER_CMD(SET_SCENE) {
         if (msg->findObject("scene", &m_scene)) {
+            // Per-frame particle emission draws from this thread's random engine. Restart it at
+            // the same seed for every scene so a lockstep capture replays the same emission
+            // sequence from frame one regardless of what rendered before.
+            determinism::SeedThreadRandom();
+            m_lockstep_draw_count = 0;
             std::shared_ptr<WPSceneScriptMediaState> media_state;
             std::shared_ptr<std::vector<float>>      audio_samples;
             msg->findObject("media_state", &media_state);
@@ -721,6 +761,7 @@ private:
             m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
             m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
             m_scene->scriptHost->HandleCursorMove();
+            m_scene_loaded.store(true, std::memory_order_release);
         }
     }
     MHANDLER_CMD(SET_SPEED) { msg->findFloat("value", &m_speed); }
@@ -801,6 +842,9 @@ private:
     uint32_t                                 m_output_width { 1920 };
     uint32_t                                 m_output_height { 1080 };
     std::atomic<bool>                        m_cursor_left_down { false };
+    std::atomic<bool>                        m_scene_loaded { false };
+    // Draws since the current scene was installed; only maintained in lockstep mode.
+    uint64_t                                 m_lockstep_draw_count { 0 };
 
     std::unique_ptr<vulkan::VulkanRender> m_render;
     std::unique_ptr<rg::RenderGraph>      m_rg { nullptr };
@@ -893,8 +937,27 @@ void SceneWallpaper::pause() {
     msg->setBool("value", true);
     msg->post();
 }
-void SceneWallpaper::requestFrame() {
-    m_main_handler->renderHandler()->frame_timer.RequestFrame();
+bool SceneWallpaper::requestFrame() {
+    return m_main_handler->renderHandler()->frame_timer.RequestFrame();
+}
+
+bool SceneWallpaper::sceneLoaded() const { return m_main_handler->renderHandler()->sceneLoaded(); }
+
+uint64_t SceneWallpaper::publishedFrameCount() const {
+    auto* swapchain = exSwapchain();
+    return swapchain ? swapchain->publishedCount() : 0;
+}
+
+bool SceneWallpaper::flush(std::chrono::milliseconds timeout) {
+    // Barrier through both loopers in message order. The main looper forwards the same promise
+    // to the render looper when it reaches the marker, so everything queued on either looper at
+    // the time of this call (including main-to-render hops) has run before the wait returns.
+    auto barrier = std::make_shared<std::promise<void>>();
+    auto future  = barrier->get_future();
+    auto msg     = CreateMsgWithCmd(m_main_handler, MainHandler::CMD::CMD_FLUSH);
+    msg->setObject("barrier", barrier);
+    if (msg->post() != looper::status_t::OK) return false;
+    return future.wait_for(timeout) == std::future_status::ready;
 }
 
 void SceneWallpaper::mouseInput(double x, double y) {
@@ -1141,8 +1204,23 @@ MHANDLER_CMD_IMPL(MainHandler, FIRST_FRAME) {
     if (m_first_frame_callback) m_first_frame_callback();
 }
 
+MHANDLER_CMD_IMPL(MainHandler, FLUSH) {
+    // First half of the barrier: everything this looper queued before the marker has run. Hand
+    // the same promise to the render looper so it completes only after the forwarded messages.
+    std::shared_ptr<std::promise<void>> barrier;
+    if (! msg->findObject("barrier", &barrier) || ! barrier) return;
+    auto forwarded = CreateMsgWithCmd(m_render_handler, RenderHandler::CMD::CMD_FLUSH);
+    forwarded->setObject("barrier", barrier);
+    if (forwarded->post() != looper::status_t::OK) barrier->set_value();
+}
+
 void MainHandler::loadScene() {
     if (m_source.empty() || m_assets.empty()) return;
+
+    // Particle range parsing and start-time prewarm draw from this thread's random engine.
+    // Restarting it here makes the parsed scene identical on every lockstep run.
+    determinism::SeedThreadRandom();
+    m_render_handler->markSceneUnloaded();
 
     LOG_INFO("loading scene: %s user-properties=%zu hrbigb2=%s",
              m_source.c_str(),
@@ -1251,8 +1329,12 @@ void MainHandler::loadScene() {
 
     // The timer owns the single outstanding draw gate. Startup and producer-triggered requests use
     // that same path so scene parsing or initial Vulkan setup cannot accumulate dozens of stale
-    // CMD_DRAW messages in front of live pointer input.
-    m_render_handler->frame_timer.RequestFrame();
+    // CMD_DRAW messages in front of live pointer input. In lockstep mode the embedding requests
+    // every draw itself, including the first one: an implicit startup draw would publish a frame
+    // the driver never asked for and shift its step numbering by one.
+    if (! determinism::LockstepEnabled()) {
+        m_render_handler->frame_timer.RequestFrame();
+    }
 }
 void MainHandler::sendRenderReady() {
     auto self = weak_from_this().lock();
@@ -1290,6 +1372,16 @@ bool MainHandler::init() {
             }
         });
         frameTimer.SetRequiredFps(15);
+        // Lockstep capture drives every draw through requestFrame(); the periodic timer must
+        // never run, otherwise the number of draws between two captured frames follows the wall
+        // clock. play()/pause() still toggle sound and video, but no longer start the timer.
+        frameTimer.SetExternallyDriven(determinism::LockstepEnabled());
+        if (determinism::LockstepEnabled()) {
+            LOG_INFO("SceneLockstep: enabled fixed-dt=%.6f seed=%s epoch=%s",
+                     determinism::FixedFrameTime(1.0 / 15.0),
+                     determinism::RandomSeed() ? "set" : "unset",
+                     determinism::FixedEpoch() ? "set" : "unset");
+        }
         frameTimer.Run();
     }
 

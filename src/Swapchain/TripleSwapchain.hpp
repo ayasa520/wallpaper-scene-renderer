@@ -2,8 +2,10 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <unistd.h>
+#include <utility>
 #include "Core/NoCopyMove.hpp"
 
 namespace wallpaper
@@ -18,14 +20,32 @@ public:
         std::lock_guard<std::mutex> lk(stateMutex());
         if (! dirty().exchange(false)) return nullptr;
         presented() = ready().exchange(presented());
+        std::swap(m_presented_sequence, m_ready_sequence);
         return presented();
     }
     void renderFrame() {
         std::lock_guard<std::mutex> lk(stateMutex());
-        inprogress() = ready().exchange(inprogress());
+        // Number every published frame. The ring is latest-wins: a slot that was never eaten is
+        // silently replaced by the next one, so a consumer that wants to prove it observed every
+        // draw compares consecutive presentedSequence() values instead of counting eats.
+        m_inprogress_sequence = ++m_published_count;
+        inprogress()          = ready().exchange(inprogress());
+        std::swap(m_ready_sequence, m_inprogress_sequence);
         dirty().exchange(true);
     }
     T* getInprogress() { return inprogress(); }
+
+    // 1-based publish number of the frame most recently returned by eatFrame(); 0 before the
+    // first eat. Consecutive values differ by exactly one when no frame was skipped.
+    uint64_t presentedSequence() {
+        std::lock_guard<std::mutex> lk(stateMutex());
+        return m_presented_sequence;
+    }
+    // Total number of renderFrame() calls so far.
+    uint64_t publishedCount() {
+        std::lock_guard<std::mutex> lk(stateMutex());
+        return m_published_count;
+    }
 
     /*
      * Explicit-sync stash for the exported offscreen ring: the render thread
@@ -71,6 +91,12 @@ private:
     std::atomic<bool>  m_dirty { false };
     std::mutex         m_state_mutex;
     std::array<std::atomic<int>, 3> m_acquire_fds { -1, -1, -1 };
+    // Publish numbers travel with the slot pointers: each role's sequence names the frame that
+    // the slot currently in that role holds. All four are guarded by m_state_mutex.
+    uint64_t m_published_count { 0 };
+    uint64_t m_ready_sequence { 0 };
+    uint64_t m_inprogress_sequence { 0 };
+    uint64_t m_presented_sequence { 0 };
 };
 
 } // namespace wallpaper

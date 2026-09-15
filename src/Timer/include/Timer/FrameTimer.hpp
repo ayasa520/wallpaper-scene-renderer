@@ -17,7 +17,14 @@ public:
 
     void Run();
     void Stop();
-    void RequestFrame();
+    // Returns false when a draw is already outstanding and the request was therefore dropped.
+    bool RequestFrame();
+
+    // Externally driven timers never start the periodic thread and never re-request a draw
+    // after a slow frame: the embedding decides when every draw happens. Used by lockstep
+    // golden-frame capture so the number of draws between two captured frames is exact.
+    void SetExternallyDriven(bool);
+    bool ExternallyDriven() const;
 
     u16    RequiredFps() const;
     bool   Running() const;
@@ -45,6 +52,7 @@ private:
     // and explicit producer requests share the same latest-frame scheduling contract instead of
     // building a FIFO queue of stale frames ahead of pointer input.
     std::atomic<bool>                      m_frame_outstanding { false };
+    std::atomic<bool>                      m_externally_driven { false };
 
     ThreadTimer m_timer;
 
