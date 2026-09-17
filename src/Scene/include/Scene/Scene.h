@@ -327,6 +327,10 @@ public:
     // a candidate after it was queued. Named targets follow destination ownership separately.
     std::unordered_set<std::string>      pendingStaticTextureReleaseKeys;
     std::unordered_set<std::string>      pendingVideoTextureReleaseKeys;
+    // Destination replacement and owner removal retire the scene descriptor only after the
+    // final retained-owner census. GPU-only release requests below keep their descriptors for
+    // later reactivation, such as a disabled post-processing stage.
+    std::unordered_set<std::string>      pendingRenderTargetRetirementKeys;
     std::unordered_set<std::string>      pendingRenderTargetReleaseKeys;
     // Direct text rerastering changes pass-owned atlas and mesh resources without naming a
     // render-target dependency, so text layers need their own resource-refresh dirty key set.

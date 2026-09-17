@@ -67,6 +67,7 @@ public:
     void Clear();
     bool ReleaseTexture(std::string_view key);
     bool ReleaseRenderTarget(std::string_view key);
+    void RetireUnusedRenderTargets();
 
     std::optional<ExImageParameters> CreateExTex(uint32_t witdh, uint32_t height, VkFormat,
                                                  VkImageTiling, ExternalFrameExportMode,
@@ -119,7 +120,7 @@ private:
         TextureKey         content_key;
         TexHash            content_hash { 0 };
         uint64_t           generation { 0 };
-        VmaImageParameters image;
+        std::shared_ptr<const VmaImageParameters> image;
         Set<std::string>   query_keys;
     };
     std::vector<std::unique_ptr<QueryTex>> m_query_texs;

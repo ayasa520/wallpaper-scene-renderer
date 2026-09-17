@@ -991,10 +991,10 @@ bool TextureCache::ReleaseTexture(std::string_view key) {
 
 bool TextureCache::ReleaseRenderTarget(std::string_view key) {
     const std::string key_string(key);
+    purgeQueuedWorkForKey(key_string);
     const auto        query_it = m_query_map.find(key_string);
     if (query_it == m_query_map.end() || query_it->second == nullptr) return false;
 
-    purgeQueuedWorkForKey(key_string);
     const auto before_bytes = GetTrackedBytes();
     const auto before_count = GetTrackedImageCount();
     auto*      query        = query_it->second;
@@ -1032,11 +1032,28 @@ bool TextureCache::ReleaseRenderTarget(std::string_view key) {
     return true;
 }
 
+void TextureCache::RetireUnusedRenderTargets() {
+    // Final-reader handoff removes transient query names while prepared passes retain their
+    // image references. An empty lookup alone therefore cannot identify unused storage. The
+    // renderer calls this only after prior GPU work completes and stale passes/bindings retire;
+    // a pool entry with no logical key and no external image owner has reached its final use.
+    const auto before_bytes = GetTrackedBytes();
+    const auto before_count = GetTrackedImageCount();
+    const auto retired = std::erase_if(m_query_texs, [](const auto& query) {
+        return query->query_keys.empty() && query->image.use_count() == 1;
+    });
+    if (retired != 0) {
+        LOG_INFO("TextureCacheRetireUnusedTargets: released=%zu bytes-before=%zu bytes-after=%zu "
+                 "images-before=%zu images-after=%zu",
+                 retired, before_bytes, GetTrackedBytes(), before_count, GetTrackedImageCount());
+    }
+}
+
 std::optional<ImageParameters> TextureCache::Query(std::string_view key, TextureKey content_hash,
                                                    bool persist) {
     const std::string key_string(key);
     const TexHash     tex_hash = TextureKey::HashValue(content_hash);
-    auto queue_initial_clear = [&](const VmaImageParameters& image) {
+    auto queue_initial_clear = [&](const std::shared_ptr<const VmaImageParameters>& image) {
         if (content_hash.usage == TexUsage::DEPTH) return;
         // The render target may be sampled by a feedback pass before a writer touches it. Keep the
         // deterministic transparent-black bootstrap, but record it into the renderer's next frame
@@ -1046,7 +1063,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             .key   = key_string,
             .image = ImageParameters(image),
         });
-        TraceTextureUpload("queue-clear", key, image, VK_IMAGE_LAYOUT_UNDEFINED);
+        TraceTextureUpload("queue-clear", key, ImageParameters(image), VK_IMAGE_LAYOUT_UNDEFINED);
         LOG_INFO("TextureCacheInitialClearQueued: key='%s' render-target=%dx%d mip-levels=%u "
                  "transparent-black=true",
                  key_string.c_str(),
@@ -1069,8 +1086,8 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
                      key_string.c_str(),
                      query->content_hash,
                      tex_hash,
-                     query->image.extent.width,
-                     query->image.extent.height,
+                     query->image->extent.width,
+                     query->image->extent.height,
                      content_hash.width,
                      content_hash.height);
 
@@ -1082,7 +1099,9 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
                 m_query_map.erase(key_string);
             } else {
                 if (auto opt = CreateTex(content_hash); opt.has_value()) {
-                    query->image        = std::move(opt.value());
+                    // A replaced allocation remains alive through any prepared consumer that
+                    // still holds it while the graph's other bindings are being refreshed.
+                    query->image = std::make_shared<VmaImageParameters>(std::move(opt.value()));
                     query->generation   = ++m_render_target_generation;
                     query->content_key  = content_hash;
                     query->content_hash = tex_hash;
@@ -1092,9 +1111,9 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
                     query->query_keys.insert(key_string);
                     m_query_map[key_string] = query;
                     queue_initial_clear(query->image);
-                    TraceRenderTargetAllocation("replace", key, query->image, query->generation,
+                    TraceRenderTargetAllocation("replace", key, *query->image, query->generation,
                                                 query->persist);
-                    return query->image;
+                    return ImageParameters(query->image);
                 }
                 return std::nullopt;
             }
@@ -1102,7 +1121,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             query->share_ready = false;
             query->persist     = persist;
 
-            return query->image;
+            return ImageParameters(query->image);
         }
     };
 
@@ -1116,10 +1135,12 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
 
         m_query_map[key_string] = &(*query);
 
-        TraceRenderTargetAllocation("share", key, query->image, query->generation, query->persist);
-        return query->image;
+        TraceRenderTargetAllocation("share", key, *query->image, query->generation, query->persist);
+        return ImageParameters(query->image);
     }
 
+    auto image = CreateTex(content_hash);
+    if (!image.has_value()) return std::nullopt;
     m_query_texs.emplace_back(std::make_unique<QueryTex>());
     auto& query                   = *m_query_texs.back();
     m_query_map[key_string] = &query;
@@ -1129,14 +1150,11 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
     query.content_hash = tex_hash;
     query.query_keys.insert(key_string);
     query.persist = persist;
-    if (auto opt = CreateTex(content_hash); opt.has_value()) {
-        query.image = std::move(opt.value());
-        query.generation = ++m_render_target_generation;
-        queue_initial_clear(query.image);
-        TraceRenderTargetAllocation("create", key, query.image, query.generation, query.persist);
-        return query.image;
-    }
-    return std::nullopt;
+    query.image = std::make_shared<VmaImageParameters>(std::move(image.value()));
+    query.generation = ++m_render_target_generation;
+    queue_initial_clear(query.image);
+    TraceRenderTargetAllocation("create", key, *query.image, query.generation, query.persist);
+    return ImageParameters(query.image);
 }
 
 uint64_t TextureCache::RenderTargetGeneration(std::string_view key) const {
@@ -1239,7 +1257,7 @@ std::size_t TextureCache::GetTrackedBytes() const {
     }
     for (const auto& query : m_query_texs) {
         if (! query) continue;
-        total += ImageAllocationBytes(query->image);
+        total += ImageAllocationBytes(*query->image);
     }
     return total;
 }
@@ -1250,7 +1268,7 @@ std::size_t TextureCache::GetTrackedImageCount() const {
         total += slots.slots.size();
     }
     for (const auto& query : m_query_texs) {
-        if (query && query->image.handle) total++;
+        if (query && query->image->handle) total++;
     }
     return total;
 }

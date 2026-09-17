@@ -2176,6 +2176,7 @@ void ShaderDrawCore::destroy(RenderingResources& rr) {
     m_desc.vk_textures.clear();
     m_desc.vk_tex_binding.clear();
     m_desc.vk_output              = {};
+    m_desc.vk_resolve             = {};
     m_desc.depth_stencil_image_ref = nullptr;
     m_desc.immutable_mesh.reset();
     auto* mesh_buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;

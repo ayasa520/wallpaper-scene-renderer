@@ -1478,6 +1478,7 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
     if (m_device_faulted || !m_device) return;
     if (scene.pendingStaticTextureReleaseKeys.empty() &&
         scene.pendingVideoTextureReleaseKeys.empty() &&
+        scene.pendingRenderTargetRetirementKeys.empty() &&
         scene.pendingRenderTargetReleaseKeys.empty()) {
         return;
     }
@@ -1492,6 +1493,8 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
     std::size_t released_videos = 0;
     std::size_t retained_static = 0;
     std::size_t retained_videos = 0;
+    std::size_t retired_destinations = 0;
+    std::size_t retained_destinations = 0;
 
     // Property changes and layer callbacks can acquire an imported key after it was queued.
     // Prior submissions are complete and the graph now describes the new scene, so decide
@@ -1499,6 +1502,19 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
     // Keeping this check at destruction also covers script deletion and model replacement.
     const auto retained = CollectRetainedResidencyResources(scene);
 
+    // Destination references can change more than once while script callbacks and parent setup
+    // drain. Decide retirement against the final scene, before preparing its new GPU consumers.
+    // GPU-only release requests remain separate: disabling a stage keeps its CPU descriptors
+    // available for reactivation even though that stage's current GPU allocation is released.
+    for (const auto& key : scene.pendingRenderTargetRetirementKeys) {
+        if (retained.render_targets.contains(key)) {
+            retained_destinations++;
+            continue;
+        }
+        scene.renderTargets.erase(key);
+        scene.pendingRenderTargetReleaseKeys.insert(key);
+        retired_destinations++;
+    }
     for (const auto& key : scene.pendingStaticTextureReleaseKeys) {
         if (retained.static_textures.contains(key)) {
             retained_static++;
@@ -1538,9 +1554,15 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
              m_device->video_tex_cache().GetTrackedEntryCount(),
              retained_static,
              retained_videos);
+    if (!scene.pendingRenderTargetRetirementKeys.empty()) {
+        LOG_INFO("SceneDestinationRetirement: retired=%zu retained=%zu candidates=%zu",
+                 retired_destinations, retained_destinations,
+                 scene.pendingRenderTargetRetirementKeys.size());
+    }
 
     scene.pendingStaticTextureReleaseKeys.clear();
     scene.pendingVideoTextureReleaseKeys.clear();
+    scene.pendingRenderTargetRetirementKeys.clear();
     scene.pendingRenderTargetReleaseKeys.clear();
 }
 
@@ -1637,6 +1659,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         (void)refresh_all;
         (void)refreshed_passes;
         (void)prepared_passes;
+        m_device->tex_cache().RetireUnusedRenderTargets();
         // Mature renderers do not submit a separate upload command and idle the whole device while
         // rebuilding resource bindings. The next draw command records all dirty vertex, dynamic,
         // and texture uploads before executing passes, preserving ordering without a render-thread
@@ -1719,6 +1742,9 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         if (destroyed_passes.size() != before_destroy_count) retired_count++;
     }
     m_compiled_pass_refs = std::move(next_compiled_pass_refs);
+    // Drop the temporary references to retired pass objects before checking allocation owners.
+    // Reused passes are already retained by the new graph and keep their image references.
+    reusable_passes.clear();
     releasePendingSceneResources(scene);
 
     LOG_INFO("RenderGraphResidencyDiff: reused=%zu new=%zu retired=%zu graph-passes=%zu",
@@ -1780,6 +1806,8 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         }
         if (p != nullptr && !p->prepared()) unprepared_count++;
     }
+
+    m_device->tex_cache().RetireUnusedRenderTargets();
 
     LOG_INFO("RenderGraphCompileSummary: total=%zu reused-refreshed=%zu refreshed=%zu "
              "prepared=%zu dependency-prepared=%zu already-prepared=%zu unprepared=%zu mode=%s "

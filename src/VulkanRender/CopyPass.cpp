@@ -237,4 +237,6 @@ void CopyPass::destory(const Device&, RenderingResources&) {
     // prepared state guarantees that recreated render targets are rebound from the texture cache
     // instead of reusing stale source/destination image handles captured by the previous prepare.
     setPrepared(false);
+    m_desc.vk_src = {};
+    m_desc.vk_dst = {};
 }

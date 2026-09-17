@@ -782,6 +782,7 @@ void ShadowAtlasPass::destory(const Device&, RenderingResources&) {
     setPrepared(false);
     clearReleaseTexs();
     m_fb.reset();
+    m_desc.vk_target = {};
     m_fb_extent = {};
     if (m_dyn_buf != nullptr && m_ubo_buf) m_dyn_buf->unallocateSubRef(m_ubo_buf);
     releaseCasters();

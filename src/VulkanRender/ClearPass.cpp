@@ -117,4 +117,5 @@ void ClearPass::execute(const Device&, RenderingResources& rr) {
 void ClearPass::destory(const Device&, RenderingResources&) {
     setPrepared(false);
     clearReleaseTexs();
+    m_desc.vk_target = {};
 }

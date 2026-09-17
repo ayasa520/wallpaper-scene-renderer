@@ -202,7 +202,7 @@ public:
     auto&       GetEffect(std::size_t index) { return m_effects.at(index); }
     std::size_t SourceSlot() const;
     const std::string& SourceTarget() const;
-    void SetDestinationTargets(std::string first_target, std::string second_target);
+    void SetDestinationTargets(Scene&, std::string first_target, std::string second_target);
     void RefreshDestinationTargets(
         Scene& scene, std::optional<std::array<int32_t, 2>> destination_extent = std::nullopt,
         std::optional<TextureSample> destination_sampler = std::nullopt);

@@ -7,6 +7,9 @@
 #include "vk_mem_alloc.h"
 #include "vvk/vma_wrapper.hpp"
 
+#include <memory>
+#include <utility>
+
 namespace wallpaper
 {
 namespace vulkan
@@ -81,6 +84,12 @@ struct ImageParameters {
     uint        mipmap_level { 1 };
     uint        samples { 1 };
 
+    // Prepared passes retain a target allocation independently of its transient lookup name.
+    // The final-reader handoff permits reuse within the graph; it does not end the lifetime of
+    // copied descriptors/framebuffers that will execute that graph again. Imported and external
+    // images continue to have their own owners and leave this target-specific reference empty.
+    std::shared_ptr<const VmaImageParameters> allocation_owner;
+
     ImageParameters()  = default;
     ~ImageParameters() = default;
     ImageParameters(const VmaImageParameters& o) noexcept
@@ -96,6 +105,10 @@ struct ImageParameters {
           sampler(*o.sampler),
           extent(o.extent),
           mipmap_level(o.mipmap_level) {}
+    explicit ImageParameters(std::shared_ptr<const VmaImageParameters> image) noexcept
+        : ImageParameters(*image) {
+        allocation_owner = std::move(image);
+    }
 };
 
 struct ImageSlots : NoCopy {

@@ -382,5 +382,8 @@ void FinPass::executeImage(const Device& device, RenderingResources& rr,
 void FinPass::destory(const Device&, RenderingResources& rr) {
     setPrepared(false);
     clearReleaseTexs();
+    m_desc.fb.reset();
+    m_desc.vk_result = {};
+    m_desc.vk_present = {};
     rr.vertex_buf->unallocateSubRef(m_desc.vertex_buf);
 }

@@ -442,4 +442,5 @@ void VolumetricsSingleFillPass::destory(const Device&, RenderingResources& rr) {
     m_fb.reset();
     m_fb_extent = {};
     if (m_vertex_buf) rr.vertex_buf->unallocateSubRef(m_vertex_buf);
+    m_desc.vk_dst = {};
 }

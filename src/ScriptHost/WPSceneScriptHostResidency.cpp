@@ -1,7 +1,7 @@
 #include "WPSceneScriptHostShared.hpp"
 
 // Layer destruction nominates resources after the whole batch's surviving owners are known.
-// Imported candidates receive a final reference check at the renderer's release boundary.
+// Imported and destination candidates receive a final reference check at the release boundary.
 
 #include "Scene/Scene.h"
 #include "Utils/Logging.h"
@@ -30,7 +30,7 @@ void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
     }
     for (const auto& key : resources.render_targets) {
         if (retained_resources.render_targets.count(key) != 0) continue;
-        queued_render_targets += scene.pendingRenderTargetReleaseKeys.insert(key).second ? 1 : 0;
+        queued_render_targets += scene.pendingRenderTargetRetirementKeys.insert(key).second ? 1 : 0;
     }
 
     if (queued_static != 0 || queued_video != 0 || queued_render_targets != 0) {

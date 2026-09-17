@@ -125,4 +125,5 @@ void MipHistoryPass::execute(const Device&, RenderingResources& rr) {
 void MipHistoryPass::destory(const Device&, RenderingResources&) {
     setPrepared(false);
     clearReleaseTexs();
+    m_target = {};
 }

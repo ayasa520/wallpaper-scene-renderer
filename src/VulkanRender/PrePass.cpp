@@ -99,4 +99,6 @@ void PrePass::execute(const Device&, RenderingResources& rr) {
 void PrePass::destory(const Device&, RenderingResources&) {
     setPrepared(false);
     clearReleaseTexs();
+    m_desc.vk_result = {};
+    m_desc.vk_msaa = {};
 }
