@@ -3299,18 +3299,17 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
         // timers and property animations even if they used to share a physical tree.
         std::unordered_set<uint32_t> removed_instance_ids;
         auto&                        instances = opaque->instances;
-        instances.erase(std::remove_if(instances.begin(),
-                                       instances.end(),
-                                       [&](const std::unique_ptr<ScriptInstance>& instance) {
-                                           if (! instance ||
-                                               instance->registration.object_id != layer_id) {
-                                               return false;
-                                           }
-                                           removed_instance_ids.insert(instance->instance_id);
-                                           FreeScriptInstance(context, *instance);
-                                           return true;
-                                       }),
-                        instances.end());
+        // Destroy callbacks can create scripted layers and synchronously dispatch properties.
+        // Erase list nodes without moving surviving unique_ptrs: sequence compaction would leave
+        // null entries visible to that nested dispatch when a layer's refreshed material scripts
+        // follow other owners in the registry. The selected instance stays discoverable until its
+        // own callback returns; previously retired instances have already left the live registry.
+        instances.remove_if([&](const std::unique_ptr<ScriptInstance>& instance) {
+            if (instance->registration.object_id != layer_id) return false;
+            removed_instance_ids.insert(instance->instance_id);
+            FreeScriptInstance(context, *instance);
+            return true;
+        });
 
         auto& timers = opaque->timers;
         timers.erase(
