@@ -5,6 +5,7 @@
 #include "RenderGraph/RenderGraph.hpp"
 #include "Scene/Scene.h"
 #include "Scene/SceneMesh.h"
+#include "Scene/SceneResidency.h"
 #include "SpecTexs.hpp"
 #include "Interface/IImageParser.h"
 #include "Interface/IShaderValueUpdater.h"
@@ -1489,8 +1490,20 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
     std::size_t released_static = 0;
     std::size_t released_render_targets = 0;
     std::size_t released_videos = 0;
+    std::size_t retained_static = 0;
+    std::size_t retained_videos = 0;
+
+    // Property changes and layer callbacks can acquire an imported key after it was queued.
+    // Prior submissions are complete and the graph now describes the new scene, so decide
+    // reachability here using all retained materials, including hidden and inactive sources.
+    // Keeping this check at destruction also covers script deletion and model replacement.
+    const auto retained = CollectRetainedResidencyResources(scene);
 
     for (const auto& key : scene.pendingStaticTextureReleaseKeys) {
+        if (retained.static_textures.contains(key)) {
+            retained_static++;
+            continue;
+        }
         if (m_device->tex_cache().ReleaseTexture(key)) released_static++;
         scene.DropParsedImageCache(key);
     }
@@ -1498,13 +1511,17 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
         if (m_device->tex_cache().ReleaseRenderTarget(key)) released_render_targets++;
     }
     for (const auto& key : scene.pendingVideoTextureReleaseKeys) {
+        if (retained.video_textures.contains(key)) {
+            retained_videos++;
+            continue;
+        }
         if (m_device->video_tex_cache().Release(key)) released_videos++;
     }
 
     LOG_INFO("SceneResidencyRelease: static=%zu/%zu render-target=%zu/%zu video=%zu/%zu "
              "texture-bytes-before=%zu texture-bytes-after=%zu texture-images-before=%zu "
              "texture-images-after=%zu video-bytes-before=%zu video-bytes-after=%zu "
-             "video-entries-before=%zu video-entries-after=%zu",
+             "video-entries-before=%zu video-entries-after=%zu retained-static=%zu retained-video=%zu",
              released_static,
              scene.pendingStaticTextureReleaseKeys.size(),
              released_render_targets,
@@ -1518,7 +1535,9 @@ void VulkanRender::Impl::releasePendingSceneResources(Scene& scene) {
              before_video_bytes,
              m_device->video_tex_cache().GetTrackedBytes(),
              before_video_count,
-             m_device->video_tex_cache().GetTrackedEntryCount());
+             m_device->video_tex_cache().GetTrackedEntryCount(),
+             retained_static,
+             retained_videos);
 
     scene.pendingStaticTextureReleaseKeys.clear();
     scene.pendingVideoTextureReleaseKeys.clear();

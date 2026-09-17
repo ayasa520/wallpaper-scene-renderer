@@ -19,6 +19,7 @@
 
 #include "Core/Literals.hpp"
 #include "Scene/SceneTexture.h"
+#include "Scene/SceneResidency.h"
 #include "WPDynamicValue.hpp"
 #include "WPPropertyAnimation.hpp"
 #include "WPSceneScriptHost.hpp"
@@ -220,18 +221,7 @@ void ResortSceneLayerTree(const WPSceneScriptHost::Opaque& opaque);
 std::optional<std::string> ResolveSceneScriptAssetFile(const Scene* scene, JSContext* context,
                                                        JSValueConst value);
 
-// The textures and render targets a layer tree currently holds resident on the GPU.
-struct LayerResidencyResources {
-    std::unordered_set<std::string> static_textures;
-    std::unordered_set<std::string> video_textures;
-    std::unordered_set<std::string> render_targets;
-};
-
-// Defined in WPSceneScriptHostResidency.cpp: resource ownership bookkeeping used by dynamic layer
-// destruction.
-LayerResidencyResources CollectLayerResidencyResources(const Scene& scene, int32_t layer_id);
-LayerResidencyResources CollectRetainedResidencyResources(
-    const Scene& scene, const std::unordered_set<int32_t>& excluded_layers);
+// Dynamic layer retirement uses the Scene-owned reference census shared with texture selection.
 void QueueLayerResourceRelease(Scene& scene, int32_t layer_id,
                                const LayerResidencyResources& resources,
                                const LayerResidencyResources& retained, const char* reason);

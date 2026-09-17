@@ -320,12 +320,11 @@ public:
     // layout change. Prepared passes keep copied Vulkan image/view handles, so they must rebind any
     // imported key whose CPU image changed before the next draw records uploads and executes.
     std::unordered_set<std::string>      dirtyImportedTextureResourceKeys;
-    // Runtime visibility changes now use explicit resource residency instead of relying on a broad
-    // texture-cache clear during every render-graph topology rebuild. Script/property code records
-    // the concrete cache keys owned only by a hidden layer branch here, and the Vulkan render thread
-    // drains the sets after old passes have released their descriptors but before the new graph is
-    // prepared. Keeping the queue on Scene preserves thread ownership: scene mutation decides what
-    // became unreachable, while Vulkan owns the actual GPU/video destruction.
+    // Scene mutation records resource retirement candidates without destroying GPU storage.
+    // The render thread drains them after completed prior use and graph replacement, before new
+    // passes prepare their descriptors. Imported inputs are checked against the final retained
+    // material references there: hidden owners keep their resources, and callbacks can reacquire
+    // a candidate after it was queued. Named targets follow destination ownership separately.
     std::unordered_set<std::string>      pendingStaticTextureReleaseKeys;
     std::unordered_set<std::string>      pendingVideoTextureReleaseKeys;
     std::unordered_set<std::string>      pendingRenderTargetReleaseKeys;

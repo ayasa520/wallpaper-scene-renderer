@@ -45,6 +45,8 @@ public:
     static std::optional<Metadata> ResolveMetadata(const Scene& scene, std::string_view name);
     static std::optional<Metadata> ResolveMetadata(const Scene& scene, const SceneMaterial& material);
     std::string_view TextureName() const;
+    const SceneMaterial& Material() const { return *m_material; }
+    const SceneMesh& SourceMesh() const { return *m_source_mesh; }
     const Metadata& TextureMetadata() const { return m_metadata; }
     void CompleteInitialTexture(Scene& scene);
     void Refresh(Scene& scene);

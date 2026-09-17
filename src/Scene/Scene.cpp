@@ -5,6 +5,7 @@
 #include "SceneCamera.h"
 #include "SceneImageEffectLayer.h"
 #include "SceneImageSource.h"
+#include "SceneResidency.h"
 
 #include "Fs/VFS.h"
 #include "Interface/IImageParser.h"
@@ -39,11 +40,13 @@ void Scene::SetSystemTextureBinding(const std::string& name, const std::string& 
     GetSystemTextureBinding(name);
     auto& current = *m_system_texture_bindings.at(name);
     if (current == texture_key) return;
+    const auto previous = CollectRetainedResidencyResources(*this);
     if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
         LOG_INFO("SceneSystemTextureChange: property='%s' previous='%s' current='%s'",
                  name.c_str(), current.c_str(), texture_key.c_str());
     }
     current = texture_key;
+    QueueReplacedImportedTextures(*this, previous);
     // Selecting a system image can replace a render-target input, so this changes graph
     // dependencies as well as descriptors. All handles are updated on the scene thread before the
     // next graph build. Pixel replacement under an unchanged key continues to use the
@@ -61,6 +64,7 @@ std::shared_ptr<const std::optional<std::string>> Scene::RegisterUserTextureBind
 }
 
 void Scene::RefreshUserTextureBindings() {
+    std::optional<LayerResidencyResources> previous;
     for (auto it = m_user_texture_bindings.begin(); it != m_user_texture_bindings.end();) {
         const auto selection = it->selection.lock();
         if (!selection) {
@@ -71,6 +75,10 @@ void Scene::RefreshUserTextureBindings() {
         std::optional<std::string> next;
         if (property != nullptr && !property->empty()) next = it->resolve(*this, *property);
         if (next != *selection) {
+            // Snapshot once before the first changed binding. Material copies share selection
+            // handles, and system inputs have lower precedence than user overrides, so the old
+            // resolved material slots are the ownership source for the entire property batch.
+            if (!previous) previous = CollectRetainedResidencyResources(*this);
             // Resolve metadata before publishing the selected key. The next source refresh and
             // graph build must see one coherent image, sampler and extent even when this texture
             // has never been used in the scene. Empty resets retain each material's own input;
@@ -94,6 +102,7 @@ void Scene::RefreshUserTextureBindings() {
         }
         ++it;
     }
+    if (previous) QueueReplacedImportedTextures(*this, *previous);
 }
 
 void Scene::RegisterTextureFromHeader(const std::string& name, const ImageHeader& header) {

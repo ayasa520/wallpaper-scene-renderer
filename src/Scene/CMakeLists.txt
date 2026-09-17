@@ -12,6 +12,7 @@ SceneImageSource.cpp
 SceneIndexArray.cpp
 SceneModelData.cpp
 SceneNode.cpp
+SceneResidency.cpp
 SceneTransform.cpp
 SceneVertexArray.cpp
 SceneShader.cpp
