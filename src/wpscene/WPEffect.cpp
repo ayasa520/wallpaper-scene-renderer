@@ -162,6 +162,10 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     // Parse the shared effect resource and pass overrides first, then apply the scene instance
     // property table. Visibility records execution state but never prevents the resource, its
     // pass materials, or its framebuffer declarations from being parsed.
+    // The selection name also belongs to this instance. A missing name stays empty even when
+    // the shared resource has a display title, and authored value wrappers use the same string
+    // property reader as other scene properties.
+    GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
     if (json.contains("visible")) {
         visible_json = json.at("visible");
         if (visible_json.is_object()) {
@@ -178,7 +182,6 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
                                 const nlohmann::json& pass_overrides) {
 	GET_JSON_NAME_VALUE_NOWARN(json, "version", version);
-    GET_JSON_NAME_VALUE(json, "name", name);
     if(json.contains("fbos")) {
         for(auto& jF:json.at("fbos")) {
             WPEffectFbo fbo;

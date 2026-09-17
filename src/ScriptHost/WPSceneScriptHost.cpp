@@ -1213,6 +1213,17 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "          return index >= 0 ? createAnimationLayer(index, nodeId, instanceId) : "
            "undefined;\n"
         << "        };\n"
+        << "        if (prop === 'getEffect' || prop === 'getEffectCount') {\n"
+        << "          if (!__native.hasLayerMember(nodeId, prop)) return undefined;\n"
+        << "          if (prop === 'getEffectCount') return () => "
+           "__native.layerCall(nodeId, 'getEffectCount');\n"
+        << "          return (nameOrIndex) => {\n"
+        << "            const index = __native.layerCall(nodeId, 'getEffect', nameOrIndex);\n"
+        << "            // The effect handle resolves its live owner for every operation. "
+           "Animation context belongs to the effect's own script instance.\n"
+        << "            return index >= 0 ? createEffectProxy(nodeId, index) : null;\n"
+        << "          };\n"
+        << "        }\n"
         << "        if (prop === 'getParent') return () => {\n"
         << "          const parentId = __native.getLayerRelation(nodeId, 'parent');\n"
         << "          // Some WE scripts call getParent().getTransformMatrix() even on imported "
@@ -6001,6 +6012,39 @@ JSValue NativeSetLayerProperty(JSContext* context, JSValueConst, int argc, JSVal
     return JS_NewBool(context, ApplyLayerPropertyValue(opaque, node_id, property_name, runtime_value));
 }
 
+int32_t ResolveLayerEffectIndex(JSContext* context, SceneImageEffectLayer* effects,
+                               JSValueConst selector) {
+    if (effects == nullptr) return -1;
+
+    if (JS_IsString(selector)) {
+        std::string name;
+        if (! ReadJSString(context, selector, &name) || name.empty()) return -1;
+
+        // Names identify scene instances, including hidden effects. Search from the end so
+        // duplicate names select the last authored instance. Numeric strings stay names, and
+        // the shared string reader preserves the layer API's NUL-terminated lookup boundary.
+        for (std::size_t end = effects->EffectCount(); end > 0; --end) {
+            if (effects->GetEffect(end - 1)->EffectName() == name) {
+                return static_cast<int32_t>(end - 1);
+            }
+        }
+        return -1;
+    }
+
+    // Only an exact Int32 Number can address an index. In particular, reject negative zero
+    // and fractional/out-of-range values before narrowing, and never invoke conversion
+    // hooks on objects, boxed primitives, or other unsupported argument types.
+    if (! JS_IsNumber(selector)) return -1;
+    double index = 0.0;
+    if (JS_ToFloat64(context, &index, selector) != 0 || ! std::isfinite(index) ||
+        index < 0.0 || index > std::numeric_limits<int32_t>::max() ||
+        std::trunc(index) != index || (index == 0.0 && std::signbit(index))) {
+        return -1;
+    }
+    const auto position = static_cast<int32_t>(index);
+    return static_cast<std::size_t>(position) < effects->EffectCount() ? position : -1;
+}
+
 JSValue NativeHasEffect(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
     auto* opaque = GetOpaque(context);
     if (opaque == nullptr || opaque->scene == nullptr || argc < 2) return JS_FALSE;
@@ -6364,7 +6408,7 @@ JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValue
                           opaque != nullptr && opaque->scene != nullptr &&
                               opaque->scene->GetLayerInitialConfigJson(node_id) != nullptr);
     }
-    if (member_name == "size") {
+    if (member_name == "size" || member_name == "getEffect" || member_name == "getEffectCount") {
         return JS_NewBool(context,
                           opaque != nullptr && (FindImageLayerById(opaque, node_id) != nullptr ||
                                                 FindTextLayerById(opaque, node_id) != nullptr));
@@ -6839,6 +6883,18 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
 
     std::string command;
     if (! ReadJSString(context, argv[1], &command)) return JS_UNDEFINED;
+
+    if (command == "getEffectCount" || command == "getEffect") {
+        auto* effects = opaque->scene != nullptr
+            ? opaque->scene->FindImageEffectLayer(layer_id) : nullptr;
+        // An image or text owner with no authored effects still exposes the methods. The
+        // optional render bridge supplies the full list; visibility only gates execution.
+        if (command == "getEffectCount") {
+            return JS_NewInt64(context, effects != nullptr ? effects->EffectCount() : 0);
+        }
+        return JS_NewInt32(context, ResolveLayerEffectIndex(
+            context, effects, argc >= 3 ? argv[2] : JS_UNDEFINED));
+    }
 
     if (command == "setParent") {
         auto* node = FindNodeById(opaque, layer_id);
