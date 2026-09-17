@@ -322,10 +322,8 @@ LayerValueHint AnimationLayerValueType(std::string_view property_name) {
 }
 
 LayerValueHint EffectValueType(std::string_view property_name) {
-    // This visibility refactor intentionally promotes only effect.visible to a runtime target.
-    // Effect material constant scripts are logged by the parser as unsupported so they do not get
-    // silently misrouted to the owning layer.
     if (property_name == "visible") return { WPDynamicValue::Type::Boolean, true };
+    if (property_name == "name") return { WPDynamicValue::Type::String, true };
     return {};
 }
 
@@ -1177,8 +1175,14 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "__native.resolvePropertyAnimation(instanceId, name) : 0;\n"
         << "          return animationId > 0 ? createTimelineAnimation(animationId) : undefined;\n"
         << "        };\n"
-        << "        if (prop === 'getMaterial') return (materialIndex = 0) => "
-           "createEffectMaterialObject(nodeId, effectIndex, materialIndex);\n"
+        << "        if (prop === 'getMaterialCount') return () => "
+           "__native.effectCall(nodeId, effectIndex, 'getMaterialCount');\n"
+        << "        if (prop === 'getMaterial') return (nameOrIndex) => {\n"
+        << "          const index = __native.effectCall(nodeId, effectIndex, 'getMaterial', "
+           "nameOrIndex);\n"
+        << "          return index >= 0 ? createEffectMaterialObject(nodeId, effectIndex, index) "
+           ": null;\n"
+        << "        };\n"
         << "        return __native.getEffectProperty(nodeId, effectIndex, prop);\n"
         << "      },\n"
         << "      set(_target, prop, value) {\n"
@@ -1187,7 +1191,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      },\n"
         << "      has(_target, prop) {\n"
         << "        if (typeof prop !== 'string') return false;\n"
-        << "        if (prop === 'getAnimation' || prop === 'getMaterial') return true;\n"
+        << "        if (prop === 'getAnimation' || prop === 'getMaterial' || "
+           "prop === 'getMaterialCount') return true;\n"
         << "        return !!__native.hasEffectMember(nodeId, effectIndex, prop);\n"
         << "      }\n"
         << "    });\n"
@@ -1583,6 +1588,30 @@ bool ReadJSString(JSContext* context, JSValueConst value, std::string* out_value
     if (text == nullptr) return false;
     *out_value = text;
     JS_FreeCString(context, text);
+    return true;
+}
+
+bool ReadJSScalarString(JSContext* context, JSValueConst value, std::string* out_value) {
+    // Explicit ToString uses the string hint and preserves the original exception from user
+    // hooks. The property transport is a terminated Unicode scalar string: QuickJS may encode
+    // an isolated UTF-16 surrogate in its UTF-8 output, so replace that one code unit without
+    // disturbing valid surrogate pairs, ordinary UTF-8, or the first-NUL boundary.
+    JSValue string_value = JS_ToString(context, value);
+    if (JS_IsException(string_value)) return false;
+    const bool converted = ReadJSString(context, string_value, out_value);
+    JS_FreeValue(context, string_value);
+    if (!converted) return false;
+
+    for (std::size_t index = 0; index + 2 < out_value->size(); ++index) {
+        const auto first = static_cast<unsigned char>((*out_value)[index]);
+        const auto second = static_cast<unsigned char>((*out_value)[index + 1]);
+        const auto third = static_cast<unsigned char>((*out_value)[index + 2]);
+        if (first == 0xed && second >= 0xa0 && second <= 0xbf &&
+            third >= 0x80 && third <= 0xbf) {
+            out_value->replace(index, 3, "\xef\xbf\xbd");
+            index += 2;
+        }
+    }
     return true;
 }
 
@@ -3827,10 +3856,9 @@ FindEffectMaterialTarget(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
         if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr)
             continue;
 
-        // Wallpaper Engine exposes post-process material passes by their authored order inside the
-        // effect. The render graph may carry additional output names, but script getMaterial(n)
-        // needs to walk only the concrete shader materials so indexes such as godrays 0/1 resolve
-        // to the downsample and cast passes that own the ray controls.
+        // Internal material handles use the dense shader-node order. The public effect method
+        // resolves authored record positions and resource names before constructing a handle,
+        // so command holes never renumber existing callback targets or uniform registrations.
         if (current_material_index == material_index) {
             return EffectMaterialTarget {
                 .effect   = effect,
@@ -5705,6 +5733,7 @@ ReadEffectPropertyValue(const WPSceneScriptHost::Opaque* opaque,
     if (effect == nullptr) return std::nullopt;
 
     if (registration.property_name == "visible") return WPDynamicValue(effect->LocalVisible());
+    if (registration.property_name == "name") return WPDynamicValue(effect->EffectName());
     return std::nullopt;
 }
 
@@ -5712,6 +5741,17 @@ bool ApplyEffectPropertyValue(WPSceneScriptHost::Opaque*       opaque,
                               const WPSceneScriptRegistration& registration,
                               const WPDynamicValue&            value) {
     if (opaque == nullptr || opaque->scene == nullptr) return false;
+    if (registration.property_name == "name") {
+        auto* effect = FindEffectTarget(opaque, registration);
+        std::string name;
+        if (effect == nullptr || !value.tryGet(&name)) return false;
+        if (effect->EffectName() == name) return true;
+        effect->SetName(std::move(name));
+        LOG_INFO("SceneEffectNameApply: layer=%d effect-id=%d effect-index=%u name='%s'",
+                 effect->OwnerLayerId(), effect->EffectId(), effect->EffectIndex(),
+                 effect->EffectName().c_str());
+        return true;
+    }
     if (registration.property_name != "visible") return false;
 
     bool visible = false;
@@ -5754,6 +5794,23 @@ LayerValueHint RegistrationValueType(const WPSceneScriptRegistration& registrati
         return { registration.value_type, true };
     }
     return LayerValueType(registration.property_name);
+}
+
+std::optional<WPDynamicValue>
+ReadRegistrationResult(JSContext* context, const WPSceneScriptRegistration& registration,
+                       JSValueConst result, WPDynamicValue::Type current_type) {
+    if (registration.target_kind == WPSceneScriptTargetKind::Effect &&
+        registration.property_name == "name") {
+        if (JS_IsNull(result) || JS_IsUndefined(result)) return std::nullopt;
+        std::string name;
+        if (!ReadJSScalarString(context, result, &name)) {
+            LogQuickJSException(context, "effect name conversion");
+            return std::nullopt;
+        }
+        return WPDynamicValue(std::move(name));
+    }
+    const auto hint = RegistrationValueType(registration);
+    return ReadDynamicValueFromJS(context, result, hint.supported ? hint.type : current_type);
 }
 
 std::optional<WPDynamicValue> ReadRegistrationValue(const WPSceneScriptHost::Opaque* opaque,
@@ -6078,7 +6135,7 @@ JSValue NativeHasEffectMember(JSContext* context, JSValueConst, int argc, JSValu
         context,
         opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index)) != nullptr &&
             (EffectValueType(member_name).supported || member_name == "getAnimation" ||
-             member_name == "getMaterial"));
+             member_name == "getMaterial" || member_name == "getMaterialCount"));
 }
 
 JSValue NativeGetEffectProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -6096,8 +6153,12 @@ JSValue NativeGetEffectProperty(JSContext* context, JSValueConst, int argc, JSVa
     if (! ReadJSString(context, argv[2], &property_name)) return JS_UNDEFINED;
     const auto* effect =
         opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index));
-    if (effect == nullptr || property_name != "visible") return JS_UNDEFINED;
-    return JS_NewBool(context, effect->LocalVisible());
+    if (effect == nullptr) return JS_UNDEFINED;
+    if (property_name == "visible") return JS_NewBool(context, effect->LocalVisible());
+    if (property_name == "name") {
+        return JS_NewStringLen(context, effect->EffectName().data(), effect->EffectName().size());
+    }
+    return JS_UNDEFINED;
 }
 
 JSValue NativeSetEffectProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -6116,6 +6177,22 @@ JSValue NativeSetEffectProperty(JSContext* context, JSValueConst, int argc, JSVa
     const auto hint = EffectValueType(property_name);
     if (! hint.supported) return JS_FALSE;
 
+    if (property_name == "name") {
+        if (JS_IsNull(argv[3]) || JS_IsUndefined(argv[3])) return JS_TRUE;
+        std::string name;
+        if (!ReadJSScalarString(context, argv[3], &name)) return JS_EXCEPTION;
+        // Conversion hooks can re-enter scene APIs. Resolve the effect through its owner only
+        // after conversion, and rename that retained instance without dirtying draw topology.
+        const WPSceneScriptRegistration registration {
+            .object_id = layer_id,
+            .property_name = "name",
+            .target_kind = WPSceneScriptTargetKind::Effect,
+            .target_index = static_cast<uint32_t>(effect_index),
+        };
+        return JS_NewBool(context, ApplyEffectPropertyValue(opaque, registration,
+                                                            WPDynamicValue(std::move(name))));
+    }
+
     const auto value = ReadDynamicValueFromJS(context, argv[3], hint.type);
     if (! value.has_value()) return JS_FALSE;
 
@@ -6132,6 +6209,45 @@ JSValue NativeSetEffectProperty(JSContext* context, JSValueConst, int argc, JSVa
             opaque->scene->renderGraphTopologyDirty ? "true" : "false");
     }
     return JS_NewBool(context, applied);
+}
+
+JSValue NativeEffectCall(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 3) return JS_UNDEFINED;
+
+    int32_t layer_id = 0;
+    int32_t effect_index = 0;
+    if (JS_ToInt32(context, &layer_id, argv[0]) != 0 ||
+        JS_ToInt32(context, &effect_index, argv[1]) != 0 || effect_index < 0) {
+        return JS_UNDEFINED;
+    }
+    auto* effect = opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index));
+    if (effect == nullptr) return JS_UNDEFINED;
+    std::string method;
+    if (!ReadJSString(context, argv[2], &method)) return JS_EXCEPTION;
+    if (method == "getMaterialCount") {
+        return JS_NewInt32(context, static_cast<int32_t>(effect->MaterialRecordCount()));
+    }
+    if (method != "getMaterial") return JS_UNDEFINED;
+
+    const JSValueConst selector = argc > 3 ? argv[3] : JS_UNDEFINED;
+    if (JS_IsString(selector)) {
+        std::string name;
+        if (!ReadJSString(context, selector, &name)) return JS_EXCEPTION;
+        return JS_NewInt32(context, effect->ResolveMaterialName(name));
+    }
+    if (JS_IsNumber(selector)) {
+        double number = 0.0;
+        if (JS_ToFloat64(context, &number, selector) != 0) return JS_EXCEPTION;
+        if (std::isfinite(number) && number >= std::numeric_limits<int32_t>::min() &&
+            number <= std::numeric_limits<int32_t>::max() && std::trunc(number) == number &&
+            !(number == 0.0 && std::signbit(number))) {
+            return JS_NewInt32(context, effect->ResolveMaterialRecord(static_cast<int32_t>(number)));
+        }
+    }
+    // Unsupported types and non-Int32 Numbers select the empty resource name. They must not
+    // enter ToInt32/ToString: user conversion hooks are unrelated to this method's selector.
+    return JS_NewInt32(context, effect->ResolveMaterialName({}));
 }
 
 JSValue NativeHasEffectMaterial(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -8490,9 +8606,8 @@ bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& in
             JS_FreeValue(context, result);
             return false;
         } else if (! JS_IsUndefined(result)) {
-            const auto hint  = RegistrationValueType(instance.registration);
-            const auto value = ReadDynamicValueFromJS(
-                context, result, hint.supported ? hint.type : instance.current_value.type());
+            const auto value = ReadRegistrationResult(
+                context, instance.registration, result, instance.current_value.type());
             if (value.has_value()) {
                 const auto runtime_value =
                     FromScriptFacingRegistrationValue(instance.registration, *value);
@@ -8608,6 +8723,10 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
                       m_impl->native_bridge,
                       "setEffectProperty",
                       JS_NewCFunction(context, NativeSetEffectProperty, "setEffectProperty", 4));
+    JS_SetPropertyStr(context,
+                      m_impl->native_bridge,
+                      "effectCall",
+                      JS_NewCFunction(context, NativeEffectCall, "effectCall", 3));
     JS_SetPropertyStr(context,
                       m_impl->native_bridge,
                       "hasEffectMaterial",
@@ -9179,9 +9298,8 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
         }
 
         if (! JS_IsUndefined(result)) {
-            const auto hint  = RegistrationValueType(instance.registration);
-            const auto value = ReadDynamicValueFromJS(
-                context, result, hint.supported ? hint.type : instance.current_value.type());
+            const auto value = ReadRegistrationResult(
+                context, instance.registration, result, instance.current_value.type());
             if (value.has_value()) {
                 const auto runtime_value =
                     FromScriptFacingRegistrationValue(instance.registration, *value);

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -69,6 +70,10 @@ public:
     nlohmann::json               visible_json;
     VisibleBinding               visible_binding;
     int32_t                      version;
+    // Public material selectors address every authored pass record, including commands.
+    // A populated entry stores the resource name of the next dense material; a command
+    // retains a null entry without manufacturing a shader material or a render node.
+    std::vector<std::optional<std::string>> material_records;
     std::vector<WPMaterial>      materials;
     std::vector<WPMaterialPass>  passes;
     std::vector<WPEffectCommand> commands;

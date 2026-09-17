@@ -494,6 +494,41 @@ void SceneImageEffect::SetLocalVisible(bool visible) {
     }
 }
 
+int32_t SceneImageEffect::ResolveMaterialRecord(int32_t record_index) const {
+    if (record_index < 0) return -1;
+    const auto position = static_cast<std::size_t>(record_index);
+    if (position >= m_material_records.size() || !m_material_records[position]) return -1;
+
+    int32_t material_index = -1;
+    for (std::size_t index = 0; index <= position; ++index) {
+        if (m_material_records[index]) ++material_index;
+    }
+    return material_index;
+}
+
+int32_t SceneImageEffect::ResolveMaterialName(std::string_view resource_name) const {
+    const auto fold_ascii = [](unsigned char value) {
+        return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
+    };
+    int32_t material_index = 0;
+    int32_t selected = -1;
+    for (const auto& record : m_material_records) {
+        if (!record) continue;
+        // Empty input selects the last concrete material. Nonempty names use an ASCII byte
+        // comparison; unsupported argument types arrive here as empty strings without running
+        // JavaScript conversion hooks. Keep all non-ASCII bytes unchanged.
+        const bool matches = resource_name.empty() ||
+            (record->size() == resource_name.size() &&
+             std::equal(record->begin(), record->end(), resource_name.begin(),
+                        [&](unsigned char left, unsigned char right) {
+                            return fold_ascii(left) == fold_ascii(right);
+                        }));
+        if (matches) selected = material_index;
+        ++material_index;
+    }
+    return selected;
+}
+
 bool SceneImageEffectLayer::HasVisibleEffects() const {
     return std::any_of(m_effects.begin(), m_effects.end(), [](const auto& effect) {
         return effect->LocalVisible();

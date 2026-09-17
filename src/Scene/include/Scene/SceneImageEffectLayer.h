@@ -122,6 +122,13 @@ struct SceneImageEffect {
     // visibility or being pruned while parsing.
     void SetIdentity(int32_t owner_layer_id, int32_t effect_id, uint32_t effect_index,
                      std::string effect_name);
+    void SetName(std::string name) { m_effect_name = std::move(name); }
+    void SetMaterialRecords(std::vector<std::optional<std::string>> records) {
+        m_material_records = std::move(records);
+    }
+    std::size_t MaterialRecordCount() const { return m_material_records.size(); }
+    int32_t ResolveMaterialRecord(int32_t record_index) const;
+    int32_t ResolveMaterialName(std::string_view resource_name) const;
     void SetLocalVisible(bool visible);
     bool LocalVisible() const { return m_local_visible; }
 
@@ -143,6 +150,10 @@ private:
     int32_t     m_effect_id { 0 };
     uint32_t    m_effect_index { 0 };
     std::string m_effect_name;
+    // These selectors outlive graph preparation and text mesh replacement. Render nodes and
+    // retained material callbacks still use dense material indices; command holes exist only
+    // in the public record table and must never shift those internal identities.
+    std::vector<std::optional<std::string>> m_material_records;
     bool        m_local_visible { true };
 };
 

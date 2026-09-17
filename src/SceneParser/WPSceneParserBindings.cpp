@@ -410,11 +410,12 @@ void RegisterSceneParticleOverrideScriptBinding(ParseContext&         context,
 
 }
 
-void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json& object_json,
-                                     const nlohmann::json& effect_json,
-                                     uint32_t              authored_effect_index) {
+void RegisterEffectPropertyBinding(ParseContext& context, const nlohmann::json& object_json,
+                                    const nlohmann::json& effect_json,
+                                    uint32_t authored_effect_index,
+                                    std::string_view property_name, WPDynamicValue::Type hint) {
     if (! object_json.is_object() || ! effect_json.is_object() ||
-        ! effect_json.contains("visible") || ! effect_json.at("visible").is_object()) {
+        ! effect_json.contains(property_name) || ! effect_json.at(property_name).is_object()) {
         return;
     }
 
@@ -435,32 +436,32 @@ void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json
                        : context.scene->FindImageEffect(object_id, authored_effect_index);
     if (effect == nullptr) return;
 
-    const auto&       visible_json = effect_json.at("visible");
+    const auto& property_json = effect_json.at(property_name);
     const std::string effect_name =
         ! authored_effect_name.empty() ? authored_effect_name : effect->EffectName();
     WPUserSetting setting;
-    if (! ParseUserSetting(visible_json, setting, WPDynamicValue::Type::Boolean)) return;
+    if (! ParseUserSetting(property_json, setting, hint)) return;
 
-    // The target points at the fully materialized SceneImageEffect. Runtime dispatch changes only
-    // its local execution bit; all pass nodes and named render targets remain attached.
+    // Bind to the materialized effect's own descriptor. Name scripts must address that effect
+    // through thisObject, while thisLayer continues to address the image/text owner. Renaming
+    // changes the live selection key without replacing pass nodes, materials, or named targets.
     WPSceneScriptRegistration registration {
         .object_id     = object_id,
         .object_name   = effect_name,
-        .property_name = "visible",
+        .property_name = std::string(property_name),
         .target_kind   = WPSceneScriptTargetKind::Effect,
         .target_index  = effect->EffectIndex(),
         .target_id     = effect_id,
-        .value_type    = WPDynamicValue::Type::Boolean,
-        .base_value    = ParsePropertyBaseValue(visible_json, WPDynamicValue::Type::Boolean)
-                             .value_or(setting.value),
+        .value_type    = hint,
+        .base_value    = ParsePropertyBaseValue(property_json, hint).value_or(setting.value),
         .setting       = std::move(setting),
     };
 
     const char* registration_kind = nullptr;
-    if (visible_json.contains("animation") && ! visible_json.at("animation").is_null()) {
+    if (property_json.contains("animation") && ! property_json.at("animation").is_null()) {
         WPPropertyAnimationDefinition animation_definition;
         if (! ParsePropertyAnimationDefinition(
-                visible_json, WPDynamicValue::Type::Boolean, animation_definition)) {
+                property_json, hint, animation_definition)) {
             return;
         }
         registration.animation =
@@ -475,7 +476,7 @@ void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json
         registration_kind = "user";
     }
 
-    if (registration_kind != nullptr) {
+    if (registration_kind != nullptr && property_name == "visible") {
         LOG_INFO("SceneVisibilityEffectRegister: layer=%d effect-id=%d effect-index=%u name='%s' "
                  "kind=%s initial-visible=%s",
                  object_id,
@@ -484,10 +485,16 @@ void RegisterEffectVisibilityBinding(ParseContext& context, const nlohmann::json
                  effect_name.c_str(),
                  registration_kind,
                  effect->LocalVisible() ? "true" : "false");
+    } else if (registration_kind != nullptr) {
+        LOG_INFO("SceneEffectPropertyRegister: layer=%d effect-id=%d effect-index=%u "
+                 "property='%.*s' kind=%s name='%s'",
+                 object_id, effect_id, effect->EffectIndex(),
+                 static_cast<int>(property_name.size()), property_name.data(),
+                 registration_kind, effect->EffectName().c_str());
     }
 }
 
-void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::json& object_json) {
+void RegisterEffectPropertyBindings(ParseContext& context, const nlohmann::json& object_json) {
     if (! object_json.is_object() || ! object_json.contains("effects") ||
         ! object_json.at("effects").is_array()) {
         return;
@@ -495,7 +502,10 @@ void RegisterEffectVisibilityBindings(ParseContext& context, const nlohmann::jso
 
     uint32_t effect_index = 0;
     for (const auto& effect_json : object_json.at("effects")) {
-        RegisterEffectVisibilityBinding(context, object_json, effect_json, effect_index);
+        RegisterEffectPropertyBinding(context, object_json, effect_json, effect_index,
+                                      "visible", WPDynamicValue::Type::Boolean);
+        RegisterEffectPropertyBinding(context, object_json, effect_json, effect_index,
+                                      "name", WPDynamicValue::Type::String);
         effect_index++;
     }
 }
@@ -939,7 +949,7 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
             RegisterSceneScriptBinding(context, object_json, "fov", WPDynamicValue::Type::Float);
         }
 
-        RegisterEffectVisibilityBindings(context, object_json);
+        RegisterEffectPropertyBindings(context, object_json);
 
         if (! object_json.contains("animationlayers") ||
             ! object_json.at("animationlayers").is_array()) {
@@ -1135,7 +1145,7 @@ void RegisterSceneScriptsForObject(ParseContext& context, const nlohmann::json& 
         RegisterSceneScriptBinding(context, object_json, "fov", WPDynamicValue::Type::Float);
     }
 
-    RegisterEffectVisibilityBindings(context, object_json);
+    RegisterEffectPropertyBindings(context, object_json);
 
     if (! object_json.contains("animationlayers") ||
         ! object_json.at("animationlayers").is_array()) {

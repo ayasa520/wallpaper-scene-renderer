@@ -1,5 +1,6 @@
 #include "wpscene/WPEffect.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 
@@ -12,6 +13,21 @@ using namespace wallpaper::wpscene;
 
 namespace
 {
+
+std::string NormalizeMaterialResourceName(std::string name) {
+    std::replace(name.begin(), name.end(), '\\', '/');
+    // Resource identity preserves the leading slash pair. Interior separator runs collapse
+    // without resolving dot segments or changing letter case, so lookup uses the same name
+    // that selected the material resource rather than a filesystem canonical path.
+    for (auto slash = name.find('/'); slash != std::string::npos;
+         slash = name.find('/', slash + 1)) {
+        if (slash == 0) continue;
+        const auto end = name.find_first_not_of('/', slash + 1);
+        const auto count = (end == std::string::npos ? name.size() : end) - slash - 1;
+        name.erase(slash + 1, count);
+    }
+    return name;
+}
 
 void ReadVisibleBinding(const nlohmann::json& json, wallpaper::VisibleBinding* binding) {
     if (! json.is_object()) return;
@@ -207,6 +223,7 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
                     cmd.FromJson(jP);
                     cmd.afterpos = passes.size();
                     commands.push_back(cmd);
+                    material_records.emplace_back(std::nullopt);
                     continue;
                 }
                 LOG_ERROR("no material in effect pass");
@@ -214,11 +231,13 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
             }
             std::string matPath;
             GET_JSON_NAME_VALUE(jP, "material", matPath);
+            matPath = NormalizeMaterialResourceName(std::move(matPath));
             nlohmann::json jMat;
             if(!PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + matPath), jMat))
                 return false;
             WPMaterial material;
             material.FromJson(jMat, instance);
+            material_records.emplace_back(matPath);
             materials.push_back(std::move(material));
             WPMaterialPass pass;
             pass.FromJson(jP);

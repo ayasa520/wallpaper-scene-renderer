@@ -2459,6 +2459,7 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
         auto effect = std::make_shared<SceneImageEffect>(visibility_policy);
         effect->SetIdentity(layer_id, authored_effect.id, static_cast<uint32_t>(effect_index),
                             authored_effect.name);
+        effect->SetMaterialRecords(authored_effect.material_records);
         const auto feedback_fbos = authored_effect.FeedbackFboNames();
         std::unordered_map<std::string, std::string> fbo_map;
         for (const auto& authored_fbo : authored_effect.fbos) {
@@ -3451,6 +3452,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             std::shared_ptr<SceneImageEffect> img_effect = std::make_shared<SceneImageEffect>();
             img_effect->SetIdentity(
                 text_obj.id, wp_effect.id, static_cast<uint32_t>(effect_index), wp_effect.name);
+            img_effect->SetMaterialRecords(wp_effect.material_records);
             const bool effect_initial_visible =
                 ResolveEffectVisibility(wp_effect, context.user_properties);
             const bool effect_runtime_visibility =
