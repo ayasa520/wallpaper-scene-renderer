@@ -56,7 +56,8 @@ private:
     bool IsEffectBlacklisted(const std::string& filePath);
 public:
     bool                         FromJson(const nlohmann::json&, fs::VFS& vfs);
-    bool                         FromFileJson(const nlohmann::json&, fs::VFS& vfs);
+    bool                         FromFileJson(const nlohmann::json&, fs::VFS& vfs,
+                                              const nlohmann::json& pass_overrides);
     std::unordered_set<std::string> FeedbackFboNames() const;
     int32_t                      id { 0 };
     std::string                  name;

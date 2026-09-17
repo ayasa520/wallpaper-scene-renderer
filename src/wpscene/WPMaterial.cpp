@@ -9,6 +9,43 @@ using namespace wallpaper::wpscene;
 
 namespace
 {
+nlohmann::json MergeMaterialPassInput(const nlohmann::json& base,
+                                     const nlohmann::json& override) {
+    // Resolve authored material inputs while their JSON types are still available. Null
+    // children preserve the base, but empty strings remain selected values. Same-kind
+    // containers merge recursively and retain untouched members or trailing array entries.
+    // When a container replaces another kind, copy each admitted child directly, including
+    // any nested nulls it contains; recursively merging into an empty container would change
+    // that input. This operation is independent of the material fields currently supported.
+    auto merged = base;
+    const nlohmann::json absent;
+    const bool same_kind = base.type() == override.type();
+    if (override.is_object()) {
+        if (!same_kind) merged = nlohmann::json::object();
+        for (const auto& [name, value] : override.items()) {
+            if (value.is_null()) continue;
+            if (same_kind) {
+                const auto found = base.find(name);
+                merged[name] = MergeMaterialPassInput(found != base.end() ? *found : absent, value);
+            } else {
+                merged[name] = value;
+            }
+        }
+    } else if (override.is_array()) {
+        if (!same_kind) merged = nlohmann::json::array();
+        for (std::size_t index = 0; index < override.size(); ++index) {
+            const auto& value = override[index];
+            if (value.is_null()) continue;
+            merged[index] = same_kind
+                ? MergeMaterialPassInput(index < base.size() ? base[index] : absent, value)
+                : value;
+        }
+    } else {
+        merged = override;
+    }
+    return merged;
+}
+
 void ReadMaterialEnum(const nlohmann::json& json, std::string_view name,
                       std::initializer_list<std::string_view> choices, std::string& value) {
     const auto entry = json.find(name);
@@ -66,111 +103,7 @@ bool WPUserTextureBinding::FromJson(const nlohmann::json& json) {
 }
 
 
-void WPMaterialPass::Update(const WPMaterialPass& p) {
-    if (!p.usertexturereference.is_null()) usertexturereference = p.usertexturereference;
-    int32_t i = -1;
-    for(const auto& el:p.textures) {
-        i++;
-        if(p.textures.size() > textures.size())
-            textures.resize(p.textures.size());
-        if(!el.empty()) {
-            textures[i] = el;
-        }
-    }
-    i = -1;
-    for (const auto& el : p.usertextures) {
-        i++;
-        if (p.usertextures.size() > usertextures.size())
-            usertextures.resize(p.usertextures.size());
-        if (! el.empty()) {
-            usertextures[i] = el;
-        }
-    }
-    for(const auto& el:p.constantshadervalues) {
-        constantshadervalues[el.first] = el.second;
-    }
-    for(const auto& el:p.usershadervalues) {
-        usershadervalues[el.first] = el.second;
-    }
-    for(const auto& el:p.combos) {
-        combos[el.first] = el.second;
-    }
-}
-
-void WPMaterial::MergePass(const WPMaterialPass& p) {
-    if (!p.usertexturereference.is_null()) usertexturereference = p.usertexturereference;
-    int32_t i = -1;
-    for(const auto& el:p.textures) {
-        i++;
-        if(p.textures.size() > textures.size())
-            textures.resize(p.textures.size());
-        if(!el.empty()) {
-            textures[i] = el;
-        }
-    }
-    i = -1;
-    for (const auto& el : p.usertextures) {
-        i++;
-        if (p.usertextures.size() > usertextures.size())
-            usertextures.resize(p.usertextures.size());
-        if (! el.empty()) {
-            usertextures[i] = el;
-        }
-    }
-    for(const auto& el:p.constantshadervalues) {
-        constantshadervalues[el.first] = el.second;
-    }
-    for(const auto& el:p.usershadervalues) {
-        usershadervalues[el.first] = el.second;
-    }
-    for(const auto& el:p.combos) {
-        combos[el.first] = el.second;
-    }
-}
-
 bool WPMaterialPass::FromJson(const nlohmann::json& json) {
-    if (const auto entry = json.find("usertexturereference"); entry != json.end()) {
-        usertexturereference = *entry;
-    }
-    if(json.contains("textures")) {
-        for(const auto& jT:json.at("textures")) {
-            std::string tex;
-            if(!jT.is_null())
-                GET_JSON_VALUE(jT, tex);
-            textures.push_back(tex);
-        }
-    }
-    if (json.contains("usertextures")) {
-        for (const auto& jT : json.at("usertextures")) {
-            WPUserTextureBinding binding;
-            if (! jT.is_null())
-                binding.FromJson(jT);
-            usertextures.push_back(binding);
-        }
-    }
-    if(json.contains("constantshadervalues")) {
-        for(const auto& jC:json.at("constantshadervalues").items()) {
-            constantshadervalues[jC.key()] = jC.value();
-        }
-    }
-    if(json.contains("usershadervalues")) {
-        for(const auto& jC:json.at("usershadervalues").items()) {
-            std::string name;
-            std::string value;
-            GET_JSON_VALUE(jC.key(), name);
-            GET_JSON_VALUE(jC.value(), value);
-            usershadervalues[name] = value;
-        }
-    }
-    if(json.contains("combos")) {
-        for(const auto& jC:json.at("combos").items()) {
-            std::string name;
-            int32_t value;
-            GET_JSON_VALUE(jC.key(), name);
-            GET_JSON_VALUE(jC.value(), value);
-            combos[name] = value;
-        }
-    }
     GET_JSON_NAME_VALUE_NOWARN(json, "target", target);
     GET_JSON_NAME_VALUE_NOWARN(json, "compose", compose);
     if(json.contains("bind")) {
@@ -183,12 +116,20 @@ bool WPMaterialPass::FromJson(const nlohmann::json& json) {
     return true;
 }
 
-bool WPMaterial::FromJson(const nlohmann::json& json) {
+bool WPMaterial::FromJson(const nlohmann::json& json, const nlohmann::json& pass_override) {
     if(!json.contains("passes") || json.at("passes").size() == 0) {
         LOG_ERROR("material no data");
         return false;
     }
-    const auto jContent = json.at("passes").at(0);
+    const auto& base = json.at("passes").at(0);
+    // Only an object is a material-instance override. Decode the selected input once, before
+    // owner preparation can add program state such as skinning or direct shape drawing.
+    const auto jContent = pass_override.is_object() ? MergeMaterialPassInput(base, pass_override)
+                                                    : base;
+    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+        LOG_INFO("SceneMaterialPassInput: base=%s override=%s resolved=%s",
+                 base.dump().c_str(), pass_override.dump().c_str(), jContent.dump().c_str());
+    }
     if (const auto entry = jContent.find("usertexturereference"); entry != jContent.end()) {
         usertexturereference = *entry;
     }

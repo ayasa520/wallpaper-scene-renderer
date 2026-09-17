@@ -154,24 +154,10 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     nlohmann::json jEffect;
     if(!PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + filePath), jEffect))
         return false;
-    if(!FromFileJson(jEffect, vfs))
+    if(!FromFileJson(jEffect, vfs, json.value("passes", nlohmann::json())))
         return false;
     // Parse-time mechanism marker for log-driven tooling: which effect resources a scene uses.
     LOG_INFO("SceneEffectParsed: id=%d file='%s' passes=%zu", id, filePath.c_str(), passes.size());
-
-    if(json.contains("passes")) {
-        const auto& jPasses = json.at("passes");
-        if(jPasses.size() > passes.size()) {
-            LOG_ERROR("passes is not injective");
-            return false;
-        }
-        int32_t i = 0;
-        for(const auto& jP:jPasses) {
-            WPMaterialPass pass;
-            pass.FromJson(jP);
-            passes[i++].Update(pass);
-        }
-    }
 
     // Parse the shared effect resource and pass overrides first, then apply the scene instance
     // property table. Visibility records execution state but never prevents the resource, its
@@ -189,7 +175,8 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     return true;
 }
 
-bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs) {
+bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
+                                const nlohmann::json& pass_overrides) {
 	GET_JSON_NAME_VALUE_NOWARN(json, "version", version);
     GET_JSON_NAME_VALUE(json, "name", name);
     if(json.contains("fbos")) {
@@ -201,7 +188,16 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs) {
     }
     if(json.contains("passes")) {
         const auto& jEPasses = json.at("passes");
+        const nlohmann::json no_override;
+        std::size_t input_index = 0;
         for(const auto& jP:jEPasses) {
+            // Instance entries address the authored effect-pass array, including positions
+            // occupied by commands. Resolve this index before filtering commands into their
+            // execution list. The resource entry owns routing; only the matching instance
+            // object is merged with the material resource before typed interpretation.
+            const auto& instance = pass_overrides.is_array() && input_index < pass_overrides.size()
+                ? pass_overrides[input_index] : no_override;
+            ++input_index;
             if(!jP.contains("material")) {
                 if(jP.contains("command")) {
                     WPEffectCommand cmd;
@@ -219,7 +215,7 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs) {
             if(!PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + matPath), jMat))
                 return false;
             WPMaterial material;
-            material.FromJson(jMat);
+            material.FromJson(jMat, instance);
             materials.push_back(std::move(material));
             WPMaterialPass pass;
             pass.FromJson(jP);

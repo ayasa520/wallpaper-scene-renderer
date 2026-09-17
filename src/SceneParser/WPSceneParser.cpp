@@ -2496,7 +2496,6 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
             bool output_is_fbo = false;
             if (material_index < authored_effect.passes.size()) {
                 const auto& pass = authored_effect.passes[material_index];
-                material_source.MergePass(pass);
                 for (const auto& binding : pass.bind) {
                     const auto target = fbo_map.find(binding.name);
                     if (target == fbo_map.end()) {
@@ -3507,7 +3506,6 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 bool                output_is_fbo = false;
                 if (wp_effect.passes.size() > material_index) {
                     const auto& wp_pass = wp_effect.passes.at(material_index);
-                    material_source.MergePass(wp_pass);
                     for (const auto& bind : wp_pass.bind) {
                         if (fbo_map.count(bind.name) == 0) continue;
                         if (material_source.textures.size() <= static_cast<usize>(bind.index)) {
@@ -3827,14 +3825,13 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
 }
 
 void PrepareShapeEffectMaterials(WPShapeObject& shape_obj) {
-    // Shape output is selected by the owning layer type. Each material-bearing effect pass gets
-    // DIRECTDRAW=1 after its authored override is read, even when the file omits the combo or
-    // explicitly writes zero. Keep this in the shape parser: the common material merge then
-    // applies this pass override over material defaults without changing image or text effects.
-    // The parsed pass list contains only material entries, so command markers are unaffected.
+    // Shape chooses its program after authored material input is fully resolved, and before
+    // shader metadata or executable selection. Apply DIRECTDRAW to that final typed material,
+    // including an authored zero, so later loading preserves the owner decision without
+    // treating it as another JSON overlay. Command entries never own a material here.
     for (auto& effect : shape_obj.effects) {
-        for (usize pass_index = 0; pass_index < effect.passes.size(); ++pass_index) {
-            auto& combos = effect.passes[pass_index].combos;
+        for (usize pass_index = 0; pass_index < effect.materials.size(); ++pass_index) {
+            auto& combos = effect.materials[pass_index].combos;
             const auto authored = combos.find("DIRECTDRAW");
             LOG_INFO("SceneShapeMaterialPreparation: layer=%d effect-id=%d pass=%zu "
                      "authored-directdraw=%s authored-value=%d final-directdraw=1",

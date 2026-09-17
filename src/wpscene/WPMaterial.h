@@ -30,17 +30,8 @@ public:
 class WPMaterialPass {
 public:
     bool                                                FromJson(const nlohmann::json&);
-    void                                                Update(const WPMaterialPass&);
-    std::vector<std::string>                            textures;
-    std::vector<WPUserTextureBinding>                   usertextures;
-    nlohmann::json                                     usertexturereference;
-    std::unordered_map<std::string, int32_t>            combos;
-    // The shader declaration owns each material property's type. Preserve the complete JSON
-    // until that declaration is available: a numeric scalar can initialize a vector, and the
-    // same object can retain a user binding, script, and independently sampled timeline. Pass
-    // overrides replace that one authored record rather than merging a stale typed sidecar.
-    std::unordered_map<std::string, nlohmann::json>      constantshadervalues;
-    std::unordered_map<std::string, std::string>        usershadervalues;
+    // Effect routing belongs to the effect resource. Material input is resolved separately,
+    // before WPMaterial interprets shader, raster state, textures and property declarations.
     std::string                                         target;
     std::vector<WPMaterialPassBindItem>                 bind;
     // A composed pass completes one destination step inside the effect. Subsequent passes
@@ -50,8 +41,8 @@ public:
 
 class WPMaterial {
 public:
-    bool                                                FromJson(const nlohmann::json&);
-    void                                                MergePass(const WPMaterialPass&);
+    bool                                                FromJson(const nlohmann::json&,
+                                                                 const nlohmann::json& pass_override = nlohmann::json());
     // Static material state starts opaque and back-face culled, with depth testing/writing
     // enabled. Each draw owner separately decides which material states apply to its pass.
     std::string                                         blending { "normal" };
@@ -74,8 +65,7 @@ public:
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPassBindItem, name, index);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPUserTextureBinding, name, type, keepaspect);
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPass, bind, target, textures, usertextures, combos,
-                                   constantshadervalues, usershadervalues, compose, usertexturereference);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterialPass, bind, target, compose);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPMaterial, blending, shader, textures, usertextures, combos,
                                    constantshadervalues, usershadervalues, usertexturereference);
 } // namespace wpscene
