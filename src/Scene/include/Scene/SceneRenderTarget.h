@@ -9,8 +9,8 @@ namespace wallpaper
 
 // Authored effect FBO sizing is shared by initial materialization and later resource setup.
 // Keep the calculation independent of parser objects and of the image/text geometry owner.
-std::array<int32_t, 2> ResolveEffectRenderTargetExtent(
-    std::array<float, 2> source_extent, uint32_t scale, uint32_t fit);
+std::array<int32_t, 2> ResolveEffectRenderTargetReferenceExtent(
+    std::array<float, 2> source_extent, std::array<uint16_t, 2> authored_extent, uint16_t fit);
 
 struct SceneRenderTarget {
     struct Bind {
@@ -20,8 +20,8 @@ struct SceneRenderTarget {
         double      scale { 1.0 };
     };
 
-    i32           width;
-    i32           height;
+    i32           width { 0 };
+    i32           height { 0 };
     i32           mapWidth { 0 };
     i32           mapHeight { 0 };
     bool          allowReuse { false };
@@ -42,6 +42,18 @@ struct SceneRenderTarget {
                            TextureFilter::LINEAR,
                            TextureFilter::LINEAR };
     Bind          bind {};
+
+    // Reference dimensions describe the last resource setup before integer scaling. The first
+    // creator owns the divisor, even when another layer later acquires and resizes this name.
+    // Ordinary unscaled targets start with identical reference and physical extents.
+    std::array<i32, 2> reference_extent { width, height };
+    uint32_t          resolution_divisor { 1 };
+    // A logical resize discards the old backing contents even when the divided size is unchanged.
+    // Carry that decision into the allocation key instead of relying only on physical dimensions.
+    uint64_t          allocation_revision { 0 };
+
+    static SceneRenderTarget FromReferenceExtent(std::array<i32, 2> extent, uint32_t divisor);
+    bool ResizeReferenceExtent(std::array<i32, 2> extent);
 
     [[nodiscard]] i32 ContentWidth() const {
         // Render targets can expose a logical content rectangle that is smaller than their

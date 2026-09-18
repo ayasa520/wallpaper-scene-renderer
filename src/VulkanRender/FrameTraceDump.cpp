@@ -120,6 +120,8 @@ uint64_t FrameTraceDump::addCommand(uint64_t index, const char* kind, const char
     command.width      = image.extent.width;
     command.height     = image.extent.height;
     command.samples    = image.samples;
+    command.allocation_revision = image.allocation_revision;
+    command.allocation_generation = image.allocation_generation;
     m_commands.push_back(std::move(command));
     return index;
 }
@@ -137,6 +139,8 @@ void FrameTraceDump::addInput(uint64_t command, const char* role, std::string_vi
         .width   = image.extent.width,
         .height  = image.extent.height,
         .samples = image.samples,
+        .allocation_revision = image.allocation_revision,
+        .allocation_generation = image.allocation_generation,
     });
 }
 
@@ -182,6 +186,13 @@ void FrameTraceDump::finishFrame(const char* phase, uint32_t output_width,
             << ", \"reflection\": " << (command.reflection ? "true" : "false")
             << ", \"count\": " << command.count << ", \"extent\": [" << command.width << ", "
             << command.height << "], \"samples\": " << command.samples;
+        // Only explicitly reconstructed targets need this extra identity. Read it from each
+        // command's retained image binding, not from the scene's latest requested descriptor:
+        // stale bindings and missing same-size replacements must remain observable to the gate.
+        if (command.allocation_revision != 0) {
+            out << ", \"allocation\": {\"revision\": " << command.allocation_revision
+                << ", \"generation\": " << command.allocation_generation << "}";
+        }
         if (! command.inputs.empty()) {
             out << ",\n     \"inputs\": [";
             for (size_t j = 0; j < command.inputs.size(); ++j) {
@@ -192,7 +203,12 @@ void FrameTraceDump::finishFrame(const char* phase, uint32_t output_width,
                 WriteString(out, input.key);
                 out << ", \"access\": " << (input.read ? "\"read\"" : "\"metadata\"")
                     << ", \"binding\": " << input.binding << ", \"extent\": [" << input.width
-                    << ", " << input.height << "], \"samples\": " << input.samples << "}";
+                    << ", " << input.height << "], \"samples\": " << input.samples;
+                if (input.allocation_revision != 0) {
+                    out << ", \"allocation\": {\"revision\": " << input.allocation_revision
+                        << ", \"generation\": " << input.allocation_generation << "}";
+                }
+                out << "}";
             }
             out << "]";
         }

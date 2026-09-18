@@ -2063,6 +2063,7 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
     auto target = scene.renderTargets.at(previous_names[0]);
     target.width = target.mapWidth = static_cast<int32_t>(next_backing_extent[0]);
     target.height = target.mapHeight = static_cast<int32_t>(next_backing_extent[1]);
+    target.reference_extent = { target.width, target.height };
     const auto& render_contract = state.render_contract;
     const auto next_names = ResolveSceneDestinationRenderTargets(
         scene, layer_id, effect_layer.Owner().ParentId(),

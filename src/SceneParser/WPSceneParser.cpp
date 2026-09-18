@@ -2479,27 +2479,22 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
         std::unordered_map<std::string, std::string> fbo_map;
         for (const auto& authored_fbo : authored_effect.fbos) {
             const auto name = EffectFboRenderTargetName(authored_fbo, authored_effect.id);
-            const auto size = authored_fbo.ResolveSize(target_resolution);
+            const auto reference = authored_fbo.ResolveReferenceExtent(target_resolution);
             const bool feedback = feedback_fbos.contains(authored_fbo.name);
-            const SceneRenderTarget target {
-                .width = size[0],
-                .height = size[1],
-                .mapWidth = size[0],
-                .mapHeight = size[1],
-                // A declared target is retained by its owner, including when its writer discards
-                // fragments or the effect is hidden. Pass read-before-write analysis alone cannot
-                // determine whether the next frame will consume these stored pixels.
-                .allowReuse = false,
-            };
+            // The descriptor retains reference dimensions and the first creator's divisor.
+            // Name-only acquisition leaves both untouched when another owner already registered
+            // this target. Declared targets remain persistent through hidden or discard-only use.
+            const auto target = SceneRenderTarget::FromReferenceExtent(reference, authored_fbo.scale);
             InternNamedRenderTarget(scene, name, target);
-            if (authored_fbo.fit > 0 || feedback) {
+            if (authored_fbo.fit <= 4096 || feedback) {
                 LOG_INFO("SceneEffectFboResolve: layer=%d effect-id=%d effect='%s' "
                          "fbo='%s' target='%s' size=%dx%d scale=%u fit=%u persistent-feedback=%s",
                          layer_id, authored_effect.id, authored_effect.name.c_str(),
-                         authored_fbo.name.c_str(), name.c_str(), size[0], size[1],
-                         authored_fbo.scale, authored_fbo.fit, feedback ? "true" : "false");
+                         authored_fbo.name.c_str(), name.c_str(), target.width, target.height,
+                         static_cast<unsigned>(authored_fbo.scale),
+                         static_cast<unsigned>(authored_fbo.fit), feedback ? "true" : "false");
             }
-            layer.AddEffectRenderTarget(name, authored_fbo.scale, authored_fbo.fit);
+            layer.AddEffectRenderTarget(name, { authored_fbo.width, authored_fbo.height }, authored_fbo.fit);
             fbo_map[authored_fbo.name] = name;
         }
 
@@ -3482,21 +3477,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             for (const auto& wp_fbo : wp_effect.fbos) {
                 const std::string rt_name =
                     EffectFboRenderTargetName(wp_fbo, wp_effect.id);
-                const auto fbo_size = wp_fbo.ResolveSize(effect_target_resolution);
+                const auto reference = wp_fbo.ResolveReferenceExtent(effect_target_resolution);
                 const bool        persistent_feedback_fbo =
                     feedback_fbos.count(wp_fbo.name) != 0;
-                SceneRenderTarget fbo_target {
-                    .width      = fbo_size[0],
-                    .height     = fbo_size[1],
-                    .mapWidth   = fbo_size[0],
-                    .mapHeight  = fbo_size[1],
-                    // Text effect targets participate in the same global name table as image
-                    // effects. Persistent allocation also preserves feedback contents across
-                    // frames when the authored command stream reads its previous output.
-                    .allowReuse = false,
-                };
+                const auto fbo_target = SceneRenderTarget::FromReferenceExtent(reference, wp_fbo.scale);
                 InternNamedRenderTarget(scene, rt_name, fbo_target);
-                if (wp_fbo.fit > 0 || persistent_feedback_fbo) {
+                if (wp_fbo.fit <= 4096 || persistent_feedback_fbo) {
                     LOG_INFO("SceneTextEffectFboResolve: layer=%d effect-id=%d effect='%s' "
                              "fbo='%s' target='%s' size=%dx%d scale=%u fit=%u "
                              "persistent-feedback=%s",
@@ -3505,13 +3491,13 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                              wp_effect.name.c_str(),
                              wp_fbo.name.c_str(),
                              rt_name.c_str(),
-                             fbo_size[0],
-                             fbo_size[1],
-                             wp_fbo.scale,
-                             wp_fbo.fit,
+                             fbo_target.width,
+                             fbo_target.height,
+                             static_cast<unsigned>(wp_fbo.scale),
+                             static_cast<unsigned>(wp_fbo.fit),
                              persistent_feedback_fbo ? "true" : "false");
                 }
-                imgEffectLayer->AddEffectRenderTarget(rt_name, wp_fbo.scale, wp_fbo.fit);
+                imgEffectLayer->AddEffectRenderTarget(rt_name, { wp_fbo.width, wp_fbo.height }, wp_fbo.fit);
                 fbo_map[wp_fbo.name] = rt_name;
             }
 

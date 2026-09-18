@@ -53,6 +53,9 @@ struct TextureKey {
     TextureSample sample {};
     uint          mipmap_level { 1 };
     uint          sample_count { 1 };
+    // Logical reconstruction is part of allocation identity even if the physical descriptor
+    // stays equal. Reusing that old image would preserve contents past the requested reset.
+    uint64_t      allocation_revision { 0 };
 
     static TexHash HashValue(const TextureKey&);
 

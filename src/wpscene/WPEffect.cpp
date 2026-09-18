@@ -16,6 +16,28 @@ using namespace wallpaper::wpscene;
 namespace
 {
 
+int32_t ReadFboInt32(const nlohmann::json& json, const char* name, int32_t default_value) {
+    const auto value = json.find(name);
+    if (value == json.end() || !value->is_number()) return default_value;
+    constexpr auto minimum = std::numeric_limits<int32_t>::min();
+    constexpr auto maximum = std::numeric_limits<int32_t>::max();
+    // Numeric admission precedes narrowing to the authored byte/word fields. Integral JSON
+    // doubles are valid integers here, while booleans, strings, fractional numbers and values
+    // outside signed 32-bit range do not replace the property's default.
+    if (value->is_number_unsigned()) {
+        const auto integer = value->get<uint64_t>();
+        return integer <= maximum ? static_cast<int32_t>(integer) : default_value;
+    }
+    if (value->is_number_integer()) {
+        const auto integer = value->get<int64_t>();
+        return integer >= minimum && integer <= maximum
+            ? static_cast<int32_t>(integer) : default_value;
+    }
+    const auto number = value->get<double>();
+    return number >= minimum && number <= maximum && std::trunc(number) == number
+        ? static_cast<int32_t>(number) : default_value;
+}
+
 std::string NormalizeMaterialResourceName(std::string name) {
     std::replace(name.begin(), name.end(), '\\', '/');
     // Resource identity preserves the leading slash pair. Interior separator runs collapse
@@ -62,8 +84,10 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE(json, "name", name);
     GET_JSON_NAME_VALUE(json, "format", format);
 
-    GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
-    GET_JSON_NAME_VALUE_NOWARN(json, "fit", fit);
+    scale = static_cast<uint8_t>(ReadFboInt32(json, "scale", 1));
+    width = static_cast<uint16_t>(ReadFboInt32(json, "width", -1));
+    height = static_cast<uint16_t>(ReadFboInt32(json, "height", -1));
+    fit = static_cast<uint16_t>(ReadFboInt32(json, "fit", -1));
     GET_JSON_NAME_VALUE_NOWARN(json, "unique", unique);
     const auto clear = json.find("clear");
     if (clear != json.end() && clear->is_string()) {
@@ -93,8 +117,8 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
     return true;
 }
 
-std::array<int32_t, 2> WPEffectFbo::ResolveSize(std::array<float, 2> source_size) const {
-    return wallpaper::ResolveEffectRenderTargetExtent(source_size, scale, fit);
+std::array<int32_t, 2> WPEffectFbo::ResolveReferenceExtent(std::array<float, 2> source_size) const {
+    return wallpaper::ResolveEffectRenderTargetReferenceExtent(source_size, { width, height }, fit);
 }
 
 // The blacklist belongs to the shared effect parser, not to WPImageObject. Text effects and image

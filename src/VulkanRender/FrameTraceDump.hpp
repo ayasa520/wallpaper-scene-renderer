@@ -38,6 +38,8 @@ public:
         uint32_t    width { 0 };
         uint32_t    height { 0 };
         uint32_t    samples { 0 };
+        uint64_t    allocation_revision { 0 };
+        uint64_t    allocation_generation { 0 };
     };
     struct Uniform {
         std::string        name;
@@ -56,6 +58,8 @@ public:
         uint32_t             width { 0 };
         uint32_t             height { 0 };
         uint32_t             samples { 0 };
+        uint64_t             allocation_revision { 0 };
+        uint64_t             allocation_generation { 0 };
         std::vector<Input>   inputs;
         std::vector<Uniform> uniforms;
     };

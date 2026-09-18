@@ -314,7 +314,8 @@ public:
     const std::vector<std::string>& RuntimeRenderTargetNames() const {
         return m_runtime_render_target_names;
     }
-    void AddEffectRenderTarget(std::string name, uint32_t scale, uint32_t fit);
+    void AddEffectRenderTarget(std::string name, std::array<uint16_t, 2> authored_extent,
+                               uint16_t fit);
     bool ResizeEffectRenderTargets(Scene& scene, std::array<float, 2> source_extent);
     bool        CopyBackground() const;
     AlphaWritePolicy CompositionChildAlphaWritePolicy(AlphaWritePolicy enclosing_policy) const {
@@ -355,8 +356,8 @@ private:
 
     struct EffectRenderTarget {
         std::string name;
-        uint32_t scale;
-        uint32_t fit;
+        std::array<uint16_t, 2> authored_extent;
+        uint16_t fit;
     };
 
     SceneObject& m_owner;

@@ -58,6 +58,7 @@ inline TextureKey ToTexKey(wallpaper::SceneRenderTarget rt) {
         .sample       = rt.sample,
         .mipmap_level = rt.mipmap_level,
         .sample_count = rt.sample_count > 0 ? static_cast<uint>(rt.sample_count) : 1u,
+        .allocation_revision = rt.allocation_revision,
     };
 }
 } // namespace vulkan

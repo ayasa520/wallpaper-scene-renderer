@@ -39,19 +39,60 @@ std::array<int32_t, 2> ResolveShapeDestinationExtent(std::array<int32_t, 2> canv
              ClampDestinationRenderTargetExtent(canvas_size[1] / 2) };
 }
 
-std::array<int32_t, 2> ResolveEffectRenderTargetExtent(
-    std::array<float, 2> source_extent, uint32_t scale, uint32_t fit) {
-    const float source_width  = std::max(1.0f, source_extent[0]);
-    const float source_height = std::max(1.0f, source_extent[1]);
-    const auto round_pixel = [](float value) {
-        return std::max(1, static_cast<int32_t>(std::lround(std::max(1.0f, value))));
-    };
-    if (fit > 0) {
-        const float fit_scale = static_cast<float>(fit) / std::max(source_width, source_height);
-        return { round_pixel(source_width * fit_scale), round_pixel(source_height * fit_scale) };
+std::array<int32_t, 2> ResolveEffectRenderTargetReferenceExtent(
+    std::array<float, 2> source_extent, std::array<uint16_t, 2> authored_extent, uint16_t fit) {
+    constexpr uint16_t max_authored_extent = 4096;
+    int32_t width = authored_extent[0] <= max_authored_extent
+        ? authored_extent[0] : static_cast<int32_t>(source_extent[0]);
+    int32_t height = authored_extent[1] <= max_authored_extent
+        ? authored_extent[1] : static_cast<int32_t>(source_extent[1]);
+    if (fit <= max_authored_extent) {
+        // Fit limits the longer selected axis; it never enlarges a smaller source. Preserve the
+        // float ratio followed by multiplication and truncation, before the target's divisor is
+        // applied. Keeping reference selection separate also lets a shared target retain its
+        // first creator's divisor when a different owner reruns setup.
+        if (width >= height) {
+            const auto longer = std::min<int32_t>(width, fit);
+            const float ratio = static_cast<float>(height) / static_cast<float>(width);
+            height = static_cast<int32_t>(ratio * static_cast<float>(longer));
+            width = longer;
+        } else {
+            const auto longer = std::min<int32_t>(height, fit);
+            const float ratio = static_cast<float>(width) / static_cast<float>(height);
+            width = static_cast<int32_t>(ratio * static_cast<float>(longer));
+            height = longer;
+        }
     }
-    const float divisor = static_cast<float>(std::max<uint32_t>(1u, scale));
-    return { round_pixel(source_width / divisor), round_pixel(source_height / divisor) };
+    return { width, height };
+}
+
+static std::array<int32_t, 2> ResolveScaledRenderTargetExtent(
+    std::array<int32_t, 2> reference_extent, uint32_t divisor) {
+    return { std::max(2, reference_extent[0] / static_cast<int32_t>(divisor)),
+             std::max(2, reference_extent[1] / static_cast<int32_t>(divisor)) };
+}
+
+SceneRenderTarget SceneRenderTarget::FromReferenceExtent(
+    std::array<i32, 2> extent, uint32_t divisor) {
+    const auto physical = ResolveScaledRenderTargetExtent(extent, divisor);
+    return SceneRenderTarget {
+        .width = physical[0],
+        .height = physical[1],
+        .mapWidth = physical[0],
+        .mapHeight = physical[1],
+        .reference_extent = extent,
+        .resolution_divisor = divisor,
+    };
+}
+
+bool SceneRenderTarget::ResizeReferenceExtent(std::array<i32, 2> extent) {
+    if (reference_extent == extent) return false;
+    const auto physical = ResolveScaledRenderTargetExtent(extent, resolution_divisor);
+    reference_extent = extent;
+    width = mapWidth = physical[0];
+    height = mapHeight = physical[1];
+    ++allocation_revision;
+    return true;
 }
 
 TextureSample DestinationRenderTargetSampler(bool point_sampled, bool clamp_uvs) {

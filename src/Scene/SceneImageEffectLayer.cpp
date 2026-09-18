@@ -249,6 +249,7 @@ void SceneImageEffectLayer::RefreshDestinationTargets(
         target.width = target.mapWidth = extent[0];
         target.height = target.mapHeight = extent[1];
     }
+    target.reference_extent = { target.width, target.height };
     const bool private_output =
         DeclaredFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter;
     const auto names = ResolveSceneDestinationRenderTargets(
@@ -264,9 +265,10 @@ void SceneImageEffectLayer::RefreshDestinationTargets(
              target.width, target.height, m_destination_uses_card_size ? "true" : "false");
 }
 
-void SceneImageEffectLayer::AddEffectRenderTarget(std::string name, uint32_t scale, uint32_t fit) {
+void SceneImageEffectLayer::AddEffectRenderTarget(
+    std::string name, std::array<uint16_t, 2> authored_extent, uint16_t fit) {
     AddRuntimeRenderTargetName(name);
-    m_effect_render_targets.push_back({ std::move(name), scale, fit });
+    m_effect_render_targets.push_back({ std::move(name), authored_extent, fit });
 }
 
 bool SceneImageEffectLayer::ResizeEffectRenderTargets(
@@ -274,20 +276,25 @@ bool SceneImageEffectLayer::ResizeEffectRenderTargets(
     // Unlike destination slots, an existing FBO keeps its authored name and is resized in place.
     // Run every retained record at this owner's setup boundary, including when its own
     // destination extent did not change: another owner may have resized a shared FBO since this
-    // one last ran. Per-frame transform updates do not enter this operation. Only changed
-    // descriptors invalidate their GPU backing/history.
+    // one last ran. Per-frame transform updates do not enter this operation. The shared target
+    // retains its first divisor; this owner only supplies the next unscaled reference extent.
+    // A changed reference invalidates backing/history even when division yields the same size.
     bool changed = false;
     for (const auto& fbo : m_effect_render_targets) {
         auto& target = scene.renderTargets.at(fbo.name);
-        const auto extent = ResolveEffectRenderTargetExtent(source_extent, fbo.scale, fbo.fit);
-        if (target.width == extent[0] && target.height == extent[1] &&
-            target.mapWidth == extent[0] && target.mapHeight == extent[1]) continue;
+        const auto reference = ResolveEffectRenderTargetReferenceExtent(
+            source_extent, fbo.authored_extent, fbo.fit);
+        const auto previous_reference = target.reference_extent;
+        const std::array<int32_t, 2> previous_size { target.width, target.height };
+        if (!target.ResizeReferenceExtent(reference)) continue;
         LOG_INFO("SceneEffectFboResize: layer=%d target='%s' previous=%dx%d extent=%dx%d "
-                 "source=[%.3f %.3f] scale=%u fit=%u",
-                 m_owner.Id(), fbo.name.c_str(), target.width, target.height,
-                 extent[0], extent[1], source_extent[0], source_extent[1], fbo.scale, fbo.fit);
-        target.width = target.mapWidth = extent[0];
-        target.height = target.mapHeight = extent[1];
+                 "source=[%.3f %.3f] scale=%u fit=%u previous-reference=%dx%d "
+                 "reference=%dx%d revision=%llu",
+                 m_owner.Id(), fbo.name.c_str(), previous_size[0], previous_size[1],
+                 target.width, target.height, source_extent[0], source_extent[1],
+                 target.resolution_divisor, static_cast<unsigned>(fbo.fit),
+                 previous_reference[0], previous_reference[1], reference[0], reference[1],
+                 static_cast<unsigned long long>(target.allocation_revision));
         scene.MarkRenderTargetResourcesDirty(fbo.name);
         changed = true;
     }

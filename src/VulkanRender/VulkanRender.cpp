@@ -1211,6 +1211,7 @@ void VulkanRender::Impl::setRenderTargetSize(Scene& scene) {
             // logical extent. Only text-owned runtime targets intentionally diverge these values.
             rt.mapWidth = rt.width;
             rt.mapHeight = rt.height;
+            rt.reference_extent = { rt.width, rt.height };
         }
     }
     for (auto& item : scene.renderTargets) {
@@ -1229,10 +1230,13 @@ void VulkanRender::Impl::setRenderTargetSize(Scene& scene) {
         // a logical content rectangle that differs from its physical allocation.
         rt.mapWidth = (i32)(rt.bind.scale * bind_rt->second.ContentWidth());
         rt.mapHeight = (i32)(rt.bind.scale * bind_rt->second.ContentHeight());
+        rt.reference_extent = { rt.width, rt.height };
     }
     for (auto& item : scene.renderTargets) {
         auto& rt = item.second;
-        if (! item.first.empty() && (rt.width * rt.height <= 4)) {
+        // Allocation requires positive axes. Effect sizing supplies its own minimum; an area
+        // threshold incorrectly rejects legal 2x2 targets and can overflow for large extents.
+        if (! item.first.empty() && (rt.width <= 0 || rt.height <= 0)) {
             LOG_ERROR("wrong size for render target: %s", item.first.c_str());
         } else if (rt.has_mipmap) {
             rt.mipmap_level =

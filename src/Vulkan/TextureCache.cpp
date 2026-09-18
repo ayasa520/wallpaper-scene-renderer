@@ -771,6 +771,7 @@ std::size_t TextureKey::HashValue(const TextureKey& k) {
     utils::hash_combine(seed, (int)k.sample.magFilter);
     utils::hash_combine(seed, (int)k.sample.minFilter);
     utils::hash_combine(seed, (int)k.sample_count);
+    utils::hash_combine(seed, k.allocation_revision);
     return seed;
 }
 
@@ -1053,6 +1054,12 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
                                                    bool persist) {
     const std::string key_string(key);
     const TexHash     tex_hash = TextureKey::HashValue(content_hash);
+    const auto image_for_query = [](const QueryTex& query) {
+        ImageParameters image(query.image);
+        image.allocation_revision = query.content_key.allocation_revision;
+        image.allocation_generation = query.generation;
+        return image;
+    };
     auto queue_initial_clear = [&](const std::shared_ptr<const VmaImageParameters>& image) {
         if (content_hash.usage == TexUsage::DEPTH) return;
         // The render target may be sampled by a feedback pass before a writer touches it. Keep the
@@ -1082,14 +1089,16 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             // an existing key until the entire cache was cleared, which made minute-level text
             // bridge updates recreate every scene texture and caused visible hitches.
             LOG_INFO("TextureCache: resize cached render target key='%s' previousHash=%zu nextHash=%zu "
-                     "previousSize=[%u, %u] nextSize=[%d, %d]",
+                     "previousSize=[%u, %u] nextSize=[%d, %d] previousRevision=%llu nextRevision=%llu",
                      key_string.c_str(),
                      query->content_hash,
                      tex_hash,
                      query->image->extent.width,
                      query->image->extent.height,
                      content_hash.width,
-                     content_hash.height);
+                     content_hash.height,
+                     static_cast<unsigned long long>(query->content_key.allocation_revision),
+                     static_cast<unsigned long long>(content_hash.allocation_revision));
 
             if (query->query_keys.size() > 1) {
                 // A reusable image can be shared by multiple logical render-target keys. When only
@@ -1113,7 +1122,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
                     queue_initial_clear(query->image);
                     TraceRenderTargetAllocation("replace", key, *query->image, query->generation,
                                                 query->persist);
-                    return ImageParameters(query->image);
+                    return image_for_query(*query);
                 }
                 return std::nullopt;
             }
@@ -1121,7 +1130,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
             query->share_ready = false;
             query->persist     = persist;
 
-            return ImageParameters(query->image);
+            return image_for_query(*query);
         }
     };
 
@@ -1136,7 +1145,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
         m_query_map[key_string] = &(*query);
 
         TraceRenderTargetAllocation("share", key, *query->image, query->generation, query->persist);
-        return ImageParameters(query->image);
+        return image_for_query(*query);
     }
 
     auto image = CreateTex(content_hash);
@@ -1154,7 +1163,7 @@ std::optional<ImageParameters> TextureCache::Query(std::string_view key, Texture
     query.generation = ++m_render_target_generation;
     queue_initial_clear(query.image);
     TraceRenderTargetAllocation("create", key, *query.image, query.generation, query.persist);
-    return ImageParameters(query.image);
+    return image_for_query(query);
 }
 
 uint64_t TextureCache::RenderTargetGeneration(std::string_view key) const {

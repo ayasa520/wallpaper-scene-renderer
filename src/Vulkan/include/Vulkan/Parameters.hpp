@@ -84,6 +84,12 @@ struct ImageParameters {
     uint        mipmap_level { 1 };
     uint        samples { 1 };
 
+    // These describe the actual retained target allocation returned by the cache. They travel
+    // with copied pass bindings, so structural traces can distinguish a reconstructed target
+    // from a stale consumer of its prior allocation without exposing process-specific handles.
+    uint64_t allocation_revision { 0 };
+    uint64_t allocation_generation { 0 };
+
     // Prepared passes retain a target allocation independently of its transient lookup name.
     // The final-reader handoff permits reuse within the graph; it does not end the lifetime of
     // copied descriptors/framebuffers that will execute that graph again. Imported and external

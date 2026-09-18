@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -40,20 +41,18 @@ public:
 class WPEffectFbo {
 public:
     bool        FromJson(const nlohmann::json&);
-    std::array<int32_t, 2> ResolveSize(std::array<float, 2> source_size) const;
+    std::array<int32_t, 2> ResolveReferenceExtent(std::array<float, 2> source_size) const;
     std::string name;
     std::string format;
-    uint32_t    scale { 1 };
+    uint8_t     scale { 1 };
+    uint16_t    width { std::numeric_limits<uint16_t>::max() };
+    uint16_t    height { std::numeric_limits<uint16_t>::max() };
+    uint16_t    fit { std::numeric_limits<uint16_t>::max() };
     bool        unique { false };
     // A partial clear string still supplies values to named functions. Setup clearing is a
     // separate authored decision, so preserve it independently of the parsed color components.
     std::array<float, 4> clear_color {};
     bool                clear_on_setup { false };
-    // Wallpaper Engine effect FBOs can use either `scale` (divide the source size) or `fit`
-    // (fit the source aspect into a fixed longest edge). Cursor ripple uses `fit=512` for its
-    // simulation buffers; treating that as scale=1 makes the propagation texel step several times
-    // too small and the authored wavefront appears not to spread.
-    uint32_t    fit { 0 };
 };
 
 class WPImageEffect {
@@ -86,7 +85,7 @@ public:
     std::unordered_map<std::string, std::size_t> clear_functions;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, fit, unique, clear_color, clear_on_setup);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, width, height, fit, unique, clear_color, clear_on_setup);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageEffect, name, visible, passes, fbos, materials, clear_functions);
 
 } // namespace wpscene
