@@ -1244,6 +1244,50 @@ static bool AddReflectionStage(Scene& scene, ExtraInfo& extra) {
 static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
     std::unique_ptr<rg::RenderGraph> rgraph = std::make_unique<rg::RenderGraph>();
     ExtraInfo                        extra { .rgraph = rgraph.get(), .scene = &scene };
+    const auto clear_requests = scene.PendingRenderTargetClears();
+    auto clears_recorded = std::make_shared<std::vector<bool>>(clear_requests.size(), false);
+    rg::PassNode* last_requested_clear = nullptr;
+    std::unordered_set<const rg::PassNode*> requested_clear_passes;
+    for (std::size_t index = 0; index < clear_requests.size(); ++index) {
+        const auto& request = clear_requests[index];
+        auto* pass = rgraph->addPass<vulkan::ClearPass>(
+            "requested_clear", rg::PassNode::Type::Clear,
+            [&, index, request, clears_recorded](rg::RenderGraphBuilder& builder,
+                                                 vulkan::ClearPass::Desc& desc) {
+                if (last_requested_clear != nullptr) builder.dependOn(*last_requested_clear);
+                auto* target = builder.createTexNode(rg::createTexDesc(request.target, &scene), true);
+                builder.write(target);
+                desc.target = request.target;
+                desc.clear_value = VkClearValue { .color = {
+                    request.color[0], request.color[1], request.color[2], request.color[3] } };
+                desc.on_recorded = [index, request, clears_recorded]() {
+                    (*clears_recorded)[index] = true;
+                    if (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr) {
+                        LOG_INFO("SceneRenderTargetClearRecord: sequence=%llu layer=%d effect=%d "
+                                 "reason=%s target='%s' color=[%.9g %.9g %.9g %.9g]",
+                                 static_cast<unsigned long long>(request.sequence),
+                                 request.owner_layer_id, request.effect_id,
+                                 request.setup ? "setup" : "function", request.target.c_str(),
+                                 request.color[0], request.color[1], request.color[2], request.color[3]);
+                    }
+                };
+            });
+        requested_clear_passes.insert(pass);
+        last_requested_clear = pass;
+    }
+    if (!clear_requests.empty()) {
+        // Building or warming a graph cannot consume script operations. A successful GPU
+        // submission acknowledges only its recorded prefix; requests appended afterward and
+        // any unrecorded suffix remain scene-owned for a later graph.
+        rgraph->onFrameSubmitted([&scene, clear_requests, clears_recorded]() {
+            uint64_t through_sequence = 0;
+            for (std::size_t index = 0; index < clear_requests.size(); ++index) {
+                if (!(*clears_recorded)[index]) break;
+                through_sequence = clear_requests[index].sequence;
+            }
+            if (through_sequence != 0) scene.CommitRenderTargetClears(through_sequence);
+        });
+    }
     for (size_t index = 0; index < scene.layerOrder.size(); index++) {
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
@@ -1405,6 +1449,19 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
             });
     }
 
+    if (last_requested_clear != nullptr) {
+        // Script/setup requests precede the entire draw walk, including independent shadow,
+        // reflection and ordinary passes. Texture hazards order consumers of a cleared image;
+        // this explicit phase edge also orders draws that happen to use other targets.
+        for (const auto pass_id : rgraph->topologicalOrder()) {
+            if (requested_clear_passes.contains(rgraph->getPassNode(pass_id))) continue;
+            rgraph->afterBuild(pass_id, [last_requested_clear](rg::RenderGraphBuilder& builder,
+                                                              rg::Pass&) {
+                builder.dependOn(*last_requested_clear);
+                return true;
+            });
+        }
+    }
     return rgraph;
 }
 

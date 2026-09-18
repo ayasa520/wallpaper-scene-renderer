@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 
 #include "Fs/VFS.h"
@@ -63,6 +65,27 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
     GET_JSON_NAME_VALUE_NOWARN(json, "scale", scale);
     GET_JSON_NAME_VALUE_NOWARN(json, "fit", fit);
     GET_JSON_NAME_VALUE_NOWARN(json, "unique", unique);
+    const auto clear = json.find("clear");
+    if (clear != json.end() && clear->is_string()) {
+        const char* token = clear->get_ref<const std::string&>().c_str();
+        clear_on_setup = *token == '\0';
+        // Numeric conversion and component traversal have different boundaries: a number may
+        // end before the token does, while only literal spaces advance to the next component.
+        // Retain partial prefixes with zero remaining components. Empty strings and reaching
+        // the fourth component request setup clearing; shorter prefixes only supply a color.
+        if (*token != '\0') {
+            for (std::size_t index = 0; index < clear_color.size(); ++index) {
+                clear_color[index] = static_cast<float>(std::strtod(token, nullptr));
+                if (index + 1 == clear_color.size()) {
+                    clear_on_setup = true;
+                    break;
+                }
+                token = std::strchr(token, ' ');
+                if (token == nullptr) break;
+                while (*token == ' ') ++token;
+            }
+        }
+    }
     if(scale == 0) { 
         LOG_ERROR("fbo scale can't be 0");
         scale = 1;
@@ -246,6 +269,30 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
     } else {
         LOG_ERROR("no passes in effect file");
         return false;
+    }
+
+    const auto functions = json.find("functions");
+    if (functions != json.end() && functions->is_object()) {
+        for (const auto& [name, function] : functions->items()) {
+            if (name.empty() || !function.is_object()) continue;
+            const auto action = function.find("action");
+            const auto targets = function.find("fbos");
+            if (action == function.end() || !action->is_string() || *action != "clear" ||
+                targets == function.end() || !targets->is_array()) continue;
+            std::size_t count = 0;
+            for (const auto& target : *targets) {
+                if (!target.is_string()) continue;
+                const auto& target_name = target.get_ref<const std::string&>();
+                if (target_name.empty()) continue;
+                if (std::any_of(fbos.begin(), fbos.end(), [&](const auto& fbo) {
+                        return fbo.name == target_name;
+                    })) ++count;
+            }
+            // Functions select a prefix by the number of admitted references, including
+            // duplicates. The reference values do not reorder that prefix. Admit only a
+            // nonempty prefix contained in this effect's target records.
+            if (count != 0 && count <= fbos.size()) clear_functions.emplace(name, count);
+        }
     }
     return true;
 }

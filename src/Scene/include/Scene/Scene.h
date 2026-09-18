@@ -269,6 +269,22 @@ public:
                                                      uint32_t effect_index, bool visible);
     bool                    SetEffectLocalVisibilityById(int32_t owner_layer_id,
                                                          int32_t effect_id, bool visible);
+
+    struct RenderTargetClear {
+        uint64_t sequence;
+        std::string target;
+        std::array<float, 4> color;
+        int32_t owner_layer_id;
+        int32_t effect_id;
+        bool setup;
+    };
+    void QueueRenderTargetClear(std::string target, std::array<float, 4> color,
+                                 int32_t owner_layer_id, int32_t effect_id, bool setup);
+    const std::vector<RenderTargetClear>& PendingRenderTargetClears() const {
+        return m_pending_render_target_clears;
+    }
+    void CommitRenderTargetClears(uint64_t through_sequence);
+
     std::shared_ptr<Image>  GetParsedImageIfReady(const std::string& texture_key);
     std::shared_ptr<Image>  ParseImageBlockingCached(const std::string& texture_key);
     ParsedImageRequest      RequestParsedImageAsync(const std::string& texture_key);
@@ -635,6 +651,12 @@ public:
 
 private:
     bool ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible);
+
+    // Script/setup calls precede GPU work. Retain their ordered target references until an
+    // actual submission acknowledges the recorded prefix, independently of owner visibility,
+    // graph warm-up and deletion callbacks. Later requests keep their own sequence numbers.
+    uint64_t m_render_target_clear_sequence { 0 };
+    std::vector<RenderTargetClear> m_pending_render_target_clears;
 
     uint64_t m_reflection_disable_revision { 0 };
     std::unordered_map<std::string, std::shared_ptr<std::string>> m_system_texture_bindings;

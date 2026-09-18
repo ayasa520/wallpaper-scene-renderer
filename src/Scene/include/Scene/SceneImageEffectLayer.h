@@ -106,7 +106,16 @@ struct SceneImageEffect {
     // invocations in order against one frame-local table, then commit the final table only after
     // submission. Retaining the effect also keeps callback ownership valid across graph rebuilds.
     using FrameFboBindings = std::unordered_map<std::shared_ptr<SceneImageEffect>, FboBindings>;
-    void RegisterFbo(const std::string& target) { m_fbo_bindings.emplace(target, target); }
+    void RegisterFbo(const std::string& target, std::array<float, 4> clear_color,
+                     bool clear_on_setup) {
+        m_fbo_bindings.emplace(target, target);
+        m_fbo_records.push_back({ target, clear_color, clear_on_setup });
+    }
+    void RegisterClearFunction(const std::string& name, std::size_t target_count) {
+        m_clear_functions.emplace(name, target_count);
+    }
+    void ExecuteMaterialFunction(Scene&, const std::string& name) const;
+    void QueueSetupClears(Scene&) const;
     bool IsDeclaredFbo(const std::string& target) const {
         return m_fbo_bindings.contains(target);
     }
@@ -146,6 +155,15 @@ private:
     // skipped frames must not advance feedback history. Swap commands retain their fixed
     // authored operands while non-swap references use the current table at each boundary.
     FboBindings m_fbo_bindings;
+    struct FboRecord {
+        std::string target;
+        std::array<float, 4> clear_color;
+        bool clear_on_setup;
+    };
+    // Record order and record colors survive binding swaps. Each request resolves the current
+    // physical target at call time, then the scene owns it independently of the effect's life.
+    std::vector<FboRecord> m_fbo_records;
+    std::unordered_map<std::string, std::size_t> m_clear_functions;
     int32_t     m_owner_layer_id { 0 };
     int32_t     m_effect_id { 0 };
     uint32_t    m_effect_index { 0 };
@@ -206,6 +224,7 @@ public:
 
     void AddEffect(const std::shared_ptr<SceneImageEffect>& node) { m_effects.push_back(node); }
     std::size_t EffectCount() const { return m_effects.size(); }
+    void QueueSetupClears(Scene&) const;
     std::size_t VisibleCompositionStepCount() const;
     bool HasVisibleEffects() const;
     bool UsesShapeDraw() const;

@@ -1379,6 +1379,44 @@ bool Scene::SetEffectLocalVisibility(int32_t owner_layer_id, uint32_t effect_ind
     return effect != nullptr && ApplyEffectLocalVisibility(*effect, visible);
 }
 
+void Scene::QueueRenderTargetClear(std::string target, std::array<float, 4> color,
+                                    int32_t owner_layer_id, int32_t effect_id, bool setup) {
+    const auto sequence = ++m_render_target_clear_sequence;
+    m_pending_render_target_clears.push_back(
+        { sequence, std::move(target), color, owner_layer_id, effect_id, setup });
+    MarkRenderGraphTopologyDirty();
+    if (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr) {
+        LOG_INFO("SceneRenderTargetClearQueue: sequence=%llu layer=%d effect=%d reason=%s "
+                 "target='%s' color=[%.9g %.9g %.9g %.9g]",
+                 static_cast<unsigned long long>(sequence), owner_layer_id, effect_id,
+                 setup ? "setup" : "function", m_pending_render_target_clears.back().target.c_str(),
+                 color[0], color[1], color[2], color[3]);
+    }
+}
+
+void Scene::CommitRenderTargetClears(uint64_t through_sequence) {
+    const auto end = std::find_if(m_pending_render_target_clears.begin(),
+                                  m_pending_render_target_clears.end(),
+                                  [through_sequence](const auto& request) {
+                                      return request.sequence > through_sequence;
+                                  });
+    if (end == m_pending_render_target_clears.begin()) return;
+    const auto count = static_cast<std::size_t>(end - m_pending_render_target_clears.begin());
+    // A queued request may have outlived its owner. Once submitted, nominate its target for the
+    // ordinary retained-resource census; actual storage release still waits for completed GPU
+    // use. A surviving owner or a later request retains the same target there.
+    for (auto request = m_pending_render_target_clears.begin(); request != end; ++request) {
+        pendingRenderTargetRetirementKeys.insert(request->target);
+    }
+    m_pending_render_target_clears.erase(m_pending_render_target_clears.begin(), end);
+    MarkRenderGraphTopologyDirty();
+    if (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr) {
+        LOG_INFO("SceneRenderTargetClearCommit: through=%llu count=%zu pending=%zu",
+                 static_cast<unsigned long long>(through_sequence), count,
+                 m_pending_render_target_clears.size());
+    }
+}
+
 bool Scene::SetEffectLocalVisibilityById(int32_t owner_layer_id, int32_t effect_id,
                                          bool visible) {
     auto* effect = FindImageEffectById(owner_layer_id, effect_id);
@@ -1400,6 +1438,9 @@ bool Scene::ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible) {
     if (FindTextLayerState(layer_id) != nullptr) {
         return SyncTextLayerEffectVisibility(*this, layer_id);
     }
+    // Changing the visible composition count reruns the retained targets' setup clears even
+    // when the image dimensions stay the same. Hiding a layer alone does not enter this path.
+    if (auto* layer = FindImageEffectLayer(layer_id)) layer->QueueSetupClears(*this);
     return true;
 }
 

@@ -30,6 +30,7 @@ void ClearPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.use_scene_clear_color     = next.m_desc.use_scene_clear_color;
     m_desc.should_clear_color        = next.m_desc.should_clear_color;
     m_desc.should_clear_model_depth  = next.m_desc.should_clear_model_depth;
+    m_desc.on_recorded              = next.m_desc.on_recorded;
 }
 
 bool ClearPass::referencesRenderTarget(std::string_view render_target) const {
@@ -91,6 +92,7 @@ void ClearPass::execute(const Device&, RenderingResources& rr) {
     if (clear_color) {
         ClearRenderTargetColor(rr.command, img, clear_value.color,
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (m_desc.on_recorded) m_desc.on_recorded();
     }
     // Trace the already evaluated decision; visibility and clear callbacks can observe
     // live scene state and must never be invoked a second time just for diagnostics.

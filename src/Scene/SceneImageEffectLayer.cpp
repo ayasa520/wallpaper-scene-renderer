@@ -160,6 +160,34 @@ bool SceneImageEffect::CommitFboBindings(const FboBindings& bindings) {
     return true;
 }
 
+void SceneImageEffect::ExecuteMaterialFunction(Scene& scene, const std::string& name) const {
+    const auto function = m_clear_functions.find(name);
+    if (function == m_clear_functions.end()) return;
+    // The function's admitted reference count selects ordered records from the start. Resolve
+    // each record through the committed binding table now: later swaps, visibility changes or
+    // owner deletion cannot change which target this call already selected.
+    for (std::size_t index = 0; index < function->second; ++index) {
+        const auto& record = m_fbo_records[index];
+        scene.QueueRenderTargetClear(m_fbo_bindings.at(record.target), record.clear_color,
+                                      OwnerLayerId(), EffectId(), false);
+    }
+}
+
+void SceneImageEffect::QueueSetupClears(Scene& scene) const {
+    for (const auto& record : m_fbo_records) {
+        if (record.clear_on_setup) {
+            scene.QueueRenderTargetClear(m_fbo_bindings.at(record.target), record.clear_color,
+                                          OwnerLayerId(), EffectId(), true);
+        }
+    }
+}
+
+void SceneImageEffectLayer::QueueSetupClears(Scene& scene) const {
+    // Setup visits retained resources even when an effect currently contributes no draw passes.
+    // Ordinary per-frame maintenance does not call this operation unless resource setup runs.
+    for (const auto& effect : m_effects) effect->QueueSetupClears(scene);
+}
+
 void SceneImageEffectLayer::SetDestinationTargets(Scene& scene, std::string first_target,
                                                   std::string second_target) {
     // Re-layout selects shared images by extent and recreates a private slot under its owner
@@ -263,6 +291,7 @@ bool SceneImageEffectLayer::ResizeEffectRenderTargets(
         scene.MarkRenderTargetResourcesDirty(fbo.name);
         changed = true;
     }
+    QueueSetupClears(scene);
     return changed;
 }
 

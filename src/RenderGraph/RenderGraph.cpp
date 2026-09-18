@@ -123,6 +123,12 @@ void RenderGraphBuilder::read(TexNode* texnode) {
     }
 }
 
+void RenderGraphBuilder::dependOn(const PassNode& predecessor) {
+    // Ordered operations can affect disjoint images. Represent their execution dependency
+    // directly instead of inventing a sampled texture and changing its final-reader lifetime.
+    m_rg.m_dg.Connect(predecessor.ID(), m_passnode_wip->ID());
+}
+
 void RenderGraphBuilder::write(TexNode* node) {
     // after all old reader
     if(node->version() > 0) {

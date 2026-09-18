@@ -110,6 +110,11 @@ LayerResidencyResources CollectRetainedResidencyResources(
     }
     for (const auto& node : scene.bloom.nodes) CollectNode(scene, node.get(), resources);
     CollectNode(scene, scene.bloom.node.get(), resources);
+    // Deletion callbacks can retire the originating owner before its requested clear is
+    // submitted. The scene queue is an independent target owner until submission consumes it.
+    for (const auto& request : scene.PendingRenderTargetClears()) {
+        resources.render_targets.insert(request.target);
+    }
     return resources;
 }
 

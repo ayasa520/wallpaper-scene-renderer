@@ -3354,6 +3354,9 @@ bool wallpaper::SyncTextLayerEffectVisibility(Scene& scene, int32_t layer_id) {
     // authored effect FBO extents all update before the next submitted frame.
     if (previous_padding == state.render_contract.UsesEffectPadding()) {
         state.primitive->render_contract = state.render_contract;
+        // The shaped geometry can stay unchanged while effect counts rerun target setup.
+        // Revisit current FBO extents and authored clears without rebuilding glyph pages.
+        UpdateTextLayerBridgeBackingInternal(scene, layer_id, state, true);
         return true;
     }
     LOG_INFO("SceneTextEffectPaddingChange: layer=%d enabled=%s",

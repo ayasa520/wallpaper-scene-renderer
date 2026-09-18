@@ -180,7 +180,14 @@ void LoadEffectCommands(const wpscene::WPImageEffect& source, SceneImageEffect& 
         if (found == declared_fbos.end()) return std::nullopt;
         return found->second;
     };
-    for (const auto& [_, target] : declared_fbos) effect.RegisterFbo(target);
+    // FBO declaration order belongs to function execution. The lookup table resolves names for
+    // commands, but its hash iteration order must never replace the authored record sequence.
+    for (const auto& fbo : source.fbos) {
+        effect.RegisterFbo(declared_fbos.at(fbo.name), fbo.clear_color, fbo.clear_on_setup);
+    }
+    for (const auto& [name, count] : source.clear_functions) {
+        effect.RegisterClearFunction(name, count);
+    }
     for (const auto& command : source.commands) {
         if (command.command != "copy" && command.command != "swap") {
             LOG_ERROR("Unknown effect command: %s", command.command.c_str());
@@ -2479,7 +2486,10 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
                 .height = size[1],
                 .mapWidth = size[0],
                 .mapHeight = size[1],
-                .allowReuse = !feedback,
+                // A declared target is retained by its owner, including when its writer discards
+                // fragments or the effect is hidden. Pass read-before-write analysis alone cannot
+                // determine whether the next frame will consume these stored pixels.
+                .allowReuse = false,
             };
             InternNamedRenderTarget(scene, name, target);
             if (authored_fbo.fit > 0 || feedback) {
@@ -2610,6 +2620,7 @@ void LoadLayerEffects(ParseContext& context, SceneImageEffectLayer& layer,
                      EffectVisibilityCanChangeAtRuntime(authored_effect) ? "true" : "false");
         }
         layer.AddEffect(effect);
+        effect->QueueSetupClears(scene);
     }
 }
 } // namespace
@@ -3631,6 +3642,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                              effect_runtime_visibility ? "true" : "false");
                 }
                 imgEffectLayer->AddEffect(img_effect);
+                img_effect->QueueSetupClears(scene);
             }
         }
 

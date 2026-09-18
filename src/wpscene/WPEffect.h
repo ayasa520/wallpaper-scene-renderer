@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -44,6 +45,10 @@ public:
     std::string format;
     uint32_t    scale { 1 };
     bool        unique { false };
+    // A partial clear string still supplies values to named functions. Setup clearing is a
+    // separate authored decision, so preserve it independently of the parsed color components.
+    std::array<float, 4> clear_color {};
+    bool                clear_on_setup { false };
     // Wallpaper Engine effect FBOs can use either `scale` (divide the source size) or `fit`
     // (fit the source aspect into a fixed longest edge). Cursor ripple uses `fit=512` for its
     // simulation buffers; treating that as scale=1 makes the propagation texel step several times
@@ -78,10 +83,11 @@ public:
     std::vector<WPMaterialPass>  passes;
     std::vector<WPEffectCommand> commands;
     std::vector<WPEffectFbo>     fbos;
+    std::unordered_map<std::string, std::size_t> clear_functions;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, fit, unique);
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageEffect, name, visible, passes, fbos, materials);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPEffectFbo, name, scale, fit, unique, clear_color, clear_on_setup);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WPImageEffect, name, visible, passes, fbos, materials, clear_functions);
 
 } // namespace wpscene
 } // namespace wallpaper

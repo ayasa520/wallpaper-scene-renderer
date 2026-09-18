@@ -1180,6 +1180,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "__native.effectCall(nodeId, effectIndex, 'getMaterialCount');\n"
         << "        if (prop === 'setMaterialProperty') return (name, value) => "
            "__native.effectCall(nodeId, effectIndex, 'setMaterialProperty', name, value);\n"
+        << "        if (prop === 'executeMaterialFunction') return (name) => "
+           "__native.effectCall(nodeId, effectIndex, 'executeMaterialFunction', name);\n"
         << "        if (prop === 'getMaterial') return (nameOrIndex) => {\n"
         << "          const index = __native.effectCall(nodeId, effectIndex, 'getMaterial', "
            "nameOrIndex);\n"
@@ -1195,7 +1197,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      has(_target, prop) {\n"
         << "        if (typeof prop !== 'string') return false;\n"
         << "        if (prop === 'getAnimation' || prop === 'getMaterial' || "
-           "prop === 'getMaterialCount' || prop === 'setMaterialProperty') return true;\n"
+           "prop === 'getMaterialCount' || prop === 'setMaterialProperty' || "
+           "prop === 'executeMaterialFunction') return true;\n"
         << "        return !!__native.hasEffectMember(nodeId, effectIndex, prop);\n"
         << "      }\n"
         << "    });\n"
@@ -6138,7 +6141,8 @@ JSValue NativeHasEffectMember(JSContext* context, JSValueConst, int argc, JSValu
         context,
         opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index)) != nullptr &&
             (EffectValueType(member_name).supported || member_name == "getAnimation" ||
-             member_name == "getMaterial" || member_name == "getMaterialCount"));
+             member_name == "getMaterial" || member_name == "getMaterialCount" ||
+             member_name == "executeMaterialFunction"));
 }
 
 JSValue NativeGetEffectProperty(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -6323,6 +6327,15 @@ JSValue NativeEffectCall(JSContext* context, JSValueConst, int argc, JSValueCons
     }
     auto* effect = opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index));
     if (effect == nullptr) return JS_UNDEFINED;
+    if (method == "executeMaterialFunction") {
+        // Only primitive strings select a function. Rejected argument kinds do not invoke
+        // conversion hooks, and missing/unknown names retain the method's void result.
+        const JSValueConst argument = argc > 3 ? argv[3] : JS_UNDEFINED;
+        std::string name;
+        if (JS_IsString(argument) && !ReadJSString(context, argument, &name)) return JS_EXCEPTION;
+        effect->ExecuteMaterialFunction(*opaque->scene, name);
+        return JS_UNDEFINED;
+    }
     if (method == "getMaterialCount") {
         return JS_NewInt32(context, static_cast<int32_t>(effect->MaterialRecordCount()));
     }

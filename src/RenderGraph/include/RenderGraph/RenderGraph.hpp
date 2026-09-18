@@ -22,6 +22,7 @@ public:
     TexNode*        createTexNode(const TexNode::Desc&, bool write = false);
     void            read(TexNode*);
     void            write(TexNode*);
+    void            dependOn(const PassNode&);
     const PassNode& workPassNode() const;
     void            setWorkPassNode(PassNode*);
     void            markSelfWrite(TexNode*);

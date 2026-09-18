@@ -26,6 +26,9 @@ public:
         bool                  use_scene_clear_color { false };
         std::function<bool()> should_clear_color;
         std::function<bool()> should_clear_model_depth;
+        // Recording is separate from submission acknowledgement. Request owners may mark this
+        // operation recorded here, then consume it only from the graph's submission callback.
+        std::function<void()> on_recorded;
     };
 
     explicit ClearPass(const Desc&);
