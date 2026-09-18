@@ -1,4 +1,5 @@
 #include "WPMaterial.h"
+#include "WPEffectInput.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -80,9 +81,18 @@ void TraceMaterialRenderState(const nlohmann::json& json, const WPMaterial& mate
 }
 } // namespace
 
-bool WPMaterialPassBindItem::FromJson(const nlohmann::json& json) {
-    GET_JSON_NAME_VALUE(json, "name", name);
-    GET_JSON_NAME_VALUE(json, "index", index);
+bool WPMaterialPassBindItem::FromJson(const nlohmann::json& json, const nlohmann::json& combos) {
+    if (!json.is_object()) return false;
+    const auto authored_name = json.find("name");
+    const auto authored_index = json.find("index");
+    // A binding is a literal routing record. Exclude malformed or conditional records
+    // before name resolution, so an optional input cannot reference a target that the same
+    // effect instance excluded. Rejected records leave the material's authored slot intact.
+    if (authored_name == json.end() || !authored_name->is_string() ||
+        authored_index == json.end() || !authored_index->is_number() ||
+        !MatchesEffectConditions(json, combos)) return false;
+    name = authored_name->get<std::string>();
+    index = ReadEffectInteger(*authored_index);
     return true;
 }
 
@@ -103,14 +113,14 @@ bool WPUserTextureBinding::FromJson(const nlohmann::json& json) {
 }
 
 
-bool WPMaterialPass::FromJson(const nlohmann::json& json) {
+bool WPMaterialPass::FromJson(const nlohmann::json& json, const nlohmann::json& combos) {
     GET_JSON_NAME_VALUE_NOWARN(json, "target", target);
     GET_JSON_NAME_VALUE_NOWARN(json, "compose", compose);
-    if(json.contains("bind")) {
-        for(const auto& jB:json.at("bind")) {
+    const auto bindings = json.find("bind");
+    if (bindings != json.end() && bindings->is_array()) {
+        for(const auto& jB:*bindings) {
             WPMaterialPassBindItem bindItem;
-            bindItem.FromJson(jB);
-            bind.push_back(bindItem);
+            if (bindItem.FromJson(jB, combos)) bind.push_back(std::move(bindItem));
         }
     }
     return true;

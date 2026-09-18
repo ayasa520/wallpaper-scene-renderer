@@ -1,10 +1,12 @@
 #include "wpscene/WPEffect.h"
+#include "wpscene/WPEffectInput.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 
 #include "Fs/VFS.h"
 #include "Scene/SceneRenderTarget.h"
@@ -81,8 +83,14 @@ bool WPEffectCommand::FromJson(const nlohmann::json& json) {
 }
 
 bool WPEffectFbo::FromJson(const nlohmann::json& json) {
-    GET_JSON_NAME_VALUE(json, "name", name);
-    GET_JSON_NAME_VALUE(json, "format", format);
+    const auto authored_name = json.find("name");
+    const auto authored_format = json.find("format");
+    // These members identify a framebuffer declaration, rather than a dynamic property.
+    // Reject the entire record before it can allocate a target or enter a named-clear prefix.
+    if (authored_name == json.end() || !authored_name->is_string() ||
+        authored_format == json.end() || !authored_format->is_string()) return false;
+    name = authored_name->get<std::string>();
+    format = authored_format->get<std::string>();
 
     scale = static_cast<uint8_t>(ReadFboInt32(json, "scale", 1));
     width = static_cast<uint16_t>(ReadFboInt32(json, "width", -1));
@@ -217,7 +225,7 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     nlohmann::json jEffect;
     if(!PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + filePath), jEffect))
         return false;
-    if(!FromFileJson(jEffect, vfs, json.value("passes", nlohmann::json())))
+    if(!FromFileJson(jEffect, vfs, json))
         return false;
     // Parse-time mechanism marker for log-driven tooling: which effect resources a scene uses.
     LOG_INFO("SceneEffectParsed: id=%d file='%s' passes=%zu", id, filePath.c_str(), passes.size());
@@ -243,13 +251,18 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
 }
 
 bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
-                                const nlohmann::json& pass_overrides) {
+                                const nlohmann::json& instance) {
 	GET_JSON_NAME_VALUE_NOWARN(json, "version", version);
+    const nlohmann::json no_input;
+    const auto combo_input = instance.find("combos");
+    const auto& combos = combo_input == instance.end() ? no_input : *combo_input;
+    const auto pass_input = instance.find("passes");
+    const auto& pass_overrides = pass_input == instance.end() ? no_input : *pass_input;
     if(json.contains("fbos")) {
         for(auto& jF:json.at("fbos")) {
+            if (!MatchesEffectConditions(jF, combos)) continue;
             WPEffectFbo fbo;
-            fbo.FromJson(jF);
-            fbos.push_back(std::move(fbo));
+            if (fbo.FromJson(jF)) fbos.push_back(std::move(fbo));
         }
     }
     if(json.contains("passes")) {
@@ -257,13 +270,14 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
         const nlohmann::json no_override;
         std::size_t input_index = 0;
         for(const auto& jP:jEPasses) {
-            // Instance entries address the authored effect-pass array, including positions
-            // occupied by commands. Resolve this index before filtering commands into their
-            // execution list. The resource entry owns routing; only the matching instance
-            // object is merged with the material resource before typed interpretation.
-            const auto& instance = pass_overrides.is_array() && input_index < pass_overrides.size()
+            // Overrides retain their authored resource positions, including rejected records
+            // and commands. Public material records and command positions instead compact to
+            // the admitted sequence. Resolve the original index before the condition gate,
+            // which must run before any material loading or command interpretation.
+            const auto& material_input = pass_overrides.is_array() && input_index < pass_overrides.size()
                 ? pass_overrides[input_index] : no_override;
             ++input_index;
+            if (!MatchesEffectConditions(jP, combos)) continue;
             if(!jP.contains("material")) {
                 if(jP.contains("command")) {
                     WPEffectCommand cmd;
@@ -283,11 +297,11 @@ bool WPImageEffect::FromFileJson(const nlohmann::json& json, fs::VFS& vfs,
             if(!PARSE_JSON(fs::GetFileContent(vfs, "/assets/" + matPath), jMat))
                 return false;
             WPMaterial material;
-            material.FromJson(jMat, instance);
+            material.FromJson(jMat, material_input);
             material_records.emplace_back(matPath);
             materials.push_back(std::move(material));
             WPMaterialPass pass;
-            pass.FromJson(jP);
+            pass.FromJson(jP, combos);
             passes.push_back(std::move(pass));
         }
     } else {

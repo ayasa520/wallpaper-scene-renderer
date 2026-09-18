@@ -62,7 +62,7 @@ private:
 public:
     bool                         FromJson(const nlohmann::json&, fs::VFS& vfs);
     bool                         FromFileJson(const nlohmann::json&, fs::VFS& vfs,
-                                              const nlohmann::json& pass_overrides);
+                                              const nlohmann::json& instance);
     std::unordered_set<std::string> FeedbackFboNames() const;
     int32_t                      id { 0 };
     std::string                  name;
@@ -74,7 +74,7 @@ public:
     nlohmann::json               visible_json;
     VisibleBinding               visible_binding;
     int32_t                      version;
-    // Public material selectors address every authored pass record, including commands.
+    // Public material selectors address every admitted pass record, including commands.
     // A populated entry stores the resource name of the next dense material; a command
     // retains a null entry without manufacturing a shader material or a render node.
     std::vector<std::optional<std::string>> material_records;

@@ -13,7 +13,7 @@ namespace wpscene
 
 class WPMaterialPassBindItem {
 public:
-    bool        FromJson(const nlohmann::json&);
+    bool        FromJson(const nlohmann::json&, const nlohmann::json& combos);
     std::string name;
     int32_t     index;
 };
@@ -29,7 +29,8 @@ public:
 
 class WPMaterialPass {
 public:
-    bool                                                FromJson(const nlohmann::json&);
+    bool                                                FromJson(const nlohmann::json&,
+                                                                 const nlohmann::json& combos);
     // Effect routing belongs to the effect resource. Material input is resolved separately,
     // before WPMaterial interprets shader, raster state, textures and property declarations.
     std::string                                         target;
