@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <memory>
 #include <limits>
+#include <numbers>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -1177,6 +1178,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        };\n"
         << "        if (prop === 'getMaterialCount') return () => "
            "__native.effectCall(nodeId, effectIndex, 'getMaterialCount');\n"
+        << "        if (prop === 'setMaterialProperty') return (name, value) => "
+           "__native.effectCall(nodeId, effectIndex, 'setMaterialProperty', name, value);\n"
         << "        if (prop === 'getMaterial') return (nameOrIndex) => {\n"
         << "          const index = __native.effectCall(nodeId, effectIndex, 'getMaterial', "
            "nameOrIndex);\n"
@@ -1192,7 +1195,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      has(_target, prop) {\n"
         << "        if (typeof prop !== 'string') return false;\n"
         << "        if (prop === 'getAnimation' || prop === 'getMaterial' || "
-           "prop === 'getMaterialCount') return true;\n"
+           "prop === 'getMaterialCount' || prop === 'setMaterialProperty') return true;\n"
         << "        return !!__native.hasEffectMember(nodeId, effectIndex, prop);\n"
         << "      }\n"
         << "    });\n"
@@ -6211,6 +6214,89 @@ JSValue NativeSetEffectProperty(JSContext* context, JSValueConst, int argc, JSVa
     return JS_NewBool(context, applied);
 }
 
+std::optional<ShaderValue> ReadEffectMaterialArgument(JSContext* context, JSValueConst value) {
+    // Method arguments are classified before any destination descriptor is visited. Numeric
+    // inputs narrow to float storage, preserving negative zero and nonfinite values. Objects
+    // take the two-component argument form even when they also expose z/w; their components
+    // admit Numbers only, so arrays, missing fields and conversion-hook objects supply zero.
+    if (JS_IsNumber(value)) {
+        double number = 0.0;
+        if (JS_ToFloat64(context, &number, value) != 0) return std::nullopt;
+        return ShaderValue(static_cast<float>(number));
+    }
+    if (!JS_IsObject(value)) return ShaderValue(0.0f);
+
+    constexpr std::array<const char*, 2> names { "x", "y" };
+    std::array<float, 2> components {};
+    for (size_t index = 0; index < names.size(); ++index) {
+        // Each property read can run script and mutate the next component or the scene. Read
+        // x before y exactly once, finish conversion before resolving any material, and retain
+        // a pending exception without performing a partial set of material writes.
+        JSValue component = JS_GetPropertyStr(context, value, names[index]);
+        if (JS_IsException(component)) return std::nullopt;
+        if (JS_IsNumber(component)) {
+            double number = 0.0;
+            const int result = JS_ToFloat64(context, &number, component);
+            JS_FreeValue(context, component);
+            if (result != 0) return std::nullopt;
+            components[index] = static_cast<float>(number);
+        } else {
+            JS_FreeValue(context, component);
+        }
+    }
+    return ShaderValue(components);
+}
+
+void ApplyEffectMaterialArgument(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
+                                  uint32_t effect_index, const std::string& property_name,
+                                  const ShaderValue& argument) {
+    auto* effect = opaque->scene->FindImageEffect(layer_id, effect_index);
+    if (effect == nullptr) return;
+
+    // Bulk lookup gives static raster descriptors priority over shader aliases. Those controls
+    // are strings, so this numeric/vector method cannot write them, including a same-name
+    // shader property that is exposed by an ordinary material object's accessor.
+    if (std::any_of(std::begin(kEffectMaterialRasterProperties),
+                    std::end(kEffectMaterialRasterProperties),
+                    [&](std::string_view name) { return name == property_name; })) return;
+
+    size_t material_index = 0;
+    for (auto& effect_node : effect->nodes) {
+        auto* node = effect_node.sceneNode.get();
+        if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr)
+            continue;
+        auto& material = *node->Mesh()->Material();
+        const size_t index = material_index++;
+        std::string uniform_name;
+        const auto* current = FindRuntimeMaterialUniformValue(material, property_name, &uniform_name);
+        if (current == nullptr || current->size() != argument.size()) continue;
+
+        // Every matching pass consumes the same converted argument. Descriptor units apply to
+        // each scalar separately; vector widths must match and are never broadcast or resized.
+        // Keep the value on the retained material so hidden owners and text relayout consume
+        // the same write without changing pass topology or script registration.
+        ShaderValue stored = argument;
+        const auto units = material.uniformScalarDegrees.find(uniform_name);
+        const bool angular = stored.size() == 1 && units != material.uniformScalarDegrees.end() &&
+                             units->second;
+        if (angular) stored[0] *= std::numbers::pi_v<float> / 180.0f;
+        material.customShader.constValues[uniform_name] = stored;
+
+        std::ostringstream description;
+        description << std::setprecision(std::numeric_limits<float>::max_digits10) << '[';
+        for (size_t component = 0; component < stored.size(); ++component) {
+            if (component != 0) description << ',';
+            description << stored[component];
+        }
+        description << ']';
+        LOG_INFO("SceneEffectMaterialBulkApply: layer=%d effect-index=%u effect-id=%d "
+                 "material-index=%zu material='%s' property='%s' uniform='%s' angular=%s value=%s",
+                 layer_id, effect_index, effect->EffectId(), index, material.name.c_str(),
+                 property_name.c_str(), uniform_name.c_str(), angular ? "true" : "false",
+                 description.str().c_str());
+    }
+}
+
 JSValue NativeEffectCall(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
     auto* opaque = GetOpaque(context);
     if (opaque == nullptr || opaque->scene == nullptr || argc < 3) return JS_UNDEFINED;
@@ -6221,10 +6307,22 @@ JSValue NativeEffectCall(JSContext* context, JSValueConst, int argc, JSValueCons
         JS_ToInt32(context, &effect_index, argv[1]) != 0 || effect_index < 0) {
         return JS_UNDEFINED;
     }
-    auto* effect = opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index));
-    if (effect == nullptr) return JS_UNDEFINED;
     std::string method;
     if (!ReadJSString(context, argv[2], &method)) return JS_EXCEPTION;
+    if (method == "setMaterialProperty") {
+        const JSValueConst name = argc > 3 ? argv[3] : JS_UNDEFINED;
+        std::string property_name;
+        if (JS_IsString(name) && !ReadJSString(context, name, &property_name)) return JS_EXCEPTION;
+        const auto value = ReadEffectMaterialArgument(context, argc > 4 ? argv[4] : JS_UNDEFINED);
+        if (!value.has_value()) return JS_EXCEPTION;
+        // Component getters may re-enter scene APIs. Resolve the owner only after all reads,
+        // and keep this method's void result even when no material descriptor accepts a write.
+        ApplyEffectMaterialArgument(opaque, layer_id, static_cast<uint32_t>(effect_index),
+                                    property_name, *value);
+        return JS_UNDEFINED;
+    }
+    auto* effect = opaque->scene->FindImageEffect(layer_id, static_cast<uint32_t>(effect_index));
+    if (effect == nullptr) return JS_UNDEFINED;
     if (method == "getMaterialCount") {
         return JS_NewInt32(context, static_cast<int32_t>(effect->MaterialRecordCount()));
     }

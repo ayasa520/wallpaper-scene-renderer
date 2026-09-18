@@ -1262,6 +1262,12 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     // view. A metadata declaration excluded by the compiled program must not recreate a member
     // through an authored script, animation or user binding after material construction.
     material.uniformAliases = pWPShaderInfo->activeMaterialAliases;
+    material.uniformScalarDegrees.clear();
+    for (const auto& [property_name, uniform_name] : material.uniformAliases) {
+        const auto conversion = pWPShaderInfo->materialConversions.find(uniform_name);
+        material.uniformScalarDegrees[uniform_name] =
+            conversion != pWPShaderInfo->materialConversions.end() && conversion->second == "rad2deg";
+    }
 
     return MaterialLoadResult { .geometry_stage_loaded = geometry_stage_loaded };
 }
@@ -1437,6 +1443,8 @@ void MergeImageSourceProgramBindings(SceneMaterial& material, const SceneMateria
     material.customShader.constValues.insert(variant.customShader.constValues.begin(),
                                              variant.customShader.constValues.end());
     material.uniformAliases.insert(variant.uniformAliases.begin(), variant.uniformAliases.end());
+    material.uniformScalarDegrees.insert(variant.uniformScalarDegrees.begin(),
+                                         variant.uniformScalarDegrees.end());
     material.systemTextureBindings.insert(variant.systemTextureBindings.begin(),
                                            variant.systemTextureBindings.end());
     material.systemTextureReferences.insert(variant.systemTextureReferences.begin(),

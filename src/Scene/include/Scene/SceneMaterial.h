@@ -66,6 +66,7 @@ public:
           userTextureBindings(std::move(o.userTextureBindings)),
           defines(std::move(o.defines)),
           uniformAliases(std::move(o.uniformAliases)),
+          uniformScalarDegrees(std::move(o.uniformScalarDegrees)),
           hasSprite(o.hasSprite),
           customShader(std::move(o.customShader)),
           blenmode(o.blenmode),
@@ -123,6 +124,10 @@ public:
     // Keeping the parser alias table on the runtime material lets script proxies resolve those
     // authored names without depending on project-specific shader source at assignment time.
     Map<std::string, std::string> uniformAliases;
+    // Scalar method arguments use the units of the selected material descriptor. Keep both
+    // converted and unconverted entries: merging another source program may add bindings, but
+    // must not change the units of a primary descriptor that already owns its uniform.
+    Map<std::string, bool> uniformScalarDegrees;
 
     const ShaderValue* FindUniformValue(std::string_view uniform_name) const {
         const auto key = std::string(uniform_name);

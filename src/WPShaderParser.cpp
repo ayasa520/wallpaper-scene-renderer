@@ -33,7 +33,7 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 #define SHADER_SRC_DIR "prepared-shaders02"
 #define SHADER_SRC_SUFFIX "wpsrc"
 
-static constexpr int              kPreShaderMetadataVersion { 3 };
+static constexpr int              kPreShaderMetadataVersion { 4 };
 static constexpr int              kPreparedShaderSourceVersion { 4 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
     // For a single-sample back buffer, texSample2DBackBuffer expands to texSample2D(s, (u)). The
@@ -1754,6 +1754,14 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                     const auto declaration = TryParseDeclLine(line, 0, { "uniform" });
                     if (declaration.has_value() && ! IsSamplerType(declaration->type)) {
                         pWPShaderInfo->materialTypes[declaration->name] = declaration->type;
+                        auto& conversion = pWPShaderInfo->materialConversions[declaration->name];
+                        conversion.clear();
+                        const auto authored_conversion = sv_json.find("conversion");
+                        if (authored_conversion != sv_json.end() && authored_conversion->is_string()) {
+                            // Material metadata uses terminated strings. Preserve exact spelling
+                            // so only the declared unit conversion affects a selected descriptor.
+                            conversion = authored_conversion->get_ref<const std::string&>().c_str();
+                        }
                     }
 
                     ShaderValue sv;
@@ -2356,6 +2364,7 @@ inline bool LoadPreShaderInfo(WPShaderInfo& shader_info, fs::IBinaryStream& file
     if (! LoadStringMap(shader_info.combos, file)) return false;
     if (! LoadStringMap(shader_info.alias, file)) return false;
     if (! LoadStringMap(shader_info.materialTypes, file)) return false;
+    if (! LoadStringMap(shader_info.materialConversions, file)) return false;
     if (! LoadShaderValueMap(shader_info.svs, file)) return false;
     if (! LoadDefaultTexs(shader_info.defTexs, file)) return false;
     return true;
@@ -2366,6 +2375,7 @@ inline void SavePreShaderInfo(const WPShaderInfo& shader_info, fs::IBinaryStream
     SaveStringMap(shader_info.combos, file);
     SaveStringMap(shader_info.alias, file);
     SaveStringMap(shader_info.materialTypes, file);
+    SaveStringMap(shader_info.materialConversions, file);
     SaveShaderValueMap(shader_info.svs, file);
     SaveDefaultTexs(shader_info.defTexs, file);
 }
@@ -2379,6 +2389,9 @@ inline void MergeShaderInfo(WPShaderInfo& into, const WPShaderInfo& from) {
     }
     for (const auto& [key, value] : from.materialTypes) {
         into.materialTypes[key] = value;
+    }
+    for (const auto& [key, value] : from.materialConversions) {
+        into.materialConversions[key] = value;
     }
     for (const auto& [key, value] : from.svs) {
         into.svs[key] = value;

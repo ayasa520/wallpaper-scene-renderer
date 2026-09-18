@@ -30,6 +30,10 @@ struct WPShaderInfo {
     // Material descriptors retain their declared shader type independently of default values.
     // A scalar-authored vec3 still owns three script/timeline channels, including on cache hits.
     Map<std::string, std::string> materialTypes;
+    // Keep scalar units with the declaration metadata, including an empty conversion. A
+    // later declaration or cached shader must preserve its own unconverted descriptor rather
+    // than inherit an earlier stage's units while the type and alias maps are merged.
+    Map<std::string, std::string> materialConversions;
     WPDefaultTexs    defTexs;
 
     size_t MaterialValueComponents(std::string_view uniform_name) const;
