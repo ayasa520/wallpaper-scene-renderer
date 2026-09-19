@@ -1171,6 +1171,12 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      }\n"
         << "    });\n"
         << "  }\n"
+        << "  function createScriptMaterialObject(instanceId) {\n"
+        << "    const names = __native.getScriptMaterialPropertyNames(instanceId);\n"
+        << "    return __native.createMaterialObject(names,\n"
+        << "      prop => __native.getScriptMaterialProperty(instanceId, prop),\n"
+        << "      (prop, value) => __native.setScriptMaterialProperty(instanceId, prop, value));\n"
+        << "  }\n"
         << "  function createThisObjectProxy() {\n"
         << "    const animationObject = __objectKind === 'animationLayer'\n"
         << "      ? (createAnimationLayer(__objectIndex, __nodeId, __instanceId) ?? undefined)\n"
@@ -1182,6 +1188,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         // facade, but resolve ordinary owner properties through scene storage instead of
         // manufacturing a layer proxy for object id zero.
         << "    const baseObject = __objectKind === 'scene' ? __sceneProxy\n"
+        << "      : __objectKind === 'materialUniform' ? createScriptMaterialObject(__instanceId)\n"
         << "      : (effectObject ?? animationObject ?? createLayerProxy(__nodeId, "
            "__instanceId));\n"
         << "    return new Proxy({}, {\n"
@@ -3703,13 +3710,16 @@ const ShaderValue* FindMaterialUniformValue(const SceneMaterial& material,
 std::optional<WPDynamicValue> DynamicValueFromShaderValue(const ShaderValue& value,
                                                           WPDynamicValue::Type hint);
 
-struct EffectMaterialTarget {
+struct MaterialPropertyTarget {
     SceneImageEffect* effect { nullptr };
     SceneNode*        node { nullptr };
     SceneMaterial*    material { nullptr };
+    int32_t           layer_id { 0 };
+    int32_t           effect_index { -1 };
+    int32_t           material_index { 0 };
 };
 
-std::optional<EffectMaterialTarget>
+std::optional<MaterialPropertyTarget>
 FindEffectMaterialTarget(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
                          uint32_t effect_index, uint32_t material_index) {
     if (opaque == nullptr || opaque->scene == nullptr) return std::nullopt;
@@ -3727,15 +3737,71 @@ FindEffectMaterialTarget(WPSceneScriptHost::Opaque* opaque, int32_t layer_id,
         // resolves authored record positions and resource names before constructing a handle,
         // so command holes never renumber existing callback targets or uniform registrations.
         if (current_material_index == material_index) {
-            return EffectMaterialTarget {
+            return MaterialPropertyTarget {
                 .effect   = effect,
                 .node     = node,
                 .material = node->Mesh()->Material(),
+                .layer_id = layer_id,
+                .effect_index = static_cast<int32_t>(effect_index),
+                .material_index = static_cast<int32_t>(material_index),
             };
         }
         current_material_index++;
     }
 
+    return std::nullopt;
+}
+
+std::optional<MaterialPropertyTarget>
+FindScriptMaterialTarget(WPSceneScriptHost::Opaque* opaque, uint32_t instance_id) {
+    const auto* instance = FindInstance(opaque, instance_id);
+    if (instance == nullptr ||
+        instance->registration.target_kind != WPSceneScriptTargetKind::MaterialUniform) {
+        return std::nullopt;
+    }
+
+    // A property script retains its material resource, while thisLayer identifies the authored
+    // layer. Resolve that exact resource through the current owner on each access; a shader name
+    // or a node position cannot distinguish multiple materials on the same layer. Script callbacks
+    // carry only the instance id, so removing an instance cannot retarget an old object to a newly
+    // created owner that happens to reuse the layer id.
+    const auto& registration = instance->registration;
+    std::optional<MaterialPropertyTarget> target;
+    ForEachBaseLayerMaterial(opaque, registration.object_id,
+                             [&](SceneMaterial& material, SceneNode* node) {
+        if (&material == registration.material) {
+            target = MaterialPropertyTarget {
+                .node = node,
+                .material = &material,
+                .layer_id = registration.object_id,
+                .material_index = static_cast<int32_t>(registration.target_index),
+            };
+        }
+    });
+    if (target.has_value()) return target;
+
+    auto* effects = opaque->scene->FindImageEffectLayer(registration.object_id);
+    if (effects == nullptr) return std::nullopt;
+    for (size_t effect_index = 0; effect_index < effects->EffectCount(); ++effect_index) {
+        auto* effect = effects->GetEffect(effect_index).get();
+        int32_t material_index = 0;
+        for (const auto& effect_node : effect->nodes) {
+            auto* node = effect_node.sceneNode.get();
+            if (node == nullptr || node->Mesh() == nullptr || node->Mesh()->Material() == nullptr)
+                continue;
+            if (node->Mesh()->Material() == registration.material) {
+                return MaterialPropertyTarget {
+                    .effect = effect,
+                    .node = node,
+                    .material = registration.material,
+                    .layer_id = registration.object_id,
+                    .effect_index = static_cast<int32_t>(effect_index),
+                    .material_index = material_index,
+                };
+            }
+            ++material_index;
+        }
+    }
     return std::nullopt;
 }
 
@@ -6266,6 +6332,177 @@ JSValue NativeHasEffectMaterial(JSContext* context, JSValueConst, int argc, JSVa
     return JS_NewBool(context, target.has_value());
 }
 
+JSValue MaterialPropertyNames(JSContext* context, const SceneMaterial& material) {
+    JSValue names = JS_NewArray(context);
+    // Membership comes from the same compiled aliases and retained value storage used by
+    // has/get/set. Raw shader symbols, inactive declarations and unrelated defaults must not
+    // become own properties merely because a script enumerates the material. Static and
+    // shader descriptors share one namespace; constructing the script object's own slots
+    // coalesces collisions while its live value lookup retains the shader alias's precedence.
+    uint32_t index = 0;
+    const auto append = [&](std::string_view name) {
+        JS_SetPropertyUint32(context, names, index++, JS_NewStringLen(context, name.data(), name.size()));
+    };
+    for (const auto name : kEffectMaterialRasterProperties) append(name);
+    for (const auto& [name, uniform_name] : material.uniformAliases) {
+        if (FindMaterialUniformValue(material, uniform_name) != nullptr) append(name);
+    }
+    return names;
+}
+
+
+JSValue ReadMaterialProperty(JSContext* context, const SceneMaterial& material,
+                             const std::string& property_name) {
+    std::string uniform_name;
+    const auto* uniform =
+        FindRuntimeMaterialUniformValue(material, property_name, &uniform_name);
+    // A selected shader descriptor is installed after static material descriptors, so its
+    // literal name replaces a same-named static accessor in the JavaScript object.
+    if (uniform != nullptr) {
+        if (MaterialScalarUsesDegrees(material, uniform_name, *uniform)) {
+            // Scalar angle storage remains in radians for every shader consumer. Convert only
+            // the published read, rounding the scale once from double precision and performing
+            // the multiplication in float before promoting the result to a script Number.
+            constexpr float radians_to_degrees = static_cast<float>(180.0 / std::numbers::pi_v<double>);
+            const float degrees = (*uniform)[0] * radians_to_degrees;
+            return JS_NewFloat64(context, static_cast<double>(degrees));
+        }
+        return ShaderUniformValueToJS(context, *uniform);
+    }
+    if (property_name == "blending") {
+        return JS_NewString(context, MaterialBlendingName(material.blenmode).data());
+    }
+    if (property_name == "cullmode") {
+        return JS_NewString(context, MaterialCullModeName(material.cullMode).data());
+    }
+    if (property_name == "alphawriting") {
+        return JS_NewString(context, MaterialAlphaWritingName(material.alphaWriting).data());
+    }
+    if (property_name == "depthtest" || property_name == "depthwrite") {
+        const bool enabled = property_name == "depthtest"
+            ? material.depthTest : material.depthWrite;
+        return JS_NewString(context, MaterialEnumName(enabled, kMaterialDepthModes).data());
+    }
+    return JS_UNDEFINED;
+}
+
+
+JSValue WriteMaterialProperty(JSContext* context, WPSceneScriptHost::Opaque* opaque,
+                              const MaterialPropertyTarget& target,
+                              const std::string& property_name, JSValueConst js_value) {
+    const int32_t layer_id = target.layer_id;
+    const int32_t effect_index = target.effect_index;
+    const int32_t material_index = target.material_index;
+    std::string       uniform_name;
+    const auto* const current_uniform =
+        FindRuntimeMaterialUniformValue(*target.material, property_name, &uniform_name);
+    if (current_uniform == nullptr && property_name == "blending") {
+        return ApplyMaterialRasterEnum(context, js_value, target.node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialBlendingModes, &SceneMaterial::blenmode,
+                                       "SceneEffectMaterialBlendApply");
+    }
+    if (current_uniform == nullptr && property_name == "cullmode") {
+        return ApplyMaterialRasterEnum(context, js_value, target.node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialCullModes, &SceneMaterial::cullMode,
+                                       "SceneEffectMaterialCullApply");
+    }
+    if (current_uniform == nullptr && property_name == "alphawriting") {
+        return ApplyMaterialRasterEnum(context, js_value, target.node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialAlphaWritingModes, &SceneMaterial::alphaWriting,
+                                       "SceneEffectMaterialAlphaApply");
+    }
+    if (current_uniform == nullptr &&
+        (property_name == "depthtest" || property_name == "depthwrite")) {
+        return ApplyMaterialRasterEnum(context, js_value, target.node->Mesh()->SharedMaterial(),
+                                       *opaque->scene, layer_id, effect_index, material_index,
+                                       kMaterialDepthModes,
+                                       property_name == "depthtest" ? &SceneMaterial::depthTest
+                                                                    : &SceneMaterial::depthWrite,
+                                       property_name == "depthtest" ? "SceneEffectMaterialDepthTestApply"
+                                                                    : "SceneEffectMaterialDepthWriteApply");
+    }
+    if (current_uniform == nullptr) {
+        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
+                  "material='%s' property='%s' unresolved uniform='%s'",
+                  layer_id,
+                  effect_index,
+                  material_index,
+                  target.material->name.c_str(),
+                  property_name.c_str(),
+                  uniform_name.c_str());
+        return JS_FALSE;
+    }
+
+    // Null and undefined leave numeric material properties unchanged. Shared script state can
+    // still be unset during an initial property callback; these values must neither become zero
+    // nor enter scalar/component conversion. Keep the same rule for handles and script owners.
+    if (JS_IsNull(js_value) || JS_IsUndefined(js_value)) {
+        if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+            LOG_INFO("SceneMaterialUniformNoop: layer=%d property='%s' uniform='%s' "
+                     "value-type=%s reason=nullish-value",
+                     layer_id, property_name.c_str(), uniform_name.c_str(),
+                     JS_IsUndefined(js_value) ? "undefined" : "null");
+        }
+        return JS_TRUE;
+    }
+
+    const auto value =
+        ReadDynamicValueFromJS(context, js_value, RuntimeDynamicTypeForShaderValue(*current_uniform));
+    if (! value.has_value()) {
+        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
+                  "material='%s' property='%s' uniform='%s' invalid JS value",
+                  layer_id,
+                  effect_index,
+                  material_index,
+                  target.material->name.c_str(),
+                  property_name.c_str(),
+                  uniform_name.c_str());
+        return JS_FALSE;
+    }
+
+    auto shader_value = value->toShaderValue();
+    if (! shader_value.has_value()) {
+        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
+                  "material='%s' property='%s' uniform='%s' invalid value %s",
+                  layer_id,
+                  effect_index,
+                  material_index,
+                  target.material->name.c_str(),
+                  property_name.c_str(),
+                  uniform_name.c_str(),
+                  value->describe().c_str());
+        return JS_FALSE;
+    }
+
+    // Public scalar angle writes use degrees, including values read back from this property.
+    // Narrow through the existing conversion first, then scale in float so round trips and
+    // direct assignments retain radian storage without changing any shader's input units.
+    const bool angular = MaterialScalarUsesDegrees(*target.material, uniform_name, *shader_value);
+    if (angular) (*shader_value)[0] *= std::numbers::pi_v<float> / 180.0f;
+    const std::string stored_description =
+        angular ? WPDynamicValue((*shader_value)[0]).describe() : value->describe();
+
+    // Material passes read the retained constants while drawing. Resolve the public alias once
+    // and update that same material without rebuilding cameras or changing owner visibility.
+    target.material->customShader.constValues[uniform_name] = *shader_value;
+    LOG_INFO("SceneEffectMaterialUniformApply: layer=%d effect-index=%d effect-id=%d effect='%s' "
+             "material-index=%d material='%s' property='%s' uniform='%s' value=%s",
+             layer_id,
+             effect_index,
+             target.effect != nullptr ? target.effect->EffectId() : 0,
+             target.effect != nullptr ? target.effect->EffectName().c_str() : "",
+             material_index,
+             target.material->name.c_str(),
+             property_name.c_str(),
+             uniform_name.c_str(),
+             stored_description.c_str());
+    return JS_TRUE;
+}
+
+
 JSValue
 NativeGetEffectMaterialPropertyNames(JSContext* context, JSValueConst, int argc,
                                      JSValueConst* argv) {
@@ -6286,23 +6523,8 @@ NativeGetEffectMaterialPropertyNames(JSContext* context, JSValueConst, int argc,
                                                  layer_id,
                                                  static_cast<uint32_t>(effect_index),
                                                  static_cast<uint32_t>(material_index));
-    JSValue names = JS_NewArray(context);
-    if (!target.has_value()) return names;
-
-    // Membership comes from the same compiled aliases and retained value storage used by
-    // has/get/set. Raw shader symbols, inactive declarations and unrelated defaults must not
-    // become own properties merely because a script enumerates the material. Static and
-    // shader descriptors share one namespace; constructing the script object's own slots
-    // coalesces collisions while its live value lookup retains the shader alias's precedence.
-    uint32_t index = 0;
-    const auto append = [&](std::string_view name) {
-        JS_SetPropertyUint32(context, names, index++, JS_NewStringLen(context, name.data(), name.size()));
-    };
-    for (const auto name : kEffectMaterialRasterProperties) append(name);
-    for (const auto& [name, uniform_name] : target->material->uniformAliases) {
-        if (FindMaterialUniformValue(*target->material, uniform_name) != nullptr) append(name);
-    }
-    return names;
+    return target.has_value() ? MaterialPropertyNames(context, *target->material)
+                              : JS_NewArray(context);
 }
 
 JSValue
@@ -6362,37 +6584,7 @@ NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
                                                  static_cast<uint32_t>(material_index));
     if (! target.has_value()) return JS_UNDEFINED;
 
-    std::string uniform_name;
-    const auto* uniform =
-        FindRuntimeMaterialUniformValue(*target->material, property_name, &uniform_name);
-    // A selected shader descriptor is installed after static material descriptors, so its
-    // literal name replaces a same-named static accessor in the JavaScript object.
-    if (uniform != nullptr) {
-        if (MaterialScalarUsesDegrees(*target->material, uniform_name, *uniform)) {
-            // Scalar angle storage remains in radians for every shader consumer. Convert only
-            // the published read, rounding the scale once from double precision and performing
-            // the multiplication in float before promoting the result to a script Number.
-            constexpr float radians_to_degrees = static_cast<float>(180.0 / std::numbers::pi_v<double>);
-            const float degrees = (*uniform)[0] * radians_to_degrees;
-            return JS_NewFloat64(context, static_cast<double>(degrees));
-        }
-        return ShaderUniformValueToJS(context, *uniform);
-    }
-    if (property_name == "blending") {
-        return JS_NewString(context, MaterialBlendingName(target->material->blenmode).data());
-    }
-    if (property_name == "cullmode") {
-        return JS_NewString(context, MaterialCullModeName(target->material->cullMode).data());
-    }
-    if (property_name == "alphawriting") {
-        return JS_NewString(context, MaterialAlphaWritingName(target->material->alphaWriting).data());
-    }
-    if (property_name == "depthtest" || property_name == "depthwrite") {
-        const bool enabled = property_name == "depthtest"
-            ? target->material->depthTest : target->material->depthWrite;
-        return JS_NewString(context, MaterialEnumName(enabled, kMaterialDepthModes).data());
-    }
-    return JS_UNDEFINED;
+    return ReadMaterialProperty(context, *target->material, property_name);
 }
 
 JSValue
@@ -6419,102 +6611,44 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
                                                  static_cast<uint32_t>(material_index));
     if (! target.has_value()) return JS_FALSE;
 
-    std::string       uniform_name;
-    const auto* const current_uniform =
-        FindRuntimeMaterialUniformValue(*target->material, property_name, &uniform_name);
-    if (current_uniform == nullptr && property_name == "blending") {
-        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
-                                       *opaque->scene, layer_id, effect_index, material_index,
-                                       kMaterialBlendingModes, &SceneMaterial::blenmode,
-                                       "SceneEffectMaterialBlendApply");
-    }
-    if (current_uniform == nullptr && property_name == "cullmode") {
-        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
-                                       *opaque->scene, layer_id, effect_index, material_index,
-                                       kMaterialCullModes, &SceneMaterial::cullMode,
-                                       "SceneEffectMaterialCullApply");
-    }
-    if (current_uniform == nullptr && property_name == "alphawriting") {
-        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
-                                       *opaque->scene, layer_id, effect_index, material_index,
-                                       kMaterialAlphaWritingModes, &SceneMaterial::alphaWriting,
-                                       "SceneEffectMaterialAlphaApply");
-    }
-    if (current_uniform == nullptr &&
-        (property_name == "depthtest" || property_name == "depthwrite")) {
-        return ApplyMaterialRasterEnum(context, argv[4], target->node->Mesh()->SharedMaterial(),
-                                       *opaque->scene, layer_id, effect_index, material_index,
-                                       kMaterialDepthModes,
-                                       property_name == "depthtest" ? &SceneMaterial::depthTest
-                                                                    : &SceneMaterial::depthWrite,
-                                       property_name == "depthtest" ? "SceneEffectMaterialDepthTestApply"
-                                                                    : "SceneEffectMaterialDepthWriteApply");
-    }
-    if (current_uniform == nullptr) {
-        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
-                  "material='%s' property='%s' unresolved uniform='%s'",
-                  layer_id,
-                  effect_index,
-                  material_index,
-                  target->material->name.c_str(),
-                  property_name.c_str(),
-                  uniform_name.c_str());
-        return JS_FALSE;
-    }
+    return WriteMaterialProperty(context, opaque, *target, property_name, argv[4]);
+}
 
-    const auto value =
-        ReadDynamicValueFromJS(context, argv[4], RuntimeDynamicTypeForShaderValue(*current_uniform));
-    if (! value.has_value()) {
-        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
-                  "material='%s' property='%s' uniform='%s' invalid JS value",
-                  layer_id,
-                  effect_index,
-                  material_index,
-                  target->material->name.c_str(),
-                  property_name.c_str(),
-                  uniform_name.c_str());
-        return JS_FALSE;
-    }
+JSValue NativeGetScriptMaterialPropertyNames(JSContext* context, JSValueConst, int argc,
+                                            JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    uint32_t instance_id = 0;
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 1 ||
+        JS_ToUint32(context, &instance_id, argv[0]) != 0) return JS_NewArray(context);
+    const auto target = FindScriptMaterialTarget(opaque, instance_id);
+    return target.has_value() ? MaterialPropertyNames(context, *target->material)
+                              : JS_NewArray(context);
+}
 
-    auto shader_value = value->toShaderValue();
-    if (! shader_value.has_value()) {
-        LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
-                  "material='%s' property='%s' uniform='%s' invalid value %s",
-                  layer_id,
-                  effect_index,
-                  material_index,
-                  target->material->name.c_str(),
-                  property_name.c_str(),
-                  uniform_name.c_str(),
-                  value->describe().c_str());
-        return JS_FALSE;
-    }
+JSValue NativeGetScriptMaterialProperty(JSContext* context, JSValueConst, int argc,
+                                       JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    uint32_t instance_id = 0;
+    std::string property_name;
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 2 ||
+        JS_ToUint32(context, &instance_id, argv[0]) != 0 ||
+        !ReadJSString(context, argv[1], &property_name)) return JS_UNDEFINED;
+    const auto target = FindScriptMaterialTarget(opaque, instance_id);
+    return target.has_value() ? ReadMaterialProperty(context, *target->material, property_name)
+                              : JS_UNDEFINED;
+}
 
-    // Public scalar angle writes use degrees, including values read back from this property.
-    // Narrow through the existing conversion first, then scale in float so round trips and
-    // direct assignments retain radian storage without changing any shader's input units.
-    const bool angular = MaterialScalarUsesDegrees(*target->material, uniform_name, *shader_value);
-    if (angular) (*shader_value)[0] *= std::numbers::pi_v<float> / 180.0f;
-    const std::string stored_description =
-        angular ? WPDynamicValue((*shader_value)[0]).describe() : value->describe();
-
-    // Effect passes read SceneMaterial::customShader.constValues while drawing, so storing the
-    // resolved uniform here updates the next post-process pass without rebuilding cameras or
-    // changing the effect's own visibility state. This is intentionally separate from
-    // setEffectProperty(), which remains limited to effect.visible.
-    target->material->customShader.constValues[uniform_name] = *shader_value;
-    LOG_INFO("SceneEffectMaterialUniformApply: layer=%d effect-index=%d effect-id=%d effect='%s' "
-             "material-index=%d material='%s' property='%s' uniform='%s' value=%s",
-             layer_id,
-             effect_index,
-             target->effect != nullptr ? target->effect->EffectId() : 0,
-             target->effect != nullptr ? target->effect->EffectName().c_str() : "",
-             material_index,
-             target->material->name.c_str(),
-             property_name.c_str(),
-             uniform_name.c_str(),
-             stored_description.c_str());
-    return JS_TRUE;
+JSValue NativeSetScriptMaterialProperty(JSContext* context, JSValueConst, int argc,
+                                       JSValueConst* argv) {
+    auto* opaque = GetOpaque(context);
+    uint32_t instance_id = 0;
+    std::string property_name;
+    if (opaque == nullptr || opaque->scene == nullptr || argc < 3 ||
+        JS_ToUint32(context, &instance_id, argv[0]) != 0 ||
+        !ReadJSString(context, argv[1], &property_name)) return JS_FALSE;
+    const auto target = FindScriptMaterialTarget(opaque, instance_id);
+    return target.has_value() ? WriteMaterialProperty(context, opaque, *target, property_name, argv[2])
+                              : JS_FALSE;
 }
 
 JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -8779,6 +8913,18 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
         m_impl->native_bridge,
         "setEffectMaterialProperty",
         JS_NewCFunction(context, NativeSetEffectMaterialProperty, "setEffectMaterialProperty", 5));
+    JS_SetPropertyStr(context,
+                      m_impl->native_bridge,
+                      "getScriptMaterialPropertyNames",
+                      JS_NewCFunction(context, NativeGetScriptMaterialPropertyNames, "getScriptMaterialPropertyNames", 1));
+    JS_SetPropertyStr(context,
+                      m_impl->native_bridge,
+                      "getScriptMaterialProperty",
+                      JS_NewCFunction(context, NativeGetScriptMaterialProperty, "getScriptMaterialProperty", 2));
+    JS_SetPropertyStr(context,
+                      m_impl->native_bridge,
+                      "setScriptMaterialProperty",
+                      JS_NewCFunction(context, NativeSetScriptMaterialProperty, "setScriptMaterialProperty", 3));
     JS_SetPropertyStr(context,
                       m_impl->native_bridge,
                       "getLayerRelation",
