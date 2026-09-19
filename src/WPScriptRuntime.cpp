@@ -1,4 +1,6 @@
 #include "WPScriptRuntime.hpp"
+#include "WPScriptSource.hpp"
+#include "WPScriptVectors.hpp"
 
 #include <cmath>
 #include <sstream>
@@ -19,58 +21,6 @@ struct RuntimeState {
     JSRuntime* runtime { nullptr };
     JSContext* context { nullptr };
 };
-
-void ReplaceAll(std::string& source, std::string_view needle, std::string_view replacement) {
-    std::string::size_type pos = 0;
-    while ((pos = source.find(needle, pos)) != std::string::npos) {
-        source.replace(pos, needle.size(), replacement);
-        pos += replacement.size();
-    }
-}
-
-void NormalizeScriptWhitespace(std::string& source) {
-    // Workshop scripts occasionally use U+00A0 non-breaking spaces between
-    // module keywords and declarations, for example `export var` rendered as
-    // `export\xc2\xa0var`. QuickJS treats that as valid whitespace, but our
-    // module-stripping pass used to search only for ASCII spaces and therefore
-    // left the `export` token in parser-time scripts. Normalize those spaces
-    // first so authored Wallpaper Engine module syntax is removed reliably.
-    ReplaceAll(source, "\xC2\xA0", " ");
-}
-
-std::string StripScriptModuleSyntax(std::string source) {
-    NormalizeScriptWhitespace(source);
-
-    std::string::size_type pos = 0;
-    while ((pos = source.find("'use strict';", pos)) != std::string::npos) {
-        source.erase(pos, 13);
-    }
-
-    pos = 0;
-    while ((pos = source.find("\"use strict\";", pos)) != std::string::npos) {
-        source.erase(pos, 13);
-    }
-
-    pos = 0;
-    while ((pos = source.find("export ", pos)) != std::string::npos) {
-        source.erase(pos, 7);
-    }
-
-    std::istringstream input(source);
-    std::ostringstream output;
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto first = line.find_first_not_of(" \t");
-        const auto trimmed =
-            first == std::string::npos ? std::string_view {} : std::string_view(line).substr(first);
-        if (trimmed.starts_with("import ")) {
-            continue;
-        }
-        output << line << '\n';
-    }
-
-    return output.str();
-}
 
 void LogQuickJSException(JSContext* context, const char* stage) {
     JSValue exception = JS_GetException(context);
@@ -285,7 +235,7 @@ std::optional<WPScriptValue> ScriptValueFromJS(JSContext*                 contex
 }
 
 std::string BuildWrappedScript(std::string_view script_source) {
-    const std::string body = StripScriptModuleSyntax(std::string(script_source));
+    const std::string body = AdaptSceneScriptSource(script_source);
 
     std::ostringstream wrapper;
     wrapper << "(function() {\n"
@@ -351,72 +301,7 @@ std::string BuildWrappedScript(std::string_view script_source) {
             << "  };\n"
             << "  const __dot = (lhs, rhs) => lhs.reduce((sum, value, index) => sum + value * rhs[index], 0);\n"
             << "  const __mixScalar = (a, b, t) => __toNumber(a, 0) + (__toNumber(b, 0) - __toNumber(a, 0)) * __toNumber(t, 0);\n"
-            << "  const Vec2 = (typeof globalThis.Vec2 === 'function')\n"
-            << "    ? globalThis.Vec2\n"
-            << "    : (globalThis.Vec2 = class Vec2 {\n"
-            << "        constructor(a = 0, b = 0) {\n"
-            << "          const values = arguments.length === 0 ? [0, 0]\n"
-            << "            : arguments.length === 1 ? __vecValues(a, 2)\n"
-            << "            : [__toNumber(a, 0), __toNumber(b, 0)];\n"
-            << "          this.x = values[0];\n"
-            << "          this.y = values[1];\n"
-            << "        }\n"
-            << "        equals(other) { const v = __vecValues(other, 2); return Math.abs(this.x - v[0]) < 1e-6 && Math.abs(this.y - v[1]) < 1e-6; }\n"
-            << "        length() { return Math.hypot(this.x, this.y); }\n"
-            << "        lengthSqr() { return this.x * this.x + this.y * this.y; }\n"
-            << "        normalize() { const len = this.length(); return len === 0 ? new Vec2() : new Vec2(this.x / len, this.y / len); }\n"
-            << "        copy() { return new Vec2(this.x, this.y); }\n"
-            << "        add(value) { return __binaryVec(this, value, (a, b) => a + b, Vec2, ['x', 'y']); }\n"
-            << "        subtract(value) { return __binaryVec(this, value, (a, b) => a - b, Vec2, ['x', 'y']); }\n"
-            << "        multiply(value) { return __binaryVec(this, value, (a, b) => a * b, Vec2, ['x', 'y']); }\n"
-            << "        divide(value) { return __binaryVec(this, value, (a, b) => a / b, Vec2, ['x', 'y']); }\n"
-            << "        dot(value) { const rhs = __vecValues(value, 2); return __dot([this.x, this.y], rhs); }\n"
-            << "        reflect(normal) { const n = new Vec2(normal).normalize(); return this.subtract(n.multiply(2 * this.dot(n))); }\n"
-            << "        mix(other, amount) { const rhs = __vecValues(other, 2); return new Vec2(__mixScalar(this.x, rhs[0], amount), __mixScalar(this.y, rhs[1], amount)); }\n"
-            << "        perpendicular() { return new Vec2(-this.y, this.x); }\n"
-            << "        abs() { return new Vec2(Math.abs(this.x), Math.abs(this.y)); }\n"
-            << "        sign() { return new Vec2(Math.sign(this.x), Math.sign(this.y)); }\n"
-            << "        round() { return new Vec2(Math.round(this.x), Math.round(this.y)); }\n"
-            << "        floor() { return new Vec2(Math.floor(this.x), Math.floor(this.y)); }\n"
-            << "        ceil() { return new Vec2(Math.ceil(this.x), Math.ceil(this.y)); }\n"
-            << "        toString() { return `${this.x} ${this.y}`; }\n"
-            << "        toConfigString() { return this.toString(); }\n"
-            << "      });\n"
-            << "  const Vec3 = (typeof globalThis.Vec3 === 'function')\n"
-            << "    ? globalThis.Vec3\n"
-            << "    : (globalThis.Vec3 = class Vec3 {\n"
-            << "        constructor(a = 0, b = 0, c = 0) {\n"
-            << "          const values = arguments.length === 0 ? [0, 0, 0]\n"
-            << "            : arguments.length === 1 ? __vecValues(a, 3)\n"
-            << "            : arguments.length === 2 ? [__toNumber(a, 0), __toNumber(b, 0), 0]\n"
-            << "            : [__toNumber(a, 0), __toNumber(b, 0), __toNumber(c, 0)];\n"
-            << "          this.x = values[0];\n"
-            << "          this.y = values[1];\n"
-            << "          this.z = values[2];\n"
-            << "        }\n"
-            << "        equals(other) { const v = __vecValues(other, 3); return Math.abs(this.x - v[0]) < 1e-6 && Math.abs(this.y - v[1]) < 1e-6 && Math.abs(this.z - v[2]) < 1e-6; }\n"
-            << "        length() { return Math.hypot(this.x, this.y, this.z); }\n"
-            << "        lengthSqr() { return this.x * this.x + this.y * this.y + this.z * this.z; }\n"
-            << "        normalize() { const len = this.length(); return len === 0 ? new Vec3() : new Vec3(this.x / len, this.y / len, this.z / len); }\n"
-            << "        copy() { return new Vec3(this.x, this.y, this.z); }\n"
-            << "        add(value) { return __binaryVec(this, value, (a, b) => a + b, Vec3, ['x', 'y', 'z']); }\n"
-            << "        subtract(value) { return __binaryVec(this, value, (a, b) => a - b, Vec3, ['x', 'y', 'z']); }\n"
-            << "        multiply(value) { return __binaryVec(this, value, (a, b) => a * b, Vec3, ['x', 'y', 'z']); }\n"
-            << "        divide(value) { return __binaryVec(this, value, (a, b) => a / b, Vec3, ['x', 'y', 'z']); }\n"
-            << "        dot(value) { const rhs = __vecValues(value, 3); return __dot([this.x, this.y, this.z], rhs); }\n"
-            << "        reflect(normal) { const n = new Vec3(normal).normalize(); return this.subtract(n.multiply(2 * this.dot(n))); }\n"
-            << "        mix(other, amount) { const rhs = __vecValues(other, 3); return new Vec3(__mixScalar(this.x, rhs[0], amount), __mixScalar(this.y, rhs[1], amount), __mixScalar(this.z, rhs[2], amount)); }\n"
-            << "        min(value) { return __binaryVec(this, value, (a, b) => Math.min(a, b), Vec3, ['x', 'y', 'z']); }\n"
-            << "        max(value) { return __binaryVec(this, value, (a, b) => Math.max(a, b), Vec3, ['x', 'y', 'z']); }\n"
-            << "        cross(value) { const rhs = __vecValues(value, 3); return new Vec3(this.y * rhs[2] - this.z * rhs[1], this.z * rhs[0] - this.x * rhs[2], this.x * rhs[1] - this.y * rhs[0]); }\n"
-            << "        abs() { return new Vec3(Math.abs(this.x), Math.abs(this.y), Math.abs(this.z)); }\n"
-            << "        sign() { return new Vec3(Math.sign(this.x), Math.sign(this.y), Math.sign(this.z)); }\n"
-            << "        round() { return new Vec3(Math.round(this.x), Math.round(this.y), Math.round(this.z)); }\n"
-            << "        floor() { return new Vec3(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z)); }\n"
-            << "        ceil() { return new Vec3(Math.ceil(this.x), Math.ceil(this.y), Math.ceil(this.z)); }\n"
-            << "        toString() { return `${this.x} ${this.y} ${this.z}`; }\n"
-            << "        toConfigString() { return this.toString(); }\n"
-            << "      });\n"
+            << kSceneScriptVectorPrelude
             << "  const __wrapScriptValue = (value) => {\n"
             << "    if (value === undefined || value === null) return value;\n"
             << "    if (typeof value !== 'object') return value;\n"

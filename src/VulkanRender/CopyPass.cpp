@@ -130,6 +130,22 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
         return;
     }
 
+    // This pass transfers one complete target. Unequal extents do not describe a crop or
+    // a resize: a larger source would overrun the destination, while a smaller source
+    // would discard pixels outside its copied rectangle when the destination changes
+    // layout. Reject the operation before any destination barrier, keeping its existing
+    // contents available to later readers. The skipped pass still reaches its final-read
+    // lifetime boundary, but must not be reported as an actual resource read or write.
+    if (src.extent.width != dst.extent.width || src.extent.height != dst.extent.height) {
+        LOG_ERROR("SceneCopyExtentMismatch: src=%s size=%ux%u dst=%s size=%ux%u; "
+                  "whole-target copy requires equal extents",
+                  m_desc.src.c_str(), src.extent.width, src.extent.height,
+                  m_desc.dst.c_str(), dst.extent.width, dst.extent.height);
+        trace_copy("extent-mismatch", false);
+        releaseFinalReadTexs(device);
+        return;
+    }
+
     VkImageSubresourceRange srang {
         .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
         .baseMipLevel   = 0,

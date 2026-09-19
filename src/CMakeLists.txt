@@ -45,6 +45,7 @@ add_library(
   WPPropertyAnimation.cpp
   WPSceneScriptMedia.cpp
   WPScriptRuntime.cpp
+  WPScriptSource.cpp
   WPPkgFs.cpp
   Type.cpp
   WPUserSetting.cpp
