@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -460,8 +461,8 @@ Eigen::Vector3f AlignmentOffset(std::string_view alignment, std::array<float, 2>
 
 bool TextLayerUsesMaterialTint(const wpscene::WPTextObject& object) {
     (void)object;
-    // Text glyph rasters now always store coverage-only data. Background composition is handled
-    // by a dedicated quad, so every text layer can keep glyph color changes on the material path.
+    // Owner colors are applied at draw time: coverage glyphs consume the foreground RGB,
+    // palette glyphs consume only its alpha, and the background uses its own quad.
     return true;
 }
 
@@ -1023,12 +1024,13 @@ void NormalizeGlyphQuadSourceBounds(std::vector<TextRasterLayoutResult::GlyphQua
     }
 }
 
-std::shared_ptr<Image> BuildImageFromCoveragePixels(
+std::shared_ptr<Image> BuildImageFromGlyphPixels(
     const std::string& texture_key,
     int                width,
     int                height,
-    std::unique_ptr<uint8_t[]> coverage) {
-    if (width <= 0 || height <= 0 || coverage == nullptr) return nullptr;
+    std::unique_ptr<uint8_t[]> pixels,
+    bool                      color_glyph) {
+    if (width <= 0 || height <= 0 || pixels == nullptr) return nullptr;
 
     auto image                     = std::make_shared<Image>();
     image->key                     = texture_key;
@@ -1037,7 +1039,7 @@ std::shared_ptr<Image> BuildImageFromCoveragePixels(
     image->header.mapWidth         = width;
     image->header.mapHeight        = height;
     image->header.count            = 1;
-    image->header.format           = TextureFormat::R8;
+    image->header.format           = color_glyph ? TextureFormat::RGBA8 : TextureFormat::R8;
     image->header.type             = ImageType::PNG;
     image->header.sample.wrapS     = TextureWrap::CLAMP_TO_EDGE;
     image->header.sample.wrapT     = TextureWrap::CLAMP_TO_EDGE;
@@ -1051,8 +1053,8 @@ std::shared_ptr<Image> BuildImageFromCoveragePixels(
     mipmap.width  = width;
     mipmap.height = height;
     mipmap.size = static_cast<isize>(
-        static_cast<size_t>(width) * static_cast<size_t>(height));
-    mipmap.data = ImageDataPtr(coverage.release(), [](uint8_t* ptr) {
+        static_cast<size_t>(width) * static_cast<size_t>(height) * (color_glyph ? 4u : 1u));
+    mipmap.data = ImageDataPtr(pixels.release(), [](uint8_t* ptr) {
         delete[] ptr;
     });
     image->slots[0].mipmaps.push_back(std::move(mipmap));
@@ -1064,7 +1066,8 @@ struct TextGlyphBitmap {
     int                       height { 0 };
     int                       origin_x_px { 0 };
     int                       origin_y_px { 0 };
-    std::unique_ptr<uint8_t[]> coverage;
+    bool                      color_glyph { false };
+    std::unique_ptr<uint8_t[]> pixels;
 };
 
 struct TextGlyphOccurrence {
@@ -1096,7 +1099,8 @@ struct TextGlyphAtlasBuildResult {
     size_t                                          cache_miss_count { 0 };
 };
 
-std::string MakeTextGlyphCacheKey(PangoFont* font, PangoGlyph glyph, double raster_scale) {
+std::string MakeTextGlyphCacheKey(PangoFont* font, PangoGlyph glyph, double raster_scale,
+                                bool color_glyph) {
     std::string description = "<unknown>";
     if (font != nullptr) {
         if (auto* desc = pango_font_describe(font); desc != nullptr) {
@@ -1115,12 +1119,14 @@ std::string MakeTextGlyphCacheKey(PangoFont* font, PangoGlyph glyph, double rast
 
     std::ostringstream out;
     // Glyph rasters are cached by the concrete resolved font description, glyph index, and raster
-    // scale so that repeated clock/script updates can reuse the same glyph coverage without
+    // scale so that repeated clock/script updates can reuse the same glyph raster without
     // re-rasterizing the whole text layout or even the same glyph more than once. The explicit
     // atlas-raster version keeps long-lived renderer processes from reusing glyph bitmaps that
     // were generated under an older bounds contract or the pre-absolute-size font metric contract.
+    // Palette rasters have their own version; the unchanged coverage encoding keeps its identity.
     out << description << "|glyph=" << glyph << "|scaleMilli="
-        << static_cast<int>(std::lround(raster_scale * 1000.0)) << "|atlasRasterV=4";
+        << static_cast<int>(std::lround(raster_scale * 1000.0))
+        << (color_glyph ? "|atlasRasterV=5|color=1" : "|atlasRasterV=4");
     return out.str();
 }
 
@@ -1238,6 +1244,7 @@ TextGlyphCoverageBounds ResolveTextGlyphCoverageBounds(const uint8_t* data,
 std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
                                                       PangoGlyph   glyph,
                                                       double       raster_scale,
+                                                      bool         color_glyph,
                                                       std::string* out_error) {
     if (font == nullptr || glyph == 0) return nullptr;
 
@@ -1272,6 +1279,10 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     glyphs->glyphs[0].geometry.x_offset = 0;
     glyphs->glyphs[0].geometry.y_offset = 0;
     glyphs->glyphs[0].attr.is_cluster_start = 1;
+    // Isolated rasterization must retain the shaping result's color attribute. A color font
+    // can share a layout with ordinary glyphs, so the decision belongs to each glyph, not to
+    // the layer's requested font family or the foreground color.
+    glyphs->glyphs[0].attr.is_color = color_glyph;
 
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
@@ -1303,18 +1314,32 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     const int width = std::max(1, crop_max_x - crop_min_x + 1);
     const int height = std::max(1, crop_max_y - crop_min_y + 1);
 
-    // Text color is applied by TextPass, so the glyph payload only needs one coverage byte per
-    // texel. Keeping duplicate RGB channels here would multiply the same data through the glyph
-    // cache, atlas pages, Vulkan staging buffers, and resident images without changing output.
-    auto coverage_pixels = std::unique_ptr<uint8_t[]>(
-        new uint8_t[static_cast<size_t>(width) * static_cast<size_t>(height)]);
+    // Ordinary glyphs only need coverage; color glyphs must retain their own palette. Cairo
+    // supplies premultiplied native ARGB, while the text pipeline uses straight-alpha blending.
+    // Unpremultiply before packing RGBA so edge coverage is applied exactly once on the GPU.
+    const size_t pixel_stride = color_glyph ? 4u : 1u;
+    auto pixels = std::unique_ptr<uint8_t[]>(
+        new uint8_t[static_cast<size_t>(width) * static_cast<size_t>(height) * pixel_stride]);
     for (int y = 0; y < height; y++) {
         const auto* src_row = data + stride * (crop_min_y + y);
-        auto* dst_row =
-            coverage_pixels.get() + static_cast<size_t>(y) * static_cast<size_t>(width);
+        auto* dst_row = pixels.get() + static_cast<size_t>(y) *
+                                           static_cast<size_t>(width) * pixel_stride;
         for (int x = 0; x < width; x++) {
             const auto* src = src_row + (crop_min_x + x) * 4;
-            dst_row[x] = src[3];
+            if (!color_glyph) {
+                dst_row[x] = src[3];
+                continue;
+            }
+            uint32_t argb;
+            std::memcpy(&argb, src, sizeof(argb));
+            const uint32_t alpha = argb >> 24;
+            auto* dst = dst_row + static_cast<size_t>(x) * pixel_stride;
+            for (uint32_t channel = 0; channel < 3; channel++) {
+                const uint32_t premultiplied = (argb >> (16 - channel * 8)) & 0xffu;
+                dst[channel] = alpha == 0 ? 0 : static_cast<uint8_t>(
+                    std::min(255u, (premultiplied * 255u + alpha / 2u) / alpha));
+            }
+            dst[3] = static_cast<uint8_t>(alpha);
         }
     }
 
@@ -1327,7 +1352,8 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     bitmap->height = height;
     bitmap->origin_x_px = scratch_min_x_px + crop_min_x;
     bitmap->origin_y_px = scratch_min_y_px + crop_min_y;
-    bitmap->coverage = std::move(coverage_pixels);
+    bitmap->color_glyph = color_glyph;
+    bitmap->pixels = std::move(pixels);
     (void)out_error;
     return bitmap;
 }
@@ -1335,12 +1361,17 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
 std::shared_ptr<TextGlyphBitmap> GetOrCreateTextGlyphBitmap(PangoFont*   font,
                                                             PangoGlyph   glyph,
                                                             double       raster_scale,
+                                                            bool         color_glyph,
                                                             bool*        out_cache_hit,
                                                             std::string* out_error) {
     static std::mutex                                                  cache_mutex;
     static std::unordered_map<std::string, std::shared_ptr<TextGlyphBitmap>> glyph_cache;
 
-    const auto key = MakeTextGlyphCacheKey(font, glyph, raster_scale);
+    const auto key = MakeTextGlyphCacheKey(font, glyph, raster_scale, color_glyph);
+    if (std::getenv("WESCENE_TRACE_TEXT_GLYPH") != nullptr) {
+        LOG_INFO("SceneTextGlyphFont: key='%s' color=%s", key.c_str(),
+                 color_glyph ? "true" : "false");
+    }
     {
         std::scoped_lock lock(cache_mutex);
         if (const auto it = glyph_cache.find(key); it != glyph_cache.end()) {
@@ -1349,7 +1380,7 @@ std::shared_ptr<TextGlyphBitmap> GetOrCreateTextGlyphBitmap(PangoFont*   font,
         }
     }
 
-    auto bitmap = BuildTextGlyphBitmap(font, glyph, raster_scale, out_error);
+    auto bitmap = BuildTextGlyphBitmap(font, glyph, raster_scale, color_glyph, out_error);
     if (bitmap == nullptr) return nullptr;
 
     std::scoped_lock lock(cache_mutex);
@@ -1358,14 +1389,15 @@ std::shared_ptr<TextGlyphBitmap> GetOrCreateTextGlyphBitmap(PangoFont*   font,
     return it->second;
 }
 
-void CopyGlyphBitmapIntoAtlas(uint8_t*                 dst_coverage,
+void CopyGlyphBitmapIntoAtlas(uint8_t*                 dst_pixels,
                               int                      dst_width,
                               int                      dst_height,
                               int                      dst_x,
                               int                      dst_y,
                               const TextGlyphBitmap& source) {
-    if (dst_coverage == nullptr || source.coverage == nullptr) return;
+    if (dst_pixels == nullptr || source.pixels == nullptr) return;
     if (source.width <= 0 || source.height <= 0) return;
+    const size_t pixel_stride = source.color_glyph ? 4u : 1u;
 
     auto copy_pixel = [&](int dst_px, int dst_py, int src_px, int src_py) {
         if (dst_px < 0 || dst_py < 0 || dst_px >= dst_width || dst_py >= dst_height) return;
@@ -1375,7 +1407,8 @@ void CopyGlyphBitmapIntoAtlas(uint8_t*                 dst_coverage,
         const auto dst_index =
             static_cast<size_t>(dst_py) * static_cast<size_t>(dst_width) +
             static_cast<size_t>(dst_px);
-        dst_coverage[dst_index] = source.coverage[src_index];
+        std::copy_n(source.pixels.get() + src_index * pixel_stride, pixel_stride,
+                    dst_pixels + dst_index * pixel_stride);
     };
 
     for (int y = 0; y < source.height; y++) {
@@ -1448,7 +1481,8 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
 
             bool cache_hit = false;
             const auto bitmap = GetOrCreateTextGlyphBitmap(
-                run->item->analysis.font, glyph, raster_scale, &cache_hit, out_error);
+                run->item->analysis.font, glyph, raster_scale, glyph_info.attr.is_color,
+                &cache_hit, out_error);
             if (bitmap == nullptr) {
                 glyph_advance_units += glyph_info.geometry.width;
                 continue;
@@ -1483,10 +1517,11 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
             } else {
                 cache_misses++;
             }
-            unique_bitmaps.emplace(MakeTextGlyphCacheKey(run->item->analysis.font, glyph, raster_scale),
-                                   bitmap);
+            const auto cache_key = MakeTextGlyphCacheKey(
+                run->item->analysis.font, glyph, raster_scale, glyph_info.attr.is_color);
+            unique_bitmaps.emplace(cache_key, bitmap);
             occurrences.push_back(TextGlyphOccurrence {
-                .cache_key = MakeTextGlyphCacheKey(run->item->analysis.font, glyph, raster_scale),
+                .cache_key = cache_key,
                 .glyph_index = glyph,
                 .cache_hit = cache_hit,
                 .origin_x_px = bitmap->origin_x_px,
@@ -1525,7 +1560,8 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
         int                        row_height { 0 };
         int                        used_width { 0 };
         int                        used_height { 0 };
-        std::unique_ptr<uint8_t[]> coverage;
+        bool                       color_glyph { false };
+        std::unique_ptr<uint8_t[]> pixels;
     };
 
     const int max_bitmap_width =
@@ -1541,20 +1577,22 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
     std::unordered_map<std::string, PackedTextGlyphEntry> packed_entries;
     std::vector<AtlasPageBuffer> atlas_pages;
 
-    auto begin_page = [&]() -> AtlasPageBuffer& {
+    auto begin_page = [&](bool color_glyph) -> size_t {
         AtlasPageBuffer page;
         page.width = target_page_width;
         page.height = kTextGlyphAtlasMaxExtent;
-        page.coverage = std::unique_ptr<uint8_t[]>(
-            new uint8_t[static_cast<size_t>(page.width) * static_cast<size_t>(page.height)]);
-        std::fill_n(page.coverage.get(),
-                    static_cast<size_t>(page.width) * static_cast<size_t>(page.height),
-                    0);
+        page.color_glyph = color_glyph;
+        const size_t bytes = static_cast<size_t>(page.width) *
+                             static_cast<size_t>(page.height) * (color_glyph ? 4u : 1u);
+        page.pixels = std::make_unique<uint8_t[]>(bytes);
         atlas_pages.push_back(std::move(page));
-        return atlas_pages.back();
+        return atlas_pages.size() - 1;
     };
 
-    auto* current_page = &begin_page();
+    // Keep coverage and palette pages separate within the same layout. Each draw can then
+    // select one sampling contract without inflating ordinary text's R8 storage or tinting
+    // color glyphs. Store indices because growing the page vector invalidates pointers.
+    std::array<std::optional<size_t>, 2> current_pages;
     for (const auto& [cache_key, bitmap] : unique_bitmaps) {
         const int padded_width = bitmap->width + kTextGlyphAtlasPadding * 2;
         const int padded_height = bitmap->height + kTextGlyphAtlasPadding * 2;
@@ -1565,18 +1603,22 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
             return std::nullopt;
         }
 
+        auto& page_index = current_pages[bitmap->color_glyph ? 1u : 0u];
+        if (!page_index.has_value()) page_index = begin_page(bitmap->color_glyph);
+        auto* current_page = &atlas_pages[*page_index];
         if (current_page->cursor_x + padded_width > current_page->width) {
             current_page->cursor_x = kTextGlyphAtlasPadding;
             current_page->cursor_y += current_page->row_height;
             current_page->row_height = 0;
         }
         if (current_page->cursor_y + padded_height > current_page->height) {
-            current_page = &begin_page();
+            page_index = begin_page(bitmap->color_glyph);
+            current_page = &atlas_pages[*page_index];
         }
 
         const int atlas_x = current_page->cursor_x + kTextGlyphAtlasPadding;
         const int atlas_y = current_page->cursor_y + kTextGlyphAtlasPadding;
-        CopyGlyphBitmapIntoAtlas(current_page->coverage.get(),
+        CopyGlyphBitmapIntoAtlas(current_page->pixels.get(),
                                  current_page->width,
                                  current_page->height,
                                  atlas_x,
@@ -1586,7 +1628,7 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
         packed_entries.emplace(cache_key,
                                PackedTextGlyphEntry {
                                    .page_index =
-                                       static_cast<uint32_t>(atlas_pages.size() - 1),
+                                       static_cast<uint32_t>(*page_index),
                                    .x = atlas_x,
                                    .y = atlas_y,
                                    .width = bitmap->width,
@@ -1605,21 +1647,23 @@ std::optional<TextGlyphAtlasBuildResult> BuildTextGlyphAtlas(
         auto& page = atlas_pages[page_index];
         const int image_width = std::max(1, page.used_width);
         const int image_height = std::max(1, page.used_height);
-        auto trimmed_coverage = std::unique_ptr<uint8_t[]>(
-            new uint8_t[static_cast<size_t>(image_width) * static_cast<size_t>(image_height)]);
+        const size_t pixel_stride = page.color_glyph ? 4u : 1u;
+        auto trimmed_pixels = std::unique_ptr<uint8_t[]>(
+            new uint8_t[static_cast<size_t>(image_width) * static_cast<size_t>(image_height) *
+                        pixel_stride]);
         for (int y = 0; y < image_height; y++) {
-            std::copy_n(page.coverage.get() +
-                            static_cast<size_t>(y) * static_cast<size_t>(page.width),
-                        static_cast<size_t>(image_width),
-                        trimmed_coverage.get() +
-                            static_cast<size_t>(y) * static_cast<size_t>(image_width));
+            std::copy_n(page.pixels.get() +
+                            static_cast<size_t>(y) * static_cast<size_t>(page.width) * pixel_stride,
+                        static_cast<size_t>(image_width) * pixel_stride,
+                        trimmed_pixels.get() +
+                            static_cast<size_t>(y) * static_cast<size_t>(image_width) * pixel_stride);
         }
         result.pages.push_back(TextRasterLayoutResult::GlyphPage {
-            .image = BuildImageFromCoveragePixels(texture_key + "__glyph_page_" +
+            .image = BuildImageFromGlyphPixels(texture_key + "__glyph_page_" +
                                                       std::to_string(page_index),
                                                   image_width,
                                                   image_height,
-                                                  std::move(trimmed_coverage)),
+                                                  std::move(trimmed_pixels), page.color_glyph),
             .source_size = {
                 static_cast<float>(image_width),
                 static_cast<float>(image_height),

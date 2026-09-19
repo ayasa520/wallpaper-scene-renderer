@@ -59,6 +59,7 @@ int IntendedTextSampleCount(const wallpaper::Scene* scene, std::string_view outp
 struct TextPassUniforms {
     float model_view_projection[16] {};
     float color[4] {};
+    float glyph_options[4] {};
 };
 
 struct PreparedTextShaders {
@@ -127,6 +128,7 @@ std::optional<PreparedTextShaders> CompileTextShaders() {
 [[vk::binding(0, 0)]] cbuffer TextUniformBlock {
     column_major float4x4 g_ModelViewProjectionMatrix;
     float4 g_Color4;
+    float4 g_GlyphOptions;
 };
 
 struct VSInput {
@@ -138,6 +140,7 @@ struct VSOutput {
     float4 position : SV_Position;
     [[vk::location(0)]] float2 v_TexCoord : TEXCOORD0;
     [[vk::location(1)]] float4 v_Color : COLOR0;
+    [[vk::location(2)]] nointerpolation float v_ColorGlyph : TEXCOORD1;
 };
 
 VSOutput main_vs(VSInput input) {
@@ -145,6 +148,7 @@ VSOutput main_vs(VSInput input) {
     output.position = mul(g_ModelViewProjectionMatrix, float4(input.a_Position, 1.0));
     output.v_TexCoord = input.a_TexCoord;
     output.v_Color = g_Color4;
+    output.v_ColorGlyph = g_GlyphOptions.x;
     return output;
 }
 )";
@@ -157,13 +161,17 @@ struct PSInput {
     float4 position : SV_Position;
     [[vk::location(0)]] float2 v_TexCoord : TEXCOORD0;
     [[vk::location(1)]] float4 v_Color : COLOR0;
+    [[vk::location(2)]] nointerpolation float v_ColorGlyph : TEXCOORD1;
 };
 
 float4 main_ps(PSInput input) : SV_Target0 {
-    // Glyph atlas pages use R8 coverage. The shared background texture is white in every channel,
-    // so reading red keeps glyph and background draws on the same dedicated text shader.
-    const float coverage = g_Texture0.Sample(g_Texture0_ww_sampler, input.v_TexCoord).r;
-    return float4(input.v_Color.rgb, input.v_Color.a * coverage);
+    // Palette glyphs retain their sampled RGB and only inherit owner alpha. Coverage pages
+    // and the white background texture instead use the current foreground/background RGB.
+    const float4 sample = g_Texture0.Sample(g_Texture0_ww_sampler, input.v_TexCoord);
+    if (input.v_ColorGlyph > 0.5) {
+        return float4(sample.rgb, sample.a * input.v_Color.a);
+    }
+    return float4(input.v_Color.rgb, input.v_Color.a * sample.r);
 }
 )";
 
@@ -635,6 +643,8 @@ bool TextPass::ensureMeshBuffers(SceneMesh& mesh, MeshBuffers& buffers, Renderin
 }
 
 void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& rr) {
+    m_device = &device;
+    m_resources = &rr;
     const auto* primitive =
         m_desc.node != nullptr ? m_desc.node->Text() : nullptr;
     if (primitive == nullptr) return;
@@ -685,6 +695,11 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
     // disabled, so a live toggle never needs an allocation during command recording.
     rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
                                m_desc.background_ubo_buf,
+                               device.limits().minUniformBufferOffsetAlignment);
+    // A mixed layout submits coverage and palette pages before the upload executes. Their
+    // sampling modes therefore need distinct retained ranges, just like the background.
+    rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
+                               m_desc.color_glyph_ubo_buf,
                                device.limits().minUniformBufferOffsetAlignment);
 
     if (primitive->background_mesh != nullptr) {
@@ -823,39 +838,19 @@ void TextPass::refreshResources(Scene& scene, const Device& device, RenderingRes
     }
 }
 
-void TextPass::execute(const Device& device, RenderingResources& rr) {
-    const auto trace_text = [&](const char* kind, const char* result, uint32_t count = 0) {
-        return TraceRenderCommand(rr, kind, result, m_desc.output, m_desc.vk_output,
-                                  m_desc.layer_id, m_desc.reflection_pass, count);
-    };
-    if (m_desc.should_execute && !m_desc.should_execute()) {
-        trace_text("text", "execution-gate");
-        return;
-    }
+void TextPass::updateBeforeUpload() {
+    if (m_desc.should_execute && !m_desc.should_execute()) return;
     auto* node = m_desc.node;
     auto* primitive = node != nullptr ? node->Text() : nullptr;
-    if (primitive == nullptr) {
-        trace_text("text", "missing-primitive");
-        return;
-    }
-    if (!m_desc.pipeline.handle || !m_desc.framebuffer) {
-        trace_text("text", "unprepared");
-        return;
-    }
-    if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) {
-        trace_text("text", "owner-hidden");
-        return;
-    }
-
+    if (primitive == nullptr || (!node->Visible() && !m_desc.execute_when_hidden)) return;
+    auto& rr = *m_resources;
     const bool hdr_color = m_desc.scene->UsesHdrMaterials();
-
-    // Log the first actual draw of each layout revision when investigating disappearing text.
-    // Preparation alone cannot establish that an atlas, target and transform reached a draw.
-    static const bool trace_destination = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr;
-    static const bool trace_background = std::getenv("WESCENE_TRACE_TEXT_BACKGROUND") != nullptr;
-    const bool trace_revision = trace_destination &&
+    const bool trace_revision = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr &&
         m_traced_atlas_version != primitive->atlas_version;
 
+    // Upload ranges are recorded before execute(). Stage every current uniform and refreshed
+    // glyph mesh here, including the first frame. Relying on a nearby dirty allocation to make
+    // a late uniform write visible breaks as soon as atlas or uniform allocations move.
     if (primitive->atlas_version != m_loaded_atlas_version ||
         m_desc.page_textures.size() != primitive->glyph_pages.size()) {
         // Text atlas content is owned by the scene primitive, not by render-graph pass creation.
@@ -863,15 +858,17 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         // graph rebuild. Refreshing the bound atlas images lazily here keeps the dedicated text
         // pass on the new scene-owned source of truth instead of depending on parser-time texture
         // registration.
-        if (!refreshTextures(device)) {
-            trace_text("text", "texture-refresh-failed");
+        if (!refreshTextures(*m_device)) {
+            LOG_ERROR("TextPassUpload: texture refresh failed layer=%d", m_desc.layer_id);
+            setPrepared(false);
             return;
         }
     }
 
     if (primitive->background_mesh != nullptr &&
         !ensureMeshBuffers(*primitive->background_mesh, m_background_buffers, rr)) {
-        trace_text("text", "background-upload-failed");
+        LOG_ERROR("TextPassUpload: background upload failed layer=%d", m_desc.layer_id);
+        setPrepared(false);
         return;
     }
     if (m_page_buffers.size() != primitive->glyph_pages.size()) {
@@ -880,12 +877,14 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     }
     for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
         if (!ensureMeshBuffers(*primitive->glyph_pages[page_index].mesh, m_page_buffers[page_index], rr)) {
-            trace_text("text", "glyph-upload-failed");
+            LOG_ERROR("TextPassUpload: glyph upload failed layer=%d", m_desc.layer_id);
+            setPrepared(false);
             return;
         }
     }
 
-    auto write_uniforms = [&](const std::array<float, 4>& color, const StagingBufferRef& buffer) {
+    auto write_uniforms = [&](const std::array<float, 4>& color, const StagingBufferRef& buffer,
+                              bool color_glyph) {
         TextPassUniforms uniforms {};
         bool transform_written = false;
         if (m_desc.scene != nullptr && m_desc.scene->shaderValueUpdater != nullptr && node != nullptr) {
@@ -923,6 +922,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                 }, &overrides);
         }
         std::copy(color.begin(), color.end(), uniforms.color);
+        uniforms.glyph_options[0] = color_glyph ? 1.0f : 0.0f;
         if (trace_revision) {
             const auto* matrix = uniforms.model_view_projection;
             LOG_INFO("TextDestinationDraw: layer=%d name='%s' output='%s' extent=%ux%u "
@@ -939,6 +939,52 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                                { reinterpret_cast<uint8_t*>(const_cast<TextPassUniforms*>(&uniforms)),
                                  sizeof(uniforms) });
     };
+
+    if (!m_desc.private_source && primitive->object.opaquebackground &&
+        m_background_buffers.draw_count > 0) {
+        write_uniforms(primitive->BackgroundColor(hdr_color), m_desc.background_ubo_buf, false);
+    }
+    for (size_t page = 0; page < primitive->glyph_pages.size(); page++) {
+        if (m_page_buffers[page].draw_count == 0) continue;
+        const bool color_glyph =
+            primitive->layout.glyph_pages[page].image->header.format == TextureFormat::RGBA8;
+        write_uniforms(primitive->ForegroundColor(hdr_color),
+                       color_glyph ? m_desc.color_glyph_ubo_buf : m_desc.ubo_buf, color_glyph);
+    }
+}
+
+void TextPass::execute(const Device&, RenderingResources& rr) {
+    const auto trace_text = [&](const char* kind, const char* result, uint32_t count = 0) {
+        return TraceRenderCommand(rr, kind, result, m_desc.output, m_desc.vk_output,
+                                  m_desc.layer_id, m_desc.reflection_pass, count);
+    };
+    if (m_desc.should_execute && !m_desc.should_execute()) {
+        trace_text("text", "execution-gate");
+        return;
+    }
+    auto* node = m_desc.node;
+    auto* primitive = node != nullptr ? node->Text() : nullptr;
+    if (primitive == nullptr) {
+        trace_text("text", "missing-primitive");
+        return;
+    }
+    if (!m_desc.pipeline.handle || !m_desc.framebuffer) {
+        trace_text("text", "unprepared");
+        return;
+    }
+    if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) {
+        trace_text("text", "owner-hidden");
+        return;
+    }
+
+    const bool hdr_color = m_desc.scene->UsesHdrMaterials();
+
+    // Log the first actual draw of each layout revision when investigating disappearing text.
+    // Preparation alone cannot establish that an atlas, target and transform reached a draw.
+    static const bool trace_destination = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr;
+    static const bool trace_background = std::getenv("WESCENE_TRACE_TEXT_BACKGROUND") != nullptr;
+    const bool trace_revision = trace_destination &&
+        m_traced_atlas_version != primitive->atlas_version;
 
     auto bind_uniforms = [&](const PipelineParameters& pipeline, const StagingBufferRef& buffer) {
         VkDescriptorBufferInfo buffer_info {
@@ -1049,11 +1095,11 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
 
     auto draw_mesh = [&](MeshBuffers& buffers, const ImageSlotsRef& texture,
                          const std::array<float, 4>& color, const PipelineParameters& pipeline,
-                         bool background, bool depth_test) {
+                         bool background, bool depth_test, bool color_glyph) {
         if (buffers.draw_count == 0) return;
-        const auto& uniform_buffer = background ? m_desc.background_ubo_buf : m_desc.ubo_buf;
+        const auto& uniform_buffer = background ? m_desc.background_ubo_buf :
+            color_glyph ? m_desc.color_glyph_ubo_buf : m_desc.ubo_buf;
         rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline.handle);
-        write_uniforms(color, uniform_buffer);
         bind_uniforms(pipeline, uniform_buffer);
         bind_texture(texture, pipeline);
         auto gpu_buf = rr.dyn_buf->gpuBuf();
@@ -1091,7 +1137,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         if (trace_background) {
             LOG_INFO("SceneTextColorDraw: layer=%d output='%s' background=%s private-source=%s "
                      "ubo-offset=%llu color=[%.3f %.3f %.3f %.3f] brightness=%.3f blend=%s "
-                     "indexed=%s count=%u host-hdr=%s",
+                     "indexed=%s count=%u host-hdr=%s color-glyph=%s",
                      m_desc.layer_id, m_desc.output.c_str(), background ? "true" : "false",
                      m_desc.private_source ? "true" : "false",
                      static_cast<unsigned long long>(uniform_buffer.offset),
@@ -1100,7 +1146,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                      !m_desc.private_source && primitive->object.colorBlendMode == 31
                          ? "additive" : "translucent",
                      buffers.index_buf ? "true" : "false", buffers.draw_count,
-                     hdr_color ? "true" : "false");
+                     hdr_color ? "true" : "false", color_glyph ? "true" : "false");
         }
     };
 
@@ -1122,14 +1168,15 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                   m_desc.background_texture,
                   primitive->BackgroundColor(hdr_color),
                   depth_test == m_desc.glyph_depth_test ? m_desc.pipeline : m_desc.background_pipeline,
-                  true, depth_test);
+                  true, depth_test, false);
     }
 
     for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
         if (page_index >= m_desc.page_textures.size()) break;
         draw_mesh(m_page_buffers[page_index],
                   m_desc.page_textures[page_index],
-                  primitive->ForegroundColor(hdr_color), m_desc.pipeline, false, m_desc.glyph_depth_test);
+                  primitive->ForegroundColor(hdr_color), m_desc.pipeline, false, m_desc.glyph_depth_test,
+                  primitive->layout.glyph_pages[page_index].image->header.format == TextureFormat::RGBA8);
     }
 
     rr.command.EndRenderPass();
@@ -1174,6 +1221,10 @@ void TextPass::destory(const Device&, RenderingResources& rr) {
     m_page_buffers.clear();
     rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
     m_desc.ubo_buf = {};
+    rr.dyn_buf->unallocateSubRef(m_desc.color_glyph_ubo_buf);
+    m_desc.color_glyph_ubo_buf = {};
+    m_device = nullptr;
+    m_resources = nullptr;
     rr.dyn_buf->unallocateSubRef(m_desc.background_ubo_buf);
     m_desc.background_ubo_buf = {};
     setPrepared(false);

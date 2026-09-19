@@ -1,7 +1,7 @@
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(LZ4 REQUIRED liblz4)
-pkg_check_modules(PANGOCAIRO REQUIRED pangocairo)
+pkg_check_modules(PANGOCAIRO REQUIRED pangocairo>=1.50)
 # WPTextLayer directly uses PangoFcFontMap APIs. Keep pangoft2 on the static library's own link
 # interface so every consumer emits the DSO after libwescene-renderer.a; declaring it only on a
 # parent executable can place it before the archive and --as-needed will discard it too early.

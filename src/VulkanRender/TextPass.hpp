@@ -63,6 +63,7 @@ public:
         // selection differs from the current glyph selection. Both are prepared before drawing.
         PipelineParameters       background_pipeline;
         StagingBufferRef         ubo_buf;
+        StagingBufferRef         color_glyph_ubo_buf;
         StagingBufferRef         background_ubo_buf;
         ImageSlotsRef            background_texture;
         std::vector<ImageSlotsRef> page_textures;
@@ -74,6 +75,7 @@ public:
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void refreshResources(Scene&, const Device&, RenderingResources&) override;
     void dropOutputFramebuffers() override;
+    void updateBeforeUpload() override;
     void execute(const Device&, RenderingResources&) override;
     void destory(const Device&, RenderingResources&) override;
     bool warmupPipeline(Scene&, const Device&, RenderingResources&) override;
@@ -100,6 +102,10 @@ private:
     bool recreateFramebuffer(const Device&, RenderingResources&);
 
     Desc m_desc;
+    // The prepared pass borrows the renderer's device/resources until destroy. The pre-upload
+    // hook stages current text bytes through the same resources later consumed by execute().
+    const Device* m_device { nullptr };
+    RenderingResources* m_resources { nullptr };
     // Store the node identity independently of the raw node pointer because an old text pass can be
     // queried for residency after a topology rebuild has released its SceneNode owner.
     uint64_t m_node_identity { 0 };
