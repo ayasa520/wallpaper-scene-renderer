@@ -32,7 +32,7 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
         mix(other, amount) { const rhs = __vecValues(other, 2); return new Vec2(__mixScalar(this.x, rhs[0], amount), __mixScalar(this.y, rhs[1], amount)); }
         min(value) { return __binaryVec(this, value, (a, b) => Math.min(a, b), Vec2, ['x', 'y']); }
         max(value) { return __binaryVec(this, value, (a, b) => Math.max(a, b), Vec2, ['x', 'y']); }
-        perpendicular() { return new Vec2(-this.y, this.x); }
+        perpendicular() { return new Vec2(this.y, -this.x); }
         abs() { return new Vec2(Math.abs(this.x), Math.abs(this.y)); }
         sign() { return new Vec2(Math.sign(this.x), Math.sign(this.y)); }
         round() { return new Vec2(Math.round(this.x), Math.round(this.y)); }
