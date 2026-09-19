@@ -8426,8 +8426,17 @@ void UpdateInputState(WPSceneScriptHost::Opaque* opaque) {
 }
 
 bool AreUserPropertiesEqual(const UserProperty& lhs, const UserProperty& rhs) {
-    return lhs.condition == rhs.condition && lhs.is_boolean == rhs.is_boolean &&
-           AreUserPropertyValuesEqual(lhs.value, rhs.value);
+    if (lhs.condition != rhs.condition || lhs.is_boolean != rhs.is_boolean) return false;
+
+    if (const auto* lhs_string = std::get_if<std::string>(&lhs.value)) {
+        if (const auto* rhs_string = std::get_if<std::string>(&rhs.value)) {
+            // Notifications carry the authored string itself. Numeric coercion and
+            // whitespace folding belong to expression evaluation: using them here
+            // would hide a changed combo choice even though its callback value differs.
+            return *lhs_string == *rhs_string;
+        }
+    }
+    return AreUserPropertyValuesEqual(lhs.value, rhs.value);
 }
 
 void UpdateGeneralSettingsObject(JSContext* context, JSValueConst target,

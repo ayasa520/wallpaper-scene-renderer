@@ -70,6 +70,15 @@ inline bool IsUserPropertyTruthy(const UserPropertyValue& value) {
 
 inline bool MatchesUserPropertyCondition(const UserProperty& property,
                                          std::string_view   condition) {
+    if (const auto* string_value = std::get_if<std::string>(&property.value);
+        string_value != nullptr && ! condition.empty()) {
+        // A string selection names one literal option. Preserve its complete bytes,
+        // including whitespace and names such as "true" or "false", before considering
+        // the numeric and boolean selectors below. Expression comparisons have their
+        // own conversion rules and must not determine which literal option is selected.
+        return *string_value == condition;
+    }
+
     const auto trimmed = TrimString(condition);
     if (trimmed.empty()) return IsUserPropertyTruthy(property.value);
 
@@ -88,16 +97,11 @@ inline bool MatchesUserPropertyCondition(const UserProperty& property,
             return shader_value->size() > 0 && std::abs((*shader_value)[0] - expected) < 0.0001f;
         }
 
-        const auto* string_value = std::get_if<std::string>(&property.value);
-        return string_value != nullptr && TrimString(*string_value) == trimmed;
+        return false;
     }
 
     if (const auto lowered = LowerString(trimmed); lowered == "true" || lowered == "false") {
         return IsUserPropertyTruthy(property.value) == (lowered == "true");
-    }
-
-    if (const auto* string_value = std::get_if<std::string>(&property.value)) {
-        return TrimString(*string_value) == trimmed;
     }
 
     return false;
