@@ -4630,10 +4630,18 @@ constexpr float kSceneScriptRadiansToDegrees = 57.295779513082320877f;
 bool IsAngleProperty(std::string_view property_name) { return property_name == "angles"; }
 
 bool RegistrationUsesScriptAngleDegrees(const WPSceneScriptRegistration& registration) {
-    // Wallpaper Engine stores layer/camera rotations in scene JSON as radians, but SceneScript
-    // exposes the same "angles" properties as degrees. Keeping this predicate narrow prevents
-    // material uniforms, animation playback values, and other Float3 properties from being
-    // accidentally rescaled when they cross the script boundary.
+    // Material callbacks use the same public units as the material's property accessors.
+    // Resolve the registered uniform's scalar metadata instead of inferring units from its
+    // name; unflagged scalars and unrelated vectors must retain their original values.
+    if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
+        if (registration.material == nullptr) return false;
+        const auto* uniform =
+            FindMaterialUniformValue(*registration.material, registration.property_name);
+        return uniform != nullptr &&
+               MaterialScalarUsesDegrees(*registration.material, registration.property_name, *uniform);
+    }
+
+    // Layer and camera rotations also expose degrees while retaining radians internally.
     return IsAngleProperty(registration.property_name) &&
            (registration.target_kind == WPSceneScriptTargetKind::Layer ||
             registration.target_kind == WPSceneScriptTargetKind::Camera);
@@ -4660,6 +4668,16 @@ WPDynamicValue ConvertFloat3Scale(const WPDynamicValue& value, float scale) {
         std::array<float, 3> { vector[0] * scale, vector[1] * scale, vector[2] * scale });
 }
 
+WPDynamicValue ConvertScriptAngleScale(const WPSceneScriptRegistration& registration,
+                                       const WPDynamicValue& value, float scale) {
+    if (registration.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
+        float scalar = 0.0f;
+        if (!value.tryGet(&scalar)) return value;
+        return WPDynamicValue(scalar * scale);
+    }
+    return ConvertFloat3Scale(value, scale);
+}
+
 std::array<double, 3> ConvertEulerArrayScale(const std::array<double, 3>& value, double scale) {
     return { value[0] * scale, value[1] * scale, value[2] * scale };
 }
@@ -4676,7 +4694,7 @@ WPDynamicValue ToScriptFacingRegistrationValue(const WPSceneScriptRegistration& 
     // SceneScript authors write formulas such as atan2(...) * 180 / PI for layer angles. Convert
     // the renderer's internal radians to degrees before passing the update/init argument so those
     // formulas can preserve and modify the incoming value without mixing units.
-    return ConvertFloat3Scale(value, kSceneScriptRadiansToDegrees);
+    return ConvertScriptAngleScale(registration, value, kSceneScriptRadiansToDegrees);
 }
 
 WPDynamicValue FromScriptFacingRegistrationValue(const WPSceneScriptRegistration& registration,
@@ -4686,7 +4704,7 @@ WPDynamicValue FromScriptFacingRegistrationValue(const WPSceneScriptRegistration
     // Convert script-returned degrees back to the renderer's radian storage exactly at the
     // registration boundary. This keeps object transforms, property animation, and JSON parsing code
     // single-purpose: they continue to deal only in renderer-native radians.
-    return ConvertFloat3Scale(value, kSceneScriptDegreesToRadians);
+    return ConvertScriptAngleScale(registration, value, kSceneScriptDegreesToRadians);
 }
 
 WPDynamicValue ToScriptFacingLayerPropertyValue(std::string_view property_name,
