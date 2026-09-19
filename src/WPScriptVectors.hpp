@@ -102,11 +102,31 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
       }
       [this.x, this.y, this.z, this.w] = components;
     }
+    // Arithmetic owns a fresh result and leaves both inputs untouched. Read component operands
+    // directly so JavaScript operators retain their ordinary conversion and evaluation order.
+    add(value) {
+      if (typeof value === 'number') {
+        return new Vec4(this.x + value, this.y + value, this.z + value, this.w + value);
+      }
+      return new Vec4(this.x + value.x, this.y + value.y, this.z + value.z, this.w + value.w);
+    }
+    subtract(value) {
+      if (typeof value === 'number') {
+        return new Vec4(this.x - value, this.y - value, this.z - value, this.w - value);
+      }
+      return new Vec4(this.x - value.x, this.y - value.y, this.z - value.z, this.w - value.w);
+    }
     multiply(value) {
       if (typeof value === 'number') {
         return new Vec4(this.x * value, this.y * value, this.z * value, this.w * value);
       }
       return new Vec4(this.x * value.x, this.y * value.y, this.z * value.z, this.w * value.w);
+    }
+    divide(value) {
+      if (typeof value === 'number') {
+        return new Vec4(this.x / value, this.y / value, this.z / value, this.w / value);
+      }
+      return new Vec4(this.x / value.x, this.y / value.y, this.z / value.z, this.w / value.w);
     }
     toString() { return this.x + ' ' + this.y + ' ' + this.z + ' ' + this.w; }
     toConfigString() { return this.toString(); }
