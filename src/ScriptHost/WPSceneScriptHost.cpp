@@ -3754,6 +3754,12 @@ const ShaderValue* FindRuntimeMaterialUniformValue(const SceneMaterial& material
     return FindMaterialUniformValue(material, alias->second);
 }
 
+bool MaterialScalarUsesDegrees(const SceneMaterial& material, const std::string& uniform_name,
+                               const ShaderValue& value) {
+    const auto units = material.uniformScalarDegrees.find(uniform_name);
+    return value.size() == 1 && units != material.uniformScalarDegrees.end() && units->second;
+}
+
 constexpr std::string_view kEffectMaterialRasterProperties[] {
     "blending", "cullmode", "alphawriting", "depthtest", "depthwrite",
 };
@@ -6160,9 +6166,7 @@ void ApplyEffectMaterialArgument(WPSceneScriptHost::Opaque* opaque, int32_t laye
         // Keep the value on the retained material so hidden owners and text relayout consume
         // the same write without changing pass topology or script registration.
         ShaderValue stored = argument;
-        const auto units = material.uniformScalarDegrees.find(uniform_name);
-        const bool angular = stored.size() == 1 && units != material.uniformScalarDegrees.end() &&
-                             units->second;
+        const bool angular = MaterialScalarUsesDegrees(material, uniform_name, stored);
         if (angular) stored[0] *= std::numbers::pi_v<float> / 180.0f;
         material.customShader.constValues[uniform_name] = stored;
 
@@ -6358,10 +6362,22 @@ NativeGetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
                                                  static_cast<uint32_t>(material_index));
     if (! target.has_value()) return JS_UNDEFINED;
 
-    const auto* uniform = FindRuntimeMaterialUniformValue(*target->material, property_name);
+    std::string uniform_name;
+    const auto* uniform =
+        FindRuntimeMaterialUniformValue(*target->material, property_name, &uniform_name);
     // A selected shader descriptor is installed after static material descriptors, so its
     // literal name replaces a same-named static accessor in the JavaScript object.
-    if (uniform != nullptr) return ShaderUniformValueToJS(context, *uniform);
+    if (uniform != nullptr) {
+        if (MaterialScalarUsesDegrees(*target->material, uniform_name, *uniform)) {
+            // Scalar angle storage remains in radians for every shader consumer. Convert only
+            // the published read, rounding the scale once from double precision and performing
+            // the multiplication in float before promoting the result to a script Number.
+            constexpr float radians_to_degrees = static_cast<float>(180.0 / std::numbers::pi_v<double>);
+            const float degrees = (*uniform)[0] * radians_to_degrees;
+            return JS_NewFloat64(context, static_cast<double>(degrees));
+        }
+        return ShaderUniformValueToJS(context, *uniform);
+    }
     if (property_name == "blending") {
         return JS_NewString(context, MaterialBlendingName(target->material->blenmode).data());
     }
@@ -6460,7 +6476,7 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
         return JS_FALSE;
     }
 
-    const auto shader_value = value->toShaderValue();
+    auto shader_value = value->toShaderValue();
     if (! shader_value.has_value()) {
         LOG_ERROR("SceneEffectMaterialUniformApply: layer=%d effect-index=%d material-index=%d "
                   "material='%s' property='%s' uniform='%s' invalid value %s",
@@ -6473,6 +6489,14 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
                   value->describe().c_str());
         return JS_FALSE;
     }
+
+    // Public scalar angle writes use degrees, including values read back from this property.
+    // Narrow through the existing conversion first, then scale in float so round trips and
+    // direct assignments retain radian storage without changing any shader's input units.
+    const bool angular = MaterialScalarUsesDegrees(*target->material, uniform_name, *shader_value);
+    if (angular) (*shader_value)[0] *= std::numbers::pi_v<float> / 180.0f;
+    const std::string stored_description =
+        angular ? WPDynamicValue((*shader_value)[0]).describe() : value->describe();
 
     // Effect passes read SceneMaterial::customShader.constValues while drawing, so storing the
     // resolved uniform here updates the next post-process pass without rebuilding cameras or
@@ -6489,7 +6513,7 @@ NativeSetEffectMaterialProperty(JSContext* context, JSValueConst, int argc, JSVa
              target->material->name.c_str(),
              property_name.c_str(),
              uniform_name.c_str(),
-             value->describe().c_str());
+             stored_description.c_str());
     return JS_TRUE;
 }
 
