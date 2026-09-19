@@ -6906,6 +6906,11 @@ JSValue NativeCreateSceneLayer(JSContext* context, JSValueConst, int argc, JSVal
     }
 
     if (opaque->scene->scriptHost) {
+        // These registrations resolve the new owner's bindings and initialize its scripts.
+        // Keep global user-property dispatch in scene bootstrap and actual property messages:
+        // replaying it here would reset unrelated live values, send empty callbacks to existing
+        // scripts, and overwrite the new script's authored options and init result before the
+        // caller receives its layer. Nested creation follows the same registration boundary.
         for (const auto& registration : binding_registrations) {
             opaque->scene->scriptHost->RegisterPropertyBinding(registration);
         }
@@ -6915,7 +6920,6 @@ JSValue NativeCreateSceneLayer(JSContext* context, JSValueConst, int argc, JSVal
         for (const auto& registration : script_registrations) {
             opaque->scene->scriptHost->RegisterPropertyScript(registration);
         }
-        opaque->scene->scriptHost->ApplyUserProperties(opaque->user_properties, false);
     }
     opaque->scene->MarkRenderGraphTopologyDirty();
     ResortLayerTree(opaque->scene->sceneGraph.get(), opaque);
@@ -8572,10 +8576,10 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
     FreeJSValue(context, instance.script_properties);
     instance.script_properties = JS_NewObject(context);
     for (const auto& [name, setting] : instance.registration.setting.script_properties) {
-        // Wallpaper Engine builds scriptProperties from the authored option values before init().
-        // User overrides are delivered immediately afterwards through applyUserProperties(); doing
-        // that second phase here would let inactive conditional options poison init-time shared
-        // state, which is observable in drag scripts that seed a global flag from isMovable.
+        // Populate script options from authored values before init(). Scene bootstrap installs
+        // user overrides in its later property-dispatch phase; scripts created in a running scene
+        // retain these options until a real property notification. Resolving those bindings here
+        // would expose them to init before that event and change init-time shared state.
         const auto script_value = setting->value.toScriptValue();
         if (! script_value.has_value()) continue;
         SetJSProperty(context, instance.script_properties, name.c_str(), *script_value);
