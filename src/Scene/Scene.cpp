@@ -242,14 +242,15 @@ bool ResolveCameraPathSample(const Scene::CameraPathSegment& segment,
         const auto span = rhs.timestamp - lhs.timestamp;
         const auto ratio = span > 1e-9 ? (clamped_time - lhs.timestamp) / span : 0.0;
         out.timestamp = clamped_time;
-        out.eye = LerpArray3(lhs.eye, rhs.eye, ratio);
-        out.center = LerpArray3(lhs.center, rhs.center, ratio);
-        out.up = LerpArray3(lhs.up, rhs.up, ratio);
-        // Zoom uses cubic Hermite interpolation with both endpoint tangents equal to half
-        // the scalar difference. Keep this independent of the pose interpolation: it is a
-        // projection parameter, sampled from the same retained path time as the view pose.
+        // Pose components and zoom share cubic Hermite interpolation with both endpoint
+        // tangents equal to half of the component difference. Evaluate the common weight
+        // from the retained path cursor before constructing the view: interpolating an
+        // already normalized direction or matrix would change the authored pose curve.
         const float t = static_cast<float>(ratio);
         const float weight = 0.5f * t + 1.5f * t * t - t * t * t;
+        out.eye = LerpArray3(lhs.eye, rhs.eye, weight);
+        out.center = LerpArray3(lhs.center, rhs.center, weight);
+        out.up = LerpArray3(lhs.up, rhs.up, weight);
         out.zoom = lhs.zoom + (rhs.zoom - lhs.zoom) * weight;
         return true;
     }
