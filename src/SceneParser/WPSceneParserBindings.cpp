@@ -774,6 +774,8 @@ void RegisterSceneScripts(ParseContext& context, const nlohmann::json& json) {
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "camerashakespeed", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(
+            context, general_json, "zoom", WPDynamicValue::Type::Float);
+        RegisterSceneGeneralPropertyBinding(
             context, general_json, "fov", WPDynamicValue::Type::Float);
         RegisterSceneGeneralPropertyBinding(
             context, general_json, "perspectiveoverridefov", WPDynamicValue::Type::Float);

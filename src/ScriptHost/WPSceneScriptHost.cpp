@@ -428,6 +428,7 @@ LayerValueHint SceneValueType(std::string_view property_name) {
     if (property_name == "camerashakeamplitude") return { WPDynamicValue::Type::Float, true };
     if (property_name == "camerashakeroughness") return { WPDynamicValue::Type::Float, true };
     if (property_name == "camerashakespeed") return { WPDynamicValue::Type::Float, true };
+    if (property_name == "zoom") return { WPDynamicValue::Type::Float, true };
     if (property_name == "fov") return { WPDynamicValue::Type::Float, true };
     if (property_name == "perspectiveoverridefov") return { WPDynamicValue::Type::Float, true };
     if (property_name == "nearz") return { WPDynamicValue::Type::Float, true };
@@ -5289,6 +5290,9 @@ std::optional<WPDynamicValue> ReadScenePropertyValue(const WPSceneScriptHost::Op
     if (property_name == "camerashakespeed") {
         return WPDynamicValue(opaque->scene->cameraShakeSpeed);
     }
+    if (property_name == "zoom") {
+        return WPDynamicValue(static_cast<float>(opaque->scene->defaultGlobalCameraZoom));
+    }
     const auto& projection = opaque->scene->generalProjection;
     if (property_name == "fov") return WPDynamicValue(projection.fov);
     if (property_name == "perspectiveoverridefov") {
@@ -5457,9 +5461,14 @@ bool ApplyScenePropertyValue(WPSceneScriptHost::Opaque* opaque, std::string_view
         return true;
     }
 
-    // General properties retain their raw values even when a camera layer selects a
-    // different FOV. The frame camera phase consumes these values after all scripts,
-    // timelines and camera-path updates, before framing and uniform upload.
+    // General properties retain their raw values independently of camera-layer selection.
+    // Keep scene zoom separate from the selected zoom: the orthographic frame combines
+    // them after scripts, timelines and path updates, before framing and uniform upload.
+    // Reading the property during a callback must return its raw value, not that product.
+    if (property_name == "zoom") {
+        opaque->scene->defaultGlobalCameraZoom = scalar;
+        return true;
+    }
     auto& projection = opaque->scene->generalProjection;
     if (property_name == "fov") {
         projection.fov = scalar;
