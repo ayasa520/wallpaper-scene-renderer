@@ -21,6 +21,7 @@
 #include <cairo/cairo.h>
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
+#include <pango/pangofc-font.h>
 #include <pango/pangofc-fontmap.h>
 
 #include <Eigen/Geometry>
@@ -882,10 +883,70 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
     return entry.family;
 }
 
+void ApplyAssetColorFontSelection(PangoLayout* layout, const wpscene::WPTextObject& object) {
+    if (! IsSupportedFontAssetPath(object.font) || object.text.empty()) return;
+
+    auto* context = pango_layout_get_context(layout);
+    auto* font = pango_context_load_font(context, pango_layout_get_font_description(layout));
+    if (font == nullptr) {
+        LOG_ERROR("failed to select text asset font: %s", object.font.c_str());
+        return;
+    }
+    FcBool color_font = FcFalse;
+    FcPatternGetBool(pango_fc_font_get_pattern(PANGO_FC_FONT(font)), FC_COLOR, 0, &color_font);
+    if (! color_font) {
+        g_object_unref(font);
+        return;
+    }
+
+    // Emoji itemization can replace an explicitly requested family with the platform's generic
+    // emoji family. A color font supplied by the scene owns the glyphs it contains. Keep that
+    // selected face for fully covered grapheme clusters, while other clusters retain normal
+    // font selection. Cluster boundaries prevent splitting combining characters or sequences
+    // between font policies just because their individual code points have different coverage.
+    const auto* text = object.text.c_str();
+    const int character_count = static_cast<int>(g_utf8_strlen(text, -1));
+    std::vector<PangoLogAttr> boundaries(static_cast<size_t>(character_count) + 1);
+    pango_get_log_attrs(text, static_cast<int>(object.text.size()), -1,
+                        pango_context_get_language(context), boundaries.data(),
+                        static_cast<int>(boundaries.size()));
+    auto* attributes = pango_attr_list_new();
+    std::optional<guint> selected_start;
+    guint cluster_start = 0;
+    bool cluster_covered = true;
+    auto flush_selected = [&](guint end) {
+        if (! selected_start.has_value()) return;
+        auto* attribute = pango_attr_fallback_new(FALSE);
+        attribute->start_index = *selected_start;
+        attribute->end_index = end;
+        pango_attr_list_insert(attributes, attribute);
+        selected_start.reset();
+    };
+    const auto* cursor = text;
+    for (int index = 0; index < character_count; index++) {
+        cluster_covered = cluster_covered && pango_font_has_char(font, g_utf8_get_char(cursor));
+        cursor = g_utf8_next_char(cursor);
+        if (! boundaries[static_cast<size_t>(index) + 1].is_cursor_position) continue;
+        const auto cluster_end = static_cast<guint>(cursor - text);
+        if (cluster_covered) {
+            if (! selected_start.has_value()) selected_start = cluster_start;
+        } else {
+            flush_selected(cluster_start);
+        }
+        cluster_start = cluster_end;
+        cluster_covered = true;
+    }
+    flush_selected(static_cast<guint>(object.text.size()));
+    pango_layout_set_attributes(layout, attributes);
+    pango_attr_list_unref(attributes);
+    g_object_unref(font);
+}
+
 void ConfigureLayout(PangoLayout* layout, const wpscene::WPTextObject& object, int content_width) {
     if (layout == nullptr) return;
 
     pango_layout_set_text(layout, object.text.c_str(), -1);
+    ApplyAssetColorFontSelection(layout, object);
     pango_layout_set_alignment(layout, ToPangoAlignment(object.horizontalalign));
     pango_layout_set_justify(layout, object.blockalign ? TRUE : FALSE);
     pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
@@ -1126,7 +1187,7 @@ std::string MakeTextGlyphCacheKey(PangoFont* font, PangoGlyph glyph, double rast
     // Palette rasters have their own version; the unchanged coverage encoding keeps its identity.
     out << description << "|glyph=" << glyph << "|scaleMilli="
         << static_cast<int>(std::lround(raster_scale * 1000.0))
-        << (color_glyph ? "|atlasRasterV=5|color=1" : "|atlasRasterV=4");
+        << (color_glyph ? "|atlasRasterV=6|color=1" : "|atlasRasterV=4");
     return out.str();
 }
 
@@ -1143,9 +1204,25 @@ struct TextGlyphRasterBounds {
     int    height { 0 };
 };
 
+void DrawSingleTextGlyph(cairo_t* cr, PangoFont* font, PangoGlyph glyph, bool color_glyph) {
+    auto* glyphs = pango_glyph_string_new();
+    pango_glyph_string_set_size(glyphs, 1);
+    glyphs->glyphs[0].glyph = glyph;
+    glyphs->glyphs[0].geometry.width = 0;
+    glyphs->glyphs[0].geometry.x_offset = 0;
+    glyphs->glyphs[0].geometry.y_offset = 0;
+    glyphs->glyphs[0].attr.is_cluster_start = 1;
+    // Retain the shaped raster mode for both painted bounds and atlas pixels. The glyph's
+    // color layers must be drawn even when its base outline contains no contours.
+    glyphs->glyphs[0].attr.is_color = color_glyph;
+    pango_cairo_show_glyph_string(cr, font, glyphs);
+    pango_glyph_string_free(glyphs);
+}
+
 std::optional<TextGlyphRasterBounds> ResolveTextGlyphRasterBounds(PangoFont* font,
                                                                   PangoGlyph glyph,
-                                                                  double     raster_scale) {
+                                                                  double     raster_scale,
+                                                                  bool       color_glyph) {
     if (font == nullptr || glyph == 0) return std::nullopt;
 
     double min_x = 0.0;
@@ -1154,12 +1231,29 @@ std::optional<TextGlyphRasterBounds> ResolveTextGlyphRasterBounds(PangoFont* fon
     double max_y = 0.0;
     bool   have_bounds = false;
 
-    // The atlas path must match the exact rasterizer that later draws the glyph coverage. Pango's
-    // generic glyph ink rects are a good fallback, but stylized fonts can still render slightly
-    // outside those bounds once Cairo applies the final hinting/scaled-font metrics. We therefore
-    // query the Cairo scaled font first and only fall back to Pango extents when that bridge is
-    // unavailable.
-    if (PANGO_IS_CAIRO_FONT(font)) {
+    if (color_glyph) {
+        // Color-layer fonts can report an empty base-glyph ink rectangle while painting visible
+        // contours. Record the same draw used by the atlas on an unbounded surface and measure
+        // its painted extent; a guessed em box can clip layers extending beyond the base glyph.
+        auto* recording = cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, nullptr);
+        auto* cr = cairo_create(recording);
+        ApplyTextCairoRenderOptions(cr);
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+        cairo_move_to(cr, 0.0, 0.0);
+        DrawSingleTextGlyph(cr, font, glyph, true);
+        double width = 0.0;
+        double height = 0.0;
+        cairo_recording_surface_ink_extents(recording, &min_x, &min_y, &width, &height);
+        cairo_destroy(cr);
+        cairo_surface_destroy(recording);
+        if (width <= 0.0 || height <= 0.0) return std::nullopt;
+        max_x = min_x + width;
+        max_y = min_y + height;
+        have_bounds = true;
+    }
+
+    // Coverage glyphs retain their scaled-font metric path and Pango ink measurement.
+    if (!color_glyph && PANGO_IS_CAIRO_FONT(font)) {
         if (auto* scaled_font = pango_cairo_font_get_scaled_font(PANGO_CAIRO_FONT(font));
             scaled_font != nullptr) {
             cairo_glyph_t cairo_glyph {};
@@ -1248,7 +1342,7 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
                                                       std::string* out_error) {
     if (font == nullptr || glyph == 0) return nullptr;
 
-    const auto bounds = ResolveTextGlyphRasterBounds(font, glyph, raster_scale);
+    const auto bounds = ResolveTextGlyphRasterBounds(font, glyph, raster_scale, color_glyph);
     if (!bounds.has_value()) return nullptr;
 
     // The atlas now derives its final bitmap bounds from actual rendered coverage instead of
@@ -1272,18 +1366,6 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
     cairo_paint(cr);
 
-    auto* glyphs = pango_glyph_string_new();
-    pango_glyph_string_set_size(glyphs, 1);
-    glyphs->glyphs[0].glyph             = glyph;
-    glyphs->glyphs[0].geometry.width    = 0;
-    glyphs->glyphs[0].geometry.x_offset = 0;
-    glyphs->glyphs[0].geometry.y_offset = 0;
-    glyphs->glyphs[0].attr.is_cluster_start = 1;
-    // Isolated rasterization must retain the shaping result's color attribute. A color font
-    // can share a layout with ordinary glyphs, so the decision belongs to each glyph, not to
-    // the layer's requested font family or the foreground color.
-    glyphs->glyphs[0].attr.is_color = color_glyph;
-
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
     // Raster each cached glyph into its own local origin. The atlas builder later places that
@@ -1291,14 +1373,13 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
     cairo_move_to(cr,
                   -static_cast<double>(scratch_min_x_px) / raster_scale,
                   -static_cast<double>(scratch_min_y_px) / raster_scale);
-    pango_cairo_show_glyph_string(cr, font, glyphs);
+    DrawSingleTextGlyph(cr, font, glyph, color_glyph);
 
     cairo_surface_flush(surface);
     auto* data   = cairo_image_surface_get_data(surface);
     const int stride = cairo_image_surface_get_stride(surface);
     const auto coverage = ResolveTextGlyphCoverageBounds(data, scratch_width, scratch_height, stride);
     if (!coverage.has_coverage) {
-        pango_glyph_string_free(glyphs);
         cairo_destroy(cr);
         cairo_surface_destroy(surface);
         return nullptr;
@@ -1343,7 +1424,6 @@ std::shared_ptr<TextGlyphBitmap> BuildTextGlyphBitmap(PangoFont*   font,
         }
     }
 
-    pango_glyph_string_free(glyphs);
     cairo_destroy(cr);
     cairo_surface_destroy(surface);
 
