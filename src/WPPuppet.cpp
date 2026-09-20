@@ -441,6 +441,21 @@ bool WPPuppetLayer::ApplyBoneDirectionalImpulse(usize index,
     return true;
 }
 
+void WPPuppetLayer::ResetBonePhysicsSimulation(usize index) noexcept {
+    auto& runtime = Runtime();
+    if (!runtime.puppet || index >= runtime.puppet->bones.size() ||
+        !runtime.puppet->bones[index].translation_spring) return;
+
+    // Reset only the retained simulation displacement and velocity. The displayed pose
+    // and its world-space history belong to frame evaluation and must remain available:
+    // the next integration step uses that history for its motion response. Invalidating
+    // the pose cache or clearing initialization here would instead change the current
+    // frame's pose or suppress the following frame's response to the previous pose.
+    auto& state = runtime.translation_springs[index];
+    state.displacement.setZero();
+    state.velocity.setZero();
+}
+
 void WPPuppetLayer::MarkRuntimePoseMutation() noexcept {
     auto& runtime = Runtime();
     runtime.domain = PuppetPoseDomain::RuntimeMutable;

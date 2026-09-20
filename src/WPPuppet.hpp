@@ -231,6 +231,7 @@ public:
     const WPPuppet::Animation*       AnimationDefinition(usize index) const noexcept;
     bool SetLocalBoneTransform(usize index, const Eigen::Affine3f& transform) noexcept;
     bool ApplyBoneDirectionalImpulse(usize index, const Eigen::Vector3f& impulse) noexcept;
+    void ResetBonePhysicsSimulation(usize index) noexcept;
     PuppetPoseDomain PoseDomain() const noexcept;
     uint64_t PoseRevision() const noexcept;
     const void* RuntimeIdentity() const noexcept;

@@ -1153,6 +1153,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "__native.layerCall(nodeId, 'setLocalBoneOrigin', bone, origin);\n"
         << "        if (prop === 'applyBonePhysicsImpulse') return (bone, impulse) => "
            "__native.layerCall(nodeId, 'applyBonePhysicsImpulse', bone, impulse);\n"
+        << "        if (prop === 'resetBonePhysicsSimulation') return (bone) => "
+           "__native.layerCall(nodeId, 'resetBonePhysicsSimulation', bone);\n"
         << "        if (prop === 'rotateObjectSpace') return (angles) => "
            "__native.rotateLayerObjectSpace(nodeId, angles);\n"
         << "        if (prop === 'play') return __native.hasLayerMember(nodeId, 'play') ? () => "
@@ -6708,7 +6710,8 @@ JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValue
         member_name == "getLocalBoneTransform" || member_name == "getLocalBoneAngles" ||
         member_name == "getLocalBoneOrigin" || member_name == "setBoneTransform" ||
         member_name == "setLocalBoneTransform" || member_name == "setLocalBoneAngles" ||
-        member_name == "setLocalBoneOrigin" || member_name == "applyBonePhysicsImpulse") {
+        member_name == "setLocalBoneOrigin" || member_name == "applyBonePhysicsImpulse" ||
+        member_name == "resetBonePhysicsSimulation") {
         auto* node = opaque != nullptr ? FindNodeById(opaque, node_id) : nullptr;
         return JS_NewBool(context, AdvanceNodePuppetForScriptQuery(opaque, node) != nullptr);
     }
@@ -7437,6 +7440,14 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         Eigen::Affine3f transform = *current_transform;
         transform.translation() = Eigen::Vector3f(origin_values[0], origin_values[1], origin_values[2]);
         return JS_NewBool(context, SetBoneLocalTransform(opaque, node, *bone_index, transform));
+    }
+    if (command == "resetBonePhysicsSimulation") {
+        if (argc < 3) return JS_UNDEFINED;
+        const auto bone_index = ResolveBoneReference(context, argv[2], *puppet);
+        if (bone_index.has_value()) {
+            GetMutableNodeData(opaque, node)->puppet_layer.ResetBonePhysicsSimulation(*bone_index);
+        }
+        return JS_UNDEFINED;
     }
     if (command == "applyBonePhysicsImpulse") {
         if (argc < 4) return JS_FALSE;
