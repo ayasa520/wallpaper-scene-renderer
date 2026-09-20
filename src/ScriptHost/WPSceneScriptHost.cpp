@@ -3501,7 +3501,8 @@ const WPPuppet* AdvanceNodePuppetForScriptQuery(const WPSceneScriptHost::Opaque*
     }();
     const double frame_time =
         opaque != nullptr && opaque->scene != nullptr ? opaque->scene->frameTime : 0.0;
-    data->puppet_layer.AdvanceIfNeeded(frame_time, next_serial);
+    const Eigen::Affine3f world_from_model(ResolveLayerModelTransform(opaque, node).cast<float>());
+    data->puppet_layer.AdvanceIfNeeded(frame_time, next_serial, world_from_model);
     return data->puppet_layer.Puppet();
 }
 

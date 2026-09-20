@@ -81,7 +81,9 @@ void WPPuppet::prepared() {
 }
 
 std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
-                                                    double         time) noexcept {
+                                                    double time,
+                                                    const Affine3f& world_from_model,
+                                                    bool advance_simulation) noexcept {
     auto& runtime = puppet_layer.Runtime();
 
     puppet_layer.updateInterpolation(time);
@@ -145,6 +147,34 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         affine.pretranslate(trans);
         affine.rotate(quat.cast<float>());
         affine.scale(scale);
+        if (bone.translation_spring) {
+            const auto& spring = *bone.translation_spring;
+            auto& state = runtime.translation_springs[i];
+            const Affine3f world_from_parent = world_from_model * parent;
+            if (advance_simulation && state.initialized) {
+                // Simulation state stays in world space. The previous displayed origin includes
+                // script writes, while the current target comes from the authored/animated pose.
+                // A drag therefore affects the next inertia step without replacing velocity or
+                // turning the script's pose into a permanent animation override.
+                const Vector3f origin = world_from_parent * affine.translation();
+                const float dt = static_cast<float>(time);
+                const Vector3f displaced = origin + state.displacement;
+                const Vector3f corrected = state.displacement -
+                    spring.response * (displaced - state.previous_world_origin);
+                const Vector3f velocity = state.velocity - (dt * spring.stiffness) * corrected;
+                state.displacement = corrected + dt * velocity;
+                const float scene_scale = world_from_model.linear().colwise().norm().mean();
+                const float distance_limit = scene_scale * spring.max_distance;
+                const float distance = state.displacement.norm();
+                if (distance_limit > 0.0f && distance > distance_limit) {
+                    state.displacement *= distance_limit / distance;
+                }
+                // Position consumes the undamped velocity. The distance bound limits only
+                // displacement; damping is applied afterwards to the retained velocity.
+                state.velocity = velocity - std::min(dt * spring.friction, 1.0f) * velocity;
+            }
+            affine.translation() += world_from_parent.linear().inverse() * state.displacement;
+        }
         if (i < runtime.bone_overrides.size() && runtime.bone_overrides[i].enabled) {
             affine = runtime.bone_overrides[i].local_transform;
         }
@@ -155,6 +185,13 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         m_bone_local_affines[i] = affine;
         affine = parent * affine;
         m_bone_model_affines[i] = affine;
+        if (bone.translation_spring) {
+            auto& state = runtime.translation_springs[i];
+            // Recomposition after a same-frame script write updates the displayed pose for
+            // the next frame, but does not perform another integration step.
+            state.previous_world_origin = world_from_model * affine.translation();
+            state.initialized = true;
+        }
     }
 
     for (uint i = 0; i < m_final_affines.size(); i++) {
@@ -240,12 +277,18 @@ void WPPuppetLayer::prepared(std::span<const AnimationLayer> alayers) {
     runtime.layers.resize(alayers.size());
     runtime.bone_overrides.assign(runtime.puppet != nullptr ? runtime.puppet->bones.size() : 0,
                                   BoneOverride {});
+    runtime.translation_springs.assign(runtime.bone_overrides.size(), TranslationSpringState {});
     runtime.cached_skinning     = {};
     runtime.cached_frame_serial = std::numeric_limits<uint64_t>::max();
+    runtime.advanced_frame_serial = std::numeric_limits<uint64_t>::max();
     runtime.pose_revision       = 0;
     runtime.domain              = PuppetPoseDomain::AuthoredEnvelope;
 
     if (runtime.puppet == nullptr) return;
+    if (std::any_of(runtime.puppet->bones.begin(), runtime.puppet->bones.end(),
+                    [](const auto& bone) { return bone.translation_spring.has_value(); })) {
+        runtime.domain = PuppetPoseDomain::RuntimeMutable;
+    }
 
     std::transform(
         alayers.rbegin(), alayers.rend(), runtime.layers.rbegin(),
@@ -286,17 +329,33 @@ void WPPuppetLayer::RefreshBlendState() noexcept {
 
 std::span<const Eigen::Affine3f> WPPuppetLayer::genFrame(double time) noexcept {
     auto& runtime = Runtime();
-    runtime.cached_skinning = runtime.puppet->genFrame(*this, time);
+    runtime.cached_skinning = runtime.puppet->genFrame(*this, time, Affine3f::Identity(), false);
     return runtime.cached_skinning;
 }
 
 PuppetPoseSnapshot WPPuppetLayer::AdvanceIfNeeded(double time,
-                                                  uint64_t frame_serial) noexcept {
+                                                  uint64_t frame_serial,
+                                                  const Affine3f& world_from_model) noexcept {
     auto& runtime = Runtime();
     if (!runtime.puppet) return {};
-    if (runtime.cached_frame_serial != frame_serial) {
-        runtime.cached_skinning     = runtime.puppet->genFrame(*this, time);
-        runtime.cached_frame_serial = frame_serial;
+    // Pose invalidation is independent of clock advancement. Scripts can read, write and read
+    // a bone repeatedly before drawing; those reads must all observe one simulation step.
+    // An ancestor query may still carry the preceding render serial during script dispatch,
+    // so only a newer serial advances time, never a query for an older frame.
+    const bool advance = runtime.advanced_frame_serial == std::numeric_limits<uint64_t>::max() ||
+                         frame_serial > runtime.advanced_frame_serial;
+    if (advance) {
+        for (usize i = 0; i < runtime.bone_overrides.size(); ++i) {
+            if (runtime.puppet->bones[i].translation_spring) {
+                runtime.bone_overrides[i].enabled = false;
+            }
+        }
+        runtime.advanced_frame_serial = frame_serial;
+    }
+    if (advance || runtime.cached_frame_serial == std::numeric_limits<uint64_t>::max()) {
+        runtime.cached_skinning = runtime.puppet->genFrame(
+            *this, advance ? time : 0.0, world_from_model, advance);
+        runtime.cached_frame_serial = runtime.advanced_frame_serial;
         runtime.pose_revision++;
     }
     return PoseSnapshot();

@@ -3,6 +3,7 @@
 #include "Fs/IBinaryStream.h"
 #include "Fs/MemBinaryStream.h"
 #include "WPCommon.hpp"
+#include "WPJson.hpp"
 #include "Utils/Logging.h"
 #include "Scene/SceneMesh.h"
 #include "SpecTexs.hpp"
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <nlohmann/json.hpp>
 
 using namespace wallpaper;
 
@@ -34,6 +36,39 @@ constexpr uint32_t kStaticWideIndexFlag          = 1;
 constexpr uint32_t kStaticExtraFieldFlag         = 2;
 constexpr uint32_t kVertexNormalMask             = 0x00000002;
 constexpr uint32_t kVertexTangentMask            = 0x00000004;
+
+std::optional<WPPuppet::TranslationSpring> ReadTranslationSpring(const std::string& source) {
+    if (source.empty()) return std::nullopt;
+    nlohmann::json config;
+    if (!PARSE_JSON(source, config) || !config.is_object()) return std::nullopt;
+    if (!ReadJsonLiteralBoolean(config, "se", false)) return std::nullopt;
+
+    // Translation springs have their own world-space state and integration parameters.
+    // Other simulation modes and constraints cannot be represented by this state, so they
+    // must not accidentally activate a partial translation simulation.
+    if (!ReadJsonLiteralBoolean(config, "t", false)) return std::nullopt;
+    for (const char* field : {"r", "re", "ge", "ik", "ikce", "lt", "la",
+                              "tax", "tay", "taz", "rax", "ray", "raz"}) {
+        if (ReadJsonLiteralBoolean(config, field, false)) {
+            LOG_INFO("puppet translation spring has unsupported mode or constraint '%s'", field);
+            return std::nullopt;
+        }
+    }
+    for (const char* field : {"ts", "tf", "ti", "tm"}) {
+        const auto value = config.find(field);
+        if (value == config.end() || !value->is_number() ||
+            !std::isfinite(value->get<float>())) {
+            LOG_INFO("puppet translation spring requires numeric parameter '%s'", field);
+            return std::nullopt;
+        }
+    }
+    return WPPuppet::TranslationSpring {
+        .stiffness = config["ts"].get<float>(),
+        .friction = config["tf"].get<float>(),
+        .response = 1.0f - config["ti"].get<float>() / 100.0f,
+        .max_distance = config["tm"].get<float>(),
+    };
+}
 
 enum class StaticHeaderFieldRole
 {
@@ -1527,7 +1562,7 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
             for (auto& value : column) value = f.ReadFloat();
         }
 
-        f.ReadStr(); // Bone simulation JSON.
+        bone.translation_spring = ReadTranslationSpring(f.ReadStr());
     }
 
     if (mdl.mdls > 1) {

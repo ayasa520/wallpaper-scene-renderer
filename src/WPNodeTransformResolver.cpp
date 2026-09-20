@@ -66,12 +66,14 @@ Matrix4d WPNodeTransformResolver::ResolveObjectTransform(const SceneObject& obje
     const auto* parent = m_scene.FindSceneObject(object.ParentId());
     Matrix4d model = local;
     if (parent != nullptr && parent->RuntimeTransform() != nullptr) {
+        const Matrix4d parent_world = ResolveObjectTransform(*parent);
         const auto* data = FindNodeData(object.LayerNode());
         if (data != nullptr && data->IsBoneAttached()) {
             auto* parent_data = m_node_data_map.contains(parent->LayerNode())
                 ? &m_node_data_map.at(parent->LayerNode()) : nullptr;
             if (parent_data != nullptr && parent_data->puppet_layer.hasPuppet()) {
-                parent_data->puppet_layer.AdvanceIfNeeded(m_scene.frameTime, m_puppet_frame_serial);
+                parent_data->puppet_layer.AdvanceIfNeeded(
+                    m_scene.frameTime, m_puppet_frame_serial, Affine3f(parent_world.cast<float>()));
                 const auto* puppet = parent_data->puppet_layer.Puppet();
                 const auto attachment =
                     puppet->BoneModelTransform(data->transform_binding.bone_index) *
@@ -83,7 +85,7 @@ Matrix4d WPNodeTransformResolver::ResolveObjectTransform(const SceneObject& obje
         // The parent relation is authored identity data; physical render-order proxies and
         // detached source resources cannot change this multiplication chain.
         const Matrix4d parent_model = RemoveImageAlignmentOffsetFromModel(
-            ResolveObjectTransform(*parent), parent->RuntimeTransform()->AlignmentOffset());
+            parent_world, parent->RuntimeTransform()->AlignmentOffset());
         model = parent_model * local;
     }
     m_model_transform_cache[key] = model;

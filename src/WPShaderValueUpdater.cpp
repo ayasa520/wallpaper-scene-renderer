@@ -334,8 +334,11 @@ void WPShaderValueUpdater::AdvanceAllPuppets() {
         if (!nodeData.puppet_layer.hasPuppet()) continue;
         const void* runtime = nodeData.puppet_layer.RuntimeIdentity();
         if (!advanced_runtimes.insert(runtime).second) continue;
-        nodeData.puppet_layer.AdvanceIfNeeded(frame_time, m_puppet_frame_serial);
-        notification_nodes.push_back(static_cast<SceneNode*>(addr));
+        auto* node = static_cast<SceneNode*>(addr);
+        const Affine3f world_from_model(
+            ResolveModelTransformForProjection(node, nullptr, false).cast<float>());
+        nodeData.puppet_layer.AdvanceIfNeeded(frame_time, m_puppet_frame_serial, world_from_model);
+        notification_nodes.push_back(node);
     }
 
     if (m_scene->scriptHost != nullptr) {

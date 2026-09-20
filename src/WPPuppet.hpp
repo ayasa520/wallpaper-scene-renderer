@@ -68,10 +68,17 @@ public:
         Mirror,
         Single
     };
+    struct TranslationSpring {
+        float stiffness;
+        float friction;
+        float response;
+        float max_distance;
+    };
     struct Bone {
         std::string     name;
         Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
         uint32_t        parent { 0xFFFFFFFFu };
+        std::optional<TranslationSpring> translation_spring;
 
         bool noParent() const { return parent == 0xFFFFFFFFu; }
         // prepared
@@ -166,7 +173,9 @@ public:
     std::vector<Attachment> attachments;
     std::vector<Animation> anims;
 
-    std::span<const Eigen::Affine3f> genFrame(WPPuppetLayer&, double time) noexcept;
+    std::span<const Eigen::Affine3f> genFrame(WPPuppetLayer&, double time,
+                                             const Eigen::Affine3f& world_from_model,
+                                             bool advance_simulation) noexcept;
     void                             prepared();
     const Attachment*                FindAttachment(std::string_view name) const noexcept;
     uint32_t                         FindBoneIndex(std::string_view name) const noexcept;
@@ -209,7 +218,8 @@ public:
     void RefreshBlendState() noexcept;
 
     std::span<const Eigen::Affine3f> genFrame(double time) noexcept;
-    PuppetPoseSnapshot AdvanceIfNeeded(double time, uint64_t frame_serial) noexcept;
+    PuppetPoseSnapshot AdvanceIfNeeded(double time, uint64_t frame_serial,
+                                       const Eigen::Affine3f& world_from_model) noexcept;
     PuppetPoseSnapshot PoseSnapshot() const noexcept;
     std::span<const Eigen::Affine3f> SkinningMatrices() const noexcept {
         return Runtime().cached_skinning;
@@ -238,12 +248,20 @@ private:
         bool            enabled { false };
         Eigen::Affine3f local_transform { Eigen::Affine3f::Identity() };
     };
+    struct TranslationSpringState {
+        Eigen::Vector3f displacement { Eigen::Vector3f::Zero() };
+        Eigen::Vector3f velocity { Eigen::Vector3f::Zero() };
+        Eigen::Vector3f previous_world_origin { Eigen::Vector3f::Zero() };
+        bool initialized { false };
+    };
     struct RuntimeState {
         std::vector<Layer>               layers;
         std::vector<BoneOverride>        bone_overrides;
+        std::vector<TranslationSpringState> translation_springs;
         std::shared_ptr<WPPuppet>        puppet;
         std::span<const Eigen::Affine3f> cached_skinning {};
         uint64_t cached_frame_serial { std::numeric_limits<uint64_t>::max() };
+        uint64_t advanced_frame_serial { std::numeric_limits<uint64_t>::max() };
         uint64_t pose_revision { 0 };
         PuppetPoseDomain domain { PuppetPoseDomain::AuthoredEnvelope };
     };
