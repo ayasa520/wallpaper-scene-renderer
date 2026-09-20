@@ -7442,25 +7442,16 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         if (argc < 4) return JS_FALSE;
         const auto bone_index = ResolveBoneReference(context, argv[2], *puppet);
         const auto impulse = ReadDynamicValueFromJS(context, argv[3], WPDynamicValue::Type::Float3);
-        const auto current_transform = bone_index.has_value()
-                                           ? GetBoneLocalTransform(opaque, node, *bone_index)
-                                           : std::nullopt;
-        if (! bone_index.has_value() || ! impulse.has_value() || ! current_transform.has_value())
-            return JS_FALSE;
+        if (! bone_index.has_value() || ! impulse.has_value()) return JS_FALSE;
 
         std::array<float, 3> impulse_values {};
         if (! impulse->tryGet(&impulse_values)) return JS_FALSE;
 
-        Eigen::Vector3f translation {};
-        Eigen::Vector3f rotation {};
-        Eigen::Vector3f scale {};
-        DecomposeAffine(*current_transform, translation, rotation, scale);
-        translation += Eigen::Vector3f(impulse_values[0], impulse_values[1], impulse_values[2]);
-
-        return JS_NewBool(
-            context,
-            SetBoneLocalTransform(
-                opaque, node, *bone_index, ComposeAffine(translation, rotation, scale)));
+        auto* data = GetMutableNodeData(opaque, node);
+        if (!data->puppet_layer.ApplyBoneDirectionalImpulse(
+                *bone_index, Eigen::Vector3f(impulse_values[0], impulse_values[1], impulse_values[2])))
+            return JS_FALSE;
+        return JS_UNDEFINED;
     }
 
     return JS_UNDEFINED;

@@ -427,6 +427,20 @@ bool WPPuppetLayer::SetLocalBoneTransform(usize index, const Eigen::Affine3f& tr
     return true;
 }
 
+bool WPPuppetLayer::ApplyBoneDirectionalImpulse(usize index,
+                                                const Eigen::Vector3f& impulse) noexcept {
+    auto& runtime = Runtime();
+    if (!runtime.puppet || index >= runtime.puppet->bones.size() ||
+        !runtime.puppet->bones[index].translation_spring) return false;
+
+    // Directional impulses accumulate in the simulation's world-space velocity. They do
+    // not change the displayed pose or invalidate its current-frame cache: the next frame's
+    // integration consumes the new velocity. Repeated calls add independent impulses rather
+    // than replacing a pose or resetting the retained spring displacement.
+    runtime.translation_springs[index].velocity += impulse;
+    return true;
+}
+
 void WPPuppetLayer::MarkRuntimePoseMutation() noexcept {
     auto& runtime = Runtime();
     runtime.domain = PuppetPoseDomain::RuntimeMutable;

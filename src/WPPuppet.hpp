@@ -230,6 +230,7 @@ public:
     AnimationLayer*                  AnimationLayerState(usize index) noexcept;
     const WPPuppet::Animation*       AnimationDefinition(usize index) const noexcept;
     bool SetLocalBoneTransform(usize index, const Eigen::Affine3f& transform) noexcept;
+    bool ApplyBoneDirectionalImpulse(usize index, const Eigen::Vector3f& impulse) noexcept;
     PuppetPoseDomain PoseDomain() const noexcept;
     uint64_t PoseRevision() const noexcept;
     const void* RuntimeIdentity() const noexcept;
