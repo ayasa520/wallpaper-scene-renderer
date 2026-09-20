@@ -1369,16 +1369,21 @@ bool ParseAnimationRecord(fs::MemBinaryStream& f, WPPuppet::Animation& animation
     animation.bframes_array.resize(bone_count);
     for (uint32_t bone_index = 0; bone_index < bone_count; bone_index++) {
         if (!CanReadMdla(f, 8, declared_end)) return false;
-        const int32_t track_reserved = f.ReadInt32();
+        const uint32_t track_flags = f.ReadUint32();
         const uint32_t byte_size = f.ReadUint32();
-        if (track_reserved != 0 || byte_size % singile_bone_frame != 0 ||
+        if (byte_size % singile_bone_frame != 0 ||
             !CanReadMdla(f, byte_size, declared_end)) {
-            LOG_ERROR("MDLA animation %d bone %u track is invalid reserved=%d bytes=%u: %.*s",
-                      animation.id, bone_index, track_reserved, byte_size,
+            LOG_ERROR("MDLA animation %d bone %u track is invalid flags=%u bytes=%u: %.*s",
+                      animation.id, bone_index, track_flags, byte_size,
                       static_cast<int>(path.size()), path.data());
             return false;
         }
-        auto& frames = animation.bframes_array[bone_index].frames;
+        auto& track = animation.bframes_array[bone_index];
+        // Disabled tracks retain their frame payload in the file. Read it normally so later
+        // tracks and animation metadata keep their boundaries, and retain participation
+        // separately so pose blending does not replace an earlier layer with disabled values.
+        track.enabled = (track_flags & 1u) == 0;
+        auto& frames = track.frames;
         frames.resize(byte_size / singile_bone_frame);
         for (auto& frame : frames) {
             for (auto& value : frame.position) value = f.ReadFloat();

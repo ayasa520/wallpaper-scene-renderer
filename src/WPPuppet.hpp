@@ -140,6 +140,7 @@ public:
         std::string name;
 
         struct BoneFrames {
+            bool enabled { true };
             std::vector<BoneFrame> frames;
         };
         std::vector<BoneFrames> bframes_array;

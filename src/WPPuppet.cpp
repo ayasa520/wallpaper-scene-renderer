@@ -112,10 +112,16 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
             assert(i < layer.anim->bframes_array.size());
             if (i >= layer.anim->bframes_array.size()) continue;
 
+            const auto& track = layer.anim->bframes_array[i];
+            // A disabled bone track contributes nothing from this animation layer. Preserve
+            // the pose accumulated from earlier layers, or the bind pose when none contributed;
+            // its retained frame data must not replace any position, rotation or scale channel.
+            if (!track.enabled) continue;
+
             auto&  info       = layer.interp_info;
-            auto&  frame_base = layer.anim->bframes_array[i].frames[(usize)0];
-            auto&  frame_a    = layer.anim->bframes_array[i].frames[(usize)info.frame_a];
-            auto&  frame_b    = layer.anim->bframes_array[i].frames[(usize)info.frame_b];
+            auto&  frame_base = track.frames[(usize)0];
+            auto&  frame_a    = track.frames[(usize)info.frame_a];
+            auto&  frame_b    = track.frames[(usize)info.frame_b];
 
             const double   blend         = alayer.blend;
             const float    t             = static_cast<float>(info.t);
