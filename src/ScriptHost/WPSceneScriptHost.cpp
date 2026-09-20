@@ -850,10 +850,13 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "          super(16);\n"
         << "          for (let i = 0; i < 16; i++) this[i] = (i % 5 === 0) ? 1 : 0;\n"
         << "        }\n"
+        // Translation reads participate in the vector API used by bone-drag scripts. Return
+        // an independent Vec3 so arithmetic and copy operations preserve the matrix. Writes
+        // retain the matrix identity so a chained translation can feed setBoneTransform.
         << "        translation(position) {\n"
         << "          if (position === undefined) {\n"
-        << "            return { x: Number(this[3] ?? 0), y: Number(this[7] ?? 0), z: "
-           "Number(this[11] ?? 0) };\n"
+        << "            return new Vec3(Number(this[3] ?? 0), Number(this[7] ?? 0), "
+           "Number(this[11] ?? 0));\n"
         << "          }\n"
         << "          const source = Array.isArray(position)\n"
         << "            ? position\n"
@@ -861,6 +864,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "          this[3] = Number(source[0] ?? 0);\n"
         << "          this[7] = Number(source[1] ?? 0);\n"
         << "          this[11] = Number(source[2] ?? 0);\n"
+        << "          return this;\n"
         << "        }\n"
         << "        static fromArray(values) {\n"
         << "          const matrix = new Mat4();\n"
