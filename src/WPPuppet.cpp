@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include "Utils/Logging.h"
 
 using namespace wallpaper;
@@ -12,6 +13,32 @@ static Quaterniond ToQuaternion(Vector3f euler) {
     return AngleAxis<double>(euler.z(), axis[2]) * AngleAxis<double>(euler.y(), axis[1]) *
            AngleAxis<double>(euler.x(), axis[0]);
 };
+
+static Quaternionf SpringRotation(const Vector3f& angles) {
+    return AngleAxisf(angles.z(), Vector3f::UnitZ()) *
+           AngleAxisf(angles.y(), Vector3f::UnitY()) *
+           AngleAxisf(angles.x(), Vector3f::UnitX());
+}
+
+static Vector3f SpringAngles(const Matrix3f& rotation) {
+    const float z = std::atan2(rotation(1, 0), rotation(0, 0));
+    const float y = std::atan2(-rotation(2, 0),
+                              std::sqrt(rotation(2, 1) * rotation(2, 1) +
+                                        rotation(2, 2) * rotation(2, 2)));
+    const float sine = std::sin(z);
+    const float cosine = std::cos(z);
+    const float x = std::atan2(sine * rotation(0, 2) - cosine * rotation(1, 2),
+                              cosine * rotation(1, 1) - sine * rotation(0, 1));
+    Vector3f angles {x, y, z};
+    // Retain one signed Euler branch for the spring's restoring rotation. Negating these
+    // components is a different operation from conjugating a combined-axis quaternion.
+    constexpr float pi = std::numbers::pi_v<float>;
+    for (auto& angle : angles) {
+        angle = angle < 0.0f ? std::fmod(angle - pi, 2.0f * pi) + pi
+                             : std::fmod(angle + pi, 2.0f * pi) - pi;
+    }
+    return angles;
+}
 
 void WPPuppet::prepared() {
     std::vector<Affine3f> combined_tran(bones.size());
@@ -153,6 +180,51 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         affine.pretranslate(trans);
         affine.rotate(quat.cast<float>());
         affine.scale(scale);
+        if (bone.rotation_spring) {
+            const auto& spring = *bone.rotation_spring;
+            auto& state = runtime.rotation_springs[i];
+            if (advance_simulation && state.initialized) {
+                const float dt = static_cast<float>(time);
+                const Affine3f current_world = world_from_model * parent * affine;
+                const Quaternionf orientation = SpringRotation(state.angles);
+                const Vector3f predicted_tip = orientation * spring.tip;
+                const Vector3f previous_tip =
+                    current_world.inverse() * (state.previous_world * spring.tip);
+                const Vector3f predicted_direction = predicted_tip.normalized();
+                const Vector3f previous_direction = previous_tip.normalized();
+                const Quaternionf identity = Quaternionf::Identity();
+                const Quaternionf alignment =
+                    predicted_direction.dot(previous_direction) >
+                            1.0f - std::numeric_limits<float>::epsilon()
+                        ? identity
+                        : Quaternionf::FromTwoVectors(predicted_direction, previous_direction);
+
+                // Tip motion is measured in the current bone frame against the previous
+                // displayed world pose, including script writes. Bound its per-step response
+                // before converting the authored angular response from degrees to radians.
+                constexpr float radians_per_degree = std::numbers::pi_v<float> / 180.0f;
+                constexpr float max_tip_motion_per_second = 900.0f;
+                const float motion = std::min((predicted_tip - previous_tip).norm(),
+                                               dt * max_tip_motion_per_second);
+                state.velocity *= identity.slerp(
+                    std::min(motion * spring.response * radians_per_degree, 1.0f), alignment);
+                state.velocity *= identity.slerp(
+                    std::min(spring.stiffness * radians_per_degree * dt, 1.0f),
+                    SpringRotation(-state.angles));
+
+                // Quaternion velocity is a rotation increment at the reference 60 Hz step.
+                // Its step rotation precedes the retained orientation; damping affects the
+                // velocity for the following frame, not the pose just produced by this step.
+                constexpr float reference_step = 1.0f / 60.0f;
+                const Quaternionf step_rotation =
+                    identity.slerp(std::min(dt / reference_step, 1.0f), state.velocity);
+                state.angles = SpringAngles(step_rotation.toRotationMatrix() *
+                                             orientation.toRotationMatrix());
+                state.velocity = state.velocity.slerp(std::min(dt * spring.friction, 1.0f),
+                                                       identity);
+            }
+            affine.rotate(SpringRotation(state.angles));
+        }
         if (bone.translation_spring) {
             const auto& spring = *bone.translation_spring;
             auto& state = runtime.translation_springs[i];
@@ -191,6 +263,11 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         m_bone_local_affines[i] = affine;
         affine = parent * affine;
         m_bone_model_affines[i] = affine;
+        if (bone.rotation_spring) {
+            auto& state = runtime.rotation_springs[i];
+            state.previous_world = world_from_model * affine;
+            state.initialized = true;
+        }
         if (bone.translation_spring) {
             auto& state = runtime.translation_springs[i];
             // Recomposition after a same-frame script write updates the displayed pose for
@@ -284,6 +361,7 @@ void WPPuppetLayer::prepared(std::span<const AnimationLayer> alayers) {
     runtime.bone_overrides.assign(runtime.puppet != nullptr ? runtime.puppet->bones.size() : 0,
                                   BoneOverride {});
     runtime.translation_springs.assign(runtime.bone_overrides.size(), TranslationSpringState {});
+    runtime.rotation_springs.assign(runtime.bone_overrides.size(), RotationSpringState {});
     runtime.cached_skinning     = {};
     runtime.cached_frame_serial = std::numeric_limits<uint64_t>::max();
     runtime.advanced_frame_serial = std::numeric_limits<uint64_t>::max();
@@ -292,7 +370,9 @@ void WPPuppetLayer::prepared(std::span<const AnimationLayer> alayers) {
 
     if (runtime.puppet == nullptr) return;
     if (std::any_of(runtime.puppet->bones.begin(), runtime.puppet->bones.end(),
-                    [](const auto& bone) { return bone.translation_spring.has_value(); })) {
+                    [](const auto& bone) {
+                        return bone.translation_spring.has_value() || bone.rotation_spring.has_value();
+                    })) {
         runtime.domain = PuppetPoseDomain::RuntimeMutable;
     }
 
@@ -352,7 +432,8 @@ PuppetPoseSnapshot WPPuppetLayer::AdvanceIfNeeded(double time,
                          frame_serial > runtime.advanced_frame_serial;
     if (advance) {
         for (usize i = 0; i < runtime.bone_overrides.size(); ++i) {
-            if (runtime.puppet->bones[i].translation_spring) {
+            if (runtime.puppet->bones[i].translation_spring ||
+                runtime.puppet->bones[i].rotation_spring) {
                 runtime.bone_overrides[i].enabled = false;
             }
         }
@@ -433,24 +514,29 @@ bool WPPuppetLayer::SetLocalBoneTransform(usize index, const Eigen::Affine3f& tr
     return true;
 }
 
-bool WPPuppetLayer::ApplyBoneDirectionalImpulse(usize index,
-                                                const Eigen::Vector3f& impulse) noexcept {
+bool WPPuppetLayer::ApplyBonePhysicsImpulse(usize index, const Eigen::Vector3f& impulse,
+                                            const Eigen::Vector3f& angular_degrees) noexcept {
     auto& runtime = Runtime();
     if (!runtime.puppet || index >= runtime.puppet->bones.size() ||
-        !runtime.puppet->bones[index].translation_spring) return false;
+        (!runtime.puppet->bones[index].translation_spring &&
+         !runtime.puppet->bones[index].rotation_spring)) return false;
 
     // Directional impulses accumulate in the simulation's world-space velocity. They do
     // not change the displayed pose or invalidate its current-frame cache: the next frame's
     // integration consumes the new velocity. Repeated calls add independent impulses rather
     // than replacing a pose or resetting the retained spring displacement.
     runtime.translation_springs[index].velocity += impulse;
+    // Angular input is expressed in degrees and accumulates on the right of the retained
+    // quaternion velocity. It leaves both the displayed pose and its current-frame cache
+    // unchanged, just like directional input; the following update consumes the impulse.
+    constexpr float radians_per_degree = std::numbers::pi_v<float> / 180.0f;
+    runtime.rotation_springs[index].velocity *= SpringRotation(angular_degrees * radians_per_degree);
     return true;
 }
 
 void WPPuppetLayer::ResetBonePhysicsSimulation(usize index) noexcept {
     auto& runtime = Runtime();
-    if (!runtime.puppet || index >= runtime.puppet->bones.size() ||
-        !runtime.puppet->bones[index].translation_spring) return;
+    if (!runtime.puppet || index >= runtime.puppet->bones.size()) return;
 
     // Reset only the retained simulation displacement and velocity. The displayed pose
     // and its world-space history belong to frame evaluation and must remain available:
@@ -460,6 +546,9 @@ void WPPuppetLayer::ResetBonePhysicsSimulation(usize index) noexcept {
     auto& state = runtime.translation_springs[index];
     state.displacement.setZero();
     state.velocity.setZero();
+    auto& rotation = runtime.rotation_springs[index];
+    rotation.angles.setZero();
+    rotation.velocity.setIdentity();
 }
 
 void WPPuppetLayer::MarkRuntimePoseMutation() noexcept {

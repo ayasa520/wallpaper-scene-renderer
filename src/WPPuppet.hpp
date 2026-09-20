@@ -74,11 +74,18 @@ public:
         float response;
         float max_distance;
     };
+    struct RotationSpring {
+        float stiffness;
+        float friction;
+        float response;
+        Eigen::Vector3f tip;
+    };
     struct Bone {
         std::string     name;
         Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
         uint32_t        parent { 0xFFFFFFFFu };
         std::optional<TranslationSpring> translation_spring;
+        std::optional<RotationSpring> rotation_spring;
 
         bool noParent() const { return parent == 0xFFFFFFFFu; }
         // prepared
@@ -231,7 +238,8 @@ public:
     AnimationLayer*                  AnimationLayerState(usize index) noexcept;
     const WPPuppet::Animation*       AnimationDefinition(usize index) const noexcept;
     bool SetLocalBoneTransform(usize index, const Eigen::Affine3f& transform) noexcept;
-    bool ApplyBoneDirectionalImpulse(usize index, const Eigen::Vector3f& impulse) noexcept;
+    bool ApplyBonePhysicsImpulse(usize index, const Eigen::Vector3f& impulse,
+                                  const Eigen::Vector3f& angular_degrees) noexcept;
     void ResetBonePhysicsSimulation(usize index) noexcept;
     PuppetPoseDomain PoseDomain() const noexcept;
     uint64_t PoseRevision() const noexcept;
@@ -257,10 +265,17 @@ private:
         Eigen::Vector3f previous_world_origin { Eigen::Vector3f::Zero() };
         bool initialized { false };
     };
+    struct RotationSpringState {
+        Eigen::Quaternionf velocity { Eigen::Quaternionf::Identity() };
+        Eigen::Vector3f angles { Eigen::Vector3f::Zero() };
+        Eigen::Affine3f previous_world { Eigen::Affine3f::Identity() };
+        bool initialized { false };
+    };
     struct RuntimeState {
         std::vector<Layer>               layers;
         std::vector<BoneOverride>        bone_overrides;
         std::vector<TranslationSpringState> translation_springs;
+        std::vector<RotationSpringState> rotation_springs;
         std::shared_ptr<WPPuppet>        puppet;
         std::span<const Eigen::Affine3f> cached_skinning {};
         uint64_t cached_frame_serial { std::numeric_limits<uint64_t>::max() };

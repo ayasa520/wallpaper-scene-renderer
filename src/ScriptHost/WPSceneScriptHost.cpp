@@ -1151,8 +1151,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "__native.layerCall(nodeId, 'setLocalBoneAngles', bone, angles);\n"
         << "        if (prop === 'setLocalBoneOrigin') return (bone, origin) => "
            "__native.layerCall(nodeId, 'setLocalBoneOrigin', bone, origin);\n"
-        << "        if (prop === 'applyBonePhysicsImpulse') return (bone, impulse) => "
-           "__native.layerCall(nodeId, 'applyBonePhysicsImpulse', bone, impulse);\n"
+        << "        if (prop === 'applyBonePhysicsImpulse') return (bone, impulse, angular) => "
+           "__native.layerCall(nodeId, 'applyBonePhysicsImpulse', bone, impulse, angular);\n"
         << "        if (prop === 'resetBonePhysicsSimulation') return (bone) => "
            "__native.layerCall(nodeId, 'resetBonePhysicsSimulation', bone);\n"
         << "        if (prop === 'rotateObjectSpace') return (angles) => "
@@ -7458,9 +7458,16 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
         std::array<float, 3> impulse_values {};
         if (! impulse->tryGet(&impulse_values)) return JS_FALSE;
 
+        std::array<float, 3> angular_values {};
+        if (argc >= 5 && !JS_IsUndefined(argv[4])) {
+            const auto angular = ReadDynamicValueFromJS(context, argv[4], WPDynamicValue::Type::Float3);
+            if (!angular.has_value() || !angular->tryGet(&angular_values)) return JS_FALSE;
+        }
+
         auto* data = GetMutableNodeData(opaque, node);
-        if (!data->puppet_layer.ApplyBoneDirectionalImpulse(
-                *bone_index, Eigen::Vector3f(impulse_values[0], impulse_values[1], impulse_values[2])))
+        if (!data->puppet_layer.ApplyBonePhysicsImpulse(
+                *bone_index, Eigen::Vector3f(impulse_values[0], impulse_values[1], impulse_values[2]),
+                Eigen::Vector3f(angular_values[0], angular_values[1], angular_values[2])))
             return JS_FALSE;
         return JS_UNDEFINED;
     }

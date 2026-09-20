@@ -37,10 +37,7 @@ constexpr uint32_t kStaticExtraFieldFlag         = 2;
 constexpr uint32_t kVertexNormalMask             = 0x00000002;
 constexpr uint32_t kVertexTangentMask            = 0x00000004;
 
-std::optional<WPPuppet::TranslationSpring> ReadTranslationSpring(const std::string& source) {
-    if (source.empty()) return std::nullopt;
-    nlohmann::json config;
-    if (!PARSE_JSON(source, config) || !config.is_object()) return std::nullopt;
+std::optional<WPPuppet::TranslationSpring> ReadTranslationSpring(const nlohmann::json& config) {
     if (!ReadJsonLiteralBoolean(config, "se", false)) return std::nullopt;
 
     // Translation springs have their own world-space state and integration parameters.
@@ -67,6 +64,42 @@ std::optional<WPPuppet::TranslationSpring> ReadTranslationSpring(const std::stri
         .friction = config["tf"].get<float>(),
         .response = 1.0f - config["ti"].get<float>() / 100.0f,
         .max_distance = config["tm"].get<float>(),
+    };
+}
+
+std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json& config) {
+    if (!ReadJsonLiteralBoolean(config, "se", false) ||
+        !ReadJsonLiteralBoolean(config, "r", false)) return std::nullopt;
+    // Ordinary rotation springs retain an angular velocity and a relative orientation.
+    // Rigid, combined translation/rotation, gravity and constrained modes require different
+    // state transitions and must not accidentally enter this unconstrained solver.
+    for (const char* field : {"t", "re", "ge", "ik", "ikce", "lt", "la",
+                              "tax", "tay", "taz", "rax", "ray", "raz"}) {
+        if (ReadJsonLiteralBoolean(config, field, false)) {
+            LOG_INFO("puppet rotation spring has unsupported mode or constraint '%s'", field);
+            return std::nullopt;
+        }
+    }
+    for (const char* field : {"rs", "rf", "ri"}) {
+        const auto value = config.find(field);
+        if (value == config.end() || !value->is_number() ||
+            !std::isfinite(value->get<float>())) {
+            LOG_INFO("puppet rotation spring requires numeric parameter '%s'", field);
+            return std::nullopt;
+        }
+    }
+    Eigen::Vector3f tip;
+    const auto value = config.find("tp");
+    if (value == config.end() || !ReadJsonFloatVectorValue(*value, {tip.data(), 3}) ||
+        !tip.allFinite() || tip.squaredNorm() == 0.0f) {
+        LOG_INFO("puppet rotation spring requires a nonzero finite tip");
+        return std::nullopt;
+    }
+    return WPPuppet::RotationSpring {
+        .stiffness = config["rs"].get<float>(),
+        .friction = config["rf"].get<float>(),
+        .response = 1.0f - config["ri"].get<float>() / 100.0f,
+        .tip = tip,
     };
 }
 
@@ -1567,7 +1600,13 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
             for (auto& value : column) value = f.ReadFloat();
         }
 
-        bone.translation_spring = ReadTranslationSpring(f.ReadStr());
+        const auto simulation = f.ReadStr();
+        nlohmann::json simulation_config;
+        if (!simulation.empty() && PARSE_JSON(simulation, simulation_config) &&
+            simulation_config.is_object()) {
+            bone.translation_spring = ReadTranslationSpring(simulation_config);
+            bone.rotation_spring = ReadRotationSpring(simulation_config);
+        }
     }
 
     if (mdl.mdls > 1) {
