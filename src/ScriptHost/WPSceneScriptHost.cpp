@@ -819,6 +819,30 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "          return Math.atan2(y, x) * WEMath.rad2deg;\n"
         << "        }\n"
         << "      });\n"
+        << "  const Mat3 = (typeof globalThis.Mat3 === 'function')\n"
+        << "    ? globalThis.Mat3 : (globalThis.Mat3 = class Mat3 {\n"
+        << "    constructor(value) {\n"
+        << "      if (value instanceof Mat3) this.m = value.m.slice();\n"
+        << "      else if (Array.isArray(value) && value.length === 9) this.m = value.slice();\n"
+        << "      else {\n"
+        << "        const parsed = typeof value === 'string' ? value.split(' ').map(parseFloat) : [];\n"
+        << "        this.m = parsed.length === 9 ? parsed : [1,0,0, 0,1,0, 0,0,1];\n"
+        << "      }\n"
+        << "    }\n"
+        // Texture-space query results retain column-major storage and the shared Mat3 prototype.
+        // Accessors return independent vectors; a translation write mutates only the last column.
+        << "    translation(position) {\n"
+        << "      if (position instanceof Vec2) {\n"
+        << "        this.m[6] = position.x; this.m[7] = position.y; return this;\n"
+        << "      }\n"
+        << "      return new Vec2(this.m[6], this.m[7]);\n"
+        << "    }\n"
+        << "    transformPoint(point) {\n"
+        << "      const m = this.m;\n"
+        << "      return new Vec2(m[0]*point.x + m[3]*point.y + m[6],\n"
+        << "                      m[1]*point.x + m[4]*point.y + m[7]);\n"
+        << "    }\n"
+        << "  });\n"
         << "  const Mat4 = (typeof globalThis.Mat4 === 'function')\n"
         << "    ? globalThis.Mat4\n"
         << "    : (globalThis.Mat4 = class Mat4 {\n"
@@ -1089,6 +1113,8 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "'getAttachmentIndex', name);\n"
         << "        if (prop === 'getAttachmentMatrix') return (attachment) => "
            "__native.layerCall(nodeId, 'getAttachmentMatrix', attachment);\n"
+        << "        if (prop === 'transformAttachmentToTexture') return (layer, attachment) => "
+           "__native.layerCall(nodeId, 'transformAttachmentToTexture', layer, attachment);\n"
         << "        if (prop === 'getTransformMatrix') return () => __native.layerCall(nodeId, "
            "'getTransformMatrix');\n"
         << "        if (prop === 'getAttachmentOrigin') return (attachment) => "
@@ -1511,25 +1537,31 @@ JSValue NumericVectorToJS(JSContext* context, const std::vector<double>& values)
     return array;
 }
 
-JSValue Matrix4ToJS(JSContext* context, const Eigen::Matrix4d& matrix) {
-    // Layer, attachment and bone transforms share one script representation. Serialize columns
-    // explicitly instead of depending on Eigen's storage configuration, then construct the same
-    // Mat4 class exposed to authored scripts so its .m array and translation method stay aligned.
+template<int Dimension>
+JSValue MatrixToJS(JSContext* context, const Eigen::Matrix<double, Dimension, Dimension>& matrix,
+                   const char* class_name) {
+    // Native matrices and authored scripts share a constructor in this JavaScript realm.
+    // Serialize columns explicitly so .m and point/translation accessors agree independently
+    // of Eigen's storage configuration and of the matrix's dimension.
     JSValue  array = JS_NewArray(context);
     uint32_t index = 0;
-    for (int col = 0; col < 4; col++) {
-        for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < Dimension; col++) {
+        for (int row = 0; row < Dimension; row++) {
             JS_SetPropertyUint32(context, array, index++, JS_NewFloat64(context, matrix(row, col)));
         }
     }
 
     JSValue global = JS_GetGlobalObject(context);
-    JSValue ctor = JS_GetPropertyStr(context, global, "Mat4");
+    JSValue ctor = JS_GetPropertyStr(context, global, class_name);
     JSValue result = JS_CallConstructor(context, ctor, 1, &array);
     JS_FreeValue(context, ctor);
     JS_FreeValue(context, global);
     JS_FreeValue(context, array);
     return result;
+}
+
+JSValue Matrix4ToJS(JSContext* context, const Eigen::Matrix4d& matrix) {
+    return MatrixToJS(context, matrix, "Mat4");
 }
 
 JSValue Vec3ToJS(JSContext* context, const std::array<double, 3>& value) {
@@ -6667,7 +6699,8 @@ JSValue NativeHasLayerMember(JSContext* context, JSValueConst, int argc, JSValue
                           opaque != nullptr && opaque->scene != nullptr &&
                               opaque->scene->GetLayerInitialConfigJson(node_id) != nullptr);
     }
-    if (member_name == "size" || member_name == "getEffect" || member_name == "getEffectCount") {
+    if (member_name == "size" || member_name == "getEffect" || member_name == "getEffectCount" ||
+        member_name == "transformAttachmentToTexture") {
         return JS_NewBool(context,
                           opaque != nullptr && (FindImageLayerById(opaque, node_id) != nullptr ||
                                                 FindTextLayerById(opaque, node_id) != nullptr));
@@ -7245,6 +7278,67 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
 
     if (command == "getTransformMatrix") {
         return Matrix4ToJS(context, ResolveLayerModelTransform(opaque, node));
+    }
+
+    if (command == "transformAttachmentToTexture") {
+        if (argc < 4) return JS_UNDEFINED;
+        const auto reference_id = ResolveLayerReference(context, opaque, argv[2]);
+        if (! reference_id.has_value()) return JS_UNDEFINED;
+        auto* reference = FindNodeById(opaque, *reference_id);
+        const auto* reference_puppet = AdvanceNodePuppetForScriptQuery(opaque, reference);
+        if (reference_puppet == nullptr) return JS_UNDEFINED;
+        const auto attachment = ResolveAttachmentReference(context, argv[3], *reference_puppet);
+        if (! attachment.has_value()) return JS_UNDEFINED;
+        const auto attachment_world =
+            GetAttachmentWorldTransform(opaque, reference, *attachment->attachment);
+        if (! attachment_world.has_value()) return JS_UNDEFINED;
+
+        std::array<float, 2> extent;
+        if (const auto* effect = opaque->scene->FindImageEffectLayer(layer_id)) {
+            extent = effect->EffectMatrixSize();
+        } else if (const auto* image = FindImageLayerById(opaque, layer_id)) {
+            extent = image->size;
+        } else if (const auto* text = FindTextLayerById(opaque, layer_id)) {
+            extent = text->object.size;
+        } else {
+            return JS_UNDEFINED;
+        }
+
+        // The reference supplies an attachment frame; the receiver supplies the texture plane.
+        // Project the attachment origin and its X direction through their scene destination,
+        // then intersect the receiver's view rays in its own local plane. This also keeps
+        // preceding script transform writes visible without modifying either owner's TRS.
+        auto* updater = GetShaderUpdater(opaque);
+        const Eigen::Matrix4d reference_clip =
+            updater->ResolveModelViewProjectionForInput(reference) * *attachment_world;
+        const Eigen::Matrix4d owner_world = RemoveImageAlignmentOffsetFromModel(
+            ResolveLayerModelTransform(opaque, node), node->AlignmentOffset());
+        const Eigen::Matrix4d local_from_clip =
+            (updater->ResolveModelViewProjectionForInput(node) * owner_world).inverse();
+        std::array<Eigen::Vector2d, 2> points;
+        for (int index = 0; index < 2; ++index) {
+            const Eigen::Vector4d projected =
+                reference_clip * Eigen::Vector4d(index, 0.0, 0.0, 1.0);
+            const double x = projected.x() / projected.w();
+            const double y = projected.y() / projected.w();
+            const Eigen::Vector3d start =
+                (local_from_clip * Eigen::Vector4d(x, y, 0.0, 1.0)).hnormalized();
+            const Eigen::Vector3d end =
+                (local_from_clip * Eigen::Vector4d(x, y, 1.0, 1.0)).hnormalized();
+            const Eigen::Vector3d ray = end - start;
+            const Eigen::Vector3d hit = start - ray * (start.z() / ray.z());
+            // Convert the local half-unit grid origin to a centered, downward-Y texture axis.
+            // Normalize the projected basis afterwards: this query preserves direction, not
+            // the reference's scale or the receiver's pixel dimensions.
+            points[index] = Eigen::Vector2d(0.5 + (hit.x() - 0.5) / extent[0],
+                                            0.5 - (hit.y() - 0.5) / extent[1]);
+        }
+        const Eigen::Vector2d direction = (points[1] - points[0]).normalized();
+        Eigen::Matrix3d result;
+        result << direction.x(), direction.y(), points[0].x(),
+                  direction.y(), -direction.x(), points[0].y(),
+                  0.0, 0.0, 1.0;
+        return MatrixToJS(context, result, "Mat3");
     }
 
     const auto* puppet = AdvanceNodePuppetForScriptQuery(opaque, node);
