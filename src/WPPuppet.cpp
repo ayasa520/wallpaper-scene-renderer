@@ -186,10 +186,23 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
             if (advance_simulation && state.initialized) {
                 const float dt = static_cast<float>(time);
                 const Affine3f current_world = world_from_model * parent * affine;
+                const Affine3f current_inverse = current_world.inverse();
                 const Quaternionf orientation = SpringRotation(state.angles);
-                const Vector3f predicted_tip = orientation * spring.tip;
+                Vector3f predicted_tip = orientation * spring.tip;
                 const Vector3f previous_tip =
-                    current_world.inverse() * (state.previous_world * spring.tip);
+                    current_inverse * (state.previous_world * spring.tip);
+                if (spring.gravity) {
+                    const float scene_scale = world_from_model.linear().colwise().norm().mean();
+                    const Vector3f gravity = (current_inverse.linear() * spring.gravity->direction) *
+                                             (spring.gravity->mass * scene_scale);
+                    const Vector3f direction = predicted_tip.normalized();
+                    // Gravity contributes only perpendicular to the rotated bone tip. Express
+                    // the authored world direction in this bone's current frame and account for
+                    // owner scale before projecting it. Subtract that contribution from the
+                    // predicted tip so alignment toward its history supplies the gravity turn;
+                    // the same adjusted tip determines the existing motion-response weight.
+                    predicted_tip -= gravity - direction * direction.dot(gravity);
+                }
                 const Vector3f predicted_direction = predicted_tip.normalized();
                 const Vector3f previous_direction = previous_tip.normalized();
                 const Quaternionf identity = Quaternionf::Identity();

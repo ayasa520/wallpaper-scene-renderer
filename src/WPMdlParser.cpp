@@ -71,9 +71,9 @@ std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json&
     if (!ReadJsonLiteralBoolean(config, "se", false) ||
         !ReadJsonLiteralBoolean(config, "r", false)) return std::nullopt;
     // Ordinary rotation springs retain an angular velocity and a relative orientation.
-    // Rigid, combined translation/rotation, gravity, torque limits and axis locks require
-    // different state transitions. Euler angle limits belong to this spring's pose step.
-    for (const char* field : {"t", "re", "ge", "ik", "ikce", "lt",
+    // Rigid, combined translation/rotation, torque limits and axis locks require different
+    // state transitions. Gravity drives the tip response; angle limits constrain its pose.
+    for (const char* field : {"t", "re", "ik", "ikce", "lt",
                               "tax", "tay", "taz", "rax", "ray", "raz"}) {
         if (ReadJsonLiteralBoolean(config, field, false)) {
             LOG_INFO("puppet rotation spring has unsupported mode or constraint '%s'", field);
@@ -109,12 +109,27 @@ std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json&
         }
         limits = bounds;
     }
+    std::optional<WPPuppet::RotationGravity> gravity;
+    if (ReadJsonLiteralBoolean(config, "ge", false)) {
+        WPPuppet::RotationGravity parameters;
+        const auto direction = config.find("gd");
+        const auto mass = config.find("m");
+        if (direction == config.end() || mass == config.end() || !mass->is_number() ||
+            !ReadJsonFloatVectorValue(*direction, {parameters.direction.data(), 3}) ||
+            !parameters.direction.allFinite() || !std::isfinite(mass->get<float>())) {
+            LOG_INFO("puppet rotation spring requires finite gravity direction and mass");
+            return std::nullopt;
+        }
+        parameters.mass = mass->get<float>();
+        gravity = parameters;
+    }
     return WPPuppet::RotationSpring {
         .stiffness = config["rs"].get<float>(),
         .friction = config["rf"].get<float>(),
         .response = 1.0f - config["ri"].get<float>() / 100.0f,
         .tip = tip,
         .limits = limits,
+        .gravity = gravity,
     };
 }
 

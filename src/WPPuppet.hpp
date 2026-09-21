@@ -78,12 +78,17 @@ public:
         Eigen::Vector3f minimum;
         Eigen::Vector3f maximum;
     };
+    struct RotationGravity {
+        Eigen::Vector3f direction;
+        float mass;
+    };
     struct RotationSpring {
         float stiffness;
         float friction;
         float response;
         Eigen::Vector3f tip;
         std::optional<RotationLimits> limits;
+        std::optional<RotationGravity> gravity;
     };
     struct Bone {
         std::string     name;
