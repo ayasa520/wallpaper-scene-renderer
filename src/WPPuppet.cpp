@@ -220,6 +220,17 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
                     identity.slerp(std::min(dt / reference_step, 1.0f), state.velocity);
                 state.angles = SpringAngles(step_rotation.toRotationMatrix() *
                                              orientation.toRotationMatrix());
+                if (spring.limits) {
+                    const Vector3f unconstrained = state.angles;
+                    state.angles = state.angles.cwiseMax(spring.limits->minimum)
+                                               .cwiseMin(spring.limits->maximum);
+                    // Limit the relative spring displacement, leaving the authored animation
+                    // pose intact. Remove the clipped rotation from the velocity on the left
+                    // before damping, so the next step retains the permitted response instead
+                    // of repeatedly driving the bone through its angular boundary.
+                    state.velocity = SpringRotation(unconstrained - state.angles).conjugate() *
+                                     state.velocity;
+                }
                 state.velocity = state.velocity.slerp(std::min(dt * spring.friction, 1.0f),
                                                        identity);
             }

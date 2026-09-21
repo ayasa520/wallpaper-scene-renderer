@@ -74,11 +74,16 @@ public:
         float response;
         float max_distance;
     };
+    struct RotationLimits {
+        Eigen::Vector3f minimum;
+        Eigen::Vector3f maximum;
+    };
     struct RotationSpring {
         float stiffness;
         float friction;
         float response;
         Eigen::Vector3f tip;
+        std::optional<RotationLimits> limits;
     };
     struct Bone {
         std::string     name;

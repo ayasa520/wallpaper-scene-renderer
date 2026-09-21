@@ -71,9 +71,9 @@ std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json&
     if (!ReadJsonLiteralBoolean(config, "se", false) ||
         !ReadJsonLiteralBoolean(config, "r", false)) return std::nullopt;
     // Ordinary rotation springs retain an angular velocity and a relative orientation.
-    // Rigid, combined translation/rotation, gravity and constrained modes require different
-    // state transitions and must not accidentally enter this unconstrained solver.
-    for (const char* field : {"t", "re", "ge", "ik", "ikce", "lt", "la",
+    // Rigid, combined translation/rotation, gravity, torque limits and axis locks require
+    // different state transitions. Euler angle limits belong to this spring's pose step.
+    for (const char* field : {"t", "re", "ge", "ik", "ikce", "lt",
                               "tax", "tay", "taz", "rax", "ray", "raz"}) {
         if (ReadJsonLiteralBoolean(config, field, false)) {
             LOG_INFO("puppet rotation spring has unsupported mode or constraint '%s'", field);
@@ -95,11 +95,26 @@ std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json&
         LOG_INFO("puppet rotation spring requires a nonzero finite tip");
         return std::nullopt;
     }
+    std::optional<WPPuppet::RotationLimits> limits;
+    if (ReadJsonLiteralBoolean(config, "la", false)) {
+        WPPuppet::RotationLimits bounds;
+        const auto minimum = config.find("lamin");
+        const auto maximum = config.find("lamax");
+        if (minimum == config.end() || maximum == config.end() ||
+            !ReadJsonFloatVectorValue(*minimum, {bounds.minimum.data(), 3}) ||
+            !ReadJsonFloatVectorValue(*maximum, {bounds.maximum.data(), 3}) ||
+            !bounds.minimum.allFinite() || !bounds.maximum.allFinite()) {
+            LOG_INFO("puppet rotation spring requires finite angle limits");
+            return std::nullopt;
+        }
+        limits = bounds;
+    }
     return WPPuppet::RotationSpring {
         .stiffness = config["rs"].get<float>(),
         .friction = config["rf"].get<float>(),
         .response = 1.0f - config["ri"].get<float>() / 100.0f,
         .tip = tip,
+        .limits = limits,
     };
 }
 
