@@ -6,32 +6,43 @@ namespace wallpaper {
 
 // Both callback wrappers share these vector declarations. Constructors remain unique within
 // a JavaScript realm, so values created by different layer callbacks retain their identity.
-// Scalar parsing and arithmetic helpers come from the wrapper's existing numeric environment.
+// Vector components retain JavaScript values, including non-finite numbers. Host-side numeric
+// parsing is separate: applying it inside these operations would change their arithmetic.
 inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
+  const __vectorEpsilon = 0.00001;
   const Vec2 = (typeof globalThis.Vec2 === 'function')
     ? globalThis.Vec2
     : (globalThis.Vec2 = class Vec2 {
-        constructor(a = 0, b = 0) {
-          const values = arguments.length === 0 ? [0, 0]
-            : arguments.length === 1 ? __vecValues(a, 2)
-            : [__toNumber(a, 0), __toNumber(b, 0)];
-          this.x = values[0];
-          this.y = values[1];
+        constructor(x, y) {
+          if (typeof x === 'string') {
+            const words = x.split(' ');
+            this.x = parseFloat(words[0]);
+            this.y = parseFloat(words[1]);
+          } else if (x instanceof Vec3 || x instanceof Vec2) {
+            this.x = x.x;
+            this.y = x.y;
+          } else if (x !== undefined) {
+            this.x = x;
+            this.y = typeof y === 'number' ? y : x;
+          } else {
+            this.x = 0;
+            this.y = 0;
+          }
         }
-        equals(other) { const v = __vecValues(other, 2); return Math.abs(this.x - v[0]) < 1e-6 && Math.abs(this.y - v[1]) < 1e-6; }
-        length() { return Math.hypot(this.x, this.y); }
+        equals(other) { return other instanceof Vec2 && Math.abs(this.x - other.x) < __vectorEpsilon && Math.abs(this.y - other.y) < __vectorEpsilon; }
+        length() { return Math.sqrt(this.x * this.x + this.y * this.y); }
         lengthSqr() { return this.x * this.x + this.y * this.y; }
-        normalize() { const len = this.length(); return len === 0 ? new Vec2() : new Vec2(this.x / len, this.y / len); }
+        normalize() { return this.divide(this.length()); }
         copy() { return new Vec2(this.x, this.y); }
-        add(value) { return __binaryVec(this, value, (a, b) => a + b, Vec2, ['x', 'y']); }
-        subtract(value) { return __binaryVec(this, value, (a, b) => a - b, Vec2, ['x', 'y']); }
-        multiply(value) { return __binaryVec(this, value, (a, b) => a * b, Vec2, ['x', 'y']); }
-        divide(value) { return __binaryVec(this, value, (a, b) => a / b, Vec2, ['x', 'y']); }
-        dot(value) { const rhs = __vecValues(value, 2); return __dot([this.x, this.y], rhs); }
-        reflect(normal) { const n = new Vec2(normal).normalize(); return this.subtract(n.multiply(2 * this.dot(n))); }
-        mix(other, amount) { const rhs = __vecValues(other, 2); return new Vec2(__mixScalar(this.x, rhs[0], amount), __mixScalar(this.y, rhs[1], amount)); }
-        min(value) { return __binaryVec(this, value, (a, b) => Math.min(a, b), Vec2, ['x', 'y']); }
-        max(value) { return __binaryVec(this, value, (a, b) => Math.max(a, b), Vec2, ['x', 'y']); }
+        add(value) { return typeof value === 'number' ? new Vec2(this.x + value, this.y + value) : new Vec2(this.x + value.x, this.y + value.y); }
+        subtract(value) { return typeof value === 'number' ? new Vec2(this.x - value, this.y - value) : new Vec2(this.x - value.x, this.y - value.y); }
+        multiply(value) { return typeof value === 'number' ? new Vec2(this.x * value, this.y * value) : new Vec2(this.x * value.x, this.y * value.y); }
+        divide(value) { return typeof value === 'number' ? new Vec2(this.x / value, this.y / value) : new Vec2(this.x / value.x, this.y / value.y); }
+        dot(value) { return this.x * value.x + this.y * value.y; }
+        reflect(normal) { return this.subtract(normal.multiply(2 * this.dot(normal))); }
+        mix(other, amount) { return new Vec2(this.x + (other.x - this.x) * (typeof amount === 'number' ? amount : amount.x), this.y + (other.y - this.y) * (typeof amount === 'number' ? amount : amount.y)); }
+        min(value) { return typeof value === 'number' ? new Vec2(Math.min(this.x, value), Math.min(this.y, value)) : new Vec2(Math.min(this.x, value.x), Math.min(this.y, value.y)); }
+        max(value) { return typeof value === 'number' ? new Vec2(Math.max(this.x, value), Math.max(this.y, value)) : new Vec2(Math.max(this.x, value.x), Math.max(this.y, value.y)); }
         perpendicular() { return new Vec2(this.y, -this.x); }
         abs() { return new Vec2(Math.abs(this.x), Math.abs(this.y)); }
         sign() { return new Vec2(Math.sign(this.x), Math.sign(this.y)); }
@@ -44,30 +55,43 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
   const Vec3 = (typeof globalThis.Vec3 === 'function')
     ? globalThis.Vec3
     : (globalThis.Vec3 = class Vec3 {
-        constructor(a = 0, b = 0, c = 0) {
-          const values = arguments.length === 0 ? [0, 0, 0]
-            : arguments.length === 1 ? __vecValues(a, 3)
-            : arguments.length === 2 ? [__toNumber(a, 0), __toNumber(b, 0), 0]
-            : [__toNumber(a, 0), __toNumber(b, 0), __toNumber(c, 0)];
-          this.x = values[0];
-          this.y = values[1];
-          this.z = values[2];
+        constructor(x, y, z) {
+          if (typeof x === 'string') {
+            const words = x.split(' ');
+            this.x = parseFloat(words[0]);
+            this.y = parseFloat(words[1]);
+            this.z = parseFloat(words[2]);
+          } else if (x instanceof Vec3 || x instanceof Vec2) {
+            this.x = x.x;
+            this.y = x.y;
+            this.z = x instanceof Vec3 ? x.z : 0;
+          } else if (x !== undefined) {
+            this.x = x;
+            this.y = typeof y === 'number' ? y : x;
+            this.z = typeof z === 'number' ? z : (typeof y === 'number' ? 0 : x);
+          } else {
+            this.x = 0;
+            this.y = 0;
+            this.z = 0;
+          }
         }
-        equals(other) { const v = __vecValues(other, 3); return Math.abs(this.x - v[0]) < 1e-6 && Math.abs(this.y - v[1]) < 1e-6 && Math.abs(this.z - v[2]) < 1e-6; }
-        length() { return Math.hypot(this.x, this.y, this.z); }
+        equals(other) { return other instanceof Vec3 && Math.abs(this.x - other.x) < __vectorEpsilon && Math.abs(this.y - other.y) < __vectorEpsilon && Math.abs(this.z - other.z) < __vectorEpsilon; }
+        length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z); }
         lengthSqr() { return this.x * this.x + this.y * this.y + this.z * this.z; }
-        normalize() { const len = this.length(); return len === 0 ? new Vec3() : new Vec3(this.x / len, this.y / len, this.z / len); }
+        normalize() { return this.divide(this.length()); }
         copy() { return new Vec3(this.x, this.y, this.z); }
-        add(value) { return __binaryVec(this, value, (a, b) => a + b, Vec3, ['x', 'y', 'z']); }
-        subtract(value) { return __binaryVec(this, value, (a, b) => a - b, Vec3, ['x', 'y', 'z']); }
-        multiply(value) { return __binaryVec(this, value, (a, b) => a * b, Vec3, ['x', 'y', 'z']); }
-        divide(value) { return __binaryVec(this, value, (a, b) => a / b, Vec3, ['x', 'y', 'z']); }
-        dot(value) { const rhs = __vecValues(value, 3); return __dot([this.x, this.y, this.z], rhs); }
-        reflect(normal) { const n = new Vec3(normal).normalize(); return this.subtract(n.multiply(2 * this.dot(n))); }
-        mix(other, amount) { const rhs = __vecValues(other, 3); return new Vec3(__mixScalar(this.x, rhs[0], amount), __mixScalar(this.y, rhs[1], amount), __mixScalar(this.z, rhs[2], amount)); }
-        min(value) { return __binaryVec(this, value, (a, b) => Math.min(a, b), Vec3, ['x', 'y', 'z']); }
-        max(value) { return __binaryVec(this, value, (a, b) => Math.max(a, b), Vec3, ['x', 'y', 'z']); }
-        cross(value) { const rhs = __vecValues(value, 3); return new Vec3(this.y * rhs[2] - this.z * rhs[1], this.z * rhs[0] - this.x * rhs[2], this.x * rhs[1] - this.y * rhs[0]); }
+        // A Vec2 operand changes only the first two components for these four operations.
+        // Read each component directly so non-finite arithmetic is preserved in the result.
+        add(value) { return typeof value === 'number' ? new Vec3(this.x + value, this.y + value, this.z + value) : new Vec3(this.x + value.x, this.y + value.y, value instanceof Vec2 ? this.z : this.z + value.z); }
+        subtract(value) { return typeof value === 'number' ? new Vec3(this.x - value, this.y - value, this.z - value) : new Vec3(this.x - value.x, this.y - value.y, value instanceof Vec2 ? this.z : this.z - value.z); }
+        multiply(value) { return typeof value === 'number' ? new Vec3(this.x * value, this.y * value, this.z * value) : new Vec3(this.x * value.x, this.y * value.y, value instanceof Vec2 ? this.z : this.z * value.z); }
+        divide(value) { return typeof value === 'number' ? new Vec3(this.x / value, this.y / value, this.z / value) : new Vec3(this.x / value.x, this.y / value.y, value instanceof Vec2 ? this.z : this.z / value.z); }
+        dot(value) { return this.x * value.x + this.y * value.y + this.z * value.z; }
+        reflect(normal) { return this.subtract(normal.multiply(2 * this.dot(normal))); }
+        mix(other, amount) { return new Vec3(this.x + (other.x - this.x) * (typeof amount === 'number' ? amount : amount.x), this.y + (other.y - this.y) * (typeof amount === 'number' ? amount : amount.y), this.z + (other.z - this.z) * (typeof amount === 'number' ? amount : amount.z)); }
+        min(value) { return typeof value === 'number' ? new Vec3(Math.min(this.x, value), Math.min(this.y, value), Math.min(this.z, value)) : new Vec3(Math.min(this.x, value.x), Math.min(this.y, value.y), Math.min(this.z, value.z)); }
+        max(value) { return typeof value === 'number' ? new Vec3(Math.max(this.x, value), Math.max(this.y, value), Math.max(this.z, value)) : new Vec3(Math.max(this.x, value.x), Math.max(this.y, value.y), Math.max(this.z, value.z)); }
+        cross(value) { return new Vec3(this.y * value.z - this.z * value.y, this.z * value.x - this.x * value.z, this.x * value.y - this.y * value.x); }
         abs() { return new Vec3(Math.abs(this.x), Math.abs(this.y), Math.abs(this.z)); }
         sign() { return new Vec3(Math.sign(this.x), Math.sign(this.y), Math.sign(this.z)); }
         round() { return new Vec3(Math.round(this.x), Math.round(this.y), Math.round(this.z)); }

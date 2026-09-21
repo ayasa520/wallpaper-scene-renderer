@@ -153,19 +153,35 @@ static std::array<std::string, 2> SceneDestinationRenderTargetNames(
     return names;
 }
 
+static void RemoveReleasedDestinationRegistration(Scene& scene, const std::string& name) {
+    const auto previous = scene.renderTargets.find(name);
+    if (previous == scene.renderTargets.end() || !previous->second.destination_released) return;
+    // The retained descriptor belongs only to existing samplers. A writer registering this name
+    // must start with its own descriptor and replace the sampled allocation at the next GPU-safe
+    // preparation boundary. Do not cancel this release when the name gains a new owner.
+    scene.renderTargets.erase(previous);
+    scene.pendingRenderTargetReleaseKeys.insert(name);
+}
+
 std::array<std::string, 2> ResolveSceneDestinationRenderTargets(
     Scene& scene, int32_t layer_id, int32_t parent_id, bool private_output,
     const SceneRenderTarget& target) {
     const auto names = SceneDestinationRenderTargetNames(
         scene, layer_id, parent_id, private_output, target.width, target.height, target.sample);
+    // End the old slot lifetimes before looking up any replacement. When the last owner reruns
+    // setup with the same name, the lookup must see a new descriptor and a fresh allocation;
+    // another retained owner keeps the shared descriptor alive throughout the operation.
+    scene.ReleaseLayerDestinationTargets(layer_id);
     for (size_t slot = 0; slot < names.size(); ++slot) {
         if (private_output && slot == 0) {
+            RemoveReleasedDestinationRegistration(scene, names[slot]);
             // Private output allocates an independent render target in owner slot zero. Its
             // identity must survive unrelated equal-sized layers and graph lifetime reuse. A
             // re-layout creates a replacement at the new extent under the same owner name;
             // invalidate that one GPU resource instead of treating the name as an intern hit.
             auto private_target = target;
             private_target.allowReuse = false;
+            private_target.destination_released = false;
             const auto [_, inserted] = scene.renderTargets.insert_or_assign(
                 names[slot], private_target);
             if (!inserted) scene.MarkRenderTargetResourcesDirty(names[slot]);
@@ -177,11 +193,40 @@ std::array<std::string, 2> ResolveSceneDestinationRenderTargets(
             InternNamedRenderTarget(scene, names[slot], target);
         }
     }
+    scene.RetainLayerDestinationTargets(layer_id, names);
     return names;
+}
+
+void Scene::RetainLayerDestinationTargets(int32_t layer_id,
+                                           std::array<std::string, 2> targets) {
+    for (const auto& name : targets) ++m_destination_target_references[name];
+    m_layer_destination_targets.emplace(layer_id, std::move(targets));
+}
+
+void Scene::ReleaseLayerDestinationTargets(int32_t layer_id) {
+    const auto owner = m_layer_destination_targets.extract(layer_id);
+    if (owner.empty()) return;
+    for (const auto& name : owner.mapped()) {
+        auto reference = m_destination_target_references.find(name);
+        const auto remaining = --reference->second;
+        if (remaining != 0) continue;
+        m_destination_target_references.erase(reference);
+        // End named-allocation eligibility synchronously, independently of the retained sampling
+        // descriptor. Existing material readers can outlive the destination owner; the census
+        // releases their image only after those readers end. A same-name allocation explicitly
+        // removes this retired descriptor before interning, even within this callback batch.
+        renderTargets.at(name).destination_released = true;
+        pendingRenderTargetRetirementKeys.insert(name);
+        MarkRenderGraphTopologyDirty();
+        LOG_INFO("SceneDestinationRelease: layer=%d target='%s' references=%zu",
+                 layer_id, name.c_str(), remaining);
+    }
 }
 
 const SceneRenderTarget& InternNamedRenderTarget(Scene& scene, const std::string& name,
                                                  SceneRenderTarget target) {
+    RemoveReleasedDestinationRegistration(scene, name);
+    target.destination_released = false;
     // `try_emplace` makes the first-registration rule explicit and prevents a later hidden
     // language branch from silently replacing the descriptor shared by an earlier branch.
     const auto [it, inserted] = scene.renderTargets.try_emplace(name, target);

@@ -92,6 +92,8 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
     name = authored_name->get<std::string>();
     format = authored_format->get<std::string>();
 
+    // The stored byte is the divisor used by target allocation, including integer wraparound
+    // and zero. Parsing must not replace an admitted value with a different resource scale.
     scale = static_cast<uint8_t>(ReadFboInt32(json, "scale", 1));
     width = static_cast<uint16_t>(ReadFboInt32(json, "width", -1));
     height = static_cast<uint16_t>(ReadFboInt32(json, "height", -1));
@@ -117,10 +119,6 @@ bool WPEffectFbo::FromJson(const nlohmann::json& json) {
                 while (*token == ' ') ++token;
             }
         }
-    }
-    if(scale == 0) { 
-        LOG_ERROR("fbo scale can't be 0");
-        scale = 1;
     }
     return true;
 }

@@ -732,33 +732,9 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    return Array.from({ length: size }, (_, i) => __toNumber(value[['x', 'y', 'z', "
            "'w'][i]], 0));\n"
         << "  };\n"
-        << "  const __binaryVec = (self, value, op, Size, keys) => {\n"
-        << "    const lhs = keys.map((key) => __toNumber(self[key], 0));\n"
-        << "    const rhs = typeof value === 'number'\n"
-        << "      ? Array.from({ length: lhs.length }, () => __toNumber(value, 0))\n"
-        << "      : __vecValues(value, lhs.length);\n"
-        << "    return new Size(...lhs.map((entry, index) => op(entry, rhs[index])));\n"
-        << "  };\n"
-        << "  const __dot = (lhs, rhs) => lhs.reduce((sum, value, index) => sum + value * "
-           "rhs[index], 0);\n"
         << "  const __mixScalar = (a, b, t) => __toNumber(a, 0) + (__toNumber(b, 0) - "
            "__toNumber(a, 0)) * __toNumber(t, 0);\n"
-        << kSceneScriptVectorPrelude
-        << "  // The native host normally seeds these cursor vectors before any script runs, but "
-           "some\n"
-        << "  // authored pointer-follow scripts read input.cursorWorldPosition.x every frame "
-           "without a\n"
-        << "  // guard. Upgrade plain native {x,y,z} cursor objects to Vec instances as well, "
-           "because\n"
-        << "  // Wallpaper Engine scripts commonly call vector helpers such as add() and subtract() "
-           "on\n"
-        << "  // input cursor positions during drag handling.\n"
-        << "  if (!input.cursorWorldPosition || typeof input.cursorWorldPosition !== 'object' || "
-           "typeof input.cursorWorldPosition.add !== 'function') input.cursorWorldPosition = new "
-           "Vec3(input.cursorWorldPosition);\n"
-        << "  if (!input.cursorScreenPosition || typeof input.cursorScreenPosition !== 'object' || "
-           "typeof input.cursorScreenPosition.add !== 'function') input.cursorScreenPosition = "
-           "new Vec2(input.cursorScreenPosition);\n"
+        << "  const { Vec2, Vec3, Vec4 } = globalThis;\n"
         << "  const WEMath = (globalThis.WEMath && typeof globalThis.WEMath === 'object')\n"
         << "    ? globalThis.WEMath\n"
         << "    : (globalThis.WEMath = {\n"
@@ -845,38 +821,28 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      });\n"
         << "  const Mat4 = (typeof globalThis.Mat4 === 'function')\n"
         << "    ? globalThis.Mat4\n"
-        << "    : (globalThis.Mat4 = class Mat4 extends Array {\n"
-        << "        constructor() {\n"
-        << "          super(16);\n"
-        << "          for (let i = 0; i < 16; i++) this[i] = (i % 5 === 0) ? 1 : 0;\n"
+        << "    : (globalThis.Mat4 = class Mat4 {\n"
+        << "        constructor(value) {\n"
+        << "          if (value instanceof Mat4) this.m = value.m.slice();\n"
+        << "          else if (Array.isArray(value) && value.length === 16) this.m = value.slice();\n"
+        << "          else {\n"
+        << "            const parsed = typeof value === 'string' ? value.split(' ').map(parseFloat) : [];\n"
+        << "            this.m = parsed.length === 16 ? parsed : Array.from({ length: 16 }, (_, i) => i % 5 === 0 ? 1 : 0);\n"
+        << "          }\n"
         << "        }\n"
-        // Translation reads participate in the vector API used by bone-drag scripts. Return
-        // an independent Vec3 so arithmetic and copy operations preserve the matrix. Writes
-        // retain the matrix identity so a chained translation can feed setBoneTransform.
+        // All native matrix APIs exchange a Mat4 with independent column-major storage in .m.
+        // Translation reads return a separate vector; vector writes preserve the matrix identity
+        // for chaining. Other argument types select the getter without changing the matrix.
         << "        translation(position) {\n"
-        << "          if (position === undefined) {\n"
-        << "            return new Vec3(Number(this[3] ?? 0), Number(this[7] ?? 0), "
-           "Number(this[11] ?? 0));\n"
+        << "          if (position instanceof Vec3 || position instanceof Vec2) {\n"
+        << "            this.m[12] = position.x;\n"
+        << "            this.m[13] = position.y;\n"
+        << "            this.m[14] = position instanceof Vec3 ? position.z : 0;\n"
+        << "            return this;\n"
         << "          }\n"
-        << "          const source = Array.isArray(position)\n"
-        << "            ? position\n"
-        << "            : [position?.x ?? 0, position?.y ?? 0, position?.z ?? 0];\n"
-        << "          this[3] = Number(source[0] ?? 0);\n"
-        << "          this[7] = Number(source[1] ?? 0);\n"
-        << "          this[11] = Number(source[2] ?? 0);\n"
-        << "          return this;\n"
-        << "        }\n"
-        << "        static fromArray(values) {\n"
-        << "          const matrix = new Mat4();\n"
-        << "          if (!Array.isArray(values)) return matrix;\n"
-        << "          for (let i = 0; i < 16; i++) {\n"
-        << "            const fallback = (i % 5 === 0) ? 1 : 0;\n"
-        << "            matrix[i] = Number(values[i] ?? fallback);\n"
-        << "          }\n"
-        << "          return matrix;\n"
+        << "          return new Vec3(this.m[12], this.m[13], this.m[14]);\n"
         << "        }\n"
         << "      });\n"
-        << "  const __toMat4 = (value) => Array.isArray(value) ? Mat4.fromArray(value) : value;\n"
         << "  const localStorage = {\n"
         << "    LOCATION_GLOBAL: 'global',\n"
         << "    LOCATION_SCREEN: 'screen',\n"
@@ -1122,7 +1088,7 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        if (prop === 'getAttachmentIndex') return (name) => __native.layerCall(nodeId, "
            "'getAttachmentIndex', name);\n"
         << "        if (prop === 'getAttachmentMatrix') return (attachment) => "
-           "__toMat4(__native.layerCall(nodeId, 'getAttachmentMatrix', attachment));\n"
+           "__native.layerCall(nodeId, 'getAttachmentMatrix', attachment);\n"
         << "        if (prop === 'getTransformMatrix') return () => __native.layerCall(nodeId, "
            "'getTransformMatrix');\n"
         << "        if (prop === 'getAttachmentOrigin') return (attachment) => "
@@ -1136,9 +1102,9 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        if (prop === 'getBoneParentIndex') return (bone) => __native.layerCall(nodeId, "
            "'getBoneParentIndex', bone);\n"
         << "        if (prop === 'getBoneTransform') return (bone) => "
-           "__toMat4(__native.layerCall(nodeId, 'getBoneTransform', bone));\n"
+           "__native.layerCall(nodeId, 'getBoneTransform', bone);\n"
         << "        if (prop === 'getLocalBoneTransform') return (bone) => "
-           "__toMat4(__native.layerCall(nodeId, 'getLocalBoneTransform', bone));\n"
+           "__native.layerCall(nodeId, 'getLocalBoneTransform', bone);\n"
         << "        if (prop === 'getLocalBoneAngles') return (bone) => __native.layerCall(nodeId, "
            "'getLocalBoneAngles', bone);\n"
         << "        if (prop === 'getLocalBoneOrigin') return (bone) => __native.layerCall(nodeId, "
@@ -1546,17 +1512,9 @@ JSValue NumericVectorToJS(JSContext* context, const std::vector<double>& values)
 }
 
 JSValue Matrix4ToJS(JSContext* context, const Eigen::Matrix4d& matrix) {
-    JSValue  array = JS_NewArray(context);
-    uint32_t index = 0;
-    for (int row = 0; row < 4; row++) {
-        for (int col = 0; col < 4; col++) {
-            JS_SetPropertyUint32(context, array, index++, JS_NewFloat64(context, matrix(row, col)));
-        }
-    }
-    return array;
-}
-
-JSValue TransformMatrixToJS(JSContext* context, const Eigen::Matrix4d& matrix) {
+    // Layer, attachment and bone transforms share one script representation. Serialize columns
+    // explicitly instead of depending on Eigen's storage configuration, then construct the same
+    // Mat4 class exposed to authored scripts so its .m array and translation method stay aligned.
     JSValue  array = JS_NewArray(context);
     uint32_t index = 0;
     for (int col = 0; col < 4; col++) {
@@ -1565,11 +1523,13 @@ JSValue TransformMatrixToJS(JSContext* context, const Eigen::Matrix4d& matrix) {
         }
     }
 
-    // Wallpaper Engine script examples commonly read transform.m[12]/m[13] for layer origin.
-    // Those indices are column-major translation slots, so expose the array through .m as WE
-    // does while leaving bone/attachment matrix helpers untouched.
-    JS_SetPropertyStr(context, array, "m", JS_DupValue(context, array));
-    return array;
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue ctor = JS_GetPropertyStr(context, global, "Mat4");
+    JSValue result = JS_CallConstructor(context, ctor, 1, &array);
+    JS_FreeValue(context, ctor);
+    JS_FreeValue(context, global);
+    JS_FreeValue(context, array);
+    return result;
 }
 
 JSValue Vec3ToJS(JSContext* context, const std::array<double, 3>& value) {
@@ -3636,15 +3596,24 @@ void DecomposeAffine(const Eigen::Affine3f& affine, Eigen::Vector3f& translation
 std::optional<Eigen::Matrix4d> ReadMatrix4FromJS(JSContext* context, JSValueConst value) {
     if (JS_IsException(value) || JS_IsUndefined(value) || JS_IsNull(value)) return std::nullopt;
 
+    JSValue components = JS_GetPropertyStr(context, value, "m");
+    if (JS_IsException(components) || JS_IsUndefined(components) || JS_IsNull(components)) {
+        JS_FreeValue(context, components);
+        return std::nullopt;
+    }
     Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity();
     for (uint32_t index = 0; index < 16; index++) {
-        JSValue    item   = JS_GetPropertyUint32(context, value, index);
+        JSValue    item   = JS_GetPropertyUint32(context, components, index);
         double     number = 0.0;
         const bool ok     = ! JS_IsException(item) && ReadJSNumber(context, item, &number);
         JS_FreeValue(context, item);
-        if (! ok) return std::nullopt;
-        matrix(static_cast<int>(index / 4), static_cast<int>(index % 4)) = number;
+        if (! ok) {
+            JS_FreeValue(context, components);
+            return std::nullopt;
+        }
+        matrix(static_cast<int>(index % 4), static_cast<int>(index / 4)) = number;
     }
+    JS_FreeValue(context, components);
     return matrix;
 }
 
@@ -7275,7 +7244,7 @@ JSValue NativeLayerCall(JSContext* context, JSValueConst, int argc, JSValueConst
     if (node == nullptr) return JS_UNDEFINED;
 
     if (command == "getTransformMatrix") {
-        return TransformMatrixToJS(context, ResolveLayerModelTransform(opaque, node));
+        return Matrix4ToJS(context, ResolveLayerModelTransform(opaque, node));
     }
 
     const auto* puppet = AdvanceNodePuppetForScriptQuery(opaque, node);
@@ -8851,6 +8820,17 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     JSContext* context = m_impl->runtime.context;
     JS_SetContextOpaque(context, m_impl);
 
+    // Install value classes before marshalling engine fields, input state or the first script's
+    // properties. Vector copy constructors distinguish actual Vec instances from ordinary
+    // objects, so native values must have their final script identity from their first exposure.
+    JSValue vector_prelude = JS_Eval(context,
+                                    kSceneScriptVectorPrelude.data(),
+                                    kSceneScriptVectorPrelude.size(),
+                                    "<scene-script-vectors>",
+                                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(vector_prelude)) LogQuickJSException(context, "vector-prelude");
+    JS_FreeValue(context, vector_prelude);
+
     if (determinism::FixedEpoch() || determinism::RandomSeed()) {
         // Install the pinned Date/performance/Math.random replacements before any wallpaper
         // script is compiled so every script observes the same built-ins from its first statement.
@@ -9144,8 +9124,10 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
                       m_impl->engine_base,
                       "userProperties",
                       JS_DupValue(context, m_impl->user_properties_object));
-    JS_SetPropertyStr(context, m_impl->engine_base, "canvasSize", JS_NewObject(context));
-    JS_SetPropertyStr(context, m_impl->engine_base, "screenResolution", JS_NewObject(context));
+    JS_SetPropertyStr(context, m_impl->engine_base, "canvasSize",
+                      NumericVectorToJS(context, { 0.0, 0.0 }));
+    JS_SetPropertyStr(context, m_impl->engine_base, "screenResolution",
+                      NumericVectorToJS(context, { 0.0, 0.0 }));
     JS_SetPropertyStr(
         context, m_impl->engine_base, "frametime", JS_NewFloat64(context, 1.0 / 60.0));
     JS_SetPropertyStr(context, m_impl->engine_base, "runtime", JS_NewFloat64(context, 0.0));
@@ -9162,8 +9144,10 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
         m_impl->engine_base,
         "registerAudioBuffers",
         JS_NewCFunction(context, NativeRegisterAudioBuffers, "registerAudioBuffers", 1));
-    JS_SetPropertyStr(context, m_impl->input, "cursorWorldPosition", JS_NewObject(context));
-    JS_SetPropertyStr(context, m_impl->input, "cursorScreenPosition", JS_NewObject(context));
+    JS_SetPropertyStr(context, m_impl->input, "cursorWorldPosition",
+                      NumericVectorToJS(context, { 0.0, 0.0, 0.0 }));
+    JS_SetPropertyStr(context, m_impl->input, "cursorScreenPosition",
+                      NumericVectorToJS(context, { 0.0, 0.0 }));
     JS_SetPropertyStr(context, m_impl->input, "cursorLeftDown", JS_FALSE);
 
     auto set_vec2 = [context](JSValueConst object, double x, double y) {

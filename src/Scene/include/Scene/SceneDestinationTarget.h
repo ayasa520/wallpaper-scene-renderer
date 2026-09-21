@@ -31,7 +31,8 @@ std::string SceneDestinationRenderTargetBaseName(int32_t width, int32_t height,
 
 // With private output, slot zero is a newly created owner target; its stable name must never hit
 // the shared-name intern table and retain an earlier layout size. Slot one remains shared.
-// Replacing a private target invalidates its GPU resource explicitly.
+// Setup releases both previous slot references before creating the new pair. Last release ends
+// named-allocation eligibility immediately; retained sampler descriptors do not count as hits.
 std::array<std::string, 2> ResolveSceneDestinationRenderTargets(
     Scene& scene, int32_t layer_id, int32_t parent_id, bool private_output,
     const SceneRenderTarget& target);

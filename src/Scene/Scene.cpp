@@ -692,6 +692,10 @@ void Scene::DestroySceneObject(int32_t layer_id) {
     auto it = sceneObjects.find(layer_id);
     if (it == sceneObjects.end()) return;
 
+    // Parent notifications may immediately acquire this owner's former destination name.
+    // Release its slots before hierarchy cleanup so that allocation observes the new lifetime.
+    ReleaseLayerDestinationTargets(layer_id);
+
     // Deletion ends one authored owner's lifetime. Its direct children become roots with their
     // existing local transforms and identities. Clear those bindings directly, without running
     // resource setup: calling SetLayerParentBinding for each child here would rebuild the dying
@@ -1185,13 +1189,16 @@ Eigen::Vector3f Scene::ResolveCameraLayerNodeTranslation(
 }
 
 double Scene::ResolveOrthographicCameraZoom() {
+    // Perspective scenes still use the shared orthographic camera for auxiliary draws. General
+    // zoom belongs to the orthographic scene projection and must not scale those consumers.
+    if (!cameraOrthographic) return 1.0;
     // Scene zoom and camera zoom are independent factors. Resolve the same effective layer
     // selection for immediate property updates and later framebuffer/aspect framing, so neither
     // consumer can replace the scene factor or discard the path sample. This is a read of the
     // current sample only: repeated projection work must never advance path playback.
     auto [layer_id, layer] = FindActiveCameraLayer(*this);
-    const double selected_zoom = !cameraOrthographic ? 1.0
-        : layer != nullptr ? layer->zoom : modelCameraPathEnabled ? cameraPathZoom : 1.0;
+    const double selected_zoom =
+        layer != nullptr ? layer->zoom : modelCameraPathEnabled ? cameraPathZoom : 1.0;
     return SanitizeCameraZoom(defaultGlobalCameraZoom * selected_zoom, layer_id);
 }
 

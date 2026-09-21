@@ -188,7 +188,7 @@ void SceneImageEffectLayer::QueueSetupClears(Scene& scene) const {
     for (const auto& effect : m_effects) effect->QueueSetupClears(scene);
 }
 
-void SceneImageEffectLayer::SetDestinationTargets(Scene& scene, std::string first_target,
+void SceneImageEffectLayer::SetDestinationTargets(std::string first_target,
                                                   std::string second_target) {
     // Re-layout selects shared images by extent and recreates a private slot under its owner
     // name, while the authored effect chain retains its input/output roles. Update both the
@@ -216,15 +216,6 @@ void SceneImageEffectLayer::SetDestinationTargets(Scene& scene, std::string firs
         for (auto& texture : m_final_composite.draw.Mesh()->Material()->textures) rebind(texture);
     }
     for (auto& name : m_runtime_render_target_names) rebind(name);
-    // Rebinding ends this owner's references to the old pair. Another owner, including a hidden
-    // one or a parent updated later in the same batch, may still select either name. Nominate the
-    // obsolete names here and let the completed graph's retained-owner census decide retirement.
-    // A private destination recreated under the same name remains the same logical resource.
-    for (const auto& previous : { m_pingpong_a, m_pingpong_b }) {
-        if (previous != first_target && previous != second_target) {
-            scene.pendingRenderTargetRetirementKeys.insert(previous);
-        }
-    }
     m_pingpong_a = std::move(first_target);
     m_pingpong_b = std::move(second_target);
 }
@@ -254,7 +245,7 @@ void SceneImageEffectLayer::RefreshDestinationTargets(
         DeclaredFinalOutputCapability() != FinalOutputCapability::SceneAuthoredWriter;
     const auto names = ResolveSceneDestinationRenderTargets(
         scene, m_owner.Id(), m_owner.ParentId(), private_output, target);
-    SetDestinationTargets(scene, names[0], names[1]);
+    SetDestinationTargets(names[0], names[1]);
     ResizeEffectRenderTargets(scene, { static_cast<float>(target.width),
                                        static_cast<float>(target.height) });
     scene.MarkRenderGraphTopologyDirty();

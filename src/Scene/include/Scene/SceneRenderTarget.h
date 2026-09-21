@@ -51,6 +51,10 @@ struct SceneRenderTarget {
     // A logical resize discards the old backing contents even when the divided size is unchanged.
     // Carry that decision into the allocation key instead of relying only on physical dimensions.
     uint64_t          allocation_revision { 0 };
+    // A destination can lose its final owning slot while a material still samples its image.
+    // Keep that sampling descriptor readable, but exclude it from named allocation hits: the
+    // next registration starts a new destination lifetime even at an identical extent.
+    bool              destination_released { false };
 
     static SceneRenderTarget FromReferenceExtent(std::array<i32, 2> extent, uint32_t divisor);
     bool ResizeReferenceExtent(std::array<i32, 2> extent);

@@ -139,6 +139,8 @@ public:
     const SceneObject* FindSceneObject(int32_t layer_id) const;
     SceneObject&       EnsureSceneObject(int32_t layer_id);
     void               DestroySceneObject(int32_t layer_id);
+    void RetainLayerDestinationTargets(int32_t layer_id, std::array<std::string, 2> targets);
+    void ReleaseLayerDestinationTargets(int32_t layer_id);
 
     // Resolve any draw handle to its owning authored layer id. The node id is the single
     // back-reference: layer handles carry their authored id from parse, drawing-phase nodes
@@ -343,9 +345,10 @@ public:
     // a candidate after it was queued. Named targets follow destination ownership separately.
     std::unordered_set<std::string>      pendingStaticTextureReleaseKeys;
     std::unordered_set<std::string>      pendingVideoTextureReleaseKeys;
-    // Destination replacement and owner removal retire the scene descriptor only after the
-    // final retained-owner census. GPU-only release requests below keep their descriptors for
-    // later reactivation, such as a disabled post-processing stage.
+    // The census releases images after their remaining sampling/command references end.
+    // Destination slots independently end named-allocation eligibility at their last release.
+    // Re-registering a released name queues its previous GPU allocation for replacement even
+    // when live material readers will consume the new descriptor during graph preparation.
     std::unordered_set<std::string>      pendingRenderTargetRetirementKeys;
     std::unordered_set<std::string>      pendingRenderTargetReleaseKeys;
     // Direct text rerastering changes pass-owned atlas and mesh resources without naming a
@@ -651,6 +654,11 @@ public:
 
 private:
     bool ApplyEffectLocalVisibility(SceneImageEffect& effect, bool visible);
+
+    // Count destination slots independently of pass/material readers. A setup operation drops
+    // both old slots before interning its replacements, including an unchanged shared name.
+    std::unordered_map<int32_t, std::array<std::string, 2>> m_layer_destination_targets;
+    std::unordered_map<std::string, std::size_t> m_destination_target_references;
 
     // Script/setup calls precede GPU work. Retain their ordered target references until an
     // actual submission acknowledges the recorded prefix, independently of owner visibility,

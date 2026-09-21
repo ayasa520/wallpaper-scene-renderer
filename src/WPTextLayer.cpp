@@ -2194,7 +2194,7 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
         render_contract.uses_private_dependency_bridge ||
             render_contract.uses_shader_color_blend_bridge,
         target);
-    effect_layer.SetDestinationTargets(scene, next_names[0], next_names[1]);
+    effect_layer.SetDestinationTargets(next_names[0], next_names[1]);
     bridge.pingpong_a = next_names[0];
     bridge.pingpong_b = next_names[1];
     // Shared named FBOs also rerun setup when this text's own extent is unchanged: another owner
