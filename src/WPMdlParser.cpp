@@ -67,32 +67,43 @@ std::optional<WPPuppet::TranslationSpring> ReadTranslationSpring(const nlohmann:
     };
 }
 
-std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json& config) {
-    if (!ReadJsonLiteralBoolean(config, "se", false) ||
+std::optional<WPPuppet::RotationSimulation> ReadRotationSimulation(const nlohmann::json& config) {
+    const bool rigid = ReadJsonLiteralBoolean(config, "re", false);
+    if ((!rigid && !ReadJsonLiteralBoolean(config, "se", false)) ||
         !ReadJsonLiteralBoolean(config, "r", false)) return std::nullopt;
-    // Ordinary rotation springs retain an angular velocity and a relative orientation.
-    // Rigid, combined translation/rotation, torque limits and axis locks require different
-    // state transitions. Gravity drives the tip response; angle limits constrain its pose.
-    for (const char* field : {"t", "re", "ik", "ikce", "lt",
+    // Spring and rigid rotation retain the same angular velocity and relative orientation.
+    // Rigid mode omits the spring's restoring force. Combined translation/rotation, torque
+    // limits and axis locks require different state transitions and remain separate modes.
+    for (const char* field : {"t", "ik", "ikce", "lt",
                               "tax", "tay", "taz", "rax", "ray", "raz"}) {
         if (ReadJsonLiteralBoolean(config, field, false)) {
-            LOG_INFO("puppet rotation spring has unsupported mode or constraint '%s'", field);
+            LOG_INFO("puppet rotation simulation has unsupported mode or constraint '%s'", field);
             return std::nullopt;
         }
     }
-    for (const char* field : {"rs", "rf", "ri"}) {
+    for (const char* field : {"rf", "ri"}) {
         const auto value = config.find(field);
         if (value == config.end() || !value->is_number() ||
             !std::isfinite(value->get<float>())) {
-            LOG_INFO("puppet rotation spring requires numeric parameter '%s'", field);
+            LOG_INFO("puppet rotation simulation requires numeric parameter '%s'", field);
             return std::nullopt;
         }
+    }
+    std::optional<float> restoring_stiffness;
+    if (!rigid) {
+        const auto stiffness = config.find("rs");
+        if (stiffness == config.end() || !stiffness->is_number() ||
+            !std::isfinite(stiffness->get<float>())) {
+            LOG_INFO("puppet rotation spring requires numeric parameter 'rs'");
+            return std::nullopt;
+        }
+        restoring_stiffness = stiffness->get<float>();
     }
     Eigen::Vector3f tip;
     const auto value = config.find("tp");
     if (value == config.end() || !ReadJsonFloatVectorValue(*value, {tip.data(), 3}) ||
         !tip.allFinite() || tip.squaredNorm() == 0.0f) {
-        LOG_INFO("puppet rotation spring requires a nonzero finite tip");
+        LOG_INFO("puppet rotation simulation requires a nonzero finite tip");
         return std::nullopt;
     }
     std::optional<WPPuppet::RotationLimits> limits;
@@ -104,7 +115,7 @@ std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json&
             !ReadJsonFloatVectorValue(*minimum, {bounds.minimum.data(), 3}) ||
             !ReadJsonFloatVectorValue(*maximum, {bounds.maximum.data(), 3}) ||
             !bounds.minimum.allFinite() || !bounds.maximum.allFinite()) {
-            LOG_INFO("puppet rotation spring requires finite angle limits");
+            LOG_INFO("puppet rotation simulation requires finite angle limits");
             return std::nullopt;
         }
         limits = bounds;
@@ -117,14 +128,14 @@ std::optional<WPPuppet::RotationSpring> ReadRotationSpring(const nlohmann::json&
         if (direction == config.end() || mass == config.end() || !mass->is_number() ||
             !ReadJsonFloatVectorValue(*direction, {parameters.direction.data(), 3}) ||
             !parameters.direction.allFinite() || !std::isfinite(mass->get<float>())) {
-            LOG_INFO("puppet rotation spring requires finite gravity direction and mass");
+            LOG_INFO("puppet rotation simulation requires finite gravity direction and mass");
             return std::nullopt;
         }
         parameters.mass = mass->get<float>();
         gravity = parameters;
     }
-    return WPPuppet::RotationSpring {
-        .stiffness = config["rs"].get<float>(),
+    return WPPuppet::RotationSimulation {
+        .restoring_stiffness = restoring_stiffness,
         .friction = config["rf"].get<float>(),
         .response = 1.0f - config["ri"].get<float>() / 100.0f,
         .tip = tip,
@@ -1635,7 +1646,7 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
         if (!simulation.empty() && PARSE_JSON(simulation, simulation_config) &&
             simulation_config.is_object()) {
             bone.translation_spring = ReadTranslationSpring(simulation_config);
-            bone.rotation_spring = ReadRotationSpring(simulation_config);
+            bone.rotation_simulation = ReadRotationSimulation(simulation_config);
         }
     }
 

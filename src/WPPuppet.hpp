@@ -82,8 +82,10 @@ public:
         Eigen::Vector3f direction;
         float mass;
     };
-    struct RotationSpring {
-        float stiffness;
+    struct RotationSimulation {
+        // Springs restore the relative orientation; rigid rotation retains it after motion
+        // settles. Both modes share tip response, angular limits and displayed-pose history.
+        std::optional<float> restoring_stiffness;
         float friction;
         float response;
         Eigen::Vector3f tip;
@@ -95,7 +97,7 @@ public:
         Eigen::Affine3f transform { Eigen::Affine3f::Identity() };
         uint32_t        parent { 0xFFFFFFFFu };
         std::optional<TranslationSpring> translation_spring;
-        std::optional<RotationSpring> rotation_spring;
+        std::optional<RotationSimulation> rotation_simulation;
 
         bool noParent() const { return parent == 0xFFFFFFFFu; }
         // prepared
@@ -275,7 +277,7 @@ private:
         Eigen::Vector3f previous_world_origin { Eigen::Vector3f::Zero() };
         bool initialized { false };
     };
-    struct RotationSpringState {
+    struct RotationSimulationState {
         Eigen::Quaternionf velocity { Eigen::Quaternionf::Identity() };
         Eigen::Vector3f angles { Eigen::Vector3f::Zero() };
         Eigen::Affine3f previous_world { Eigen::Affine3f::Identity() };
@@ -285,7 +287,7 @@ private:
         std::vector<Layer>               layers;
         std::vector<BoneOverride>        bone_overrides;
         std::vector<TranslationSpringState> translation_springs;
-        std::vector<RotationSpringState> rotation_springs;
+        std::vector<RotationSimulationState> rotation_simulations;
         std::shared_ptr<WPPuppet>        puppet;
         std::span<const Eigen::Affine3f> cached_skinning {};
         uint64_t cached_frame_serial { std::numeric_limits<uint64_t>::max() };
