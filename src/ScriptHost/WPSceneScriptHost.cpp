@@ -8849,9 +8849,9 @@ bool RunScriptInstanceInit(WPSceneScriptHost::Opaque* opaque, ScriptInstance& in
                 ApplyRegistrationValue(opaque, instance.registration, runtime_value);
             }
         }
-        if (! JS_IsException(result) && JS_IsUndefined(result)) {
-            ApplyRegistrationValue(opaque, instance.registration, instance.current_value);
-        }
+        // An undefined result does not replace the property. The init callback may have
+        // written its bound property directly, so reapplying the pre-call snapshot here
+        // would erase that write. FrameBegin reads the live property before the next update.
         JS_FreeValue(context, result);
         return true;
     }
