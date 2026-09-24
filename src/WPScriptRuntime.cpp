@@ -1,6 +1,7 @@
 #include "WPScriptRuntime.hpp"
 #include "WPScriptSource.hpp"
 #include "WPScriptVectors.hpp"
+#include "WPScriptMat3.hpp"
 
 #include <cmath>
 #include <sstream>
@@ -296,6 +297,7 @@ std::string BuildWrappedScript(std::string_view script_source) {
             << "  };\n"
             << "  const __mixScalar = (a, b, t) => __toNumber(a, 0) + (__toNumber(b, 0) - __toNumber(a, 0)) * __toNumber(t, 0);\n"
             << kSceneScriptVectorPrelude
+            << kSceneScriptMat3Prelude
             << "  const __wrapScriptValue = (value) => {\n"
             << "    if (value === undefined || value === null) return value;\n"
             << "    if (typeof value !== 'object') return value;\n"

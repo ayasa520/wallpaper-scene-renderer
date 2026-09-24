@@ -39,6 +39,7 @@
 #include "WPImageAlignment.hpp"
 #include "WPSceneParser.hpp"
 #include "WPSceneScriptMedia.hpp"
+#include "WPScriptMat3.hpp"
 #include "WPScriptSource.hpp"
 #include "WPScriptVectors.hpp"
 #include "WPSyntheticImageParser.hpp"
@@ -819,30 +820,6 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "          return Math.atan2(y, x) * WEMath.rad2deg;\n"
         << "        }\n"
         << "      });\n"
-        << "  const Mat3 = (typeof globalThis.Mat3 === 'function')\n"
-        << "    ? globalThis.Mat3 : (globalThis.Mat3 = class Mat3 {\n"
-        << "    constructor(value) {\n"
-        << "      if (value instanceof Mat3) this.m = value.m.slice();\n"
-        << "      else if (Array.isArray(value) && value.length === 9) this.m = value.slice();\n"
-        << "      else {\n"
-        << "        const parsed = typeof value === 'string' ? value.split(' ').map(parseFloat) : [];\n"
-        << "        this.m = parsed.length === 9 ? parsed : [1,0,0, 0,1,0, 0,0,1];\n"
-        << "      }\n"
-        << "    }\n"
-        // Texture-space query results retain column-major storage and the shared Mat3 prototype.
-        // Accessors return independent vectors; a translation write mutates only the last column.
-        << "    translation(position) {\n"
-        << "      if (position instanceof Vec2) {\n"
-        << "        this.m[6] = position.x; this.m[7] = position.y; return this;\n"
-        << "      }\n"
-        << "      return new Vec2(this.m[6], this.m[7]);\n"
-        << "    }\n"
-        << "    transformPoint(point) {\n"
-        << "      const m = this.m;\n"
-        << "      return new Vec2(m[0]*point.x + m[3]*point.y + m[6],\n"
-        << "                      m[1]*point.x + m[4]*point.y + m[7]);\n"
-        << "    }\n"
-        << "  });\n"
         << "  const Mat4 = (typeof globalThis.Mat4 === 'function')\n"
         << "    ? globalThis.Mat4\n"
         << "    : (globalThis.Mat4 = class Mat4 {\n"
@@ -8924,6 +8901,16 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
                                     JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(vector_prelude)) LogQuickJSException(context, "vector-prelude");
     JS_FreeValue(context, vector_prelude);
+
+    // Install the shared matrix type once per realm, before compiling callbacks or creating
+    // native query results. Its methods must remain independent of any one layer's closure.
+    JSValue matrix_prelude = JS_Eval(context,
+                                    kSceneScriptMat3Prelude.data(),
+                                    kSceneScriptMat3Prelude.size(),
+                                    "<scene-script-mat3>",
+                                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(matrix_prelude)) LogQuickJSException(context, "matrix-prelude");
+    JS_FreeValue(context, matrix_prelude);
 
     if (determinism::FixedEpoch() || determinism::RandomSeed()) {
         // Install the pinned Date/performance/Math.random replacements before any wallpaper
