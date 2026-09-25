@@ -40,20 +40,22 @@ VkBool32 DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT     
                                      VkDebugUtilsMessageTypeFlagsEXT             messageType,
                                      const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
                                      void*                                       pUserData) {
-    VkBool32 result = VK_FALSE;
+    // Application callbacks observe validation messages. VK_TRUE is reserved for layer
+    // development and can abort the Vulkan call that reported the problem. The shared
+    // synchronous logger preserves diagnostics across abrupt process exit; keep the
+    // severity-specific message prefixes used by the capture collector.
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        result |= VK_TRUE;
         ++g_validation_error_count;
 
-        std::printf("validation layer: %s\n", pCallbackData->pMessage);
+        SPDLOG_LOGGER_ERROR(WallpaperLogger(), "validation layer: {}", pCallbackData->pMessage);
     } else if (ValidationRequested() &&
                messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         // Warnings are only surfaced when the layer was explicitly requested; without it the
         // loader emits none and the counter stays zero.
         ++g_validation_warning_count;
-        std::printf("validation layer warning: %s\n", pCallbackData->pMessage);
+        SPDLOG_LOGGER_WARN(WallpaperLogger(), "validation layer warning: {}", pCallbackData->pMessage);
     }
-    return result;
+    return VK_FALSE;
 }
 
 vvk::DebugUtilsMessenger SetupDebugCallback(vvk::Instance& instance) {
