@@ -364,6 +364,11 @@ WPPuppet::Animation::getInterpolationInfo(double* cur_time) const {
 
     if (mode == PlayMode::Loop) {
         genInterpolationInfo(_info, _cur_time, (u32)length, frame_time, max_time);
+        // Loop tracks store one terminal pose beyond their frame intervals. The final
+        // interval interpolates toward that authored pose, which can differ from frame
+        // zero. Time wraps only after the interval finishes; wrapping the second sample
+        // early would discard the terminal pose and alter the last part of the motion.
+        _info.frame_b = _info.frame_a + 1;
     } else if (mode == PlayMode::Single) {
         // Clamp single-shot layers to the authored end frame so click-triggered animations
         // stay on their last pose instead of wrapping back to the start pose.
