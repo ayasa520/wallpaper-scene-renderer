@@ -1,5 +1,6 @@
 #include "RenderTargetOps.hpp"
 
+#include "Msaa.hpp"
 #include "Resource.hpp"
 #include "Utils/Logging.h"
 #include "Vulkan/Device.hpp"
@@ -17,16 +18,16 @@ std::optional<VmaImageParameters> CreateSceneDepthImage(const Device& device, Vk
     VkImageCreateInfo info {
         .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType             = VK_IMAGE_TYPE_2D,
-        .format                = VK_FORMAT_D32_SFLOAT,
+        .format                = ModelDepthAttachment::format,
         .extent                = extent,
         .mipLevels             = 1,
         .arrayLayers           = 1,
         .samples               = samples,
         .tiling                = VK_IMAGE_TILING_OPTIMAL,
-        // Scene depth is both an attachment and a source for depth-sampling consumers. Keep
-        // transfer access for stage clears and the existing volumetric depth resolve path.
+        // Scene depth is an attachment and a sampled input. Transfer destination access is
+        // needed for the stage's far-depth clear; multisample resolves use attachments.
         .usage                 = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -43,7 +44,7 @@ std::optional<VmaImageParameters> CreateSceneDepthImage(const Device& device, Vk
         .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image    = *image.handle,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format   = VK_FORMAT_D32_SFLOAT,
+        .format   = ModelDepthAttachment::format,
         .subresourceRange = VkImageSubresourceRange {
             .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
             .baseMipLevel = 0,
@@ -91,20 +92,24 @@ VmaImageParameters* AcquireSceneDepthImage(const Device& device, RenderingResour
                      replacement->extent.width, replacement->extent.height,
                      replacement->extent.depth, replacement->samples);
         }
+        // Its framebuffer holds the old source view as well as the resolved view.
+        // Destroy that dependency before replacing either image allocation.
+        attachment.resolve.reset();
         depth = std::move(replacement.value());
         attachment.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        rr.model_depth_resolved.erase(key);
-        rr.model_depth_dirty.erase(key);
+        attachment.resolve_dirty = false;
     }
-    if (samples > VK_SAMPLE_COUNT_1_BIT) {
-        auto& resolved = rr.model_depth_resolved[key];
-        const bool res_missing = !resolved.view || !resolved.handle;
-        const bool res_wrong_size = resolved.extent.width != extent.width ||
-                                    resolved.extent.height != extent.height;
-        if (res_missing || res_wrong_size) {
-            auto replacement = CreateSceneDepthImage(device, extent, VK_SAMPLE_COUNT_1_BIT);
-            if (replacement.has_value()) resolved = std::move(replacement.value());
+    if (samples > VK_SAMPLE_COUNT_1_BIT && !attachment.resolve.has_value()) {
+        auto replacement = CreateSceneDepthImage(device, extent, VK_SAMPLE_COUNT_1_BIT);
+        if (!replacement.has_value()) {
+            LOG_ERROR("SceneDepthResolve: cannot create output='%s' extent=[%u,%u]",
+                      key.c_str(), extent.width, extent.height);
+            return nullptr;
         }
+        ModelDepthResolve resolved;
+        resolved.image = std::move(replacement.value());
+        if (!CreateModelDepthResolve(device, depth, resolved)) return nullptr;
+        attachment.resolve.emplace(std::move(resolved));
     }
     return &depth;
 }
@@ -215,7 +220,7 @@ SceneDepthAction PrepareSceneModelDepth(RenderingResources& rr, std::string_view
         cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, depth_stages, 0, after);
         // A stage clear writes depth even if every model is hidden. Its sampling
         // consumer must not reuse a resolved image from a preceding visible frame.
-        if (image.samples > 1) rr.model_depth_dirty.insert(it->first);
+        if (image.samples > 1) attachment.resolve_dirty = true;
     }
     attachment.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     return clear ? SceneDepthAction::Cleared : SceneDepthAction::LayoutInitialized;

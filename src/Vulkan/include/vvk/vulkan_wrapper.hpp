@@ -143,6 +143,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCreatePipelineLayout                vkCreatePipelineLayout {};
     PFN_vkCreateQueryPool                     vkCreateQueryPool {};
     PFN_vkCreateRenderPass                    vkCreateRenderPass {};
+    PFN_vkCreateRenderPass2KHR                vkCreateRenderPass2KHR {};
     PFN_vkCreateSampler                       vkCreateSampler {};
     PFN_vkCreateSemaphore                     vkCreateSemaphore {};
     PFN_vkCreateShaderModule                  vkCreateShaderModule {};
@@ -539,6 +540,7 @@ public:
                                     Pipeline&) const noexcept;
 
     VkResult CreateRenderPass(const VkRenderPassCreateInfo& ci, RenderPass&) const noexcept;
+    VkResult CreateRenderPass2KHR(const VkRenderPassCreateInfo2& ci, RenderPass&) const noexcept;
 
     VkResult CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci,
                                   PipelineLayout&) const noexcept;

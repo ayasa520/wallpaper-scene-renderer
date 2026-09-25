@@ -137,97 +137,139 @@ bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingRes
     return true;
 }
 
+bool CreateModelDepthResolve(const Device& device, const VmaImageParameters& source,
+                             ModelDepthResolve& resolve) {
+    // Resolve a completed scene depth attachment without redrawing the scene. LOAD/STORE
+    // preserve its samples for later depth users; the single-sample destination is fully
+    // replaced and ends ready for sampling. SAMPLE_ZERO is required by the depth-resolve
+    // extension and retains an actual depth value instead of averaging unrelated surfaces.
+    const std::array attachments {
+        VkAttachmentDescription2 {
+            .sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+            .format         = ModelDepthAttachment::format,
+            .samples        = static_cast<VkSampleCountFlagBits>(source.samples),
+            .loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        },
+        VkAttachmentDescription2 {
+            .sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+            .format         = ModelDepthAttachment::format,
+            .samples        = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+    };
+    const VkAttachmentReference2 source_ref {
+        .sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+        .attachment = 0,
+        .layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+    };
+    const VkAttachmentReference2 resolve_ref {
+        .sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+        .attachment = 1,
+        .layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+    };
+    const VkSubpassDescriptionDepthStencilResolve depth_resolve {
+        .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+        .depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+        .stencilResolveMode = VK_RESOLVE_MODE_NONE,
+        .pDepthStencilResolveAttachment = &resolve_ref,
+    };
+    const VkSubpassDescription2 subpass {
+        .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+        .pNext = &depth_resolve,
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .pDepthStencilAttachment = &source_ref,
+    };
+
+    // Fixed-function depth resolves execute at COLOR_ATTACHMENT_OUTPUT and use color
+    // attachment access masks, while depth LOAD/STORE use fragment-test stages. Include
+    // both scopes. Discarding the destination's contents does not discard earlier shader
+    // reads: those must finish before the resolve overwrites it. This dependency is global,
+    // since the depth consumer samples a full-size image into a smaller lighting target.
+    const VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    const VkPipelineStageFlags resolve_stages = depth_stages |
+                                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    const VkAccessFlags depth_access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    const VkAccessFlags resolve_access = depth_access | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    const std::array dependencies {
+        VkSubpassDependency2 {
+            .sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = resolve_stages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            .dstStageMask = resolve_stages,
+            .srcAccessMask = depth_access | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = resolve_access,
+        },
+        VkSubpassDependency2 {
+            .sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+            .srcSubpass = 0,
+            .dstSubpass = VK_SUBPASS_EXTERNAL,
+            .srcStageMask = resolve_stages,
+            .dstStageMask = depth_stages | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = resolve_access,
+            .dstAccessMask = depth_access | VK_ACCESS_SHADER_READ_BIT,
+        },
+    };
+    const VkRenderPassCreateInfo2 pass_info {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
+        .attachmentCount = static_cast<uint32_t>(attachments.size()),
+        .pAttachments = attachments.data(),
+        .subpassCount = 1,
+        .pSubpasses = &subpass,
+        .dependencyCount = static_cast<uint32_t>(dependencies.size()),
+        .pDependencies = dependencies.data(),
+    };
+    VVK_CHECK_BOOL_RE(device.handle().CreateRenderPass2KHR(pass_info, resolve.pass));
+
+    const std::array views { *source.view, *resolve.image.view };
+    const VkFramebufferCreateInfo framebuffer_info {
+        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = *resolve.pass,
+        .attachmentCount = static_cast<uint32_t>(views.size()),
+        .pAttachments = views.data(),
+        .width = source.extent.width,
+        .height = source.extent.height,
+        .layers = 1,
+    };
+    VVK_CHECK_BOOL_RE(device.handle().CreateFramebuffer(framebuffer_info, resolve.framebuffer));
+    return true;
+}
+
 bool ResolveModelDepthIfNeeded(RenderingResources& rr, std::string_view output) {
-    const auto dirty_it = rr.model_depth_dirty.find(std::string(output));
-    if (dirty_it == rr.model_depth_dirty.end()) return false;
+    const auto it = rr.model_depth_images.find(std::string(output));
+    if (it == rr.model_depth_images.end()) return false;
+    auto& attachment = it->second;
+    if (!attachment.resolve_dirty || !attachment.resolve.has_value()) return false;
 
-    const auto src_it = rr.model_depth_images.find(std::string(output));
-    const auto dst_it = rr.model_depth_resolved.find(std::string(output));
-    if (src_it == rr.model_depth_images.end() || dst_it == rr.model_depth_resolved.end() ||
-        ! src_it->second.image.handle || ! dst_it->second.handle || src_it->second.image.samples <= 1) {
-        rr.model_depth_dirty.erase(dirty_it);
-        return false;
-    }
-
-    auto& src = src_it->second.image;
-    auto& dst = dst_it->second;
-    auto& cmd = rr.command;
-
-    VkImageSubresourceRange range {
-        .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
-        .baseMipLevel   = 0,
-        .levelCount     = 1,
-        .baseArrayLayer = 0,
-        .layerCount     = 1,
+    const auto& resolve = *attachment.resolve;
+    const VkRenderPassBeginInfo begin {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = *resolve.pass,
+        .framebuffer = *resolve.framebuffer,
+        .renderArea = { { 0, 0 }, { attachment.image.extent.width, attachment.image.extent.height } },
     };
-    VkImageMemoryBarrier to_transfer[2] {
-        {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .image            = *src.handle,
-            .subresourceRange = range,
-        },
-        {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = 0,
-            .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            // The resolve overwrites the full extent; prior contents are irrelevant.
-            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .image            = *dst.handle,
-            .subresourceRange = range,
-        },
-    };
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        {},
-                        {},
-                        std::array { to_transfer[0], to_transfer[1] });
-    VkImageResolve region {
-        .srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-        .dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-        .extent         = src.extent,
-    };
-    std::array<VkImageResolve, 1> regions { region };
-    cmd.ResolveImage(*src.handle,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     *dst.handle,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     regions);
-    VkImageMemoryBarrier after[2] {
-        {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
-            .dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            .image            = *src.handle,
-            .subresourceRange = range,
-        },
-        {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .image            = *dst.handle,
-            .subresourceRange = range,
-        },
-    };
-    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                        VK_DEPENDENCY_BY_REGION_BIT,
-                        {},
-                        {},
-                        std::array { after[0], after[1] });
-
-    rr.model_depth_dirty.erase(std::string(output));
+    rr.command.BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
+    rr.command.EndRenderPass();
+    const auto command = TraceRenderCommand(rr, "depth-resolve", "recorded", output, resolve.image);
+    TraceRenderCommandInput(rr, command, "resolve-source", output, attachment.image, true);
+    attachment.resolve_dirty = false;
     return true;
 }
 

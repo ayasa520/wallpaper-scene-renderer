@@ -66,6 +66,10 @@ constexpr std::array base_device_exts {
     // be enabled explicitly (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     Extension { false, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME },
     Extension { false, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME },
+    // Vulkan 1.1 exposes depth attachment resolves through these two extensions.
+    // The scene-depth consumer requires their SAMPLE_ZERO resolve mode.
+    Extension { true, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME },
+    Extension { true, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME },
     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },
@@ -493,10 +497,16 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
         image.sampler.abandon();
         image.view.abandon();
         image.handle.abandon();
+        if (attachment.resolve.has_value()) {
+            auto& resolve = *attachment.resolve;
+            resolve.framebuffer.abandon();
+            resolve.pass.abandon();
+            resolve.image.sampler.abandon();
+            resolve.image.view.abandon();
+            resolve.image.handle.abandon();
+        }
     }
     m_rendering_resources.model_depth_images.clear();
-    m_rendering_resources.model_depth_resolved.clear();
-    m_rendering_resources.model_depth_dirty.clear();
     m_rendering_resources.masked_draw_attachments.abandon();
     if (m_rendering_resources.pipeline_cache) {
         m_rendering_resources.pipeline_cache->abandon();
@@ -545,8 +555,6 @@ void VulkanRender::Impl::destroy() {
         }
         m_rendering_resources.pipeline_cache.reset();
         m_rendering_resources.model_depth_images.clear();
-        m_rendering_resources.model_depth_resolved.clear();
-        m_rendering_resources.model_depth_dirty.clear();
         m_rendering_resources.masked_draw_attachments.clear();
         m_rendering_resources.immutable_meshes.clear();
         m_vertex_buf->destroy();
@@ -1461,8 +1469,6 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     // full graph rebuilds keeps 3D model depth opt-in and avoids stale depth attachments surviving
     // after scene topology or render-target ownership changes.
     m_rendering_resources.model_depth_images.clear();
-    m_rendering_resources.model_depth_resolved.clear();
-    m_rendering_resources.model_depth_dirty.clear();
     m_rendering_resources.masked_draw_attachments.clear();
     if (clear_scene_caches) {
         // Scene switches drop GPU file meshes. Ordinary topology rebuilds keep them: the host
@@ -1601,8 +1607,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     if (msaa_samples != m_compiled_msaa_samples) {
         dropCompiledPassFramebuffers();
         m_rendering_resources.model_depth_images.clear();
-        m_rendering_resources.model_depth_resolved.clear();
-        m_rendering_resources.model_depth_dirty.clear();
         m_rendering_resources.masked_draw_attachments.clear();
         m_compiled_msaa_samples = msaa_samples;
     }

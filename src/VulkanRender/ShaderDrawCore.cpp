@@ -2156,7 +2156,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // the single-sample copy once on demand (ResolveModelDepthIfNeeded); resolving here would
         // pay one full-extent depth resolve per model chunk pass, which dominates the frame on
         // model-heavy scenes.
-        rr.model_depth_dirty.insert(m_desc.output);
+        rr.model_depth_images.at(m_desc.output).resolve_dirty = true;
     }
     // Temporary render targets may only be returned to TextureCache after the pass has actually
     // consumed them in the recorded frame. Releasing during prepare/resource-refresh is unsafe:

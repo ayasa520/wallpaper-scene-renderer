@@ -124,6 +124,7 @@ bool Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCreatePipelineLayout);
     X(vkCreateQueryPool);
     X(vkCreateRenderPass);
+    X(vkCreateRenderPass2KHR);
     X(vkCreateSampler);
     X(vkCreateSemaphore);
     X(vkCreateShaderModule);
@@ -370,6 +371,14 @@ VkResult Device::CreateRenderPass(const VkRenderPassCreateInfo& ci,
                                   RenderPass&                   pass) const noexcept {
     VkRenderPass object;
     VkResult     res = dld->vkCreateRenderPass(handle, &ci, nullptr, &object);
+    if (res == VK_SUCCESS) pass = RenderPass(object, handle, *dld);
+    return res;
+}
+
+VkResult Device::CreateRenderPass2KHR(const VkRenderPassCreateInfo2& ci,
+                                      RenderPass& pass) const noexcept {
+    VkRenderPass object;
+    VkResult res = dld->vkCreateRenderPass2KHR(handle, &ci, nullptr, &object);
     if (res == VK_SUCCESS) pass = RenderPass(object, handle, *dld);
     return res;
 }

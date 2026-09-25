@@ -75,9 +75,12 @@ inline bool ShaderDrawCanUseMsaa(const Scene& scene, std::string_view output,
 }
 
 struct RenderingResources;
+struct ModelDepthResolve;
 
 void NoteComposeMsaaDraw(RenderingResources& rr, VkSampleCountFlagBits samples);
 bool ResolveComposeMsaaIfNeeded(Scene& scene, const Device& device, RenderingResources& rr);
+bool CreateModelDepthResolve(const Device& device, const VmaImageParameters& source,
+                             ModelDepthResolve& resolve);
 // Model draws mark the shared multisampled depth dirty; the depth-sampling consumer calls this
 // once to materialize the single-sample copy before reading it.
 bool ResolveModelDepthIfNeeded(RenderingResources& rr, std::string_view output);

@@ -3,6 +3,7 @@
 #include "Core/ArrayHelper.hpp"
 #include "Msaa.hpp"
 #include "PassCommon.hpp"
+#include "RenderCommandTrace.hpp"
 #include "Resource.hpp"
 #include "SpecTexs.hpp"
 #include "Utils/Logging.h"
@@ -322,14 +323,17 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
     ResolveModelDepthIfNeeded(rr, m_desc.scene_output);
 
     VmaImageParameters* depth_image = nullptr;
-    if (auto resolved = rr.model_depth_resolved.find(m_desc.scene_output);
-        resolved != rr.model_depth_resolved.end() && resolved->second.handle &&
-        resolved->second.view) {
-        depth_image = &resolved->second;
-    } else if (auto raw = rr.model_depth_images.find(m_desc.scene_output);
-               raw != rr.model_depth_images.end() && raw->second.image.handle &&
-               raw->second.image.view && raw->second.image.samples <= 1) {
-        depth_image = &raw->second.image;
+    bool from_resolved = false;
+    if (auto it = rr.model_depth_images.find(m_desc.scene_output);
+        it != rr.model_depth_images.end()) {
+        auto& attachment = it->second;
+        if (attachment.resolve.has_value()) {
+            depth_image = &attachment.resolve->image;
+            from_resolved = true;
+        } else if (attachment.image.handle && attachment.image.view &&
+                   attachment.image.samples <= 1) {
+            depth_image = &attachment.image;
+        }
     }
     if (depth_image == nullptr) {
         // No model wrote scene depth this frame: expose an all-far (0) limit depth.
@@ -342,11 +346,6 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
     }
 
     auto& depth = *depth_image;
-    bool  from_resolved = false;
-    if (auto it = rr.model_depth_resolved.find(m_desc.scene_output);
-        it != rr.model_depth_resolved.end() && &it->second == depth_image) {
-        from_resolved = true;
-    }
     VkImageSubresourceRange depth_range {
         .aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT,
         .baseMipLevel   = 0,
@@ -415,6 +414,9 @@ void VolumetricsSingleFillPass::execute(const Device& device, RenderingResources
     rr.command.BindVertexBuffers(0, 1, &gpu, &off);
     rr.command.Draw(4, 1, 0, 0);
     rr.command.EndRenderPass();
+    const auto command = TraceRenderCommand(rr, "depth-sample", "recorded", m_desc.dst,
+                                            m_desc.vk_dst, 0, false, 4);
+    TraceRenderCommandInput(rr, command, "scene-depth", m_desc.scene_output, depth, true);
 
     VkImageMemoryBarrier depth_restore {
         .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,

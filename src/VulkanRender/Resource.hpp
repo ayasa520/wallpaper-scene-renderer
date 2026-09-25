@@ -9,9 +9,9 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace wallpaper
 {
@@ -20,12 +20,28 @@ class Scene;
 namespace vulkan
 {
 
+struct ModelDepthResolve {
+    // Member order releases the framebuffer before its render pass and resolved image view.
+    VmaImageParameters image;
+    vvk::RenderPass pass;
+    vvk::Framebuffer framebuffer;
+};
+
 struct ModelDepthAttachment {
+    static constexpr VkFormat format = VK_FORMAT_D32_SFLOAT;
+
     VmaImageParameters image;
     // Clearing is optional scene behavior; layout initialization is a Vulkan resource
     // lifetime requirement. Keep it with the allocation so a resize or sample-count
     // change resets the state, without inventing a first-frame content clear.
     VkImageLayout layout { VK_IMAGE_LAYOUT_UNDEFINED };
+    // The resolve framebuffer references both this source and its single-sample image. Keep
+    // them in one allocation generation so graph teardown destroys the framebuffer before
+    // either view. Replacement also resets resolve explicitly before replacing the source.
+    std::optional<ModelDepthResolve> resolve;
+    // Draws and clears mark depth dirty; the sampling consumer resolves once on demand,
+    // independently of the number of model chunks that wrote this destination.
+    bool resolve_dirty { false };
 };
 
 struct MipHistoryState {
@@ -75,11 +91,6 @@ struct RenderingResources {
     // Depth storage belongs to that destination, not to a particular material or visible owner.
     // Ordinary effect FBOs remain color-only; masked meshes own separate stencil attachments.
     std::unordered_map<std::string, ModelDepthAttachment> model_depth_images;
-    std::unordered_map<std::string, VmaImageParameters> model_depth_resolved;
-    // Outputs whose multisampled model depth has been written since the last single-sample
-    // resolve. Model draws only mark this; the depth-sampling consumer resolves once on demand,
-    // so a frame with hundreds of model chunks does not pay one full-extent resolve per chunk.
-    std::unordered_set<std::string> model_depth_dirty;
 
     MaskedDrawAttachmentCache masked_draw_attachments;
 };
