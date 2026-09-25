@@ -154,6 +154,21 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
     }
     length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w); }
     normalize() { return this.divide(this.length()); }
+    // Interpolation owns its result, leaving both endpoints and the weight vector available
+    // for later material updates. Evaluate each component in JavaScript number space; the
+    // host applies its numeric storage conversion only when the result reaches a property.
+    mix(other, amount) {
+      if (typeof amount === 'number') {
+        return new Vec4(this.x + (other.x - this.x) * amount,
+                        this.y + (other.y - this.y) * amount,
+                        this.z + (other.z - this.z) * amount,
+                        this.w + (other.w - this.w) * amount);
+      }
+      return new Vec4(this.x + (other.x - this.x) * amount.x,
+                      this.y + (other.y - this.y) * amount.y,
+                      this.z + (other.z - this.z) * amount.z,
+                      this.w + (other.w - this.w) * amount.w);
+    }
     toString() { return this.x + ' ' + this.y + ' ' + this.z + ' ' + this.w; }
     toConfigString() { return this.toString(); }
   });
