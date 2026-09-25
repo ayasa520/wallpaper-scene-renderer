@@ -8107,22 +8107,25 @@ JSValue NativeAnimationLayerCall(JSContext* context, JSValueConst, int argc, JSV
     }
     if (command == "setFrame") {
         if (argc < 4) return JS_UNDEFINED;
-        int32_t frame = 0;
-        if (JS_ToInt32(context, &frame, argv[3]) == 0) {
-            // Frame seeks are a visible pose write, so every duplicate puppet copy must land on the
-            // same authored frame before the next render tick samples its skinning matrices.
+        double requested_frame = 0.0;
+        if (JS_ToFloat64(context, &requested_frame, argv[3]) == 0) {
+            // A frame argument is a float position, so percentage-based seeks must retain the
+            // fraction used to interpolate between stored poses. Frame seeks are a visible pose
+            // write: every duplicate puppet copy must reach that same position before the next
+            // render tick samples its skinning matrices.
+            const auto frame = static_cast<float>(requested_frame);
             std::size_t applied = 0;
             for (auto* target_node : target_nodes) {
                 auto [target_layer, target_animation] = find_target_state(target_node);
                 if (target_layer == nullptr || target_animation == nullptr) continue;
                 const auto clamped_frame =
-                    std::clamp(frame, 0, std::max(target_animation->length - 1, 0));
+                    std::clamp(frame, 0.0f, static_cast<float>(std::max(target_animation->length - 1, 0)));
                 target_layer->cur_time =
                     target_animation->frame_time * static_cast<double>(clamped_frame);
                 applied++;
             }
             LOG_INFO("SceneAnimationLayerCall: layer=%d animation-index=%zu command='setFrame' "
-                     "frame=%d targets=%zu applied=%zu",
+                     "frame=%g targets=%zu applied=%zu",
                      node_id,
                      static_cast<size_t>(index),
                      frame,
