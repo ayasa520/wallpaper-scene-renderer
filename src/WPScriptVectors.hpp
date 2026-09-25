@@ -152,6 +152,7 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
       }
       return new Vec4(this.x / value.x, this.y / value.y, this.z / value.z, this.w / value.w);
     }
+    dot(value) { return this.x * value.x + this.y * value.y + this.z * value.z + this.w * value.w; }
     length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w); }
     normalize() { return this.divide(this.length()); }
     // Interpolation owns its result, leaving both endpoints and the weight vector available
