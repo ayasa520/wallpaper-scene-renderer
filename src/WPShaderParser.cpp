@@ -1825,11 +1825,6 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                             combos[name] = "1";
                         }
                     }
-                    if (defines.back()[0] != 'g') {
-                        LOG_INFO("PreShaderSrc User shadervalue not supported: %s %s",
-                                 defines.back().c_str(),
-                                 sv_json.dump().c_str());
-                    }
                 }
             }
         }
