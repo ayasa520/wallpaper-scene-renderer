@@ -86,6 +86,22 @@ public:
             if (! m_curActive) return 0;
             frameReads = m_curActive->NextPcmData(pData, frameCount);
         }
+        if (m_config.mode == PlaybackMode::Loop) {
+            // A loop boundary can occur inside a device callback. Continue with the next
+            // authored source in the remaining output span instead of padding each iteration
+            // to a callback boundary. Otherwise the callback size inserts silence into every
+            // repeat. Single and random playback keep their separate end/delay behavior.
+            while (frameReads > 0 && frameReads < frameCount) {
+                Switch();
+                if (! m_curActive) break;
+                auto* next_output = static_cast<float*>(pData) + frameReads * m_desc.channels;
+                const auto remaining = frameCount - static_cast<uint32_t>(frameReads);
+                const auto next_reads = m_curActive->NextPcmData(next_output, remaining);
+                // An empty next source makes no progress; do not spin inside the audio callback.
+                if (next_reads == 0) break;
+                frameReads += next_reads;
+            }
+        }
         if (frameReads < frameCount) {
             // The mixer consumes a fixed-size scratch buffer regardless of how many frames the
             // decoder returned.  Clearing the unread tail prevents stale samples after short
