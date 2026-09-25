@@ -81,7 +81,14 @@ std::string PkgLookupKey(std::string_view path) {
 
 bool LoadPkgFilesFromCache(std::string_view pkgpath, const PkgFileStamp& stamp, std::string& version,
                            std::vector<CachePkgFile>& files) {
-    auto cache_file = CreateCBinaryStream(GetPkgCachePath(pkgpath).string());
+    const auto cache_path = GetPkgCachePath(pkgpath);
+    std::error_code ec;
+    // The index is optional on first package load. Its absence is a normal miss, so do not
+    // send a missing path to the mandatory-file opener. Existing paths and metadata errors
+    // still reach that opener, preserving diagnostics for actual I/O failures.
+    if (! std::filesystem::exists(cache_path, ec) && ! ec) return false;
+
+    auto cache_file = CreateCBinaryStream(cache_path.string());
     if (! cache_file) return false;
 
     if (ReadVersion("WPKG", *cache_file) != 1) return false;
