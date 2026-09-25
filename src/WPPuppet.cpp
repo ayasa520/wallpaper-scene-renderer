@@ -123,14 +123,20 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         const Affine3f parent =
             (bone.noParent() || bone.parent >= i) ? Affine3f::Identity() : m_final_affines[bone.parent];
 
-        Vector3f trans { bone.transform.translation() };
-        Vector3f scale;
+        // Keep the local bind pose immutable while layers accumulate their contributions.
+        // Every additive layer measures its offset from this pose, even after an earlier
+        // layer has changed the current position, rotation or scale.
+        const Vector3f bind_trans { bone.transform.translation() };
+        Vector3f bind_scale;
         Matrix3f bind_rotation = bone.transform.linear();
         for (Eigen::Index axis = 0; axis < 3; ++axis) {
-            scale[axis] = bind_rotation.col(axis).norm();
-            bind_rotation.col(axis) /= scale[axis];
+            bind_scale[axis] = bind_rotation.col(axis).norm();
+            bind_rotation.col(axis) /= bind_scale[axis];
         }
-        Quaterniond quat { bind_rotation.cast<double>() };
+        const Quaterniond bind_quat { bind_rotation.cast<double>() };
+        Vector3f trans = bind_trans;
+        Vector3f scale = bind_scale;
+        Quaterniond quat = bind_quat;
         const Quaterniond ident { Quaterniond::Identity() };
 
         for (auto& layer : runtime.layers) {
@@ -146,7 +152,6 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
             if (!track.enabled) continue;
 
             auto&  info       = layer.interp_info;
-            auto&  frame_base = track.frames[(usize)0];
             auto&  frame_a    = track.frames[(usize)info.frame_a];
             auto&  frame_b    = track.frames[(usize)info.frame_b];
 
@@ -158,10 +163,10 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
 
             // The animation-layer additive flag is stored separately from blend. Later
             // non-additive layers attenuate earlier poses, while additive layers contribute only
-            // the delta from frame zero. Applying layers in authored order is the same
-            // composition: a normal layer interpolates toward its absolute pose and an additive
-            // layer contributes only its delta. Treating every full-weight layer as additive
-            // sums several complete locomotion rotations and twists articulated models.
+            // the delta from the local bind pose. A clip's first frame can already contain an
+            // authored offset, so using it as the reference would remove that offset throughout
+            // playback. Apply layers in authored order: normal layers interpolate toward their
+            // absolute pose and additive layers preserve the accumulated pose plus their delta.
             if (! alayer.additive) {
                 trans = trans * static_cast<float>(1.0 - blend) +
                         sampled_trans * static_cast<float>(blend);
@@ -171,10 +176,10 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
                 continue;
             }
 
-            trans += static_cast<float>(blend) * (sampled_trans - frame_base.position);
-            scale += static_cast<float>(blend) * (sampled_scale - frame_base.scale);
+            trans += static_cast<float>(blend) * (sampled_trans - bind_trans);
+            scale += static_cast<float>(blend) * (sampled_scale - bind_scale);
             const Quaterniond rotation_delta =
-                sampled_quat * frame_base.quaternion.conjugate();
+                sampled_quat * bind_quat.conjugate();
             quat *= ident.slerp(blend, rotation_delta);
         }
         affine.pretranslate(trans);
