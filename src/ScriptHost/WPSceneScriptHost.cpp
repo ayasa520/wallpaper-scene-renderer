@@ -40,6 +40,7 @@
 #include "WPSceneParser.hpp"
 #include "WPSceneScriptMedia.hpp"
 #include "WPScriptMat3.hpp"
+#include "WPScriptMat4.hpp"
 #include "WPScriptSource.hpp"
 #include "WPScriptVectors.hpp"
 #include "WPSyntheticImageParser.hpp"
@@ -818,30 +819,6 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "        vectorAngle2(direction) {\n"
         << "          const [x, y] = __vecValues(direction, 2);\n"
         << "          return Math.atan2(y, x) * WEMath.rad2deg;\n"
-        << "        }\n"
-        << "      });\n"
-        << "  const Mat4 = (typeof globalThis.Mat4 === 'function')\n"
-        << "    ? globalThis.Mat4\n"
-        << "    : (globalThis.Mat4 = class Mat4 {\n"
-        << "        constructor(value) {\n"
-        << "          if (value instanceof Mat4) this.m = value.m.slice();\n"
-        << "          else if (Array.isArray(value) && value.length === 16) this.m = value.slice();\n"
-        << "          else {\n"
-        << "            const parsed = typeof value === 'string' ? value.split(' ').map(parseFloat) : [];\n"
-        << "            this.m = parsed.length === 16 ? parsed : Array.from({ length: 16 }, (_, i) => i % 5 === 0 ? 1 : 0);\n"
-        << "          }\n"
-        << "        }\n"
-        // All native matrix APIs exchange a Mat4 with independent column-major storage in .m.
-        // Translation reads return a separate vector; vector writes preserve the matrix identity
-        // for chaining. Other argument types select the getter without changing the matrix.
-        << "        translation(position) {\n"
-        << "          if (position instanceof Vec3 || position instanceof Vec2) {\n"
-        << "            this.m[12] = position.x;\n"
-        << "            this.m[13] = position.y;\n"
-        << "            this.m[14] = position instanceof Vec3 ? position.z : 0;\n"
-        << "            return this;\n"
-        << "          }\n"
-        << "          return new Vec3(this.m[12], this.m[13], this.m[14]);\n"
         << "        }\n"
         << "      });\n"
         << "  const localStorage = {\n"
@@ -8908,7 +8885,7 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     if (JS_IsException(vector_prelude)) LogQuickJSException(context, "vector-prelude");
     JS_FreeValue(context, vector_prelude);
 
-    // Install the shared matrix type once per realm, before compiling callbacks or creating
+    // Install the shared matrix types once per realm, before compiling callbacks or creating
     // native query results. Its methods must remain independent of any one layer's closure.
     JSValue matrix_prelude = JS_Eval(context,
                                     kSceneScriptMat3Prelude.data(),
@@ -8917,6 +8894,14 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
                                     JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(matrix_prelude)) LogQuickJSException(context, "matrix-prelude");
     JS_FreeValue(context, matrix_prelude);
+
+    JSValue matrix4_prelude = JS_Eval(context,
+                                     kSceneScriptMat4Prelude.data(),
+                                     kSceneScriptMat4Prelude.size(),
+                                     "<scene-script-mat4>",
+                                     JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(matrix4_prelude)) LogQuickJSException(context, "matrix4-prelude");
+    JS_FreeValue(context, matrix4_prelude);
 
     if (determinism::FixedEpoch() || determinism::RandomSeed()) {
         // Install the pinned Date/performance/Math.random replacements before any wallpaper
