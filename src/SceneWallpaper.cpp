@@ -1227,11 +1227,14 @@ void MainHandler::loadScene() {
              m_user_properties.size(),
              DescribeUserPropertyForLog(m_user_properties, "hrbigb2").c_str());
 
+    // Muted scenes can mount sound streams before an audio device exists. Retire every
+    // outgoing stream before replacing its scene-owned asset filesystem; otherwise a later
+    // unmute can make the device read a stream whose asset owner has already been destroyed.
+    // Device readiness controls initialization, independently of scene sound ownership.
+    m_sound_manager->UnMountAll();
     if (! m_sound_manager->IsInited()) {
         m_sound_manager->Init();
         m_sound_manager->Play();
-    } else {
-        m_sound_manager->UnMountAll();
     }
 
     std::shared_ptr<Scene> scene { nullptr };
