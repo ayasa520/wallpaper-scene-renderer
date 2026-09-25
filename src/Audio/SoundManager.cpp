@@ -5,6 +5,7 @@
 #include "Utils/Logging.h"
 
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 
 using namespace wallpaper;
@@ -52,7 +53,8 @@ public:
             }
             return 0;
         }
-        // Read controls after acquiring the first-frame publication. The mixer's earlier
+        std::lock_guard<std::mutex> lock { m_stream_mutex };
+        // Read controls after acquiring both publication and stream ownership. The mixer's earlier
         // IsPlaying() snapshot may precede an initialization script's stop or pause; using
         // that snapshot here would let one decoded buffer escape after publication.
         if (!m_playing || m_ended) return 0;
@@ -61,6 +63,7 @@ public:
         return frames_read;
     }
     void PassDeviceDesc(const miniaudio::DeviceDesc& desc) override {
+        std::lock_guard<std::mutex> lock { m_stream_mutex };
         m_ss->PassDesc(ToSSDesc(desc));
     }
     bool IsPlaying() const override { return m_playing && !m_ended; }
@@ -69,6 +72,7 @@ public:
     float Volume() const override { return m_volume; }
 
     void Play() {
+        std::lock_guard<std::mutex> lock { m_stream_mutex };
         if (m_ended) {
             m_ss->Reset();
             m_ended = false;
@@ -79,6 +83,7 @@ public:
     void Pause() { m_playing = false; }
 
     void Stop() {
+        std::lock_guard<std::mutex> lock { m_stream_mutex };
         m_ss->Reset();
         m_playing = false;
         m_ended = false;
@@ -96,6 +101,12 @@ public:
     }
 
 private:
+    // A stream reset may destroy its active decoder. Keep decoder reads, format updates,
+    // resets and EOF publication in one critical section so script controls cannot invalidate
+    // an in-flight read or have that read overwrite a completed stop/restart with stale EOF.
+    // The device callback/initialization path takes its channel-list lock before this lock. Script
+    // controls take only this lock and never enter the device, preserving that lock order.
+    std::mutex                  m_stream_mutex;
     miniaudio::DeviceDesc        m_desc;
     std::unique_ptr<SoundStream> m_ss;
     std::shared_ptr<ScenePlaybackState> m_playback;
