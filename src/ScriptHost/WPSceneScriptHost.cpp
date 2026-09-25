@@ -8118,8 +8118,11 @@ JSValue NativeAnimationLayerCall(JSContext* context, JSValueConst, int argc, JSV
             for (auto* target_node : target_nodes) {
                 auto [target_layer, target_animation] = find_target_state(target_node);
                 if (target_layer == nullptr || target_animation == nullptr) continue;
-                const auto clamped_frame =
-                    std::clamp(frame, 0.0f, static_cast<float>(std::max(target_animation->length - 1, 0)));
+                // Clip length counts frame intervals. The last interval starts at length - 1,
+                // so using that pose index as the seek limit discards valid fractional
+                // positions. Preserve the full interval and let the sampler apply its mode.
+                const auto clamped_frame = std::clamp(
+                    frame, 0.0f, static_cast<float>(std::max(target_animation->length, 0)));
                 target_layer->cur_time =
                     target_animation->frame_time * static_cast<double>(clamped_frame);
                 applied++;
