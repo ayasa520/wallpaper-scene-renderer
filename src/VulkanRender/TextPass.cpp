@@ -542,7 +542,7 @@ bool TextPass::recreateFramebuffer(const Device& device, RenderingResources& rr)
         .layers          = 1,
     };
     const bool created = device.handle().CreateFramebuffer(info, m_desc.framebuffer) == VK_SUCCESS;
-    if (created && std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+    if (created && wallpaper::diagnostics::Options().trace_depth_attachments) {
         LOG_INFO("SceneTextDepthFramebuffer: layer=%d output='%s' framebuffer=%p "
                  "color-view=%p depth-view=%p shared-depth=%s glyph-test=%s extent=%ux%u samples=%u",
                  m_desc.layer_id, m_desc.output.c_str(), reinterpret_cast<void*>(*m_desc.framebuffer),
@@ -593,7 +593,7 @@ bool TextPass::ensureMeshBuffers(SceneMesh& mesh, MeshBuffers& buffers, Renderin
     const auto revision = mesh.DataRevision();
     const bool needs_upload = revision != buffers.uploaded_revision || buffers.force_upload;
     if (!needs_upload && mesh.Dirty().load() &&
-        std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
+        wallpaper::diagnostics::Options().trace_mesh_uploads) {
         // A rebuilt glyph page can reuse this allocation without increasing its byte capacity.
         // Record rejected CPU updates at that boundary so revision identity errors can be
         // distinguished from missing atlas data or a failed GPU upload.
@@ -633,7 +633,7 @@ bool TextPass::ensureMeshBuffers(SceneMesh& mesh, MeshBuffers& buffers, Renderin
     mesh.Dirty().store(false);
     buffers.uploaded_revision = revision;
     buffers.force_upload = false;
-    if (std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_mesh_uploads) {
         LOG_INFO("SceneTextMeshUpload: layer=%d output='%s' reflection=%s revision=%llu",
                  m_desc.layer_id, m_desc.output.c_str(),
                  m_desc.reflection_pass ? "true" : "false",
@@ -845,7 +845,7 @@ void TextPass::updateBeforeUpload() {
     if (primitive == nullptr || (!node->Visible() && !m_desc.execute_when_hidden)) return;
     auto& rr = *m_resources;
     const bool hdr_color = m_desc.scene->UsesHdrMaterials();
-    const bool trace_revision = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr &&
+    const bool trace_revision = wallpaper::diagnostics::Options().trace_text_destination &&
         m_traced_atlas_version != primitive->atlas_version;
 
     // Upload ranges are recorded before execute(). Stage every current uniform and refreshed
@@ -981,8 +981,8 @@ void TextPass::execute(const Device&, RenderingResources& rr) {
 
     // Log the first actual draw of each layout revision when investigating disappearing text.
     // Preparation alone cannot establish that an atlas, target and transform reached a draw.
-    static const bool trace_destination = std::getenv("WESCENE_TRACE_TEXT_DESTINATION") != nullptr;
-    static const bool trace_background = std::getenv("WESCENE_TRACE_TEXT_BACKGROUND") != nullptr;
+    const bool trace_destination = wallpaper::diagnostics::Options().trace_text_destination;
+    const bool trace_background = wallpaper::diagnostics::Options().trace_text_background;
     const bool trace_revision = trace_destination &&
         m_traced_atlas_version != primitive->atlas_version;
 
@@ -1043,7 +1043,7 @@ void TextPass::execute(const Device&, RenderingResources& rr) {
                      (*primitive->direct_background_depth_test ? "enabled" : "disabled"),
                  primitive->object.backgroundbrightness, hdr_color ? "true" : "false");
     }
-    if (m_desc.private_source && std::getenv("WESCENE_TRACE_TEXT_SOURCE") != nullptr) {
+    if (m_desc.private_source && wallpaper::diagnostics::Options().trace_text_source) {
         LOG_INFO("SceneTextSourceInit: layer=%d output='%s' reflection=%s mode=%s "
                  "image=%p extent=%ux%u atlas=%u pages=%zu",
                  m_desc.layer_id, m_desc.output.c_str(), m_desc.reflection_pass ? "true" : "false",
@@ -1120,7 +1120,7 @@ void TextPass::execute(const Device&, RenderingResources& rr) {
             TraceRenderCommandInput(rr, command, "sampler",
                 background ? "background" : "glyph-atlas", texture.getActive(), true, 1);
         }
-        if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_text_depth) {
             // Record the submitted consumer, not just the owner property's readback. Including
             // attachment and pipeline identity distinguishes live state replacement from atlas
             // refresh and proves that main/reflection draws retain their destination's storage.

@@ -5,20 +5,25 @@
 #include "Utils/Logging.h"
 #include "Vulkan/Parameters.hpp"
 
-#include <cstdlib>
 #include <string_view>
 
 namespace wallpaper::vulkan
 {
 
 // Command diagnostics have two sinks that share one command numbering: the human-readable log
-// (WESCENE_TRACE_RENDER_COMMANDS) and the structural per-draw JSON dump (FrameTraceDump). Either
+// and the structural per-draw JSON dump (FrameTraceDump). Either
 // one being active is enough to number commands and collect their inputs and uniforms.
+inline bool RenderCommandLogActive(const RenderingResources& rr) {
+    return wallpaper::diagnostics::Enabled && rr.trace_render_commands;
+}
+
 inline bool RenderCommandTraceActive(const RenderingResources& rr) {
-    return rr.trace_render_commands || rr.frame_trace_dump.active();
+    return wallpaper::diagnostics::Enabled &&
+        (rr.trace_render_commands || rr.frame_trace_dump.active());
 }
 
 inline void TraceRenderCommandFrame(const RenderingResources& rr, const char* phase) {
+    if constexpr (!wallpaper::diagnostics::Enabled) return;
     if (!rr.trace_render_commands) return;
     LOG_INFO("SceneRenderCommandFrame: frame=%llu time=%.6f phase=%s commands=%llu "
              "renderer=%p scene=%p",
@@ -28,9 +33,10 @@ inline void TraceRenderCommandFrame(const RenderingResources& rr, const char* ph
 }
 
 inline void BeginRenderCommandTrace(RenderingResources& rr) {
+    if constexpr (!wallpaper::diagnostics::Enabled) return;
     ++rr.draw_index;
     rr.frame_trace_dump.beginFrame(rr.draw_index, rr.scene ? rr.scene->elapsingTime : 0.0);
-    rr.trace_render_commands = std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr;
+    rr.trace_render_commands = wallpaper::diagnostics::Options().trace_render_commands;
     if (!RenderCommandTraceActive(rr)) return;
     ++rr.trace_render_frame;
     rr.trace_render_command = 0;
@@ -44,6 +50,7 @@ inline void BeginRenderCommandTrace(RenderingResources& rr) {
 // per-frame footer beyond the "submitted" phase record.
 inline void EndRenderCommandTrace(RenderingResources& rr, uint32_t output_width,
                                   uint32_t output_height, size_t tracked_images) {
+    if constexpr (!wallpaper::diagnostics::Enabled) return;
     TraceRenderCommandFrame(rr, "submitted");
     rr.frame_trace_dump.finishFrame("submitted", output_width, output_height, tracked_images);
 }

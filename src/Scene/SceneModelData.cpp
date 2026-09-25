@@ -245,7 +245,7 @@ bool ApplyShapePayload(SceneModelData::Shape& shape, const SceneModelShapeUpdate
 std::span<const SceneModelVertexAttribute> ModelVertexAttributes() { return kAttributes; }
 
 SceneModelData::~SceneModelData() {
-    if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_model_data) {
         LOG_INFO("SceneModelDataRelease: token=%u shapes=%zu", m_token, m_shapes.size());
     }
 }
@@ -386,7 +386,7 @@ uint32_t SceneModelDataRegistry::Register(std::shared_ptr<SceneModelData> data) 
     const auto token = static_cast<uint32_t>(m_next_token++);
     data->m_token = token;
     m_entries.emplace(token, Entry { data, data });
-    if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_model_data) {
         LOG_INFO("SceneModelDataCreate: token=%u shapes=%zu", token, data->Shapes().size());
     }
     return token;
@@ -401,7 +401,7 @@ bool SceneModelDataRegistry::Release(uint32_t token) {
     const auto found = m_entries.find(token);
     if (found == m_entries.end() || ! found->second.script_reference) return false;
     found->second.script_reference.reset();
-    if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_model_data) {
         LOG_INFO("SceneModelDataDestroy: token=%u retained=%s", token,
                  found->second.resource.expired() ? "false" : "true");
     }

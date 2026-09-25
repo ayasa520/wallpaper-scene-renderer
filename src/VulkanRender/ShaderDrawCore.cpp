@@ -678,7 +678,7 @@ ShaderDrawRenderState wallpaper::vulkan::BuildShaderDrawRenderState(
     ApplyAlphaWritePolicy(desc.alpha_write_policy, writes_alpha, state.color_blend);
     desc.blending = state.color_blend.blendEnable;
 
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         // Capture both persistent and effective values at pipeline construction. Uniform readback
         // alone cannot show whether a scoped owner override reached the actual raster pipeline.
         LOG_INFO("SceneMaterialRasterState: layer=%d node='%s' material='%s' output='%s' "
@@ -708,7 +708,7 @@ ShaderDrawRenderState wallpaper::vulkan::BuildShaderDrawRenderState(
         // target: DONT_CARE would discard the previous alpha before the write mask preserves it.
         state.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
     }
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         LOG_INFO("SceneMaterialAlphaState: layer=%d node='%s' material='%s' output='%s' "
                  "stored-alpha=%d destination-override=%s coverage-policy=%d writes-alpha=%s "
                  "mask=%u color-load=%d",
@@ -730,7 +730,7 @@ void wallpaper::vulkan::ApplyShaderDrawMaterialPipelineState(const wallpaper::Sc
     // The reflected destination and projection-Y inversion cancel under the top-down viewport;
     // neither reflection nor an authored owner scale rewrites the material's front-face rule.
     pipeline.raster.cullMode = ToVkCullMode(material.cullMode);
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         LOG_INFO("SceneMaterialCullState: layer=%d node='%s' material='%s' output='%s' "
                  "stored-cull=%d cull=%u front-face=%u model=%s reflection-raster=%s",
                  desc.layer_id, desc.draw.Valid() ? desc.draw.Name().c_str() : "",
@@ -749,7 +749,7 @@ void wallpaper::vulkan::ApplyShaderDrawMaterialPipelineState(const wallpaper::Sc
     pipeline.depth.depthCompareOp        = VK_COMPARE_OP_GREATER;
     pipeline.depth.depthBoundsTestEnable = false;
     pipeline.depth.stencilTestEnable     = false;
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         LOG_INFO("SceneMaterialDepthState: layer=%d node='%s' material='%s' output='%s' "
                  "stored-test=%s stored-write=%s override-test=%d override-write=%d "
                  "resolved-scene-color=%s shared-depth=%s effective-test=%s effective-write=%s clear=%s",
@@ -1032,7 +1032,7 @@ bool RecreateCustomShaderPassFramebuffer(const Device& device, RenderingResource
         .layers          = 1,
     };
     const bool created = device.handle().CreateFramebuffer(info, desc.fb) == VK_SUCCESS;
-    if (created && std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+    if (created && wallpaper::diagnostics::Options().trace_depth_attachments) {
         LOG_INFO("SceneDepthFramebuffer: layer=%d node='%s' output='%s' framebuffer=%p "
                  "color-view=%p depth-view=%p resolved-scene-color=%s shared-depth=%s "
                  "extent=%ux%u samples=%u",
@@ -1181,7 +1181,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         }
     }
     const auto render_state = BuildShaderDrawRenderState(*mesh.Material(), m_desc);
-    if (const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+    if (const char* trace_layer = wallpaper::diagnostics::Options().transform_layer;
         trace_layer != nullptr && std::to_string(m_desc.layer_id) == trace_layer) {
         const auto& blend = render_state.color_blend;
         LOG_INFO("SceneShaderDrawPrepare: layer=%d node='%s' output='%s' count=%u "
@@ -1289,6 +1289,9 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             auto&       index_buf        = m_desc.index_buf;
             auto&       force_dyn_upload = m_desc.force_dyn_upload;
             auto&       uploaded_revision = m_desc.uploaded_mesh_revision;
+            // The callback already refers to pass-owned storage. Read diagnostic names from
+            // that same descriptor when logging instead of copying strings into the closure;
+            // compiled-out INFO calls must not leave string allocations during preparation.
             update_dyn_buf_op                = [&mesh,
                                                 &vertex_bufs,
                                                 &draw_count,
@@ -1296,10 +1299,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                                                 dyn_buf,
                                                 &force_dyn_upload,
                                                 &uploaded_revision,
-                                                layer_id = m_desc.layer_id,
-                                                node_name = m_desc.draw.Name(),
-                                                output = m_desc.output,
-                                                reflection_pass = m_desc.reflection_pass]() {
+                                                &desc = m_desc]() {
                 const auto revision = mesh.DataRevision();
                 const bool bootstrap_upload = force_dyn_upload;
                 const bool needs_upload = revision != uploaded_revision || bootstrap_upload;
@@ -1438,12 +1438,12 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     mesh.Dirty().store(false);
                     uploaded_revision = revision;
                     force_dyn_upload = false;
-                    if (std::getenv("WESCENE_TRACE_MESH_UPLOADS") != nullptr) {
+                    if (wallpaper::diagnostics::Options().trace_mesh_uploads) {
                         LOG_INFO("SceneMeshUpload: layer=%d output='%s' reflection=%s "
                                  "revision=%llu draw-count=%u node='%s' bootstrap=%s",
-                                 layer_id, output.c_str(), reflection_pass ? "true" : "false",
+                                 desc.layer_id, desc.output.c_str(), desc.reflection_pass ? "true" : "false",
                                  static_cast<unsigned long long>(revision), draw_count,
-                                 node_name.c_str(), bootstrap_upload ? "true" : "false");
+                                 desc.draw.Name().c_str(), bootstrap_upload ? "true" : "false");
                     }
                 }
             };
@@ -1485,14 +1485,7 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
              effect_snapshot_camera = m_desc.effect_snapshot_camera,
              uniform_writes = &m_trace_uniform_writes,
              textures = &m_desc.textures]() {
-                // Uniform writes are collected for the log (both trace variables set) and for
-                // the structural frame dump whenever a dump directory is configured; the dump
-                // decides per draw whether it consumes them.
-                const bool trace_uniforms =
-                    (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr &&
-                     std::getenv("WESCENE_TRACE_RENDER_UNIFORMS") != nullptr) ||
-                    FrameTraceDump::Configured();
-                uniform_writes->clear();
+                const auto trace_uniforms = uniform_writes->beginUpdate();
                 auto update_unf_op = [block, buf, bufref, extension, trace_uniforms, uniform_writes](
                                          std::string_view name, wallpaper::ShaderValue value) {
                     if (block) UpdateShaderDrawUniform(buf, *bufref, *block, name, value);
@@ -1503,8 +1496,8 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                             // Extension-only uniforms use separate buffers and cannot establish
                             // what this draw consumed. Keep reflected and packed sizes distinct
                             // so compact matrices and strided arrays retain their upload meaning.
-                            uniform_writes->push_back({std::string(name), value,
-                                member->second.offset, member->second.size});
+                            uniform_writes->record(name, value,
+                                member->second.offset, member->second.size);
                         }
                     }
                     if (extension != nullptr) extension->updateUniform(buf, name, value);
@@ -1822,8 +1815,8 @@ void ShaderDrawCore::updateBeforeUpload() {
 }
 
 void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
-    const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
-    const char* trace_target = std::getenv("WESCENE_TRACE_RENDER_TARGET");
+    const char* trace_layer = wallpaper::diagnostics::Options().transform_layer;
+    const char* trace_target = wallpaper::diagnostics::Options().render_target;
     // A named target can connect otherwise unrelated owners. Select both its producer and
     // consumers in the same process so the trace can compare actual GPU image identities,
     // execution gates and ordering without changing the render graph or reading pixels.
@@ -1834,6 +1827,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
                 m_desc.textures.end()));
     if (trace_draw) ++m_trace_draw_sequence;
     const auto trace_result = [&](const char* result) {
+        if constexpr (!wallpaper::diagnostics::Enabled) return;
         if (RenderCommandTraceActive(rr)) {
             const bool recorded_draw = std::string_view(result) == "draw" && m_desc.draw_count > 0;
             const auto command = TraceRenderCommand(rr, "shader", result, m_desc.output,
@@ -1876,7 +1870,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // checkpoints. This opt-in keeps the existing layer/target filter and adds the
         // scene clock so resource generations can be matched to SceneMediaDispatch.
         const bool trace_every_frame = rr.trace_render_commands ||
-            std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr;
+            wallpaper::diagnostics::Options().trace_draw_every_frame;
         if (!trace_draw || (!trace_every_frame && m_trace_draw_sequence != 1 &&
                             m_trace_draw_sequence != 121 && m_trace_draw_sequence != 601)) return;
         LOG_INFO("SceneShaderDrawExecute: sequence=%llu time=%.6f layer=%d node='%s' result=%s "
@@ -1897,7 +1891,7 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
                      m_desc.vk_tex_binding[index], static_cast<unsigned>(slots.active),
                      reinterpret_cast<void*>(input.handle), input.extent.width, input.extent.height);
         }
-        if (const char* trace_uniform = std::getenv("WESCENE_TRACE_MATERIAL_UNIFORM");
+        if (const char* trace_uniform = wallpaper::diagnostics::Options().material_uniform;
             trace_uniform != nullptr && m_desc.draw.Mesh() != nullptr) {
             const auto& material = *m_desc.draw.Mesh()->Material();
             const auto log_value = [&](const auto& values, const char* source) {

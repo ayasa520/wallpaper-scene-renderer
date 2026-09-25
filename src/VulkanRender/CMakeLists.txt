@@ -15,7 +15,6 @@ MaskedDrawRenderer.cpp
 MaskedDrawShaderContract.cpp
 MaskedMeshPass.cpp
 FinPass.cpp
-FrameTraceDump.cpp
 Msaa.cpp
 PrePass.cpp
 RenderTargetOps.cpp
@@ -24,6 +23,10 @@ TextPass.cpp
 VulkanPass.cpp
 VulkanRender.cpp
 )
+
+target_sources(${LIB_NAME} PRIVATE
+    "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/FrameTraceDump.cpp>"
+    "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/GpuPassProfiler.cpp>")
 
 target_link_libraries(${LIB_NAME}
 PRIVATE

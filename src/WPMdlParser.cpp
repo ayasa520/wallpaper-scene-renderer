@@ -2081,7 +2081,7 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
         append(v.texcoord);
         vertex.SetVertexs(i, one_vert);
     }
-    if (std::getenv("WESCENE_TRACE_PUPPET_VERTEX_INPUT") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_puppet_vertex_input) {
         float max_position_delta = 0.0f;
         for (const auto& v : mdl.vertexs) {
             const Eigen::Vector3f delta = Eigen::Vector3f(v.prelighting_position.data()) -
@@ -2175,7 +2175,7 @@ void WPMdlParser::GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl) {
                      static_cast<unsigned long long>(group.identity),
                      static_cast<int>(group.blend), group.inverted ? "true" : "false",
                      group.coverageGroups.size() - 1);
-            if (std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr) {
+            if (wallpaper::diagnostics::Options().trace_masked_draw) {
                 for (size_t step = 0; step < group.coverageGroups.size(); ++step) {
                     LOG_INFO("masked draw ancestry: group=%zu step=%zu source-group=%u",
                              group_index, step, group.coverageGroups[step]);

@@ -3878,7 +3878,7 @@ JSValue ApplyMaterialRasterEnum(JSContext* context, JSValueConst value,
         // schedule a refresh when the scene has no other pending resource changes.
         scene.MarkRenderGraphTopologyDirty();
     }
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         LOG_INFO("%s: layer=%d effect-index=%d material-index=%d "
                  "material='%s' previous='%s' value='%s' changed=%s topology-dirty=%s",
                  trace_event, layer_id, effect_index, material_index, material->name.c_str(),
@@ -4410,7 +4410,7 @@ bool InstanceReceivesCursor(const WPSceneScriptHost::Opaque* opaque, const Scrip
     const double cursor_y = clip != nullptr ? cursor.ndc_y : cursor.world_y;
     const bool hit = cursor_x >= (*bounds)[0] && cursor_x <= (*bounds)[2] &&
                      cursor_y >= (*bounds)[1] && cursor_y <= (*bounds)[3];
-    if (is_model && std::getenv("WESCENE_TRACE_MODEL_INPUT") != nullptr) {
+    if (is_model && wallpaper::diagnostics::Options().trace_model_input) {
         LOG_INFO("SceneModelCursorBounds: layer=%d perspective=%s cursor=[%.6f %.6f] "
                  "bounds=[%.6f %.6f %.6f %.6f] hit=%s",
                  layer_id, owner->ModelPerspective() ? "true" : "false", cursor_x, cursor_y,
@@ -4875,7 +4875,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id
         const bool applied = property_name == "color" ? value.tryGet(&modulation->color)
             : property_name == "alpha" ? value.tryGet(&modulation->alpha)
                                        : value.tryGet(&modulation->brightness);
-        if (applied && std::getenv("WESCENE_TRACE_SHAPE_STATE") != nullptr) {
+        if (applied && wallpaper::diagnostics::Options().trace_shape_state) {
             LOG_INFO("SceneShapeOwnerProperty: layer=%d property='%.*s' value=%s "
                      "material-controls=unchanged",
                      layer_id, static_cast<int>(property_name.size()), property_name.data(),
@@ -4916,7 +4916,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id
         auto& size = object->ImageRuntimeState()->size;
         const auto old_size = size;
         size = new_size;
-        if (std::getenv("WESCENE_TRACE_SHAPE_STATE") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_shape_state) {
             LOG_INFO("SceneShapeOwnerSize: layer=%d old=[%.6f %.6f] "
                      "stored=[%.6f %.6f] accepted=true materialized=%s "
                      "geometry=retained resources-dirty=%s topology-dirty=%s",
@@ -5143,7 +5143,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, int32_t layer_id
                 if (property_name == "intensity") {
                     float intensity = 0.0f;
                     if (! value.tryGet(&intensity)) return false;
-                    if (std::getenv("WESCENE_TRACE_VOLUMETRICS") != nullptr) {
+                    if (wallpaper::diagnostics::Options().trace_volumetrics) {
                         LOG_INFO("SceneLightIntensityApply: layer=%d elapsed=%.6f "
                                  "intensity=%.6f targets=%zu",
                                  layer_id, opaque->scene->elapsingTime,
@@ -5842,7 +5842,9 @@ JSValue NativeConsoleLog(JSContext* context, JSValueConst, int argc, JSValueCons
         message += text;
         JS_FreeCString(context, text);
     }
-    LOG_INFO("SceneScript log: %s", message.c_str());
+    // Authored console output is part of the script API, independently of renderer tracing.
+    // Keep both the observable argument conversions above and the completed message in release.
+    WallpaperLog(LOGLEVEL_INFO, "", 0, "SceneScript log: %s", message.c_str());
     return JS_UNDEFINED;
 }
 
@@ -5935,7 +5937,7 @@ JSValue ApplyTextLayerDepthTest(JSContext* context, WPSceneScriptHost::Opaque* o
     if (changed && ! ApplyTextLayerPropertyValue(opaque, layer_id, "depthtest", next)) {
         return JS_FALSE;
     }
-    if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_text_depth) {
         LOG_INFO("SceneTextDepthApply: layer=%d previous=%s value=%s changed=%s topology-dirty=%s",
                  layer_id, current->describe().c_str(), next.describe().c_str(),
                  changed ? "true" : "false",
@@ -6420,7 +6422,7 @@ JSValue WriteMaterialProperty(JSContext* context, WPSceneScriptHost::Opaque* opa
     // still be unset during an initial property callback; these values must neither become zero
     // nor enter scalar/component conversion. Keep the same rule for handles and script owners.
     if (JS_IsNull(js_value) || JS_IsUndefined(js_value)) {
-        if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_material_types) {
             LOG_INFO("SceneMaterialUniformNoop: layer=%d property='%s' uniform='%s' "
                      "value-type=%s reason=nullish-value",
                      layer_id, property_name.c_str(), uniform_name.c_str(),
@@ -9772,7 +9774,7 @@ void WPSceneScriptHost::ApplyMediaState(const WPSceneScriptMediaState& media_sta
         ? media_state.playback_state != 0
         : previous.playback_state != media_state.playback_state;
 
-    const bool trace_media = std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr;
+    const bool trace_media = wallpaper::diagnostics::Options().trace_media_state;
     if (trace_media &&
         (initial_dispatch || thumbnail_changed || properties_changed || playback_changed)) {
         // Correlate received media snapshots with the scene clock and the actual draw trace.

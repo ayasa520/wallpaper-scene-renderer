@@ -79,7 +79,7 @@ VmaImageParameters* AcquireSceneDepthImage(const Device& device, RenderingResour
                       key.c_str(), extent.width, extent.height, static_cast<unsigned>(samples));
             return nullptr;
         }
-        if (std::getenv("WESCENE_TRACE_DEPTH_ATTACHMENTS") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_depth_attachments) {
             LOG_INFO("SceneDepthAttachmentAllocate: output='%s' "
                      "old-image=%p old-view=%p old-extent=%ux%ux%u old-samples=%u "
                      "new-image=%p new-view=%p new-extent=%ux%ux%u new-samples=%u",

@@ -1,5 +1,6 @@
 #include "WPMaterial.h"
 #include "WPEffectInput.hpp"
+#include "Utils/Diagnostics.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -64,7 +65,7 @@ void ReadMaterialEnum(const nlohmann::json& json, std::string_view name,
 }
 
 void TraceMaterialRenderState(const nlohmann::json& json, const WPMaterial& material) {
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") == nullptr) return;
+    if (!wallpaper::diagnostics::Options().trace_material_state) return;
 
     // Keep raw entry types and omitted keys visible next to the selected material state.
     // The draw trace records effective owner state separately, including depth-write changes
@@ -136,7 +137,7 @@ bool WPMaterial::FromJson(const nlohmann::json& json, const nlohmann::json& pass
     // owner preparation can add program state such as skinning or direct shape drawing.
     const auto jContent = pass_override.is_object() ? MergeMaterialPassInput(base, pass_override)
                                                     : base;
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         LOG_INFO("SceneMaterialPassInput: base=%s override=%s resolved=%s",
                  base.dump().c_str(), pass_override.dump().c_str(), jContent.dump().c_str());
     }

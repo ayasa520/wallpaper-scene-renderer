@@ -26,6 +26,7 @@
 #include "CustomShaderPass.hpp"
 #include "Resource.hpp"
 #include "RenderCommandTrace.hpp"
+#include "GpuPassProfiler.hpp"
 #include "Vulkan/Util.hpp"
 
 #include "Core/ArrayHelper.hpp"
@@ -211,24 +212,7 @@ struct VulkanRender::Impl {
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
     std::vector<std::function<void()>> m_frame_submitted_callbacks;
 
-    // Diagnostic (VIVID_GPU_PROFILE): GPU timestamps around every executed pass in the offscreen
-    // frame, aggregated by pass profile name and reported periodically. Off by default.
-    struct GpuPassProfiler {
-        bool                                    checked { false };
-        bool                                    enabled { false };
-        vvk::QueryPool                          pool;
-        uint32_t                                capacity { 0 };
-        uint32_t                                used { 0 };
-        bool                                    pending { false };
-        double                                  period_ns { 0.0 };
-        std::vector<std::string>                pending_names;
-        std::unordered_map<std::string, double> accum_ms;
-        double                                  total_ms { 0.0 };
-        uint32_t                                frames { 0 };
-    } m_gpu_profiler;
-    bool gpuProfilerActive();
-    void gpuProfilerCollect();
-    void gpuProfilerReport();
+    [[no_unique_address]] GpuPassProfiler m_gpu_profiler;
 };
 
 VulkanRender::VulkanRender(): pImpl(std::make_unique<Impl>()) {}
@@ -325,7 +309,7 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
 
     std::vector<InstanceLayer> inst_layers;
     // valid layer
-    if (info.enable_valid_layer) {
+    if (wallpaper::diagnostics::Enabled && info.enable_valid_layer) {
         inst_layers.push_back({ true, VALIDATION_LAYER_NAME });
         LOG_INFO("vulkan valid layer \"%s\" enabled", VALIDATION_LAYER_NAME.data());
     }
@@ -564,9 +548,7 @@ void VulkanRender::Impl::destroy() {
         m_render_cmd.reset();
         m_cmds.reset();
 
-        // The profiler query pool is device-owned; release it before the device goes away.
-        m_gpu_profiler.pool.reset();
-        m_gpu_profiler.pending = false;
+        m_gpu_profiler.reset();
 
         m_device->Destroy();
     }
@@ -824,8 +806,10 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     if (!checkVkResult(m_device->present_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit swapchain frame"))
         return;
-    EndRenderCommandTrace(rr, m_device->out_extent().width, m_device->out_extent().height,
-                          m_device->tex_cache().GetTrackedImageCount());
+    if (RenderCommandTraceActive(rr)) {
+        EndRenderCommandTrace(rr, m_device->out_extent().width, m_device->out_extent().height,
+                              m_device->tex_cache().GetTrackedImageCount());
+    }
     for (const auto& callback : m_frame_submitted_callbacks) callback();
     VkPresentInfoKHR present_info {
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -872,93 +856,6 @@ bool VulkanRender::Impl::drainOffscreenFrame() {
     return true;
 }
 
-bool VulkanRender::Impl::gpuProfilerActive() {
-    auto& profiler = m_gpu_profiler;
-    if (! profiler.checked) {
-        profiler.checked = true;
-        profiler.enabled = std::getenv("VIVID_GPU_PROFILE") != nullptr && m_device != nullptr;
-        if (profiler.enabled) {
-            profiler.period_ns = m_device->limits().timestampPeriod;
-            profiler.capacity  = 4096;
-            const VkQueryPoolCreateInfo pool_ci {
-                .sType              = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                .pNext              = nullptr,
-                .flags              = 0,
-                .queryType          = VK_QUERY_TYPE_TIMESTAMP,
-                .queryCount         = profiler.capacity,
-                .pipelineStatistics = 0,
-            };
-            if (m_device->handle().CreateQueryPool(pool_ci, profiler.pool) != VK_SUCCESS ||
-                profiler.period_ns <= 0.0) {
-                LOG_INFO("GpuPassProfiler: query pool unavailable, profiling disabled");
-                profiler.enabled = false;
-            } else {
-                LOG_INFO("GpuPassProfiler: enabled timestamp-period=%.3fns capacity=%u",
-                         profiler.period_ns,
-                         profiler.capacity);
-            }
-        }
-    }
-    return profiler.enabled;
-}
-
-void VulkanRender::Impl::gpuProfilerCollect() {
-    auto& profiler = m_gpu_profiler;
-    if (! profiler.enabled || ! profiler.pending) return;
-    profiler.pending = false;
-
-    const uint32_t used = profiler.used;
-    if (used < 2) return;
-    std::vector<uint64_t> ticks(used, 0);
-    // The frame fence for the submission that wrote these queries was waited in
-    // drainOffscreenFrame(), so the results are available without further blocking.
-    const VkResult result = m_device->handle().GetQueryPoolResults(
-        *profiler.pool,
-        0,
-        used,
-        ticks.size() * sizeof(uint64_t),
-        ticks.data(),
-        sizeof(uint64_t),
-        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-    if (result != VK_SUCCESS) return;
-
-    for (uint32_t i = 1; i < used; i++) {
-        const double delta_ms = static_cast<double>(ticks[i] - ticks[i - 1]) *
-                                profiler.period_ns / 1e6;
-        profiler.accum_ms[profiler.pending_names[i - 1]] += delta_ms;
-    }
-    profiler.total_ms += static_cast<double>(ticks[used - 1] - ticks[0]) *
-                         profiler.period_ns / 1e6;
-    profiler.frames++;
-    if (profiler.frames >= 240) gpuProfilerReport();
-}
-
-void VulkanRender::Impl::gpuProfilerReport() {
-    auto& profiler = m_gpu_profiler;
-    if (profiler.frames == 0) return;
-
-    std::vector<std::pair<std::string, double>> entries(profiler.accum_ms.begin(),
-                                                        profiler.accum_ms.end());
-    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
-
-    LOG_INFO("GpuPassProfiler: frames=%u gpu-total=%.2fms/frame passes=%zu",
-             profiler.frames,
-             profiler.total_ms / profiler.frames,
-             entries.size());
-    const std::size_t top_count = std::min<std::size_t>(entries.size(), 40);
-    for (std::size_t i = 0; i < top_count; i++) {
-        LOG_INFO("GpuPassProfiler: %6.3fms/frame %s",
-                 entries[i].second / profiler.frames,
-                 entries[i].first.c_str());
-    }
-
-    profiler.accum_ms.clear();
-    profiler.total_ms = 0.0;
-    profiler.frames   = 0;
-}
-
 void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     RenderingResources& rr = m_rendering_resources;
     if (!m_ex_swapchain) {
@@ -967,9 +864,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!drainOffscreenFrame()) {
         return;
     }
-    if (gpuProfilerActive()) {
-        gpuProfilerCollect();
-    }
+    m_gpu_profiler.collect(*m_device);
 
     auto render_lock = m_ex_swapchain->acquireRenderLock();
     auto* inprogress_handle = m_ex_swapchain->getInprogress();
@@ -978,7 +873,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     }
 
     const uint32_t slot_id = static_cast<uint32_t>(inprogress_handle->id());
-    const bool trace_frame = m_trace_next_offscreen_frame;
+    const bool trace_frame = wallpaper::diagnostics::Enabled && m_trace_next_offscreen_frame;
     if (trace_frame) {
         LOG_INFO("OffscreenFirstFrameTrace: stage=frame-begin slot=%u passes=%zu",
                  slot_id,
@@ -1023,15 +918,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         return;
     BeginRenderCommandTrace(rr);
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=command-begin-complete");
-    const bool gpu_profile_frame = gpuProfilerActive();
-    if (gpu_profile_frame) {
-        auto& profiler = m_gpu_profiler;
-        profiler.used  = 0;
-        profiler.pending_names.clear();
-        rr.command.ResetQueryPool(*profiler.pool, 0, profiler.capacity);
-        rr.command.WriteTimestamp(
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
-    }
+    m_gpu_profiler.beginFrame(*m_device, rr.command);
 
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=uploads-begin");
     m_vertex_buf->recordUpload(rr.command);
@@ -1041,19 +928,14 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     m_device->video_tex_cache().RecordUploads(rr.command);
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=uploads-complete");
 
-    if (gpu_profile_frame && m_gpu_profiler.used < m_gpu_profiler.capacity) {
-        auto& profiler = m_gpu_profiler;
-        rr.command.WriteTimestamp(
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
-        profiler.pending_names.emplace_back("__uploads");
-    }
+    m_gpu_profiler.afterUploads(rr.command);
 
-    const char* trace_present_after = std::getenv("WESCENE_TRACE_PRESENT_AFTER");
+    const char* trace_present_after = wallpaper::diagnostics::Options().present_after;
     for (std::size_t pass_index = 0; pass_index < m_passes.size(); pass_index++) {
         auto* p = m_passes[pass_index];
         if (! p->prepared()) continue;
         std::string pass_name;
-        if (trace_frame || gpu_profile_frame || trace_present_after != nullptr) {
+        if (trace_frame || trace_present_after != nullptr) {
             pass_name = p->profileName();
         }
         if (trace_frame) {
@@ -1067,12 +949,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
                      pass_index,
                      pass_name.c_str());
         }
-        if (gpu_profile_frame && m_gpu_profiler.used < m_gpu_profiler.capacity) {
-            auto& profiler = m_gpu_profiler;
-            rr.command.WriteTimestamp(
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *profiler.pool, profiler.used++);
-            profiler.pending_names.emplace_back(pass_name);
-        }
+        m_gpu_profiler.afterPass(rr.command, *p);
         if (trace_present_after != nullptr && pass_name == trace_present_after) {
             // This opt-in inspection stops the offscreen frame at one exact pass identity and
             // presents that pass's physical output before a subsequent draw can overwrite it.
@@ -1126,13 +1003,13 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     if (!checkVkResult(m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame),
                        "submit offscreen frame"))
         return;
-    EndRenderCommandTrace(rr, m_device->out_extent().width, m_device->out_extent().height,
-                          m_device->tex_cache().GetTrackedImageCount());
+    if (RenderCommandTraceActive(rr)) {
+        EndRenderCommandTrace(rr, m_device->out_extent().width, m_device->out_extent().height,
+                              m_device->tex_cache().GetTrackedImageCount());
+    }
     for (const auto& callback : m_frame_submitted_callbacks) callback();
     if (trace_frame) LOG_INFO("OffscreenFirstFrameTrace: stage=submit-complete");
-    if (gpu_profile_frame && m_gpu_profiler.used >= 2) {
-        m_gpu_profiler.pending = true;
-    }
+    m_gpu_profiler.submitted();
 
     /*
      * The immutable-mesh CPU payloads were memcpy'd into staging buffers at
@@ -1367,7 +1244,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
         }
     }
 
-    if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_scene_projection) {
         // Inspect the actual post-framing matrix, not just a successful script setter.
         // This opt-in frame trace distinguishes raw scene storage, selected layer FOV,
         // effective clip planes and the independent orthographic perspective override.
@@ -1845,7 +1722,8 @@ void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGrap
     // setRenderTargetSize() can reallocate screen-bound render targets.
     (void)drainOffscreenFrame();
 
-    const auto started_at = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point started_at;
+    if constexpr (wallpaper::diagnostics::Enabled) started_at = std::chrono::steady_clock::now();
     auto       nodes      = rg.topologicalOrder();
 
     setRenderTargetSize(scene);
@@ -1863,14 +1741,15 @@ void VulkanRender::Impl::warmupRenderGraphPipelines(Scene& scene, rg::RenderGrap
         }
     }
 
-    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now() - started_at)
-                                .count();
-    LOG_INFO("RenderGraphPipelineWarmup: graph-passes=%zu pipeline-passes=%zu warmed=%zu "
-             "cached-states=%zu duration=%.2fms",
-             nodes.size(),
-             pipeline_passes,
-             warmed_passes,
-             m_rendering_resources.pipeline_cache->size(),
-             static_cast<double>(elapsed_us) / 1000.0);
+    if constexpr (wallpaper::diagnostics::Enabled) {
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - started_at).count();
+        LOG_INFO("RenderGraphPipelineWarmup: graph-passes=%zu pipeline-passes=%zu warmed=%zu "
+                 "cached-states=%zu duration=%.2fms",
+                 nodes.size(),
+                 pipeline_passes,
+                 warmed_passes,
+                 m_rendering_resources.pipeline_cache->size(),
+                 static_cast<double>(elapsed_us) / 1000.0);
+    }
 }

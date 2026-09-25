@@ -86,7 +86,7 @@ void PrePass::execute(const Device&, RenderingResources& rr) {
         TraceRenderCommand(rr, "clear", scene.clearEnabled ? "recorded" : "preserved",
                            SpecTex_DefaultMS, m_desc.vk_msaa);
     }
-    if (std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_scene_clear) {
         LOG_INFO("SceneStageClear: target='%.*s' clear-enabled=%s color-action=%s "
                  "color=[%.6f %.6f %.6f %.6f] model-depth=%s msaa=%s",
                  static_cast<int>(m_desc.result.size()), m_desc.result.data(),

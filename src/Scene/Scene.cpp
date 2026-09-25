@@ -41,7 +41,7 @@ void Scene::SetSystemTextureBinding(const std::string& name, const std::string& 
     auto& current = *m_system_texture_bindings.at(name);
     if (current == texture_key) return;
     const auto previous = CollectRetainedResidencyResources(*this);
-    if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_media_state) {
         LOG_INFO("SceneSystemTextureChange: property='%s' previous='%s' current='%s'",
                  name.c_str(), current.c_str(), texture_key.c_str());
     }
@@ -1059,7 +1059,7 @@ void Scene::UpdateModelCameraPath() {
     // of including time spent under camera-layer ownership. Frame preparation is the sole caller;
     // visibility setters and repeated camera/uniform consumers must not advance playback again.
     modelCameraPathTime += frameTime;
-    if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_scene_projection) {
         LOG_INFO("SceneCameraPathSample: scene-time=%.6f path-time=%.9f next-time=%.9f "
                  "segment=%d local-time=%.9f delta=%.9f zoom=%.9f",
                  elapsingTime,
@@ -1393,7 +1393,7 @@ void Scene::QueueRenderTargetClear(std::string target, std::array<float, 4> colo
     m_pending_render_target_clears.push_back(
         { sequence, std::move(target), color, owner_layer_id, effect_id, setup });
     MarkRenderGraphTopologyDirty();
-    if (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_render_commands) {
         LOG_INFO("SceneRenderTargetClearQueue: sequence=%llu layer=%d effect=%d reason=%s "
                  "target='%s' color=[%.9g %.9g %.9g %.9g]",
                  static_cast<unsigned long long>(sequence), owner_layer_id, effect_id,
@@ -1418,7 +1418,7 @@ void Scene::CommitRenderTargetClears(uint64_t through_sequence) {
     }
     m_pending_render_target_clears.erase(m_pending_render_target_clears.begin(), end);
     MarkRenderGraphTopologyDirty();
-    if (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_render_commands) {
         LOG_INFO("SceneRenderTargetClearCommit: through=%llu count=%zu pending=%zu",
                  static_cast<unsigned long long>(through_sequence), count,
                  m_pending_render_target_clears.size());

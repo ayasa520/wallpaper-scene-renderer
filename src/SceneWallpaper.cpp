@@ -214,7 +214,9 @@ public:
                 CASE_CMD(RENDER_READY);
                 CASE_CMD(STOP);
                 CASE_CMD(FIRST_FRAME);
-                CASE_CMD(FLUSH);
+            case CMD::CMD_FLUSH:
+                if constexpr (diagnostics::Enabled) handle_FLUSH(msg);
+                break;
             default: break;
             }
         }
@@ -337,7 +339,9 @@ public:
                 CASE_CMD(SET_OFFSCREEN_READY_CALLBACK);
                 CASE_CMD(RECONFIGURE_OFFSCREEN_EXPORT);
                 CASE_CMD(INIT_VULKAN);
-                CASE_CMD(FLUSH);
+            case CMD::CMD_FLUSH:
+                if constexpr (diagnostics::Enabled) handle_FLUSH(msg);
+                break;
             default: break;
             }
         }
@@ -351,7 +355,10 @@ public:
     // compiled the first render graph, i.e. the next draw renders real content. Cleared by the
     // main handler before it posts a replacement scene.
     bool sceneLoaded() const { return m_scene_loaded.load(std::memory_order_acquire); }
-    void markSceneUnloaded() { m_scene_loaded.store(false, std::memory_order_release); }
+    void markSceneUnloaded() {
+        if constexpr (diagnostics::Enabled)
+            m_scene_loaded.store(false, std::memory_order_release);
+    }
 
     double textRenderScale() const {
         // Text stays in the authored letter box. Desktop render scale is applied when the
@@ -367,7 +374,9 @@ private:
     void RefreshRenderGraphIfNeeded() {
         if (! m_scene || ! m_scene->renderGraphDirty) return;
 
-        const auto started_at                = std::chrono::steady_clock::now();
+        // Timing is diagnostic work too; removing the log alone would retain clock reads.
+        std::chrono::steady_clock::time_point started_at;
+        if constexpr (diagnostics::Enabled) started_at = std::chrono::steady_clock::now();
         // Imported allocations are already current at this frame boundary. Refresh source
         // metadata and then its named-source readers before deciding whether descriptors alone
         // suffice: a same-key dimension change can require new destination slots and projection.
@@ -397,13 +406,14 @@ private:
         m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
         m_render->compileRenderGraph(*m_scene, *m_rg, ! requires_topology_rebuild);
         m_scene->ClearRenderGraphDirty();
-        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - started_at)
-                                    .count();
-        if (elapsed_us >= SCENE_RENDER_GRAPH_SLOW_THRESHOLD_US) {
-            LOG_INFO("SceneWallpaper: render graph rebuild slow duration=%.2fms mode=%s",
-                     elapsed_us / 1000.0,
-                     requires_topology_rebuild ? "topology" : "resources");
+        if constexpr (diagnostics::Enabled) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - started_at).count();
+            if (elapsed_us >= SCENE_RENDER_GRAPH_SLOW_THRESHOLD_US) {
+                LOG_INFO("SceneWallpaper: render graph rebuild slow duration=%.2fms mode=%s",
+                         elapsed_us / 1000.0,
+                         requires_topology_rebuild ? "topology" : "resources");
+            }
         }
     }
 
@@ -479,12 +489,10 @@ private:
 
         const bool thumbnail_changed = MediaThumbnailChanged(m_applied_media_state, media_state);
         const bool render_graph_dirty_before = m_scene->renderGraphDirty;
-        const auto started_at                = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point started_at;
+        if constexpr (diagnostics::Enabled) started_at = std::chrono::steady_clock::now();
         m_scene->scriptHost->ApplyMediaState(*media_state);
         const bool render_graph_dirty_after = m_scene->renderGraphDirty;
-        const auto elapsed_us               = std::chrono::duration_cast<std::chrono::microseconds>(
-                                                  std::chrono::steady_clock::now() - started_at)
-                                                  .count();
         m_applied_media_state               = media_state;
 
         if (thumbnail_changed && ! render_graph_dirty_after) {
@@ -493,15 +501,19 @@ private:
             LOG_INFO("SceneScript: media state requested render graph rebuild");
         }
 
-        if (elapsed_us >= SCENE_MEDIA_APPLY_SLOW_THRESHOLD_US) {
-            LOG_INFO("SceneScript: media state apply slow duration=%.2fms thumbnail-changed=%s "
-                     "render-graph-dirty-before=%s after=%s title='%s' artist='%s'",
-                     elapsed_us / 1000.0,
-                     thumbnail_changed ? "true" : "false",
-                     render_graph_dirty_before ? "true" : "false",
-                     render_graph_dirty_after ? "true" : "false",
-                     media_state->title.c_str(),
-                     media_state->artist.c_str());
+        if constexpr (diagnostics::Enabled) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - started_at).count();
+            if (elapsed_us >= SCENE_MEDIA_APPLY_SLOW_THRESHOLD_US) {
+                LOG_INFO("SceneScript: media state apply slow duration=%.2fms thumbnail-changed=%s "
+                         "render-graph-dirty-before=%s after=%s title='%s' artist='%s'",
+                         elapsed_us / 1000.0,
+                         thumbnail_changed ? "true" : "false",
+                         render_graph_dirty_before ? "true" : "false",
+                         render_graph_dirty_after ? "true" : "false",
+                         media_state->title.c_str(),
+                         media_state->artist.c_str());
+            }
         }
     }
     MHANDLER_CMD(DRAW) {
@@ -761,7 +773,8 @@ private:
             m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
             m_scene->paritileSys->SetMousePos(pos[0], pos[1]);
             m_scene->scriptHost->HandleCursorMove();
-            m_scene_loaded.store(true, std::memory_order_release);
+            if constexpr (diagnostics::Enabled)
+                m_scene_loaded.store(true, std::memory_order_release);
         }
     }
     MHANDLER_CMD(SET_SPEED) { msg->findFloat("value", &m_speed); }
@@ -941,6 +954,7 @@ bool SceneWallpaper::requestFrame() {
     return m_main_handler->renderHandler()->frame_timer.RequestFrame();
 }
 
+#if WESCENE_ENABLE_DIAGNOSTICS
 bool SceneWallpaper::sceneLoaded() const { return m_main_handler->renderHandler()->sceneLoaded(); }
 
 uint64_t SceneWallpaper::publishedFrameCount() const {
@@ -959,6 +973,8 @@ bool SceneWallpaper::flush(std::chrono::milliseconds timeout) {
     if (msg->post() != looper::status_t::OK) return false;
     return future.wait_for(timeout) == std::future_status::ready;
 }
+
+#endif
 
 void SceneWallpaper::mouseInput(double x, double y) {
     auto msg =
@@ -1204,6 +1220,7 @@ MHANDLER_CMD_IMPL(MainHandler, FIRST_FRAME) {
     if (m_first_frame_callback) m_first_frame_callback();
 }
 
+#if WESCENE_ENABLE_DIAGNOSTICS
 MHANDLER_CMD_IMPL(MainHandler, FLUSH) {
     // First half of the barrier: everything this looper queued before the marker has run. Hand
     // the same promise to the render looper so it completes only after the forwarded messages.
@@ -1213,6 +1230,8 @@ MHANDLER_CMD_IMPL(MainHandler, FLUSH) {
     forwarded->setObject("barrier", barrier);
     if (forwarded->post() != looper::status_t::OK) barrier->set_value();
 }
+
+#endif
 
 void MainHandler::loadScene() {
     if (m_source.empty() || m_assets.empty()) return;

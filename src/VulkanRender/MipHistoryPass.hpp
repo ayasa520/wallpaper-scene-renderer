@@ -18,11 +18,15 @@ public:
 
         MipHistoryState* state { nullptr };
         uint64_t disable_revision { 0 };
+#if WESCENE_ENABLE_DIAGNOSTICS
+        // Clear completion needs only the state and revision above. Keep capture metadata
+        // out of production submissions, including the target string's storage and copies.
         uint64_t frame { 0 };
         VkImage image { VK_NULL_HANDLE };
         uint32_t mip_levels { 0 };
         bool trace { false };
         std::string target;
+#endif
     };
 
     struct Desc {

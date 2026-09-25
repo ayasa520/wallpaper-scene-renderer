@@ -2,6 +2,7 @@
 
 #include "Interface/IShaderValueUpdater.h"
 #include "Resource.hpp"
+#include "ShaderUniformTrace.hpp"
 #include "Scene/Scene.h"
 #include "Scene/SceneShader.h"
 #include "SpriteAnimation.hpp"
@@ -201,13 +202,6 @@ public:
     const ShaderDrawData& data() const { return m_desc; }
 
 private:
-    struct TracedUniformWrite {
-        std::string name;
-        ShaderValue value;
-        std::size_t offset;
-        std::size_t reflected_size;
-    };
-
     ShaderDrawData       m_desc;
     // Keep the draw identity by value. A topology diff can retire the source node or the
     // object's publication resources before querying the old pass. The copied generation
@@ -218,12 +212,14 @@ private:
     BlendMode            m_material_blend { BlendMode::Disable };
     SceneCullMode        m_material_cull { SceneCullMode::None };
     SceneAlphaWriting    m_material_alpha_writing { SceneAlphaWriting::Default };
+    // Only development draws retain uploaded values for structural trace serialization.
+    // Production keeps the upload callback but owns no copies of those uniform payloads.
     uint64_t             m_trace_draw_sequence { 0 };
     // Uniform updates precede the shared staging upload and may also run during graph
     // preparation. Retain optional per-pass writes until the actual draw is recorded,
     // so diagnostics can associate current values with a submitted command instead of
     // mistaking warmup or a repeated scene clock for another rendered invocation.
-    std::vector<TracedUniformWrite> m_trace_uniform_writes;
+    [[no_unique_address]] ShaderUniformTrace m_trace_uniform_writes;
     ShaderDrawExtension* m_extension { nullptr };
 };
 

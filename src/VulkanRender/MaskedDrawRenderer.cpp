@@ -228,7 +228,7 @@ bool MaskedDrawRenderer::prepareProgram(const Device& device, RenderingResources
                 VK_ATTACHMENT_LOAD_OP_DONT_CARE, attachment, invocation.sample_count,
                 invocation.resolve_msaa);
         if (!pipeline.create(device, *pass, prepared, resources.pipeline_cache.get())) return false;
-        if (std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_masked_draw) {
             LOG_INFO("MaskedDrawPipeline: layer=%d node='%s' role=%s blend=%d pipeline=%p "
                      "render-pass=%p shared-depth=%s test=%s write=%s compare=%u "
                      "depth-format=%u depth-load=%u depth-store=%u samples=%u resolve=%s",
@@ -350,7 +350,7 @@ void MaskedDrawRenderer::updateUniform(StagingBuffer* buffer, std::string_view n
                                     name, value);
         }
     }
-    if (name == G_BONES && std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr) {
+    if (name == G_BONES && wallpaper::diagnostics::Options().trace_masked_draw) {
         // This diagnostic fingerprints the exact shared pose bytes sent to both programs.
         // It is not another pose cache and performs no work outside the opt-in trace.
         m_pose_hash = 14695981039346656037ull;
@@ -366,9 +366,9 @@ void MaskedDrawRenderer::recordIndexed(const ShaderDrawRecordContext& context) {
     auto& command = context.resources.command;
     const auto& plan = data.draw.Mesh()->MaskedDraw();
     const auto& extent = data.vk_output.extent;
-    ++m_draw_sequence;
-    const bool trace = std::getenv("WESCENE_TRACE_MASKED_DRAW") != nullptr &&
-        (m_draw_sequence % 120 == 1 || std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr);
+    if constexpr (wallpaper::diagnostics::Enabled) ++m_draw_sequence;
+    const bool trace = wallpaper::diagnostics::Options().trace_masked_draw &&
+        (m_draw_sequence % 120 == 1 || wallpaper::diagnostics::Options().trace_draw_every_frame);
     const auto trace_range = [&](const char* role, const SceneMesh::DrawRange& range,
                                   int32_t group, const char* shader, VkPipeline pipeline,
                                   const VmaImageParameters* target = nullptr) {

@@ -308,15 +308,18 @@ JSValue NativeApplyModelData(JSContext* context, JSValueConst receiver, int argc
     if (! model) return JS_ThrowTypeError(context, "applyData: model resource has been released");
     if (argc < 1) return JS_ThrowTypeError(context, "applyData requires shape updates");
     try {
-        const auto start = std::chrono::steady_clock::now();
+        const bool trace = wallpaper::diagnostics::Options().trace_model_data;
+        const auto start = trace ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point {};
         SceneModelDataUpdate data;
         if (! ReadModelUpdate(context, argv[0], data)) return JS_EXCEPTION;
-        const auto copied = std::chrono::steady_clock::now();
+        const auto copied = trace ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point {};
         std::string error;
         if (! model->ApplyData(data, error)) {
             return JS_ThrowTypeError(context, "applyData: %s", error.c_str());
         }
-        if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+        if (trace) {
             const auto applied = std::chrono::steady_clock::now();
             const auto micros = [](auto duration) {
                 return std::chrono::duration<double, std::micro>(duration).count();
@@ -351,7 +354,7 @@ JSValue NativeReplaceModelData(JSContext* context, JSValueConst receiver, int ar
         opaque->pending_model_refresh_tokens.insert(*token);
         std::string error;
         const bool succeeded = model->ReplaceData(data, error);
-        if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_model_data) {
             LOG_INFO("SceneModelDataReplace: token=%u shapes=%zu revision=%llu success=%s",
                      *token, model->Shapes().size(),
                      static_cast<unsigned long long>(model->StructureRevision()),

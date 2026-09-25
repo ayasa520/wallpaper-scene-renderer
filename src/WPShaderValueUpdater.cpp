@@ -120,7 +120,7 @@ Matrix4d ModelPerspectiveViewProjection(const Scene& scene, const Matrix4d& inco
     // Neither the shared camera nor the frame eye/basis uniforms are modified here.
     destination(2, 3) = -distance;
     const Matrix4d projection = Perspective(angle, aspect, kNearPlane, far_plane);
-    if (trace && std::getenv("WESCENE_TRACE_MODEL_PROJECTION") != nullptr) {
+    if (trace && wallpaper::diagnostics::Options().trace_model_projection) {
         LOG_INFO("SceneModelProjection: frame=%llu layer=%d reflection=%s orthographic=%s "
                  "angle-radians=%.9f incoming-p11=%.9f distance=%.9f aspect=%.9f "
                  "near=%.6f far=%.6f incoming-destination=[%.9f %.9f %.9f] "
@@ -623,7 +623,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             updateOp("g_Color", std::array<float, 3> { color[0], color[1], color[2] });
         }
         if (info.has_COLOR4) updateOp("g_Color4", color);
-        if (std::getenv("WESCENE_TRACE_TEXT_COLOR") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_text_color) {
             LOG_INFO("SceneTextEffectColor: frame=%llu layer=%d node='%s' reflection=%s "
                      "rgba=[%.6f %.6f %.6f %.6f] brightness=%.6f uniforms=[%d %d %d] host-hdr=%s",
                      static_cast<unsigned long long>(m_puppet_frame_serial),
@@ -653,9 +653,12 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             // PrepareFrame() is the sole pose-advance boundary. Uniform consumers only publish the
             // immutable snapshot selected for this frame, so mask pre-passes, clipped main passes
             // and effect writers cannot independently advance animation or mutate render topology.
-            assert(pose.frame_serial == m_puppet_frame_serial);
+            // Initial graph preparation also initializes uniform buffers before the first frame
+            // has a pose serial. No draw is submitted at that boundary; the first PrepareFrame()
+            // selects the snapshot before upload. Enforce serial equality once frames have begun.
+            assert(m_puppet_frame_serial == 0 || pose.frame_serial == m_puppet_frame_serial);
             updateOp(G_BONES, ToDxcRowVectorSkinningUniform(pose.skinning));
-            const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+            const char* trace_layer = wallpaper::diagnostics::Options().transform_layer;
             if (draw.Phase() != nullptr && trace_layer != nullptr &&
                 std::to_string(draw.LayerId(*m_scene)) == trace_layer &&
                 (m_puppet_frame_serial == 1 || m_puppet_frame_serial == 121 ||
@@ -827,7 +830,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         // draws and the authored last pass. Comparing the raw model with the submitted model
         // identifies whether placement was changed by routing, parallax, or camera rebasing;
         // the clip-space origin then separates those changes from projection differences.
-        const char* trace_layer = std::getenv("WESCENE_TRACE_TRANSFORM_LAYER");
+        const char* trace_layer = wallpaper::diagnostics::Options().transform_layer;
         const int32_t layer_id = draw.LayerId(*m_scene);
         if (trace_layer != nullptr && std::to_string(layer_id) == trace_layer) {
             const auto raw_model = transformResolver.ResolveRawModelTransform(draw);
@@ -955,7 +958,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                     effectModel = (effectModel * cardScale).eval();
                     effectMvp = etvpTrans;
                 }
-                if (std::getenv("WESCENE_TRACE_EFFECT_PROJECTION") != nullptr &&
+                if (wallpaper::diagnostics::Options().trace_effect_projection &&
                     (trace_layer == nullptr || std::to_string(layer_id) == trace_layer)) {
                     LOG_INFO("SceneEffectMatrixSnapshot: frame=%llu layer=%d node='%s' "
                              "snapshot-source=%s "
@@ -999,7 +1002,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
                 Matrix4d inverse = Matrix4d::Identity();
                 if (std::abs(determinant) > 1e-12) inverse = etvpTrans.inverse();
                 updateOp(G_ETVPI, ToDxcCBufferMatrixUniform(inverse));
-                if (std::getenv("WESCENE_TRACE_EFFECT_PROJECTION") != nullptr &&
+                if (wallpaper::diagnostics::Options().trace_effect_projection &&
                     (trace_layer == nullptr || std::to_string(layer_id) == trace_layer)) {
                     // Evaluate the screen-to-effect mapping using the float matrix actually
                     // uploaded to the shader. Screen-space pointer effects unproject clip Z=0
@@ -1068,7 +1071,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         if (info.has_AVP) {
             updateOp(G_AVP, ToDxcCBufferMatrixUniform(snapshot.incoming_view_projection));
         }
-        if (std::getenv("WESCENE_TRACE_PRELIGHTING") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_prelighting) {
             LOG_INFO("SceneImagePrelightingMatrices: frame=%llu layer=%d name='%s' "
                      "am-origin=[%.6f %.6f %.6f] am-scale=[%.6f %.6f %.6f] "
                      "avp-origin=[%.6f %.6f %.6f %.6f] incoming-camera='%s' "
@@ -1114,7 +1117,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             // This opt-in trace ties the authored light animation to an executed volume
             // pass and its actual camera projection. Sampling every ten rendered frames
             // keeps short lightning peaks observable without flooding ordinary captures.
-            if (std::getenv("WESCENE_TRACE_VOLUMETRICS") != nullptr &&
+            if (wallpaper::diagnostics::Options().trace_volumetrics &&
                 m_puppet_frame_serial % 10 == 0) {
                 const Vector4d clip = viewProTrans *
                     Vector4d(origin.x(), origin.y(), origin.z(), 1.0);
@@ -1231,10 +1234,10 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         if (reflection_pass) eye.y() = -eye.y();
         updateOp(G_EYE_POSITION, std::array<float, 3> { eye.x(), eye.y(), eye.z() });
 
-        if ((std::getenv("WESCENE_TRACE_EYE_POSITION") != nullptr ||
-             std::getenv("WESCENE_TRACE_REFLECTION") != nullptr) &&
+        if ((wallpaper::diagnostics::Options().trace_eye_position ||
+             wallpaper::diagnostics::Options().trace_reflection) &&
             (m_puppet_frame_serial <= 2 ||
-             std::getenv("WESCENE_TRACE_DRAW_EVERY_FRAME") != nullptr)) {
+             wallpaper::diagnostics::Options().trace_draw_every_frame)) {
             const auto raster_eye = camera->GetPosition();
             LOG_INFO("SceneEyePositionDraw: frame=%llu layer=%d node='%s' material='%s' "
                      "raster-camera='%.*s' reflection=%s orthographic=%s eye=[%.6f %.6f %.6f] "

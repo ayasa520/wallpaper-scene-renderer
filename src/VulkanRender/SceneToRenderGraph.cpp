@@ -616,14 +616,14 @@ static void AddDrawPassImpl(SceneDraw draw, std::string_view output, i32 imgId, 
             CheckAndSetSprite(scene, pdesc, *material);
             for (usize i = 0; i < material->textures.size(); i++) {
                 const auto&  url = material->Texture(i);
-                if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr &&
+                if (wallpaper::diagnostics::Options().trace_media_state &&
                     material->systemTextureBindings.contains(i)) {
                     LOG_INFO("SceneMaterialSystemTextureBind: layer=%d node='%s' "
                              "shader='%s' slot=%zu authored='%s' selected='%s'",
                              draw.LayerId(scene), draw.Name().c_str(), material->name.c_str(),
                              i, material->textures[i].c_str(), url.c_str());
                 }
-                if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") != nullptr &&
+                if (wallpaper::diagnostics::Options().trace_texture_uploads &&
                     material->userTextureBindings.contains(i)) {
                     LOG_INFO("SceneMaterialUserTextureBind: layer=%d node='%s' "
                              "shader='%s' slot=%zu authored='%s' selected='%s'",
@@ -802,7 +802,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
 
     if (const auto* object = scene.FindSceneObject(imgId);
         object != nullptr && object->LayerNode() == node &&
-        std::getenv("WESCENE_TRACE_OBJECT_DRAW") != nullptr) {
+        wallpaper::diagnostics::Options().trace_object_draw) {
         LOG_INFO("SceneObjectDrawVisit: layer=%d parent=%d passthrough=%s "
                  "composition-member=%s compose-source=%s reflection=%s output='%.*s'",
                  object->Id(), object->ParentId(), object->Passthrough() ? "true" : "false",
@@ -1262,7 +1262,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(Scene& scene) {
                     request.color[0], request.color[1], request.color[2], request.color[3] } };
                 desc.on_recorded = [index, request, clears_recorded]() {
                     (*clears_recorded)[index] = true;
-                    if (std::getenv("WESCENE_TRACE_RENDER_COMMANDS") != nullptr) {
+                    if (wallpaper::diagnostics::Options().trace_render_commands) {
                         LOG_INFO("SceneRenderTargetClearRecord: sequence=%llu layer=%d effect=%d "
                                  "reason=%s target='%s' color=[%.9g %.9g %.9g %.9g]",
                                  static_cast<unsigned long long>(request.sequence),

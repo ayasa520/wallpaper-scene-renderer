@@ -11,6 +11,7 @@
 #include <type_traits>
 
 #include "Utils/Identity.hpp"
+#include "Utils/Diagnostics.h"
 #include "Utils/String.h"
 #include "WPDynamicValue.hpp"
 
@@ -250,7 +251,7 @@ bool TryGetUserPropertyOverride(const nlohmann::json& json, T& value) {
 
     const bool converted = TryConvertUserPropertyValue(*property, value);
     if constexpr (std::is_same_v<T, std::array<float, 2>>) {
-        if (converted && std::getenv("WESCENE_TRACE_USER_BINDINGS") != nullptr) {
+        if (converted && wallpaper::diagnostics::Options().trace_user_bindings) {
             LOG_INFO("SceneUserPropertyBinding: property='%s' type=float2 source=%s resolved=[%.6f %.6f]",
                      binding->name.c_str(),
                      DescribeUserPropertyValue(property_entry->value).c_str(),
@@ -343,14 +344,7 @@ inline bool _GetJsonValue(const char* file, const char* func, int line, const nl
     try {
         return _GetJsonValue<T>(json, value);
     } catch (const njson::type_error& e) {
-        WallpaperLog(LOGLEVEL_INFO,
-                     file,
-                     line,
-                     "%s %s at %s\n%s",
-                     e.what(),
-                     nameinfo.c_str(),
-                     func,
-                     json.dump(4).c_str());
+        LOG_INFO("%s %s at %s\n%s", e.what(), nameinfo.c_str(), func, json.dump(4).c_str());
     } catch (const std::invalid_argument& e) {
         WallpaperLog(LOGLEVEL_ERROR, file, line, "%s %s at %s", e.what(), nameinfo.c_str(), func);
     } catch (const std::out_of_range& e) {
@@ -369,10 +363,7 @@ GetJsonValue(const char* file, const char* func, int line, const nlohmann::json&
     if (has_name) {
         if (! json.contains(name)) {
             if (warn)
-                WallpaperLog(LOGLEVEL_INFO,
-                             "",
-                             0,
-                             "read json \"%s\" not a key at %s(%s:%d)",
+                LOG_INFO("read json \"%s\" not a key at %s(%s:%d)",
                              name.data(),
                              func,
                              file,
@@ -380,10 +371,7 @@ GetJsonValue(const char* file, const char* func, int line, const nlohmann::json&
             return false;
         } else if (json.at(name).is_null()) {
             if (warn)
-                WallpaperLog(LOGLEVEL_INFO,
-                             "",
-                             0,
-                             "read json \"%s\" is null at %s(%s:%d)",
+                LOG_INFO("read json \"%s\" is null at %s(%s:%d)",
                              name.data(),
                              func,
                              file,

@@ -855,7 +855,7 @@ bool SelectCompiledMaterialDescriptors(SceneMaterialCustomShader& material_shade
     info.activeMaterialAliases.clear();
     auto& defaults = material_shader.shader->default_uniforms;
     defaults       = info.svs;
-    const bool trace = std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr;
+    const bool trace = wallpaper::diagnostics::Options().trace_material_types;
     for (const auto& [material_name, uniform_name] : info.alias) {
         const bool active = accessed_uniforms.contains(uniform_name);
         if (active) {
@@ -1005,7 +1005,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
             // their current targets.
             material.systemTextureBindings.emplace(
                 i, pScene->GetSystemTextureBinding(binding.name));
-            if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
+            if (wallpaper::diagnostics::Options().trace_media_state) {
                 LOG_INFO("SceneMaterialSystemTexture: shader='%s' slot=%zu property='%s' "
                          "authored='%s' override='%s'",
                          wpmat.shader.c_str(), i, binding.name.c_str(), textures[i].c_str(),
@@ -1216,7 +1216,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
         return std::nullopt;
     }
 
-    if (std::getenv("WESCENE_TRACE_MATERIAL_STATE") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_state) {
         const auto hdr = pWPShaderInfo->combos.find("HDR");
         LOG_INFO("SceneMaterialQuality: shader='%s' postprocessing=%d host-hdr=%s hdr-combo='%s'",
                  wpmat.shader.c_str(), pScene->bloom.quality,
@@ -1247,7 +1247,7 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
                 material.systemTextureReferences.emplace(i, SceneMaterial::TextureReference {
                     .size = *size, .keepAspect = keep_aspect,
                 });
-                if (std::getenv("WESCENE_TRACE_MEDIA_STATE") != nullptr) {
+                if (wallpaper::diagnostics::Options().trace_media_state) {
                     LOG_INFO("SceneMaterialSystemTextureReference: shader='%s' slot=%u "
                              "authored='%s' reference=[%.3f %.3f] keep-aspect=%s",
                              wpmat.shader.c_str(), i, material.textures[i].c_str(),
@@ -1849,7 +1849,7 @@ const std::string* ResolveMaterialValueUniformName(const WPShaderInfo& info,
     // defaults or live bindings by changing case, punctuation, prefixes or parentheses.
     const auto alias = info.activeMaterialAliases.find(material_value_name);
     if (alias != info.activeMaterialAliases.end()) return &alias->second;
-    if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_types) {
         LOG_INFO("SceneMaterialNameLookup: material-value='%s' result=%s",
                  material_value_name.c_str(), info.alias.contains(material_value_name)
                      ? "inactive-material-name" : "unknown-material-name");
@@ -1915,7 +1915,7 @@ void ApplyResolvedConstvalue(SceneMaterial& material, const WPShaderInfo& info,
     if (! value.has_value()) return;
     material.customShader.constValues[uniform_name] =
         ClampParserOpacityUniformValue(uniform_name, *value);
-    if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_material_types) {
         LOG_INFO("SceneMaterialConstantType: shader='%s' material-value='%s' uniform='%s' "
                  "declared-type=%s components=%zu authored=%s",
                  material.name.c_str(), material_value_name.c_str(),
@@ -2059,7 +2059,7 @@ void RegisterConstantShaderValueBindings(ParseContext& context, const wpscene::W
         // no longer own this descriptor. Register only the selected shorthand writer instead
         // of retaining competing callbacks that can overwrite later user-property updates.
         if (FindMaterialUserPropertyName(wpmat, material_value_name) != nullptr) {
-            if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+            if (wallpaper::diagnostics::Options().trace_material_types) {
                 LOG_INFO("SceneMaterialBindingReplace: layer=%d material-value='%s' "
                          "replacement=usershadervalues",
                          object_id, material_value_name.c_str());
@@ -2365,7 +2365,7 @@ void ParseCamera(ParseContext& context, const wpscene::WPScene& scene_config) {
         scene.UpdateActiveCameraLayer();
     }
 
-    if (std::getenv("WESCENE_TRACE_SCENE_PROJECTION") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_scene_projection) {
         const auto& camera = *scene.activeCamera;
         const auto projection = camera.GetProjectionMatrix();
         LOG_INFO("SceneCameraInitialization: orthographic=%s general-zoom=%.9f "

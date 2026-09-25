@@ -1,5 +1,9 @@
 #pragma once
 
+#include "Diagnostics.h"
+
+#include <spdlog/spdlog.h>
+
 #include <string>
 #include <span>
 
@@ -32,10 +36,22 @@ enum
     LOGLEVEL_ERROR = 2
 };
 
-#define LOG_INFO(...)  WallpaperLog(LOGLEVEL_INFO, "", 0, __VA_ARGS__)
-#define LOG_WARN(...)  WallpaperLog(LOGLEVEL_WARN, __SHORT_FILE__, __LINE__, __VA_ARGS__)
-#define LOG_ERROR(...) WallpaperLog(LOGLEVEL_ERROR, __SHORT_FILE__, __LINE__, __VA_ARGS__)
+// spdlog's compiled level removes the complete INFO call, including printf formatting and
+// argument evaluation, from production. Keep the printf-facing API at this boundary so scene
+// and GPU code only describe their messages. Authored console output uses WallpaperLog and
+// stays observable independently of the renderer's internal diagnostic level.
+#define LOG_INFO(...) \
+    SPDLOG_LOGGER_INFO(WallpaperLogger(), "{}", \
+        FormatWallpaperLog(LOGLEVEL_INFO, "", 0, __VA_ARGS__))
+#define LOG_WARN(...) \
+    SPDLOG_LOGGER_WARN(WallpaperLogger(), "{}", \
+        FormatWallpaperLog(LOGLEVEL_WARN, __SHORT_FILE__, __LINE__, __VA_ARGS__))
+#define LOG_ERROR(...) \
+    SPDLOG_LOGGER_ERROR(WallpaperLogger(), "{}", \
+        FormatWallpaperLog(LOGLEVEL_ERROR, __SHORT_FILE__, __LINE__, __VA_ARGS__))
 
+spdlog::logger* WallpaperLogger();
+std::string FormatWallpaperLog(int level, const char* file, int line, const char* fmt, ...);
 void WallpaperLog(int level, const char* file, int line, const char* fmt, ...);
 
 std::string logToTmpfileWithSha1(std::span<const char>, const char* fmt, ...);

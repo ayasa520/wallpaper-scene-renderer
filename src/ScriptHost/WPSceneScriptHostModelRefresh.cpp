@@ -113,7 +113,7 @@ void ProcessPendingSceneModelRefresh(WPSceneScriptHost::Opaque& opaque) {
         }
         scene.MarkRenderGraphTopologyDirty();
         RegisterSceneRegistrationRange(&opaque, range);
-        if (std::getenv("WESCENE_TRACE_MODEL_DATA") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_model_data) {
             LOG_INFO("SceneModelRefresh: layer=%d token=%u root=%p revision=%llu->%llu "
                      "retired-chunks=%zu chunks=%zu retired-scripts=%zu parent=%d",
                      layer_id, model->Token(), static_cast<void*>(root),

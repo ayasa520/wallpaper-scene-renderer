@@ -10,6 +10,7 @@
 #include "Core/ArrayHelper.hpp"
 #include "Utils/AutoDeletor.hpp"
 #include "Utils/Hash.h"
+#include "Utils/Diagnostics.h"
 #include "include/Vulkan/Parameters.hpp"
 #include "vvk/vulkan_wrapper.hpp"
 
@@ -69,7 +70,7 @@ namespace
 {
 void TraceTextureUpload(const char* action, std::string_view key, const ImageParameters& image,
                         VkImageLayout old_layout) {
-    if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") == nullptr) return;
+    if (!wallpaper::diagnostics::Options().trace_texture_uploads) return;
     // Pair the logical key with the physical allocation at queue/record boundaries.
     // In particular, a replaced pending upload must not be mistaken for a completed
     // layout transition simply because a descriptor already references the image.
@@ -83,7 +84,7 @@ void TraceTextureUpload(const char* action, std::string_view key, const ImagePar
 void TraceRenderTargetAllocation(const char* action, std::string_view key,
                                  const ImageParameters& image, uint64_t generation,
                                  bool persistent) {
-    if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") == nullptr) return;
+    if (!wallpaper::diagnostics::Options().trace_texture_uploads) return;
     // A numeric image handle may recur after retirement. Record the allocation's
     // generation when a key is created, replaced or assigned shared storage so
     // retained history can be joined to the actual submitted image lifetime.
@@ -1197,7 +1198,7 @@ void TextureCache::purgeQueuedWorkForKey(std::string_view key) {
     const auto same_key = [key](const auto& work) {
         return work.key == key;
     };
-    if (std::getenv("WESCENE_TRACE_TEXTURE_UPLOADS") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_texture_uploads) {
         for (const auto& upload : m_pending_image_uploads) {
             if (same_key(upload)) {
                 TraceTextureUpload("purge-pending-image", key, upload.image, upload.old_layout);

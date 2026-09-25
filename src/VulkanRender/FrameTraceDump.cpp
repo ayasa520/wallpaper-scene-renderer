@@ -4,7 +4,6 @@
 
 #include <charconv>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -25,10 +24,10 @@ struct DumpSettings {
 const DumpSettings& Settings() {
     static const DumpSettings settings = [] {
         DumpSettings result;
-        const char* directory = std::getenv("WESCENE_DUMP_FRAME_TRACE");
+        const char* directory = wallpaper::diagnostics::Options().frame_trace_directory;
         if (directory == nullptr || *directory == '\0') return result;
         result.directory = directory;
-        const char* draws = std::getenv("WESCENE_DUMP_FRAME_TRACE_DRAWS");
+        const char* draws = wallpaper::diagnostics::Options().frame_trace_draws;
         if (draws == nullptr || *draws == '\0' || std::string_view(draws) == "all") {
             result.all_draws = true;
             return result;

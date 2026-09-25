@@ -1448,7 +1448,7 @@ std::shared_ptr<TextGlyphBitmap> GetOrCreateTextGlyphBitmap(PangoFont*   font,
     static std::unordered_map<std::string, std::shared_ptr<TextGlyphBitmap>> glyph_cache;
 
     const auto key = MakeTextGlyphCacheKey(font, glyph, raster_scale, color_glyph);
-    if (std::getenv("WESCENE_TRACE_TEXT_GLYPH") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_text_glyph) {
         LOG_INFO("SceneTextGlyphFont: key='%s' color=%s", key.c_str(),
                  color_glyph ? "true" : "false");
     }
@@ -2576,7 +2576,7 @@ bool wpscene::WPTextObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
                             depth_value->get_ref<const std::string&>() == "enabled"
                         ? "enabled" : "disabled";
     }
-    if (std::getenv("WESCENE_TRACE_TEXT_DEPTH") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_text_depth) {
         LOG_INFO("SceneTextDepthInitial: layer=%d name='%s' input=%s value='%s'",
                  id, name.c_str(), depth_value != json.end() ? depth_value->type_name() : "omitted",
                  depthtest.c_str());

@@ -12,23 +12,23 @@
  * so two runs of a deterministic capture produce byte-identical files and any difference names
  * the command, texture or uniform that changed.
  *
- *   WESCENE_DUMP_FRAME_TRACE=<dir>          enables the dump and selects the output directory
- *   WESCENE_DUMP_FRAME_TRACE_DRAWS=1,60,120 1-based draw numbers to dump, or "all"
- *
+ * Development diagnostic settings select an output directory and 1-based draw numbers.
  * Files are named draw-NNNNNN.json.
  */
 
 #include "Vulkan/Parameters.hpp"
+#include "Utils/Diagnostics.h"
 
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace wallpaper::vulkan
 {
 
-class FrameTraceDump {
+class FrameTraceRecorder {
 public:
     struct Input {
         std::string role;
@@ -64,7 +64,7 @@ public:
         std::vector<Uniform> uniforms;
     };
 
-    // True when the environment selects a dump directory. Cheap enough to call per frame.
+    // True when diagnostic settings select a dump directory. Cheap enough to call per frame.
     static bool Configured();
 
     // Called once per draw before any command is recorded. Decides whether this draw is dumped.
@@ -92,5 +92,25 @@ private:
     double               m_scene_time { 0.0 };
     std::vector<Command> m_commands;
 };
+// No settings, containers or serializer are linked into a production renderer. This empty
+// interface keeps pass code shared while its constant predicates erase diagnostic-only work.
+class DisabledFrameTrace {
+public:
+    static constexpr bool Configured() { return false; }
+    constexpr bool active() const { return false; }
+    constexpr void beginFrame(uint64_t, double) const {}
+    constexpr uint64_t addCommand(uint64_t, const char*, const char*, std::string_view,
+                                  const ImageParameters&, int32_t, bool, uint32_t) const {
+        return 0;
+    }
+    constexpr void addInput(uint64_t, const char*, std::string_view,
+                            const ImageParameters&, bool, int32_t) const {}
+    constexpr void addUniform(uint64_t, std::string_view, size_t, size_t,
+                              const float*, size_t) const {}
+    constexpr void finishFrame(const char*, uint32_t, uint32_t, size_t) const {}
+};
+
+using FrameTraceDump = std::conditional_t<wallpaper::diagnostics::Enabled,
+                                         FrameTraceRecorder, DisabledFrameTrace>;
 
 } // namespace wallpaper::vulkan

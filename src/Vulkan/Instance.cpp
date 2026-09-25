@@ -16,21 +16,21 @@ using namespace wallpaper::vulkan;
 
 constexpr std::array<InstanceLayer, 0> base_inst_layers {};
 
-// Golden-frame test runs opt into the Khronos validation layer (WESCENE_VK_VALIDATION=1) so
+// Golden-frame test runs opt into the Khronos validation layer through diagnostic settings so
 // synchronization and lifetime mistakes that never show up in pixels still fail the run.
+#if WESCENE_ENABLE_DIAGNOSTICS
 constexpr std::array validation_inst_layers { InstanceLayer { false, "VK_LAYER_KHRONOS_validation" } };
-
 constexpr std::array base_inst_exts { Extension { true, VK_EXT_DEBUG_UTILS_EXTENSION_NAME } };
+#else
+constexpr std::array<Extension, 0> base_inst_exts {};
+#endif
 
 namespace
 {
 
+#if WESCENE_ENABLE_DIAGNOSTICS
 bool ValidationRequested() {
-    static const bool requested = [] {
-        const char* value = std::getenv("WESCENE_VK_VALIDATION");
-        return value != nullptr && std::string_view(value) == "1";
-    }();
-    return requested;
+    return wallpaper::diagnostics::Options().validation;
 }
 
 std::atomic<uint64_t> g_validation_error_count { 0 };
@@ -72,6 +72,7 @@ vvk::DebugUtilsMessenger SetupDebugCallback(vvk::Instance& instance) {
         .pUserData       = nullptr,
     });
 }
+#endif
 
 VkResult CreatInstance(vvk::Instance* inst, std::span<const std::string_view> exts,
                        std::span<const std::string_view> layers, vvk::InstanceDispatch& dld) {
@@ -200,11 +201,13 @@ bool Instance::supportExt(std::string_view name) const { return exists(m_extensi
 bool Instance::supportLayer(std::string_view name) const { return exists(m_layers, name); }
 
 void Instance::Destroy() {
+#if WESCENE_ENABLE_DIAGNOSTICS
     if (ValidationRequested()) {
         LOG_INFO("VulkanValidationSummary: errors=%llu warnings=%llu",
                  static_cast<unsigned long long>(g_validation_error_count.load()),
                  static_cast<unsigned long long>(g_validation_warning_count.load()));
     }
+#endif
 }
 
 void Instance::Abandon() {
@@ -238,6 +241,7 @@ bool Instance::Create(Instance& inst, std::span<const Extension> instExts,
     }
 
     EnumateLayers(inst.m_layers, inst.m_dld);
+#if WESCENE_ENABLE_DIAGNOSTICS
     const std::span<const InstanceLayer> optional_layers =
         ValidationRequested() ? std::span<const InstanceLayer>(validation_inst_layers)
                               : std::span<const InstanceLayer>(base_inst_layers);
@@ -245,6 +249,9 @@ bool Instance::Create(Instance& inst, std::span<const Extension> instExts,
         LOG_INFO("vulkan validation layer requested: %s",
                  inst.supportLayer(validation_inst_layers[0].name) ? "available" : "NOT INSTALLED");
     }
+#else
+    const std::span<const InstanceLayer> optional_layers = base_inst_layers;
+#endif
     std::array test_layers_array { std::span<const InstanceLayer>(base_inst_layers),
                                    optional_layers, instLayers };
     for (auto& test_layers : test_layers_array) {
@@ -265,7 +272,9 @@ bool Instance::Create(Instance& inst, std::span<const Extension> instExts,
     VVK_CHECK_BOOL_RE(CreatInstance(&inst.m_vinst, exts_vec, layers_vec, inst.m_dld));
     vvk::Load(*inst.m_vinst, inst.m_dld);
 
+#if WESCENE_ENABLE_DIAGNOSTICS
     inst.m_debug_utils = SetupDebugCallback(inst.m_vinst);
+#endif
 
     // VK_CHECK_RESULT_ACT(return false, CreatInstance(&inst.m_inst, exts_vec, layers_vec));
     // VK_CHECK_RESULT_ACT(return false, setupDebugCallback(&inst.m_inst, inst.m_debug_utils));

@@ -1799,7 +1799,7 @@ inline void ParseWPShader(const std::string& src, WPShaderInfo* pWPShaderInfo,
                             const auto components =
                                 pWPShaderInfo->MaterialValueComponents(declaration->name);
                             shadervalues[name] = ReadMaterialMetadataDefault(sv_json, components);
-                            if (std::getenv("WESCENE_TRACE_MATERIAL_TYPES") != nullptr) {
+                            if (wallpaper::diagnostics::Options().trace_material_types) {
                                 LOG_INFO("SceneMaterialDefaultType: material-value='%s' uniform='%s' "
                                          "components=%zu metadata=%s",
                                          material.c_str(), name.c_str(), components,

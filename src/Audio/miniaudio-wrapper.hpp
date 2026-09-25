@@ -33,11 +33,7 @@ namespace miniaudio
 {
 
 inline bool TraceSoundMixEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("WESCENE_TRACE_SOUND_MIX");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
+    return wallpaper::diagnostics::Options().trace_sound_mix;
 }
 
 struct DeviceDesc {

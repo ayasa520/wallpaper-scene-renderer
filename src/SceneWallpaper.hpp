@@ -70,6 +70,7 @@ public:
     void mouseInput(double x, double y);
     void mouseLeftButton(bool down);
 
+#if WESCENE_ENABLE_DIAGNOSTICS
     // Lockstep capture support (see Core/Determinism.hpp). flush() returns once every message
     // queued on the main and render loopers at call time has been handled; sceneLoaded() reports
     // whether the render thread has installed the parsed scene; publishedFrameCount() counts
@@ -77,6 +78,7 @@ public:
     bool     flush(std::chrono::milliseconds timeout);
     bool     sceneLoaded() const;
     uint64_t publishedFrameCount() const;
+#endif
 
     void setPropertyBool(std::string_view, bool);
     void setPropertyInt32(std::string_view, int32_t);

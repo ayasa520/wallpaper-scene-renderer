@@ -1,5 +1,7 @@
 set(LIB_NAME wpUtils)
 
+find_package(spdlog 1.14 REQUIRED)
+
 add_library(${LIB_NAME}
 STATIC
 Logging.cpp
@@ -9,11 +11,17 @@ Sha.cpp
 DynamicLibrary.cpp
 )
 
-target_link_libraries(${LIB_NAME}
-PRIVATE
-)
+target_link_libraries(${LIB_NAME} PUBLIC spdlog::spdlog)
 target_include_directories(${LIB_NAME} PUBLIC include PRIVATE include/Utils)
 target_compile_options(${LIB_NAME} PRIVATE ${warn_opts})
+# Debug is the only instrumented configuration. Propagate its compile-time policy through
+# every renderer archive and embedding target because public headers contain diagnostic state.
+# Generator expressions also preserve the boundary with multi-configuration generators.
+target_compile_definitions(${LIB_NAME} PUBLIC
+    WESCENE_ENABLE_DIAGNOSTICS=$<CONFIG:Debug>
+    SPDLOG_ACTIVE_LEVEL=$<IF:$<CONFIG:Debug>,SPDLOG_LEVEL_INFO,SPDLOG_LEVEL_WARN>)
+target_sources(${LIB_NAME} PRIVATE
+    "$<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/Diagnostics.cpp>")
 
 # Keep the utility archive on the baseline ISA. The optimized functions use a compiler target
 # attribute and are selected only after a runtime CPU check, so accepting an AVX compiler flag

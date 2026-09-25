@@ -19,6 +19,7 @@ void MipHistoryPass::Submission::Commit() {
     // disable requests pending, even if another graph is prepared in the meantime.
     state->submitted_disable_revision = disable_revision;
     state->creation_clear_pending = false;
+#if WESCENE_ENABLE_DIAGNOSTICS
     if (trace) {
         LOG_INFO("SceneMipHistorySubmit: frame=%llu target='%s' image=%p generation=%llu "
                  "disable-revision=%llu mip-levels=%u",
@@ -27,6 +28,7 @@ void MipHistoryPass::Submission::Commit() {
                  static_cast<unsigned long long>(state->generation),
                  static_cast<unsigned long long>(disable_revision), mip_levels);
     }
+#endif
     state = nullptr;
 }
 
@@ -62,7 +64,7 @@ void MipHistoryPass::Bind(Scene& scene, const Device& device, RenderingResources
         // creation request now and retains it through all preparation-only visits.
         history = { generation, scene.ReflectionDisableRevision(), !scene.reflectionsEnabled };
     }
-    if (rr.trace_render_commands || std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr) {
+    if (RenderCommandLogActive(rr) || wallpaper::diagnostics::Options().trace_scene_clear) {
         LOG_INFO("SceneMipHistoryBind: target='%s' image=%p generation=%llu replaced=%s "
                  "creation-pending=%s disable-revision=%llu applied-revision=%llu mip-levels=%u",
                  m_desc.target.c_str(), reinterpret_cast<void*>(m_target.handle),
@@ -99,15 +101,17 @@ void MipHistoryPass::execute(const Device&, RenderingResources& rr) {
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         submission.state = &history;
         submission.disable_revision = revision;
+#if WESCENE_ENABLE_DIAGNOSTICS
         submission.frame = rr.trace_render_frame;
         submission.image = m_target.handle;
         submission.mip_levels = m_target.mipmap_level;
-        submission.trace = rr.trace_render_commands ||
-                           std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr;
+        submission.trace = RenderCommandLogActive(rr) ||
+                           wallpaper::diagnostics::Options().trace_scene_clear;
         submission.target = m_desc.target;
+#endif
     }
     TraceRenderCommand(rr, "clear", clear ? "recorded" : "preserved", m_desc.target, m_target);
-    if (rr.trace_render_commands || std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr) {
+    if (RenderCommandLogActive(rr) || wallpaper::diagnostics::Options().trace_scene_clear) {
         LOG_INFO("SceneMipHistory: frame=%llu target='%s' image=%p generation=%llu "
                  "quality-enabled=%s disable-revision=%llu applied-revision=%llu "
                  "creation-pending=%s action=%s color=[0 0 0 1] mip-levels=%u",

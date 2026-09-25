@@ -66,7 +66,7 @@ struct RenderingResources {
     // Draws recorded since renderer init, counted whether or not tracing is on. Selects the
     // draws the structural trace dump writes; matches the embedding's lockstep draw count.
     uint64_t       draw_index { 0 };
-    FrameTraceDump frame_trace_dump;
+    [[no_unique_address]] FrameTraceDump frame_trace_dump;
 
     vvk::CommandBuffer command;
 

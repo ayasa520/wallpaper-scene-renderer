@@ -104,8 +104,8 @@ void ClearPass::execute(const Device&, RenderingResources& rr) {
         ? PrepareSceneModelDepth(rr, m_desc.target, m_desc.should_clear_model_depth())
         : SceneDepthAction::Unused;
     if (m_desc.use_scene_clear_color &&
-        (std::getenv("WESCENE_TRACE_SCENE_CLEAR") != nullptr ||
-         std::getenv("WESCENE_TRACE_REFLECTION") != nullptr)) {
+        (wallpaper::diagnostics::Options().trace_scene_clear ||
+         wallpaper::diagnostics::Options().trace_reflection)) {
         LOG_INFO("SceneStageClear: target='%s' clear-enabled=%s color-action=%s "
                  "color=[%.6f %.6f %.6f %.6f] model-depth=%s",
                  m_desc.target.c_str(), rr.scene->clearEnabled ? "true" : "false",

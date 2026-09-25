@@ -138,7 +138,7 @@ void SceneImageEffect::ResolveCommand(Command& command, FboBindings& bindings,
                                            : std::string(current_destination);
         command.dst = command.authored_dst ? bindings.at(*command.authored_dst) : std::string();
     }
-    if (std::getenv("WESCENE_TRACE_EFFECT_PHASES") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_effect_phases) {
         LOG_INFO("SceneEffectCommandResolve: layer=%d effect=%d position=%d "
                  "command=%s compose=%s final-destination=%s source='%s' target='%s' copy=%s",
                  OwnerLayerId(), EffectId(), command.afterpos,
@@ -153,7 +153,7 @@ void SceneImageEffect::ResolveCommand(Command& command, FboBindings& bindings,
 bool SceneImageEffect::CommitFboBindings(const FboBindings& bindings) {
     if (m_fbo_bindings == bindings) return false;
     m_fbo_bindings = bindings;
-    if (std::getenv("WESCENE_TRACE_EFFECT_PHASES") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_effect_phases) {
         LOG_INFO("SceneEffectSwapCommit: layer=%d effect=%d bindings=%zu",
                  OwnerLayerId(), EffectId(), m_fbo_bindings.size());
     }
@@ -730,7 +730,7 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
             for (const auto slot : it->fbo_texture_slots) {
                 texs.at(slot) = fbo_bindings.at(it->authored_textures.at(slot));
             }
-            if (std::getenv("WESCENE_TRACE_EFFECT_PHASES") != nullptr) {
+            if (wallpaper::diagnostics::Options().trace_effect_phases) {
                 LOG_INFO("SceneEffectMatrixPhase: layer=%d node='%s' compose=%s "
                          "layer-space=%s input='%s' output='%s'",
                          it->sceneNode->ID(), it->sceneNode->Name().c_str(),
@@ -1006,7 +1006,7 @@ void SceneImageEffectLayer::ResolveShapeEffect(const SceneMesh& default_mesh,
         for (const auto slot : node.fbo_texture_slots) {
             material.textures.at(slot) = bindings.at(node.authored_textures.at(slot));
         }
-        if (std::getenv("WESCENE_TRACE_EFFECT_PHASES") != nullptr) {
+        if (wallpaper::diagnostics::Options().trace_effect_phases) {
             LOG_INFO("SceneShapeMaterialResolve: layer=%d effect=%d material=%d "
                      "final-material=%s compose=%s explicit-fbo=%s input='%s' output='%s' "
                      "owner-transform=true mesh=%s blend=%d",
@@ -1116,7 +1116,7 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
                                   default_node,
                                   effect_cam);
     }
-    if (std::getenv("WESCENE_TRACE_EFFECT_PHASES") != nullptr) {
+    if (wallpaper::diagnostics::Options().trace_effect_phases) {
         LOG_INFO("SceneEffectFinalSegment: layer=%d private=%s visible-writers=%zu "
                  "source-publication=%s composition-steps=%zu source-slot=%zu source='%s'",
                  m_owner.Id(), final_decision.keep_authored_final_private ? "true" : "false",
