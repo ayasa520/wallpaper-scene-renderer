@@ -103,7 +103,6 @@ public:
     virtual void      PassDeviceDesc(const DeviceDesc&)              = 0;
     virtual bool      IsPlaying() const                             = 0;
     virtual bool      IsEnded() const                               = 0;
-    virtual bool      ShouldRemove() const                          = 0;
     virtual float     Volume() const                                = 0;
 };
 
@@ -232,6 +231,14 @@ public:
             m_channels.push_back(chnw);
         }
     }
+    void UnmountChannel(const Channel* channel) {
+        // Explicit unmount waits for the current mixer read, independently of playback,
+        // pause or mute. The owner keeps its reference until this call returns, so the
+        // decoder is destroyed after the list lock is released, on the owning thread.
+        std::unique_lock<std::mutex> lock { m_mutex };
+        std::erase_if(m_channels,
+                      [channel](const auto& item) { return item.chn.get() == channel; });
+    }
     void UnmountAll() {
         {
             std::unique_lock<std::mutex> lock { m_mutex };
@@ -310,14 +317,7 @@ private:
                         channel.traced_master_volume = master_volume;
                     }
                 }
-                if (m_channels[i].chn->ShouldRemove()) m_channels[i].end = true;
             }
-            m_channels.erase(std::remove_if(m_channels.begin(),
-                                            m_channels.end(),
-                                            [](auto& c) {
-                                                return c.end;
-                                            }),
-                             m_channels.end());
         }
         AnalyzeSpectrum(static_cast<const float*>(pOutput), frameCount, phyChannels, m_device.sampleRate);
     }
@@ -389,7 +389,6 @@ private:
 
 private:
     struct ChannelWrap {
-        bool                     end { false };
         std::shared_ptr<Channel> chn;
         bool                    mix_traced { false };
         bool                    audible_traced { false };

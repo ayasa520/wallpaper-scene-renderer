@@ -68,7 +68,6 @@ public:
     }
     bool IsPlaying() const override { return m_playing && !m_ended; }
     bool IsEnded() const override { return m_ended; }
-    bool ShouldRemove() const override { return m_detached; }
     float Volume() const override { return m_volume; }
 
     void Play() {
@@ -95,10 +94,6 @@ public:
     }
 
     void SetVolume(float volume) { m_volume = std::clamp(volume, 0.0f, 1.0f); }
-    void Detach() {
-        m_playing  = false;
-        m_detached = true;
-    }
 
 private:
     // A stream reset may destroy its active decoder. Keep decoder reads, format updates,
@@ -116,7 +111,6 @@ private:
     // gain/control writes, including isPlaying() checks made before the decoder's readiness check.
     std::atomic<bool>             m_playing { true };
     std::atomic<bool>             m_ended { false };
-    std::atomic<bool>             m_detached { false };
     std::atomic<float>            m_volume { 1.0f };
 };
 
@@ -237,7 +231,7 @@ void SoundManager::Pause() { pImpl->device.Stop(); }
 bool SoundManager::UnmountStream(SoundHandle handle) {
     auto it = pImpl->channels.find(handle);
     if (it == pImpl->channels.end() || !it->second) return false;
-    it->second->Detach();
+    pImpl->device.UnmountChannel(it->second.get());
     pImpl->channels.erase(it);
     return true;
 }
@@ -281,12 +275,10 @@ bool SoundManager::SetStreamVolume(SoundHandle handle, float volume) {
 }
 
 void SoundManager::UnMountAll() {
-    for (auto& [handle, channel] : pImpl->channels) {
-        (void)handle;
-        if (channel) channel->Detach();
-    }
-    pImpl->channels.clear();
+    // Keep the owners alive while the device waits for its final mixer read. Clear
+    // the owning references afterwards so stream teardown does not run under its lock.
     pImpl->device.UnmountAll();
+    pImpl->channels.clear();
 }
 float SoundManager::Volume() const { return pImpl->device.Volume(); }
 
