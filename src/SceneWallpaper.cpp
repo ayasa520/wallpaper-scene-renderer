@@ -240,6 +240,7 @@ private:
     bool m_inited { false };
     bool m_render_ready { false };
     bool m_staged_scene_load { false };
+    bool m_loaded_hdr_materials_eligible { false };
     std::optional<bool> m_loaded_material_hdr;
 
     std::string                              m_assets;
@@ -1084,7 +1085,8 @@ MHANDLER_CMD_IMPL(MainHandler, SET_PROPERTY) {
                 // Do not reparse the outgoing project with the incoming project's properties
                 // while that transaction is still being assembled by the producer.
                 if (m_staged_scene_load) return;
-                const bool material_hdr = Scene::HdrMaterialsForQuality(m_postprocessing_quality);
+                const bool material_hdr = Scene::HdrMaterialsForQuality(
+                    m_postprocessing_quality, m_loaded_hdr_materials_eligible);
                 if (m_loaded_material_hdr.has_value() && *m_loaded_material_hdr != material_hdr) {
                     // HDR is a compile-time material choice, including descriptor membership.
                     // Crossing that choice reconstructs the scene through its existing load/
@@ -1322,6 +1324,7 @@ void MainHandler::loadScene() {
         scene->SetReflectionsEnabled(m_reflections_enabled);
         scene->volumetrics.quality = m_volumetrics_quality;
         scene->shadows.quality     = m_shadows_quality;
+        m_loaded_hdr_materials_eligible = scene->hdrMaterialsEligible;
         m_loaded_material_hdr     = scene->UsesHdrMaterials();
         scene->msaa.quality        = m_antialiasing_quality;
         scene->textureResolution.quality = m_texture_resolution_quality;

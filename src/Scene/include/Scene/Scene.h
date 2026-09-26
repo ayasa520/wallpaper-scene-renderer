@@ -109,13 +109,19 @@ public:
         int                        built_quality { -1 };
     };
 
-    // Material program selection follows host quality independently of scene bloom metadata
-    // and the output surface's storage format. Both ultra and display-HDR select this shader
-    // family; choosing it does not allocate floating-point targets or change presentation.
-    static constexpr bool HdrMaterialsForQuality(int32_t postprocessing_quality) {
-        return postprocessing_quality >= 2;
+    // HDR materials require both authored Bloom and HDR to be enabled when the scene loads.
+    // Keep that initial eligibility separate from live Bloom properties: scripts can change
+    // the post-process effect without changing an already compiled material's combinations
+    // or descriptors. Host quality then selects the program family within that eligibility.
+    // Attachment storage and output presentation remain separate decisions.
+    bool hdrMaterialsEligible { false };
+    static constexpr bool HdrMaterialsForQuality(int32_t postprocessing_quality,
+                                                bool scene_hdr_eligible) {
+        return scene_hdr_eligible && postprocessing_quality >= 2;
     }
-    bool UsesHdrMaterials() const { return HdrMaterialsForQuality(bloom.quality); }
+    bool UsesHdrMaterials() const {
+        return HdrMaterialsForQuality(bloom.quality, hdrMaterialsEligible);
+    }
 
     enum class ParsedImageRequestState
     {

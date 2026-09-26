@@ -4499,6 +4499,24 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
 
     InitContext(context, vfs, sc, scene_id);
     context.scene->bloom.quality = postprocessing_quality;
+    // Material eligibility belongs to the authored scene at load time. Read literal flags
+    // or a property's initial value without evaluating its user binding or script; the live
+    // Bloom state parsed above has a different lifetime and must not select shader families.
+    const auto general_json = json.find("general");
+    const auto authored_flag_enabled = [&](std::string_view name) {
+        if (general_json == json.end() || ! general_json->is_object()) return false;
+        const auto property = general_json->find(name);
+        if (property != general_json->end() && property->is_object()) {
+            return ReadJsonLiteralBoolean(*property, "value", false);
+        }
+        return ReadJsonLiteralBoolean(*general_json, name, false);
+    };
+    const bool authored_bloom = authored_flag_enabled("bloom");
+    const bool authored_hdr = authored_flag_enabled("hdr");
+    context.scene->hdrMaterialsEligible = authored_bloom && authored_hdr;
+    LOG_INFO("SceneMaterialQuality: quality=%d authored-bloom=%s authored-hdr=%s hdr-materials=%s",
+             postprocessing_quality, authored_bloom ? "true" : "false",
+             authored_hdr ? "true" : "false", context.scene->UsesHdrMaterials() ? "true" : "false");
     for (const auto& obj : wp_objs) {
         // Every authored object becomes exactly one SceneObject in parse order before per-type
         // materialization runs. Visibility only controls draw execution.
