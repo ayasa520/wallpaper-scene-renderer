@@ -154,7 +154,37 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
     }
     dot(value) { return this.x * value.x + this.y * value.y + this.z * value.z + this.w * value.w; }
     length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w); }
+    lengthSqr() { return this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w; }
+    distance(value) {
+      const dx = this.x - value.x, dy = this.y - value.y;
+      const dz = this.z - value.z, dw = this.w - value.w;
+      return Math.sqrt(dx * dx + dy * dy + dz * dz + dw * dw);
+    }
+    distanceSqr(value) {
+      const dx = this.x - value.x, dy = this.y - value.y;
+      const dz = this.z - value.z, dw = this.w - value.w;
+      return dx * dx + dy * dy + dz * dz + dw * dw;
+    }
     normalize() { return this.divide(this.length()); }
+    copy() { return new Vec4(this.x, this.y, this.z, this.w); }
+    equals(value) {
+      return value instanceof Vec4 && Math.abs(this.x - value.x) < __vectorEpsilon &&
+        Math.abs(this.y - value.y) < __vectorEpsilon && Math.abs(this.z - value.z) < __vectorEpsilon &&
+        Math.abs(this.w - value.w) < __vectorEpsilon;
+    }
+    isFinite() {
+      return Number.isFinite(this.x) && Number.isFinite(this.y) &&
+        Number.isFinite(this.z) && Number.isFinite(this.w);
+    }
+    negate() { return new Vec4(-this.x, -this.y, -this.z, -this.w); }
+    reflect(normal) { return this.subtract(normal.multiply(2 * this.dot(normal))); }
+    project(value) {
+      // Projection onto a zero vector is defined as a fresh zero result. Nonzero
+      // directions need not be normalized, and neither input is mutated by projection.
+      const squared = value.lengthSqr();
+      if (squared === 0) return new Vec4(0, 0, 0, 0);
+      return value.multiply(this.dot(value) / squared);
+    }
     // Interpolation owns its result, leaving both endpoints and the weight vector available
     // for later material updates. Evaluate each component in JavaScript number space; the
     // host applies its numeric storage conversion only when the result reaches a property.
@@ -169,6 +199,88 @@ inline constexpr std::string_view kSceneScriptVectorPrelude = R"JS(
                       this.y + (other.y - this.y) * amount.y,
                       this.z + (other.z - this.z) * amount.z,
                       this.w + (other.w - this.w) * amount.w);
+    }
+    min(value) {
+      if (typeof value === 'number') {
+        return new Vec4(Math.min(this.x, value), Math.min(this.y, value),
+                        Math.min(this.z, value), Math.min(this.w, value));
+      }
+      return new Vec4(Math.min(this.x, value.x), Math.min(this.y, value.y),
+                      Math.min(this.z, value.z), Math.min(this.w, value.w));
+    }
+    max(value) {
+      if (typeof value === 'number') {
+        return new Vec4(Math.max(this.x, value), Math.max(this.y, value),
+                        Math.max(this.z, value), Math.max(this.w, value));
+      }
+      return new Vec4(Math.max(this.x, value.x), Math.max(this.y, value.y),
+                      Math.max(this.z, value.z), Math.max(this.w, value.w));
+    }
+    clamp(minimum, maximum) {
+      // Each bound independently accepts a scalar or a component vector. Read both
+      // complete bounds before constructing the result; no temporary vector is needed.
+      const minX = typeof minimum === 'number' ? minimum : minimum.x;
+      const minY = typeof minimum === 'number' ? minimum : minimum.y;
+      const minZ = typeof minimum === 'number' ? minimum : minimum.z;
+      const minW = typeof minimum === 'number' ? minimum : minimum.w;
+      const maxX = typeof maximum === 'number' ? maximum : maximum.x;
+      const maxY = typeof maximum === 'number' ? maximum : maximum.y;
+      const maxZ = typeof maximum === 'number' ? maximum : maximum.z;
+      const maxW = typeof maximum === 'number' ? maximum : maximum.w;
+      return new Vec4(Math.max(minX, Math.min(maxX, this.x)),
+                      Math.max(minY, Math.min(maxY, this.y)),
+                      Math.max(minZ, Math.min(maxZ, this.z)),
+                      Math.max(minW, Math.min(maxW, this.w)));
+    }
+    abs() { return new Vec4(Math.abs(this.x), Math.abs(this.y), Math.abs(this.z), Math.abs(this.w)); }
+    sign() { return new Vec4(Math.sign(this.x), Math.sign(this.y), Math.sign(this.z), Math.sign(this.w)); }
+    round() { return new Vec4(Math.round(this.x), Math.round(this.y), Math.round(this.z), Math.round(this.w)); }
+    floor() { return new Vec4(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z), Math.floor(this.w)); }
+    ceil() { return new Vec4(Math.ceil(this.x), Math.ceil(this.y), Math.ceil(this.z), Math.ceil(this.w)); }
+    fract() {
+      return new Vec4(this.x - Math.floor(this.x), this.y - Math.floor(this.y),
+                      this.z - Math.floor(this.z), this.w - Math.floor(this.w));
+    }
+    mod(value) {
+      // Use floor-based modulo so negative components follow shader arithmetic.
+      // JavaScript's remainder operator gives a different result for signed operands.
+      if (typeof value === 'number') {
+        return new Vec4(this.x - value * Math.floor(this.x / value),
+                        this.y - value * Math.floor(this.y / value),
+                        this.z - value * Math.floor(this.z / value),
+                        this.w - value * Math.floor(this.w / value));
+      }
+      return new Vec4(this.x - value.x * Math.floor(this.x / value.x),
+                      this.y - value.y * Math.floor(this.y / value.y),
+                      this.z - value.z * Math.floor(this.z / value.z),
+                      this.w - value.w * Math.floor(this.w / value.w));
+    }
+    step(edge) {
+      const x = typeof edge === 'number' ? edge : edge.x;
+      const y = typeof edge === 'number' ? edge : edge.y;
+      const z = typeof edge === 'number' ? edge : edge.z;
+      const w = typeof edge === 'number' ? edge : edge.w;
+      return new Vec4(this.x < x ? 0 : 1, this.y < y ? 0 : 1,
+                      this.z < z ? 0 : 1, this.w < w ? 0 : 1);
+    }
+    smoothStep(minimum, maximum) {
+      // Normalize and clamp each component against its independently selected bounds
+      // before applying the cubic Hermite curve. Keep all arithmetic in number space;
+      // material assignment is the later boundary that converts values for GPU storage.
+      const minX = typeof minimum === 'number' ? minimum : minimum.x;
+      const minY = typeof minimum === 'number' ? minimum : minimum.y;
+      const minZ = typeof minimum === 'number' ? minimum : minimum.z;
+      const minW = typeof minimum === 'number' ? minimum : minimum.w;
+      const maxX = typeof maximum === 'number' ? maximum : maximum.x;
+      const maxY = typeof maximum === 'number' ? maximum : maximum.y;
+      const maxZ = typeof maximum === 'number' ? maximum : maximum.z;
+      const maxW = typeof maximum === 'number' ? maximum : maximum.w;
+      const x = Math.max(0, Math.min(1, (this.x - minX) / (maxX - minX)));
+      const y = Math.max(0, Math.min(1, (this.y - minY) / (maxY - minY)));
+      const z = Math.max(0, Math.min(1, (this.z - minZ) / (maxZ - minZ)));
+      const w = Math.max(0, Math.min(1, (this.w - minW) / (maxW - minW)));
+      return new Vec4(x * x * (3 - 2 * x), y * y * (3 - 2 * y),
+                      z * z * (3 - 2 * z), w * w * (3 - 2 * w));
     }
     toString() { return this.x + ' ' + this.y + ' ' + this.z + ' ' + this.w; }
     toConfigString() { return this.toString(); }
