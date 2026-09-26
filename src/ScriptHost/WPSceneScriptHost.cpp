@@ -1448,15 +1448,18 @@ JSValue NumericVectorToJS(JSContext* context, const std::vector<double>& values)
         return JS_NewFloat64(context, values.empty() ? 0.0 : values.front());
     }
 
-    if (values.size() == 2 || values.size() == 3) {
+    // Numeric vector reads are detached script values, including four-component material
+    // uniforms. Use the realm's vector class for every supported width so readbacks retain
+    // their value methods without sharing component storage with the material.
+    if (values.size() <= 4) {
+        static constexpr const char* classes[] = { "Vec2", "Vec3", "Vec4" };
         JSValue global = JS_GetGlobalObject(context);
-        JSValue ctor   = JS_GetPropertyStr(context, global, values.size() == 2 ? "Vec2" : "Vec3");
+        JSValue ctor   = JS_GetPropertyStr(context, global, classes[values.size() - 2]);
         if (! JS_IsException(ctor) && JS_IsFunction(context, ctor)) {
-            std::array<JSValue, 3> args {
-                JS_NewFloat64(context, values[0]),
-                JS_NewFloat64(context, values[1]),
-                JS_NewFloat64(context, values.size() > 2 ? values[2] : 0.0),
-            };
+            std::array<JSValue, 4> args {};
+            for (size_t index = 0; index < values.size(); index++) {
+                args[index] = JS_NewFloat64(context, values[index]);
+            }
             JSValue result =
                 JS_CallConstructor(context, ctor, static_cast<int>(values.size()), args.data());
             for (size_t index = 0; index < values.size(); index++) {
