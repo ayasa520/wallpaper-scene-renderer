@@ -641,13 +641,20 @@ WPParticleParser::genParticleOperatorOp(const nlohmann::json&                   
             std::array<float, 3> force { 0, 0, 0 };
             GET_JSON_NAME_VALUE_NOWARN(wpj, "drag", drag);
             GET_JSON_NAME_VALUE_NOWARN(wpj, "force", force);
-            Vector3d vecF = Vector3f(force.data()).cast<double>();
+            const Vector3f vecF(force.data());
             return [=](const ParticleInfo& info) {
+                // Angular drag damps velocity independently of the current orientation. Apply
+                // force before integrating rotation, then damp the velocity carried into the
+                // next step. Using rotation as a drag input creates an unintended restoring
+                // torque. Keep the intermediates in the particle state's float precision so
+                // repeated prewarm and live updates round consistently at each operation.
+                const float dt = static_cast<float>(info.time_pass);
+                constexpr float kDragDtMax = 0.99999988079071045f;
+                const float drag_factor = 1.0f - std::min(drag * dt, kDragDtMax);
                 for (auto& p : info.particles) {
-                    Vector3d acc =
-                        algorism::DragForce(PM::GetAngular(p).cast<double>(), drag) + vecF;
-                    PM::AngularAccelerate(p, acc, info.time_pass);
-                    PM::RotateByTime(p, info.time_pass);
+                    p.angularVelocity += vecF * dt;
+                    p.rotation += p.angularVelocity * dt;
+                    p.angularVelocity *= drag_factor;
                 }
             };
         } else if (name == "sizechange") {
