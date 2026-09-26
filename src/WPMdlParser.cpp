@@ -44,11 +44,28 @@ std::optional<WPPuppet::TranslationSpring> ReadTranslationSpring(const nlohmann:
     // Other simulation modes and constraints cannot be represented by this state, so they
     // must not accidentally activate a partial translation simulation.
     if (!ReadJsonLiteralBoolean(config, "t", false)) return std::nullopt;
-    for (const char* field : {"r", "re", "ge", "ik", "ikce", "lt", "la",
-                              "tax", "tay", "taz", "rax", "ray", "raz"}) {
+    for (const char* field : {"r", "re", "ge", "ik", "ikce", "lt", "la"}) {
         if (ReadJsonLiteralBoolean(config, field, false)) {
             LOG_INFO("puppet translation spring has unsupported mode or constraint '%s'", field);
             return std::nullopt;
+        }
+    }
+    // Axis booleans enable motion; a complete true triplet is an unconstrained spring.
+    // The axis group takes effect only when all three literal booleans are present.
+    // Rotation is disabled on this path, so its saved axis options do not constrain
+    // translation. A disabled translation axis needs a different integration step.
+    constexpr std::array translation_axes {"tax", "tay", "taz"};
+    const bool has_translation_axes = std::all_of(
+        translation_axes.begin(), translation_axes.end(), [&](const char* field) {
+            const auto value = config.find(field);
+            return value != config.end() && value->is_boolean();
+        });
+    if (has_translation_axes) {
+        for (const char* field : translation_axes) {
+            if (!config[field].get<bool>()) {
+                LOG_INFO("puppet translation spring has unsupported disabled axis '%s'", field);
+                return std::nullopt;
+            }
         }
     }
     for (const char* field : {"ts", "tf", "ti", "tm"}) {
