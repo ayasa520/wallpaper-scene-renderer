@@ -20,6 +20,10 @@ class Image;
 namespace vulkan
 {
 
+// Use the same file-image policy for sampler creation and device admission. The
+// selected device must support this level before any anisotropic sampler is created.
+inline constexpr float kFileTextureAnisotropy = 8.0f;
+
 VkFormat             ToVkType(TextureFormat);
 VkSamplerAddressMode ToVkType(TextureWrap);
 VkFilter             ToVkType(TextureFilter);

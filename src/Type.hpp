@@ -131,6 +131,10 @@ struct TextureSample {
     TextureWrap   wrapT { TextureWrap::REPEAT };
     TextureFilter magFilter { TextureFilter::NEAREST };
     TextureFilter minFilter { TextureFilter::NEAREST };
+    // Interpolated file images opt in when their headers are parsed. Keep this separate
+    // from linear filtering: render targets, glyph pages and generated media images
+    // also use linear filters without the file-image sampling policy.
+    bool anisotropic { false };
 
     bool operator==(const TextureSample&) const = default;
 };

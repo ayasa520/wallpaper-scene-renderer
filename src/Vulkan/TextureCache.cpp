@@ -127,13 +127,11 @@ std::vector<uint64_t> FilterSupportedDrmModifiers(const vvk::PhysicalDevice& gpu
     return usable_modifiers;
 }
 
-VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
-    auto& sam = key.sample;
-    const float max_lod = key.mipmap_level > 0
-        ? static_cast<float>(key.mipmap_level - 1)
+VkSamplerCreateInfo GenSamplerInfo(const TextureSample& sam, uint32_t mipmap_levels, bool compare) {
+    const float max_lod = mipmap_levels > 0
+        ? static_cast<float>(mipmap_levels - 1)
         : 0.0f;
 
-    const bool compare = key.usage == TexUsage::DEPTH;
     VkSamplerCreateInfo sampler_info { .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                                        .pNext            = nullptr,
                                        .magFilter        = ToVkType(sam.magFilter),
@@ -144,8 +142,9 @@ VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
                                        .addressModeU     = (ToVkType(sam.wrapS)),
                                        .addressModeV     = (ToVkType(sam.wrapT)),
                                        .addressModeW     = (ToVkType(sam.wrapT)),
-                                       .anisotropyEnable = (false),
-                                       .maxAnisotropy    = (1.0f),
+                                       .anisotropyEnable = sam.anisotropic ? VK_TRUE : VK_FALSE,
+                                       .maxAnisotropy    = sam.anisotropic
+                                           ? kFileTextureAnisotropy : 1.0f,
                                        // Shadow atlases hold reversed depth (near = 1): a receiver
                                        // is lit when its light-space depth is GREATER than the
                                        // stored caster depth.
@@ -707,29 +706,7 @@ bool CreateImageSlotForTexture(const Device& device, const Image& image, usize s
     if (image_slot.width <= 0 || image_slot.height <= 0 || image_slot.mipmaps.empty()) {
         return false;
     }
-    const float max_lod = mipmap_levels > 0
-        ? static_cast<float>(mipmap_levels - 1)
-        : 0.0f;
-    VkSamplerCreateInfo sampler_info {
-        .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .pNext                   = nullptr,
-        .magFilter               = ToVkType(sam.magFilter),
-        .minFilter               = (ToVkType(sam.minFilter)),
-        .mipmapMode              = sam.minFilter == TextureFilter::NEAREST
-            ? VK_SAMPLER_MIPMAP_MODE_NEAREST
-            : VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU            = (ToVkType(sam.wrapS)),
-        .addressModeV            = (ToVkType(sam.wrapT)),
-        .addressModeW            = (ToVkType(sam.wrapT)),
-        .anisotropyEnable        = (false),
-        .maxAnisotropy           = (1.0f),
-        .compareEnable           = (false),
-        .compareOp               = VK_COMPARE_OP_NEVER,
-        .minLod                  = (0.0f),
-        .maxLod                  = max_lod,
-        .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
-        .unnormalizedCoordinates = (false),
-    };
+    const auto sampler_info = GenSamplerInfo(sam, static_cast<uint32_t>(mipmap_levels), false);
     VkFormat   format = ToVkType(image.header.format);
     VkExtent3D ext { (u32)image_slot.width, (u32)image_slot.height, 1 };
 
@@ -741,6 +718,12 @@ bool CreateImageSlotForTexture(const Device& device, const Image& image, usize s
                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         opt.has_value()) {
         image_paras = std::move(opt.value());
+        LOG_INFO("TextureSampler: key='%s' slot=%zu min=%s mag=%s wrap=%s/%s "
+                 "anisotropy=%.0f mip-levels=%zu",
+                 image.key.c_str(), slot_index,
+                 TextureFilterName(sam.minFilter).data(), TextureFilterName(sam.magFilter).data(),
+                 TextureWrapName(sam.wrapS).data(), TextureWrapName(sam.wrapT).data(),
+                 sampler_info.maxAnisotropy, mipmap_levels);
         return true;
     }
 
@@ -771,6 +754,7 @@ std::size_t TextureKey::HashValue(const TextureKey& k) {
     utils::hash_combine(seed, (int)k.sample.wrapT);
     utils::hash_combine(seed, (int)k.sample.magFilter);
     utils::hash_combine(seed, (int)k.sample.minFilter);
+    utils::hash_combine(seed, k.sample.anisotropic);
     utils::hash_combine(seed, (int)k.sample_count);
     utils::hash_combine(seed, k.allocation_revision);
     return seed;
@@ -910,7 +894,8 @@ void TextureCache::allocateCmd() {
 std::optional<VmaImageParameters> TextureCache::CreateTex(TextureKey tex_key) {
     VmaImageParameters image_paras;
     do {
-        VkSamplerCreateInfo sam_info = GenSamplerInfo(tex_key);
+        VkSamplerCreateInfo sam_info = GenSamplerInfo(tex_key.sample, tex_key.mipmap_level,
+                                                     tex_key.usage == TexUsage::DEPTH);
         VkExtent3D          ext { (u32)tex_key.width, (u32)tex_key.height, 1 };
         const auto samples = static_cast<VkSampleCountFlagBits>(
             tex_key.sample_count > 0 ? tex_key.sample_count : 1u);

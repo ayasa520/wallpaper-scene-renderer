@@ -40,7 +40,7 @@ namespace
 constexpr std::string_view TEX_HEADER_DIR { "tex-headers01" };
 // Bump when cached sprite-frame UVs or other header fields would be interpreted
 // differently. A version mismatch is a miss; do not rewrite stale records in place.
-constexpr int kTextureHeaderCacheVersion = 5;
+constexpr int kTextureHeaderCacheVersion = 6;
 
 char* Lz4Decompress(const char* src, int size, int decompressed_size) {
     char* dst       = new char[(usize)decompressed_size];
@@ -114,6 +114,7 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
             flags[WPTexFlagEnum::clampUVs] ? TextureWrap::CLAMP_TO_EDGE : TextureWrap::REPEAT;
         header.sample.minFilter = header.sample.magFilter =
             flags[WPTexFlagEnum::noInterpolation] ? TextureFilter::NEAREST : TextureFilter::LINEAR;
+        header.sample.anisotropic = !flags[WPTexFlagEnum::noInterpolation];
         header.extraHeader["compo1"].val = flags[WPTexFlagEnum::compo1];
         header.extraHeader["compo2"].val = flags[WPTexFlagEnum::compo2];
         header.extraHeader["compo3"].val = flags[WPTexFlagEnum::compo3];
@@ -286,6 +287,7 @@ bool LoadCachedImageHeader(ImageHeader& header, uint64_t& file_size, fs::IBinary
     if (! ReadPod(file, wrap_t)) return false;
     if (! ReadPod(file, mag_filter)) return false;
     if (! ReadPod(file, min_filter)) return false;
+    if (! ReadPod(file, header.sample.anisotropic)) return false;
 
     header.type             = static_cast<ImageType>(type);
     header.format           = static_cast<TextureFormat>(format);
@@ -327,6 +329,7 @@ void SaveCachedImageHeader(const ImageHeader& header, uint64_t file_size, fs::IB
     WritePod(file, wrap_t);
     WritePod(file, mag_filter);
     WritePod(file, min_filter);
+    WritePod(file, header.sample.anisotropic);
 
     SaveExtraHeaderMap(header.extraHeader, file);
     SaveSpriteAnimation(header.spriteAnim, file);
@@ -443,6 +446,7 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
             if (i_mipmap == 0 && !LZ4_compressed && header.type == ImageType::UNKNOWN &&
                 LooksLikeMp4Payload(probe, read)) {
                 header.isVideoTexture = true;
+                header.sample.anisotropic = false;
                 header.extraHeader["texb_is_video_mp4"].val = 1;
             }
             if (src_size > static_cast<i32>(read)) file.SeekCur(src_size - static_cast<i32>(read));
@@ -521,6 +525,7 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
             if (i_image == 0 && i_mipmap == 0 && img.header.type == ImageType::UNKNOWN &&
                 LooksLikeMp4Payload(result, static_cast<size_t>(src_size))) {
                 img.header.isVideoTexture = true;
+                img.header.sample.anisotropic = false;
                 img.header.extraHeader["texb_is_video_mp4"].val = 1;
             }
             // TEXB0003/TEXB0004 textures may store an image container payload instead of raw RGBA

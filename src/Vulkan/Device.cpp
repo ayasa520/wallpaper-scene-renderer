@@ -61,8 +61,18 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, std::span<const Extension> exts, 
             }
         }
     }
-    if (! gpu.GetFeatures().geometryShader) {
+    const auto features = gpu.GetFeatures();
+    if (! features.geometryShader) {
         LOG_INFO("reject vulkan device \"%s\": missing geometryShader feature", gpu_props.deviceName);
+        return false;
+    }
+    if (! features.samplerAnisotropy ||
+        gpu_props.limits.maxSamplerAnisotropy < kFileTextureAnisotropy) {
+        LOG_INFO("reject vulkan device \"%s\": file textures require %.0fx sampler anisotropy "
+                 "(feature=%s, limit=%.0f)",
+                 gpu_props.deviceName, kFileTextureAnisotropy,
+                 features.samplerAnisotropy ? "true" : "false",
+                 gpu_props.limits.maxSamplerAnisotropy);
         return false;
     }
     return true;
@@ -151,8 +161,21 @@ bool Device::Create(Instance& inst,
                   gpu_props.deviceName);
         return false;
     }
+    // An explicitly selected GPU reaches device creation without the automatic
+    // candidate filter. Require the same sampling capability here, and enable the
+    // feature on the logical device before file-image samplers can request it.
+    if (! supported_features.samplerAnisotropy ||
+        device.m_limits.maxSamplerAnisotropy < kFileTextureAnisotropy) {
+        LOG_ERROR("cannot create vulkan device '%s': file textures require %.0fx sampler anisotropy "
+                  "(feature=%s, limit=%.0f)",
+                  gpu_props.deviceName, kFileTextureAnisotropy,
+                  supported_features.samplerAnisotropy ? "true" : "false",
+                  device.m_limits.maxSamplerAnisotropy);
+        return false;
+    }
     VkPhysicalDeviceFeatures enabled_features {};
     enabled_features.geometryShader = VK_TRUE;
+    enabled_features.samplerAnisotropy = VK_TRUE;
     VVK_CHECK_BOOL_RE(vvk::Device::Create(device.m_device,
                                           *device.m_gpu,
                                           device.ChooseDeviceQueue(*inst.surface()),

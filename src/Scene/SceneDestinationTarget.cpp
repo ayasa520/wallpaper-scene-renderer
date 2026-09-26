@@ -98,7 +98,9 @@ bool SceneRenderTarget::ResizeReferenceExtent(std::array<i32, 2> extent) {
 TextureSample DestinationRenderTargetSampler(bool point_sampled, bool clamp_uvs) {
     const auto wrap = clamp_uvs ? TextureWrap::CLAMP_TO_EDGE : TextureWrap::REPEAT;
     const auto filter = point_sampled ? TextureFilter::NEAREST : TextureFilter::LINEAR;
-    return TextureSample { wrap, wrap, filter, filter };
+    // A destination inherits the requested filtering and addressing, but it is a new
+    // rendered image. Do not carry file-image anisotropy across the source/target boundary.
+    return TextureSample { wrap, wrap, filter, filter, false };
 }
 
 std::string SceneDestinationRenderTargetBaseName(int32_t width, int32_t height,
