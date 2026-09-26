@@ -166,6 +166,11 @@ struct WPSceneScriptHost::Opaque {
     // registry. Appending must preserve both the active iterator and every instance address;
     // owner destruction is drained separately before frame dispatch begins.
     std::list<std::unique_ptr<ScriptInstance>>   instances;
+    // Bootstrap may instantiate the same authored source for many different owners.
+    // Retain only compiled programs for that batch, never exports or mutable closures.
+    // Initialize releases these references after property/media dispatch; live functions
+    // keep their bytecode, and later dynamically created sources cannot grow this table.
+    std::unordered_map<std::string, JSValue>     initial_script_programs;
     std::vector<ScriptTimer>                     timers;
     std::vector<AudioBufferBinding>              audio_buffers;
     ExternalSceneAudioState                      external_audio;

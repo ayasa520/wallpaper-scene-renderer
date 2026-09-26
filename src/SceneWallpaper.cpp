@@ -718,6 +718,8 @@ private:
             // that authored density for later rerasterization; desktop render scale must not
             // rebuild glyphs or enlarge effect ping-pong.
             m_scene->textRenderScale = 1.0;
+            LOG_INFO("SceneLoad: stage=script-host-begin scripts=%zu",
+                     m_scene->scriptRegistrations.size());
             m_scene->scriptHost = std::make_unique<WPSceneScriptHost>(m_scene.get());
             for (const auto& registration : m_scene->bindingRegistrations) {
                 m_scene->scriptHost->RegisterPropertyBinding(registration);
@@ -728,7 +730,9 @@ private:
             for (const auto& registration : m_scene->scriptRegistrations) {
                 m_scene->scriptHost->RegisterPropertyScript(registration);
             }
+            LOG_INFO("SceneLoad: stage=script-initialize-begin");
             m_scene->scriptHost->Initialize();
+            LOG_INFO("SceneLoad: stage=script-initialize-complete");
             if (media_state) {
                 m_scene->scriptHost->ApplyMediaState(*media_state);
                 m_applied_media_state = std::move(media_state);
@@ -753,10 +757,12 @@ private:
             m_scene->RefreshImageSourceTextures();
 
             if (m_rg) m_render->clearLastRenderGraph(true);
+            LOG_INFO("SceneLoad: stage=pipeline-warmup-begin");
             {
                 auto warmup_rg = sceneToPipelineWarmupRenderGraph(*m_scene);
                 m_render->warmupRenderGraphPipelines(*m_scene, *warmup_rg);
             }
+            LOG_INFO("SceneLoad: stage=pipeline-warmup-complete");
             m_rg = sceneToRenderGraph(*m_scene);
 
             if (main_handler.isGenGraphviz()) m_rg->ToGraphviz("graph.dot");
@@ -765,7 +771,9 @@ private:
             // show a one-frame native-aspect projection before draw-time uniform refreshes catch
             // up.
             m_render->UpdateCameraFillMode(*m_scene, m_fillmode);
+            LOG_INFO("SceneLoad: stage=graph-compile-begin");
             m_render->compileRenderGraph(*m_scene, *m_rg, false);
+            LOG_INFO("SceneLoad: stage=graph-compile-complete");
             m_scene->ClearRenderGraphDirty();
 
             auto pos                         = m_mouse_pos.load();
@@ -1313,6 +1321,9 @@ void MainHandler::loadScene() {
             LOG_ERROR("Not supported scene type");
             return;
         }
+        // These load milestones keep parser, script and GPU preparation distinguishable
+        // in startup logs. INFO diagnostics are removed by the Release build policy.
+        LOG_INFO("SceneLoad: stage=parse-begin");
         scene = m_scene_parser.Parse(scene_id,
                                      scene_src,
                                      vfs,
@@ -1321,6 +1332,7 @@ void MainHandler::loadScene() {
                                      m_render_handler->textRenderScale(),
                                      m_render_handler->outputExtent(),
                                      m_postprocessing_quality);
+        LOG_INFO("SceneLoad: stage=parse-complete");
         scene->SetReflectionsEnabled(m_reflections_enabled);
         scene->volumetrics.quality = m_volumetrics_quality;
         scene->shadows.quality     = m_shadows_quality;

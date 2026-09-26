@@ -1491,9 +1491,21 @@ void CopyGlyphBitmapIntoAtlas(uint8_t*                 dst_pixels,
                     dst_pixels + dst_index * pixel_stride);
     };
 
-    for (int y = 0; y < source.height; y++) {
-        for (int x = 0; x < source.width; x++) {
-            copy_pixel(dst_x + x, dst_y + y, x, y);
+    // Coverage and palette glyph interiors are contiguous rows. Clip the span once and
+    // copy each row as a block instead of repeating bounds and stride work for every
+    // texel. The separate gutter copies below preserve the same linear-sampling edges.
+    const int source_x_begin = std::max(0, -dst_x);
+    const int source_x_end = std::min(source.width, dst_width - dst_x);
+    const int source_y_begin = std::max(0, -dst_y);
+    const int source_y_end = std::min(source.height, dst_height - dst_y);
+    if (source_x_begin < source_x_end) {
+        const size_t row_bytes = static_cast<size_t>(source_x_end - source_x_begin) * pixel_stride;
+        for (int y = source_y_begin; y < source_y_end; y++) {
+            const size_t src_index = static_cast<size_t>(y) * source.width + source_x_begin;
+            const size_t dst_index = static_cast<size_t>(dst_y + y) * dst_width +
+                                     static_cast<size_t>(dst_x + source_x_begin);
+            std::copy_n(source.pixels.get() + src_index * pixel_stride, row_bytes,
+                        dst_pixels + dst_index * pixel_stride);
         }
     }
 

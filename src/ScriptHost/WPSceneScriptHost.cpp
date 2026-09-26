@@ -1357,19 +1357,21 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "    mediaPlaybackChanged: typeof mediaPlaybackChanged === 'function' ? "
            "mediaPlaybackChanged : undefined,\n"
         << "    destroy: typeof destroy === 'function' ? destroy : undefined,\n"
-        << "    resizeScreen: typeof resizeScreen === 'function' ? resizeScreen : undefined,\n"
-        << "    __debugInspect: () => JSON.stringify({\n"
-        << "      objectKind: __objectKind,\n"
-        << "      hasAddEndedCallback: ('addEndedCallback' in thisObject),\n"
-        << "      addEndedCallbackType: typeof thisObject.addEndedCallback,\n"
-        << "      getAnimationType: typeof thisObject.getAnimation,\n"
-        << "      playType: typeof thisObject.play,\n"
-        << "      setFrameType: typeof thisObject.setFrame,\n"
-        << "      frameCountType: typeof thisObject.frameCount,\n"
-        << "      sharedOffsetedStartAniType: typeof shared.offsetedStartAni\n"
-        << "    })\n"
-        << "  };\n"
-        << "})";
+        << "    resizeScreen: typeof resizeScreen === 'function' ? resizeScreen : undefined,\n";
+    if constexpr (diagnostics::Enabled) {
+        wrapper
+            << "    __debugInspect: () => JSON.stringify({\n"
+            << "      objectKind: __objectKind,\n"
+            << "      hasAddEndedCallback: ('addEndedCallback' in thisObject),\n"
+            << "      addEndedCallbackType: typeof thisObject.addEndedCallback,\n"
+            << "      getAnimationType: typeof thisObject.getAnimation,\n"
+            << "      playType: typeof thisObject.play,\n"
+            << "      setFrameType: typeof thisObject.setFrame,\n"
+            << "      frameCountType: typeof thisObject.frameCount,\n"
+            << "      sharedOffsetedStartAniType: typeof shared.offsetedStartAni\n"
+            << "    })\n";
+    }
+    wrapper << "  };\n" << "})";
     return wrapper.str();
 }
 
@@ -8644,6 +8646,52 @@ bool ShouldKeepScriptAuthoredInitialValue(const WPSceneScriptRegistration& regis
                        });
 }
 
+void ReleaseInitialScriptPrograms(WPSceneScriptHost::Opaque& opaque) {
+    for (auto& [source, program] : opaque.initial_script_programs) {
+        FreeJSValue(opaque.runtime.context, program);
+    }
+    opaque.initial_script_programs.clear();
+}
+
+JSValue CreateScriptFactory(WPSceneScriptHost::Opaque& opaque, const ScriptInstance& instance) {
+    JSContext* context = opaque.runtime.context;
+    const auto& source = instance.registration.setting.script;
+    std::chrono::steady_clock::time_point started;
+    if constexpr (diagnostics::Enabled) started = std::chrono::steady_clock::now();
+
+    const auto retained = opaque.initial_script_programs.find(source);
+    const bool reused = retained != opaque.initial_script_programs.end();
+    size_t compiled_bytes = 0;
+    JSValue program;
+    if (reused) {
+        program = JS_DupValue(context, retained->second);
+    } else {
+        const auto wrapped = BuildPersistentScript(source);
+        if constexpr (diagnostics::Enabled) compiled_bytes = wrapped.size();
+        program = JS_Eval(context, wrapped.c_str(), wrapped.size(), "<scene-script-factory>",
+                          JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(program) && opaque.initializing) {
+            opaque.initial_script_programs.emplace(source, JS_DupValue(context, program));
+        }
+    }
+
+    // QuickJS consumes this program reference and creates a fresh factory function.
+    // Calling that factory below still evaluates each owner's module in a new closure,
+    // with its own environment, module variables, callbacks and lifecycle. Only immutable compiled
+    // code is shared; failed compilations are not retained, so every owner keeps its error.
+    JSValue factory = JS_IsException(program) ? program : JS_EvalFunction(context, program);
+    if constexpr (diagnostics::Enabled) {
+        const double duration_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        LOG_INFO("SceneScriptCompile: instance=%u source-key=%016llx source-bytes=%zu "
+                 "factory-bytes=%zu reused=%s duration=%.3fms",
+                 instance.instance_id,
+                 static_cast<unsigned long long>(std::hash<std::string_view>{}(source)),
+                 source.size(), compiled_bytes, reused ? "true" : "false", duration_ms);
+    }
+    return factory;
+}
+
 bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance& instance) {
     if (opaque == nullptr || opaque->runtime.context == nullptr || opaque->scene == nullptr)
         return false;
@@ -8727,9 +8775,7 @@ bool InitializeScriptInstance(WPSceneScriptHost::Opaque* opaque, ScriptInstance&
 
     JS_SetPropertyStr(context, global, "__sceneScriptEnv", JS_DupValue(context, env));
 
-    const std::string wrapped = BuildPersistentScript(instance.registration.setting.script);
-    JSValue           factory = JS_Eval(
-        context, wrapped.c_str(), wrapped.size(), "<scene-script-factory>", JS_EVAL_TYPE_GLOBAL);
+    JSValue factory = CreateScriptFactory(*opaque, instance);
     if (JS_IsException(factory)) {
         LOG_ERROR("QuickJS compile context: %s",
                   DescribeScriptInstance(opaque, instance.instance_id).c_str());
@@ -9315,6 +9361,7 @@ WPSceneScriptHost::~WPSceneScriptHost() {
         FreeJSValue(m_impl->runtime.context, m_impl->scene_object);
         FreeJSValue(m_impl->runtime.context, m_impl->native_bridge);
         FreeJSValue(m_impl->runtime.context, m_impl->user_properties_object);
+        ReleaseInitialScriptPrograms(*m_impl);
         JS_FreeContext(m_impl->runtime.context);
     }
 
@@ -9457,6 +9504,9 @@ void WPSceneScriptHost::Initialize() {
     ApplyGeneralSettings(m_impl->general_settings, true);
     ApplyUserProperties(m_impl->user_properties, true);
     ApplyMediaState(m_impl->media_state, true);
+    LOG_INFO("SceneScriptPrograms: bootstrap-complete programs=%zu",
+             m_impl->initial_script_programs.size());
+    ReleaseInitialScriptPrograms(*m_impl);
 }
 
 
