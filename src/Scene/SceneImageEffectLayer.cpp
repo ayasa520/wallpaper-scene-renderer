@@ -863,8 +863,8 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
     SceneNode& default_node,
     std::string_view effect_cam,
     std::string_view final_output) {
-    // Every material drawing the current destination in this segment receives layer placement;
-    // auxiliary FBO materials retain their private raster.
+    // Current-destination materials and the selected final material receive layer placement
+    // in this segment. Non-final auxiliary FBO materials retain their private raster.
     final_output_node.uses_owner_transform = !m_fullscreen;
     final_output_node.mesh_follows_final_mesh = !m_fullscreen;
     final_output_node.output = std::string(final_output);
@@ -1101,10 +1101,22 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
         for (auto& effect : m_effects) {
             if (!effect->LocalVisible()) continue;
             for (auto& node : effect->nodes) {
+                if (!node.uses_layer_space_effect_matrices) continue;
+                if (node.output_is_fbo) {
+                    if (node.is_final_material) {
+                        // A named attachment changes the destination, not the selected final
+                        // material's owner card, placement or draw state. Keep the resolved
+                        // target alive separately while preparation assigns the node's output.
+                        // This draw does not publish to the enclosing scene destination.
+                        const auto target = node.output;
+                        ResolveVisibleFinalOutput(node, default_mesh, default_node,
+                                                  effect_cam, target);
+                    }
+                    continue;
+                }
                 const auto authored_output =
                     ResolveTemplateOrCurrent(node.authored_output, node.output);
-                if (!node.uses_layer_space_effect_matrices || node.output_is_fbo ||
-                    !IsCurrentEffectOutput(authored_output)) continue;
+                if (!IsCurrentEffectOutput(authored_output)) continue;
                 ResolveVisibleFinalOutput(node, default_mesh, default_node,
                                           effect_cam, final_output);
                 ++visible_writer_count;
