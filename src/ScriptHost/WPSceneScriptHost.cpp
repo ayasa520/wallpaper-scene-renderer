@@ -700,8 +700,11 @@ std::string BuildPersistentScript(std::string_view script_source) {
            "false;\n"
         << "  if (typeof engine.openUserShortcut !== 'function') engine.openUserShortcut = () => "
            "false;\n"
-        << "  if (typeof engine.registerAsset !== 'function') engine.registerAsset = (file) => ({ "
-           "file: String(file ?? '') });\n"
+        // Registered assets are path values shared by string properties and creation configs.
+        // Preserve the primitive string so assigning an asset to a font property selects the
+        // registered file instead of stringifying a wrapper object into an unrelated path.
+        << "  if (typeof engine.registerAsset !== 'function') engine.registerAsset = (file) => "
+           "String(file ?? '');\n"
         << "  if (typeof engine.registerAudioBuffers !== 'function') {\n"
         << "    engine.registerAudioBuffers = (resolution) => {\n"
         << "      const size = Math.max(0, Number(resolution) || 0);\n"
