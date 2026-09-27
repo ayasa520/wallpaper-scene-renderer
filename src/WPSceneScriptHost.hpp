@@ -65,7 +65,7 @@ class WPSceneScriptHost {
 public:
     struct Opaque;
 
-    explicit WPSceneScriptHost(Scene* scene);
+    WPSceneScriptHost(Scene* scene, int32_t output_width, int32_t output_height);
     ~WPSceneScriptHost();
 
     WPSceneScriptHost(const WPSceneScriptHost&)            = delete;

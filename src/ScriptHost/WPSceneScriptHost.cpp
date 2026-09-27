@@ -8496,15 +8496,10 @@ CursorPositionState ComputeCursorPositionState(const WPSceneScriptHost::Opaque* 
     const float normalized_y = std::clamp(opaque->scene->mousePositionNormalized[1], 0.0f, 1.0f);
     state.ndc_x = normalized_x * 2.0 - 1.0;
     state.ndc_y = 1.0 - normalized_y * 2.0;
-    // input.cursorScreenPosition shares its coordinate frame with engine.screenResolution:
-    // scripts divide one by the other to normalize the pointer. Use the published output size
-    // and only fall back to the authored canvas before the surface size is known.
-    const float screen_w = opaque->screen_size[0] > 0
-                               ? static_cast<float>(opaque->screen_size[0])
-                               : static_cast<float>(opaque->scene->ortho[0]);
-    const float screen_h = opaque->screen_size[1] > 0
-                               ? static_cast<float>(opaque->screen_size[1])
-                               : static_cast<float>(opaque->scene->ortho[1]);
+    // Cursor pixels and screenResolution share the physical output coordinate frame from
+    // host construction onward, including values retained by module and init callbacks.
+    const float screen_w = static_cast<float>(opaque->screen_size[0]);
+    const float screen_h = static_cast<float>(opaque->screen_size[1]);
     const float screen_x = normalized_x * screen_w;
     const float screen_y = normalized_y * screen_h;
 
@@ -8981,8 +8976,14 @@ std::optional<std::string> ResolveSceneScriptAssetFile(const Scene* scene, JSCon
     return ResolveScriptAssetFile(scene, *handle);
 }
 
-WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new Opaque()) {
+WPSceneScriptHost::WPSceneScriptHost(Scene* scene, int32_t output_width, int32_t output_height)
+    : m_scene(scene), m_impl(new Opaque()) {
     m_impl->scene           = scene;
+    // Modules and init callbacks can retain screen dimensions and cursor coordinates for
+    // later motion/layout calculations. Publish the physical output before any script runs;
+    // changing its coordinate frame after init would invent movement on the first update.
+    // The authored canvas remains a separate scene-space input.
+    m_impl->screen_size = { output_width, output_height };
     m_impl->runtime.runtime = JS_NewRuntime();
     if (m_impl->runtime.runtime == nullptr) {
         LOG_ERROR("failed to create SceneScript QuickJS runtime");
@@ -9357,8 +9358,8 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     JSValue screen_size = JS_GetPropertyStr(context, m_impl->engine_base, "screenResolution");
     if (m_scene != nullptr) {
         set_vec2(canvas_size, m_scene->ortho[0], m_scene->ortho[1]);
-        set_vec2(screen_size, m_scene->ortho[0], m_scene->ortho[1]);
     }
+    set_vec2(screen_size, output_width, output_height);
     JS_FreeValue(context, canvas_size);
     JS_FreeValue(context, screen_size);
 

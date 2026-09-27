@@ -720,7 +720,9 @@ private:
             m_scene->textRenderScale = 1.0;
             LOG_INFO("SceneLoad: stage=script-host-begin scripts=%zu",
                      m_scene->scriptRegistrations.size());
-            m_scene->scriptHost = std::make_unique<WPSceneScriptHost>(m_scene.get());
+            m_scene->scriptHost = std::make_unique<WPSceneScriptHost>(
+                m_scene.get(), static_cast<int32_t>(m_output_width),
+                static_cast<int32_t>(m_output_height));
             for (const auto& registration : m_scene->bindingRegistrations) {
                 m_scene->scriptHost->RegisterPropertyBinding(registration);
             }
@@ -740,11 +742,9 @@ private:
             if (audio_samples) {
                 m_scene->scriptHost->ApplyAudioSamples(*audio_samples);
             }
-            // Scene scripts distinguish the authored canvas (engine.canvasSize, scene ortho) from
-            // the physical wallpaper output (engine.screenResolution). UI layout scripts derive
-            // their resolution-adaptive scale from screenResolution, so publish the real output
-            // extent before the first script update runs; the host constructor only knows the
-            // canvas size.
+            // Output metadata is already available to module and init callbacks. Deliver the
+            // initial resize event after their initialization, preserving the ordering needed
+            // by scripts that allocate their callback state in init.
             m_scene->scriptHost->ResizeScreen(static_cast<int32_t>(m_output_width),
                                               static_cast<int32_t>(m_output_height));
 

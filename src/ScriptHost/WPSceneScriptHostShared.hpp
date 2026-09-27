@@ -203,8 +203,8 @@ struct WPSceneScriptHost::Opaque {
     // every frame, so only the first application per layer is logged.
     std::unordered_set<int32_t>  color_apply_reported_layers;
     std::vector<SceneRegistrationRange> pending_scene_registration_ranges;
-    // Physical wallpaper output extent (engine.screenResolution). Zero until the wallpaper
-    // surface publishes its size; cursor screen coordinates then fall back to the scene canvas.
+    // Physical output extent, supplied at host construction and updated by resize events.
+    // Screen coordinates use this size; the authored canvas remains in scene-space units.
     std::array<int32_t, 2> screen_size { 0, 0 };
     // Diagnostic aid: instance id of the script update currently executing (0 outside updates).
     uint32_t current_running_instance { 0 };
