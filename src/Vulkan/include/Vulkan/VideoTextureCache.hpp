@@ -47,7 +47,9 @@ public:
                               VideoTexturePlaybackState::Playing);
     void          ApplyPlaybackStates(const std::unordered_map<std::string, bool>& paused_by_key,
                                       const std::unordered_set<std::string>& stopped_keys,
-                                      const std::unordered_map<std::string, double>& rates_by_key);
+                                      const std::unordered_map<std::string, double>& rates_by_key,
+                                      const std::unordered_map<std::string, bool>& loops_by_key);
+    void          ApplyPlayRequests(std::unordered_set<std::string>& keys);
     void          SetGlobalPaused(bool paused);
     void          ApplySeekRequests(std::unordered_map<std::string, double>& seek_seconds_by_key);
     void          Poll();
@@ -75,6 +77,7 @@ private:
     bool         stopPlayback(Entry&);
     bool         setPlaybackRate(Entry&, double rate);
     bool         seekTo(Entry&, double seconds);
+    void         pullLatestSample(Entry&);
     bool         uploadSample(Entry&, ::GstSample*);
 
     const Device& m_device;
@@ -83,6 +86,9 @@ private:
     vvk::CommandBuffer  m_cmd;
     std::vector<std::unique_ptr<Entry>> m_entries;
     bool m_globally_paused { false };
+    // Keep completion identities unique across decoder retirement and recreation within this
+    // cache. Reusing a texture key must not hide its next completion from an existing listener.
+    uint64_t m_completion_serial { 0 };
 };
 
 } // namespace vulkan

@@ -889,6 +889,9 @@ std::string BuildPersistentScript(std::string_view script_source) {
         << "      get duration() { return Number(__native.videoTextureCall(nodeId, 'duration')) || 0; },\n"
         << "      get rate() { return Number(__native.videoTextureCall(nodeId, 'rate')) || 0; },\n"
         << "      set rate(value) { __native.videoTextureCall(nodeId, 'rate', value); },\n"
+        << "      get loop() { return !!__native.videoTextureCall(nodeId, 'loop'); },\n"
+        << "      set loop(value) { __native.videoTextureCall(nodeId, 'loop', value); },\n"
+        << "      addEndedCallback(callback) { __native.videoTextureCall(nodeId, 'addEndedCallback', callback); },\n"
         << "      play() { __native.videoTextureCall(nodeId, 'play'); },\n"
         << "      pause() { __native.videoTextureCall(nodeId, 'pause'); },\n"
         << "      stop() { __native.videoTextureCall(nodeId, 'stop'); },\n"
@@ -3212,6 +3215,11 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
                 }
             }
             opaque->texture_states.erase(node);
+            if (auto it = opaque->video_texture_callbacks.find(node);
+                it != opaque->video_texture_callbacks.end()) {
+                for (auto& binding : it->second) FreeJSValue(context, binding.callback);
+                opaque->video_texture_callbacks.erase(it);
+            }
             auto animation_state_it = opaque->animation_layer_states.find(node);
             if (animation_state_it != opaque->animation_layer_states.end()) {
                 for (auto& [index, state] : animation_state_it->second) {
@@ -7689,6 +7697,7 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     auto* node = FindNodeById(opaque, node_id);
     if (node == nullptr) {
         if (command == "isPlaying") return JS_NewBool(context, false);
+        if (command == "loop" && argc < 3) return JS_TRUE;
         if (command == "getCurrentTime" || command == "duration" || command == "rate") {
             return JS_NewFloat64(context, command == "rate" ? 1.0 : 0.0);
         }
@@ -7698,9 +7707,40 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     const auto keys = ResolveVideoTextureKeysForNode(opaque, node);
     if (keys.empty()) {
         if (command == "isPlaying") return JS_NewBool(context, false);
+        if (command == "loop" && argc < 3) return JS_TRUE;
         if (command == "getCurrentTime" || command == "duration" || command == "rate") {
             return JS_NewFloat64(context, command == "rate" ? 1.0 : 0.0);
         }
+        return JS_UNDEFINED;
+    }
+
+    if (command == "loop") {
+        if (argc >= 3) {
+            const int loop = JS_ToBool(context, argv[2]);
+            if (loop < 0) return JS_EXCEPTION;
+            for (const auto& key : keys) opaque->scene->videoTextureLoops[key] = loop != 0;
+            return JS_UNDEFINED;
+        }
+        const auto it = opaque->scene->videoTextureLoops.find(keys.front());
+        return JS_NewBool(context, it == opaque->scene->videoTextureLoops.end() || it->second);
+    }
+
+    if (command == "addEndedCallback") {
+        if (argc < 3 || !JS_IsFunction(context, argv[2])) {
+            return JS_ThrowTypeError(context, "addEndedCallback requires a function");
+        }
+        VideoTextureCallback binding;
+        binding.callback = JS_DupValue(context, argv[2]);
+        for (const auto& key : keys) {
+            opaque->scene->videoTextureRuntimeStateRequests.insert(key);
+            const auto it = opaque->scene->videoTextureRuntimeStates.find(key);
+            binding.completion_serials.emplace(
+                key, it == opaque->scene->videoTextureRuntimeStates.end()
+                         ? 0 : it->second.completionSerial);
+        }
+        // The layer owns retained functions, not the temporary JS command object. Fresh handles
+        // share decoder controls, and destroying the owning node releases every listener.
+        opaque->video_texture_callbacks[node].push_back(std::move(binding));
         return JS_UNDEFINED;
     }
 
@@ -7754,6 +7794,10 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
 
     if (command == "play" || command == "pause" || command == "stop") {
         for (const auto& key : keys) {
+            if (command == "play")
+                opaque->scene->videoTexturePlayRequests.insert(key);
+            else
+                opaque->scene->videoTexturePlayRequests.erase(key);
             if (command == "stop") {
                 // Wallpaper Engine stop() is a terminal decoder command, not just pause().
                 // Finished intro layers rely on this to release playback work after they fade out.
@@ -7817,6 +7861,36 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
     }
 
     return JS_UNDEFINED;
+}
+
+void DispatchVideoTextureCallbacks(WPSceneScriptHost::Opaque& opaque) {
+    JSContext* context = opaque.runtime.context;
+    std::vector<JSValue> due_callbacks;
+    for (auto& [node, bindings] : opaque.video_texture_callbacks) {
+        (void)node;
+        for (auto& binding : bindings) {
+            bool completed = false;
+            for (auto& [key, serial] : binding.completion_serials) {
+                const auto it = opaque.scene->videoTextureRuntimeStates.find(key);
+                if (it == opaque.scene->videoTextureRuntimeStates.end()) continue;
+                completed = completed || it->second.completionSerial > serial;
+                serial = it->second.completionSerial;
+            }
+            if (completed) due_callbacks.push_back(JS_DupValue(context, binding.callback));
+        }
+    }
+
+    // Decode completion was published by the preceding render poll. Consume every cursor before
+    // invoking script, and retain a dispatch snapshot: a callback may register more listeners or
+    // create/destroy layers without invalidating this traversal or receiving the same event twice.
+    // Layer retirement is drained at frame entry, before this batch is collected.
+    ScopedSceneScriptPhase phase(opaque, SceneScriptExecutionPhase::Callback);
+    for (auto& callback : due_callbacks) {
+        JSValue result = JS_Call(context, callback, JS_UNDEFINED, 0, nullptr);
+        if (JS_IsException(result)) LogQuickJSException(context, "videoTextureEnded");
+        JS_FreeValue(context, result);
+        JS_FreeValue(context, callback);
+    }
 }
 
 JSValue NativeHasTextureAnimation(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -9354,6 +9428,11 @@ WPSceneScriptHost::~WPSceneScriptHost() {
             }
         }
 
+        for (auto& [node, bindings] : m_impl->video_texture_callbacks) {
+            (void)node;
+            for (auto& binding : bindings) FreeJSValue(m_impl->runtime.context, binding.callback);
+        }
+
         FreeJSValue(m_impl->runtime.context, m_impl->shared);
         FreeJSValue(m_impl->runtime.context, m_impl->engine_base);
         FreeJSValue(m_impl->runtime.context, m_impl->console);
@@ -9545,6 +9624,7 @@ void WPSceneScriptHost::FrameBegin(double frame_time) {
     UpdateInputState(m_impl);
     UpdateAudioBufferBindings(m_impl);
     UpdatePropertyAnimations(m_impl, frame_time);
+    DispatchVideoTextureCallbacks(*m_impl);
 
     const double             frame_ms = std::max(0.0, frame_time * 1000.0);
     std::vector<ScriptTimer> due_timers;

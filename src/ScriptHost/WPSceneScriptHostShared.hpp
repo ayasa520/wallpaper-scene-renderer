@@ -57,6 +57,13 @@ struct AnimationLayerRuntimeState {
     std::vector<JSValue> ended_callbacks;
 };
 
+struct VideoTextureCallback {
+    JSValue callback { JS_UNDEFINED };
+    // Registration starts at the currently published serial, excluding earlier completions.
+    // Each listener retains its own cursor so adding one cannot replay an event to older listeners.
+    std::unordered_map<std::string, uint64_t> completion_serials;
+};
+
 struct PropertyAnimationInstance {
     WPSceneScriptRegistration registration;
     uint32_t                  animation_id { 0 };
@@ -187,6 +194,7 @@ struct WPSceneScriptHost::Opaque {
     std::unordered_map<SceneNode*, std::unordered_map<usize, TextureAnimationState>> texture_states;
     std::unordered_map<SceneNode*, std::unordered_map<usize, AnimationLayerRuntimeState>>
                                  animation_layer_states;
+    std::unordered_map<SceneNode*, std::vector<VideoTextureCallback>> video_texture_callbacks;
     WPSceneScriptMediaState      media_state;
     WPSceneScriptMediaState      dispatched_media_state;
     std::unordered_set<uint32_t> hovered_instances;

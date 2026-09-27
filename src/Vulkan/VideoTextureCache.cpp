@@ -47,6 +47,7 @@ GstCudaStream* gst_cuda_memory_get_stream(GstCudaMemory* mem);
 CUstream gst_cuda_stream_get_handle(GstCudaStream* stream);
 gboolean gst_cuda_context_push(GstCudaContext* ctx);
 gboolean gst_cuda_context_pop(CUcontext* cuda_ctx);
+GstContext* gst_context_new_cuda_context(GstCudaContext* cuda_ctx);
 
 CUresult CUDAAPI CuGetErrorName(CUresult error, const char** pStr);
 CUresult CUDAAPI CuGetErrorString(CUresult error, const char** pStr);
@@ -1515,6 +1516,9 @@ struct VideoTextureCache::Entry {
     VideoTextureTransferPath transfer_path { VideoTextureTransferPath::None };
     bool     paused { false };
     bool     stopped { false };
+    bool     loop { true };
+    bool     ended { false };
+    uint64_t completion_serial { 0 };
     // A zero playback rate freezes decoder time without changing the script-visible pause state.
     // Keeping that reason separate means a later positive rate resumes only when play/pause also
     // permits playback, matching the two independent IVideoTexture controls.
@@ -1609,6 +1613,7 @@ void VideoTextureCache::stopPipeline(Entry& entry) {
 
 bool VideoTextureCache::startPipeline(Entry& entry) {
     stopPipeline(entry);
+    entry.ended = false;
     entry.eos_loop_waiting_for_sample = false;
     entry.eos_loop_rebuild_attempted = false;
     entry.pipeline_failed = false;
@@ -1673,6 +1678,16 @@ bool VideoTextureCache::startPipeline(Entry& entry) {
             stopPipeline(entry);
             return false;
         }
+    }
+
+    // The retained CUDA kernel and external-memory mapping belong to the context used by the
+    // first decoder. Share that context through GStreamer's context API before a replacement
+    // graph prerolls; creating another context on the same GPU would invalidate those handles
+    // for the new decoder stream. The Vulkan buffer and displayed image keep their ownership.
+    if (entry.cuda_rgba_buffer.cuda_context != nullptr) {
+        GstContext* context = gst_context_new_cuda_context(entry.cuda_rgba_buffer.cuda_context);
+        gst_element_set_context(entry.pipeline, context);
+        gst_context_unref(context);
     }
 
     g_object_set(entry.source_elem, "stream", entry.memory_stream, nullptr);
@@ -1790,7 +1805,7 @@ bool VideoTextureCache::applyPipelinePlaybackState(Entry& entry) {
     if (entry.pipeline == nullptr || entry.stopped) return true;
 
     const auto target_state =
-        (entry.paused || entry.rate_paused || m_globally_paused) ? GST_STATE_PAUSED
+        (entry.paused || entry.ended || entry.rate_paused || m_globally_paused) ? GST_STATE_PAUSED
                                                                  : GST_STATE_PLAYING;
     if (gst_element_set_state(entry.pipeline, target_state) == GST_STATE_CHANGE_FAILURE) {
         LOG_ERROR("video texture '%s': failed to switch playback state paused=%s global_paused=%s",
@@ -1829,6 +1844,7 @@ bool VideoTextureCache::stopPlayback(Entry& entry) {
     stopPipeline(entry);
     entry.paused = true;
     entry.stopped = true;
+    entry.ended = false;
     entry.pipeline_failed = false;
     entry.eos_loop_waiting_for_sample = false;
     entry.eos_loop_rebuild_attempted = false;
@@ -1908,6 +1924,10 @@ bool VideoTextureCache::seekTo(Entry& entry, double seconds) {
     entry.eos_loop_waiting_for_sample = false;
     entry.eos_loop_rebuild_attempted = false;
     entry.current_time = clamped_seconds;
+    if (entry.ended) {
+        entry.ended = false;
+        if (!applyPipelinePlaybackState(entry)) return false;
+    }
     LOG_INFO("video texture '%s': seek accepted seconds=%.3f", entry.key.c_str(), clamped_seconds);
     return true;
 }
@@ -2209,10 +2229,14 @@ ImageSlotsRef VideoTextureCache::Acquire(std::string_view key,
 void VideoTextureCache::ApplyPlaybackStates(
     const std::unordered_map<std::string, bool>& paused_by_key,
     const std::unordered_set<std::string>& stopped_keys,
-    const std::unordered_map<std::string, double>& rates_by_key) {
+    const std::unordered_map<std::string, double>& rates_by_key,
+    const std::unordered_map<std::string, bool>& loops_by_key) {
     for (auto& entry_ptr : m_entries) {
         if (entry_ptr == nullptr) continue;
         auto& entry = *entry_ptr;
+        if (auto loop_it = loops_by_key.find(entry.key); loop_it != loops_by_key.end()) {
+            entry.loop = loop_it->second;
+        }
         if (stopped_keys.count(entry_ptr->key) != 0) {
             stopPlayback(entry);
             if (auto rate_it = rates_by_key.find(entry.key); rate_it != rates_by_key.end()) {
@@ -2226,6 +2250,23 @@ void VideoTextureCache::ApplyPlaybackStates(
         if (auto rate_it = rates_by_key.find(entry.key); rate_it != rates_by_key.end()) {
             (void)setPlaybackRate(entry, rate_it->second);
         }
+    }
+}
+
+void VideoTextureCache::ApplyPlayRequests(std::unordered_set<std::string>& keys) {
+    for (auto it = keys.begin(); it != keys.end();) {
+        auto* entry = find(*it);
+        if (entry == nullptr) {
+            ++it;
+            continue;
+        }
+        // Pause/stop state has already been applied. Rewind only a naturally completed decoder;
+        // play() on an active or paused video must preserve its current playback position.
+        if (entry->ended) {
+            entry->ended = false;
+            if (loopPipeline(*entry)) entry->current_time = 0.0;
+        }
+        it = keys.erase(it);
     }
 }
 
@@ -2264,10 +2305,10 @@ void VideoTextureCache::Poll() {
     for (auto& entry_ptr : m_entries) {
         auto& entry = *entry_ptr;
         if (entry.pipeline_failed) continue;
-        if (entry.stopped || entry.pipeline == nullptr) continue;
+        if (entry.stopped || entry.ended || entry.pipeline == nullptr) continue;
         if (m_globally_paused) continue;
 
-        bool should_loop = false;
+        bool reached_end = false;
         while (entry.bus != nullptr) {
             GstMessage* message = gst_bus_pop(entry.bus);
             if (message == nullptr) break;
@@ -2290,31 +2331,55 @@ void VideoTextureCache::Poll() {
                 entry.pipeline_failed = true;
                 break;
             }
-            case GST_MESSAGE_EOS: should_loop = true; break;
+            case GST_MESSAGE_EOS: reached_end = true; break;
             default: break;
             }
 
             gst_message_unref(message);
         }
 
-        if (should_loop && !entry.pipeline_failed) {
-            if (!loopPipeline(entry)) continue;
+        if (reached_end && !entry.pipeline_failed) {
+            // A repeated EOS with no decoded sample after a loop seek is recovery of the same
+            // completion, not another playback cycle. Preserve the existing bounded recovery and
+            // publish each real completion once, independently of whether a script registered.
+            if (!entry.eos_loop_waiting_for_sample) {
+                entry.completion_serial = ++m_completion_serial;
+                LOG_INFO("VideoTextureEnded key='%s' serial=%llu loop=%s samples=%llu",
+                         entry.key.c_str(),
+                         static_cast<unsigned long long>(entry.completion_serial),
+                         entry.loop ? "true" : "false",
+                         static_cast<unsigned long long>(entry.uploaded_sample_count));
+            }
+            if (entry.loop) {
+                if (!loopPipeline(entry)) continue;
+            } else {
+                // Appsink can still own the final decoded sample when its bus reports EOS. Upload
+                // it before freezing the pipeline, and retain the Vulkan image for the last frame.
+                // Persistent play/pause settings must not restart this completed video next frame.
+                pullLatestSample(entry);
+                entry.ended = true;
+                (void)applyPipelinePlaybackState(entry);
+                continue;
+            }
         }
 
         if (entry.paused || entry.rate_paused) continue;
-
-        GstSample* latest_sample = nullptr;
-        while (entry.appsink_elem != nullptr) {
-            GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(entry.appsink_elem), 0);
-            if (sample == nullptr) break;
-            if (latest_sample != nullptr) gst_sample_unref(latest_sample);
-            latest_sample = sample;
-        }
-        if (latest_sample == nullptr) continue;
-
-        (void)uploadSample(entry, latest_sample);
-        gst_sample_unref(latest_sample);
+        pullLatestSample(entry);
     }
+}
+
+void VideoTextureCache::pullLatestSample(Entry& entry) {
+    GstSample* latest_sample = nullptr;
+    while (entry.appsink_elem != nullptr) {
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(entry.appsink_elem), 0);
+        if (sample == nullptr) break;
+        if (latest_sample != nullptr) gst_sample_unref(latest_sample);
+        latest_sample = sample;
+    }
+    if (latest_sample == nullptr) return;
+
+    (void)uploadSample(entry, latest_sample);
+    gst_sample_unref(latest_sample);
 }
 
 void VideoTextureCache::PublishRuntimeStates(
@@ -2350,7 +2415,9 @@ void VideoTextureCache::PublishRuntimeStates(
                            .duration = entry.duration,
                            .rate = entry.rate,
                            .isPlaying = entry.pipeline != nullptr && !entry.paused &&
-                               !entry.rate_paused && !entry.stopped && !m_globally_paused,
+                               !entry.ended && !entry.rate_paused && !entry.stopped &&
+                               !m_globally_paused,
+                           .completionSerial = entry.completion_serial,
                        });
     }
 }

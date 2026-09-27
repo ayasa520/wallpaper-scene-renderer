@@ -635,7 +635,9 @@ void VulkanRender::Impl::drawFrame(Scene& scene) {
     // while prepared passes can still reuse the last uploaded frame when they are invisible.
     m_device->video_tex_cache().ApplyPlaybackStates(scene.videoTexturePaused,
                                                     scene.videoTextureStopped,
-                                                    scene.videoTextureRates);
+                                                    scene.videoTextureRates,
+                                                    scene.videoTextureLoops);
+    m_device->video_tex_cache().ApplyPlayRequests(scene.videoTexturePlayRequests);
     // setCurrentTime() requests are one-shot decoder commands, so the video cache consumes and
     // removes only the requests whose concrete GStreamer pipeline already exists.
     m_device->video_tex_cache().ApplySeekRequests(scene.videoTextureSeekRequests);

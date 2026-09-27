@@ -18,6 +18,9 @@ struct VideoTextureRuntimeState {
     double   duration { 0.0 };
     double   rate { 1.0 };
     bool     isPlaying { false };
+    // The decoder assigns a new serial only at natural completion. Scripts consume it from the
+    // published frame snapshot, so polling a stopped video cannot repeatedly fire its callbacks.
+    uint64_t completionSerial { 0 };
 };
 
 struct SceneTexture {

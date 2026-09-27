@@ -383,6 +383,10 @@ public:
     // and the Vulkan render thread applies it to the matching GStreamer entries before polling the
     // next decoded frame.
     std::unordered_map<std::string, double> videoTextureRates;
+    std::unordered_map<std::string, bool> videoTextureLoops;
+    // A naturally completed nonlooping video remains stopped even if its persistent pause value
+    // is false. Only a new play() command may restart it; keep commands until the decoder exists.
+    std::unordered_set<std::string> videoTexturePlayRequests;
     // Decoder timing belongs to GStreamer, while scripts execute before the render-thread poll.
     // Publish a coherent previous-frame snapshot instead of exposing pipeline objects across the
     // script/render boundary. Only requested keys are queried so unrelated video wallpapers pay no
