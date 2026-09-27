@@ -91,7 +91,7 @@ EffectOutputDiagnosticRoles ResolveEffectOutputDiagnosticRoles(
         return { "scene-authored-final", "authored-final", "none", "authored-final", 1 };
     }
     if (capability == FinalOutputCapability::PrivatePuppetPublication) {
-        return { "private-authored-final", "skinned-publication", "none", "skinned-publication", 1 };
+        return { "private-authored-final", "mesh-publication", "none", "mesh-publication", 1 };
     }
     return { "private-authored-final", "neutral-composite", "none", "neutral-composite", 1 };
 }
@@ -459,7 +459,7 @@ void SceneImageEffectLayer::ResolveOwnerDraw(Scene& scene) {
     mesh.Material()->blenmode = direct ? FinalBlend() : BlendMode::Normal;
     if (m_direct_puppet_source) {
         mesh.Material()->customShader.shader = direct
-            ? m_direct_puppet_source->skinned_shader : m_direct_puppet_source->ordinary_shader;
+            ? m_direct_puppet_source->direct_shader : m_direct_puppet_source->ordinary_shader;
         LOG_INFO("ScenePuppetDrawSelector: layer=%d name='%s' direct=%s visible-steps=%zu "
                  "private-publication=%s bones=%u",
                  m_owner.Id(), m_owner.Name().c_str(), direct ? "true" : "false",

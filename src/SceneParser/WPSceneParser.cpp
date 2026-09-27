@@ -1545,7 +1545,7 @@ bool LoadImageDirectPuppetSource(
         return false;
     }
     result.ordinary_shader = material.customShader.shader;
-    result.skinned_shader = skinned_material.customShader.shader;
+    result.direct_shader = skinned_material.customShader.shader;
     MergeImageSourceProgramBindings(material, skinned_material);
     LOG_INFO("SceneImageDirectPuppetMaterial: layer=%d name='%s' shader='%s' chunk-info=0x%x",
              image.id, image.name.c_str(), image.material.shader.c_str(), puppet.chunk_info);
@@ -2768,14 +2768,21 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     // Card/compose-camera size is independent of the source texture's destination extent.
     const std::array<float, 2> effect_source_size = wpimgobj.size;
     std::optional<SceneImageEffectLayer::DirectPuppetSource> direct_puppet_source;
-    if (hasEffect && puppet && puppet->HasImageSkinning() &&
+    if (hasEffect && puppet && (hasStaticImageMesh || puppet->HasImageSkinning()) &&
         !puppet->HasImagePrivateChunk() &&
         !PrimaryMaterialTextureIsSprite(*context.scene, material) &&
         !is_offscreen_dependency_source && !has_shader_color_blend &&
         !wpimgobj.config.passthrough) {
         direct_puppet_source.emplace();
-        if (!LoadImageDirectPuppetSource(context, wpimgobj, *puppet, shaderInfo,
-                                         material, *direct_puppet_source)) return;
+        if (hasStaticImageMesh) {
+            // Static crop meshes share the imported-image publication lifecycle, but have no
+            // pose or alternate skinned program. Preserve direct drawing while every effect is
+            // initially hidden; the existing visibility transition promotes the owner once an
+            // effect becomes visible and retains that state on later hide/show changes.
+            direct_puppet_source->ordinary_shader = material.customShader.shader;
+            direct_puppet_source->direct_shader = material.customShader.shader;
+        } else if (!LoadImageDirectPuppetSource(context, wpimgobj, *puppet, shaderInfo,
+                                                material, *direct_puppet_source)) return;
     }
     std::optional<SceneImageEffectLayer::PrelightingSource> prelighting_source;
     if (hasEffect && !LoadImagePrelightingSource(context, wpimgobj, puppet.get(), shaderInfo,
@@ -2867,9 +2874,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             if (hasEffect) {
                 // Static image-puppet meshes authored in the puppet slot are final-layer shape
                 // masks, not animated sources. The effect chain still needs a normal layer-sized
-                // source card so filters sample the full media texture, then the resolved writer
-                // uses the authored mesh to clip/crop the final visible image without enabling
-                // skinning uniforms.
+                // source card so filters sample the full media texture. The neutral publication
+                // draw then uses the authored mesh to clip the resolved image without skinning;
+                // an effect's custom vertex shader must not replace this final crop geometry.
                 GenCardMesh(
                     mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
                 WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
@@ -3009,12 +3016,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
             static_cast<int32_t>(std::lround(effect_target_resolution[0])));
         const int32_t effect_target_height = ClampDestinationRenderTargetExtent(
             static_cast<int32_t>(std::lround(effect_target_resolution[1])));
-        // Allocate the puppet's potential private branch before its materials are bound. Direct
-        // drawing can omit every source/publication draw for initially hidden effects; resident
-        // resources allow a later visibility change to promote the owner. Composition membership
-        // and the separate hidden-output policy do not set this flag.
+        // Both static and animated imported meshes finish effects in texture space before a
+        // neutral draw publishes their geometry. Allocate that private branch before material
+        // binding. Initially hidden effects can still draw directly; resident resources let the
+        // first visible effect promote the owner without rebuilding its imported mesh.
         const bool private_destination_output = is_offscreen_dependency_source ||
-            hasAnimatedPuppetMesh || has_shader_color_blend;
+            hasAnimatedPuppetMesh || hasStaticImageMesh || has_shader_color_blend;
         const SceneRenderTarget destination_target {
             .width = effect_target_width,
             .height = effect_target_height,
@@ -3139,12 +3146,12 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
         // The final authored material draws the layer card into the restored destination. Its
         // shader name does not change that rule: custom vertex effects and cursor unprojection
         // need the same layer geometry and object-inclusive MVP as stock effects. Dependencies,
-        // skinned surfaces and framebuffer color blending have an additional publication stage
+        // imported image meshes and framebuffer color blending have an additional publication stage
         // and retain their corresponding resource contract.
         if (is_offscreen_dependency_source) {
             imgEffectLayer->SetFinalOutputCapability(
                 FinalOutputCapability::PrivateDependency);
-        } else if (hasAnimatedPuppetMesh) {
+        } else if (hasAnimatedPuppetMesh || hasStaticImageMesh) {
             imgEffectLayer->SetFinalOutputCapability(
                 FinalOutputCapability::PrivatePuppetPublication);
         } else if (has_shader_color_blend) {

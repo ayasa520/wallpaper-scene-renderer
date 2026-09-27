@@ -203,12 +203,13 @@ public:
     };
 
     struct DirectPuppetSource {
-        // Direct skinning selects a skinned executable for the authored material. Keep controls
-        // on the owner's material; switching execution must not replace values already written by
-        // scripts. Promotion to private publication persists for this owner, even when its
-        // effects are hidden again before the next graph build.
+        // Imported image meshes can draw the authored material directly before their first
+        // visible effect. Animated meshes select a skinned executable; static crop meshes reuse
+        // the ordinary program. Keep controls on the owner's material so switching execution
+        // preserves script values. Promotion to private publication persists even when effects
+        // become hidden again before the next graph build.
         std::shared_ptr<SceneShader> ordinary_shader;
-        std::shared_ptr<SceneShader> skinned_shader;
+        std::shared_ptr<SceneShader> direct_shader;
         bool private_publication { false };
     };
 
