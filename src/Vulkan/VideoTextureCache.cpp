@@ -1842,6 +1842,10 @@ bool VideoTextureCache::stopPlayback(Entry& entry) {
     // to end. Keep the already-created Vulkan image alive for descriptor stability, but release the
     // GStreamer graph so future frames are not decoded until play() rebuilds the pipeline.
     stopPipeline(entry);
+    // Runtime state stays readable after decoder teardown. Reset the stopped clock while
+    // retaining duration and completion identity; pause and natural completion keep their
+    // timestamps because they do not perform this explicit stop transition.
+    entry.current_time = 0.0;
     entry.paused = true;
     entry.stopped = true;
     entry.ended = false;

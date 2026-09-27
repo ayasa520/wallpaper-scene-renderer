@@ -7799,8 +7799,8 @@ JSValue NativeVideoTextureCall(JSContext* context, JSValueConst, int argc, JSVal
             else
                 opaque->scene->videoTexturePlayRequests.erase(key);
             if (command == "stop") {
-                // Wallpaper Engine stop() is a terminal decoder command, not just pause().
-                // Finished intro layers rely on this to release playback work after they fade out.
+                // The render thread releases decoder work while preserving the image binding.
+                // A later play request rebuilds playback from the beginning.
                 opaque->scene->videoTexturePaused[key] = true;
                 opaque->scene->videoTextureStopped.insert(key);
             } else {
