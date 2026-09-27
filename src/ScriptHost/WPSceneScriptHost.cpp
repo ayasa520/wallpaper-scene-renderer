@@ -5836,35 +5836,36 @@ void FreeJSValue(JSContext* context, JSValue& value) {
     }
 }
 
-JSValue NativeConsoleLog(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-    std::string message;
+bool ReadConsoleMessage(JSContext* context, int argc, JSValueConst* argv, std::string& message) {
+    // String conversion can execute authored hooks. Both console methods must stop at the
+    // first failed conversion, leaving the pending exception for their native callback to
+    // return. Publish only a complete message: later hooks and partial output are observable
+    // side effects even when the script catches the original conversion failure.
     for (int i = 0; i < argc; i++) {
-        // Conversion can execute authored hooks. Complete every argument before publishing
-        // the message, and propagate a conversion exception without emitting a partial line.
         const char* text = JS_ToCString(context, argv[i]);
-        if (text == nullptr) return JS_EXCEPTION;
+        if (text == nullptr) return false;
         if (i != 0) message.push_back(' ');
         message += text;
         JS_FreeCString(context, text);
     }
+    return true;
+}
+
+JSValue NativeConsoleLog(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+    std::string message;
+    if (! ReadConsoleMessage(context, argc, argv, message)) return JS_EXCEPTION;
     // Authored console output is part of the script API, independently of renderer tracing.
     // Keep both the observable argument conversions above and the completed message in release.
     WallpaperLog(LOGLEVEL_INFO, "", 0, "SceneScript log: %s", message.c_str());
     return JS_UNDEFINED;
 }
 
-JSValue NativeConsoleWarn(JSContext* context, JSValueConst this_val, int argc, JSValueConst* argv) {
-    (void)this_val;
+JSValue NativeConsoleError(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
     std::string message;
-    for (int i = 0; i < argc; i++) {
-        if (i != 0) message.push_back(' ');
-        const char* text = JS_ToCString(context, argv[i]);
-        if (text != nullptr) {
-            message += text;
-            JS_FreeCString(context, text);
-        }
-    }
-    LOG_ERROR("SceneScript warn: %s", message.c_str());
+    if (! ReadConsoleMessage(context, argc, argv, message)) return JS_EXCEPTION;
+    // Authored messages use a stable API prefix. The shared logger preserves error severity
+    // and immediate flushing in both build profiles, independently of renderer diagnostics.
+    WallpaperLogger()->error("ERROR SceneScript error: {}", message);
     return JS_UNDEFINED;
 }
 
@@ -8988,9 +8989,9 @@ WPSceneScriptHost::WPSceneScriptHost(Scene* scene): m_scene(scene), m_impl(new O
     JS_SetPropertyStr(
         context, m_impl->console, "info", JS_NewCFunction(context, NativeConsoleLog, "info", 1));
     JS_SetPropertyStr(
-        context, m_impl->console, "warn", JS_NewCFunction(context, NativeConsoleWarn, "warn", 1));
+        context, m_impl->console, "warn", JS_NewCFunction(context, NativeConsoleError, "warn", 1));
     JS_SetPropertyStr(
-        context, m_impl->console, "error", JS_NewCFunction(context, NativeConsoleWarn, "error", 1));
+        context, m_impl->console, "error", JS_NewCFunction(context, NativeConsoleError, "error", 1));
 
     JS_SetPropertyStr(context,
                       m_impl->native_bridge,
