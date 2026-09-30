@@ -86,9 +86,12 @@ std::string_view SceneImageSource::TextureName() const {
 }
 
 void SceneImageSource::ApplyAutosize(Scene& scene, const Metadata& metadata) {
-    if (!m_policy.autosize || metadata.sprite) return;
+    if (!m_policy.autosize) return;
     auto& state = *m_owner.ImageRuntimeState();
-    const auto& size = metadata.display_size;
+    // A replacement sprite sizes the display card from one frame, not the atlas allocation
+    // or a system texture's material reference size. The retained source and publication
+    // geometry must follow this size before the new texture-space destination is selected.
+    const auto& size = metadata.sprite ? metadata.content_size : metadata.display_size;
     if (state.size == size) return;
 
     LOG_INFO("SceneImageAutosize: layer=%d texture='%s' previous=[%.3f %.3f] "
