@@ -10133,15 +10133,24 @@ void WPSceneScriptHost::ResizeScreen(int32_t width, int32_t height) {
 
 void WPSceneScriptHost::ApplyTextureAnimations(SceneNode* node, sprite_map_t& sprites,
                                                double frame_time) {
-    if (! Ready() || node == nullptr) return;
-
-    auto states_it = m_impl->texture_states.find(node);
-    if (states_it == m_impl->texture_states.end()) return;
-
-    for (auto& [slot, state] : states_it->second) {
-        if (! exists(sprites, slot)) continue;
-        state.animation.GetAnimateFrame(frame_time * state.rate);
-        sprites[slot] = state.animation;
+    // A draw consumes either the script-controlled timeline or its own timeline.
+    // Advance only the selected owner of that state, then publish its current frame.
+    // Advancing the copied sprite again in the shader updater makes even an identity
+    // property script change autoplay, because registration creates a controlled state.
+    for (auto& [slot, sprite] : sprites) {
+        if (Ready() && node != nullptr) {
+            const auto states_it = m_impl->texture_states.find(node);
+            if (states_it != m_impl->texture_states.end()) {
+                const auto state_it = states_it->second.find(slot);
+                if (state_it != states_it->second.end()) {
+                    auto& state = state_it->second;
+                    state.animation.GetAnimateFrame(frame_time * state.rate);
+                    sprite = state.animation;
+                    continue;
+                }
+            }
+        }
+        sprite.GetAnimateFrame(frame_time);
     }
 }
 

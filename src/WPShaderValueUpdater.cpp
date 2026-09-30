@@ -1352,10 +1352,14 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
 
     if (m_scene->scriptHost && pNode != nullptr) {
         m_scene->scriptHost->ApplyTextureAnimations(pNode, sprites, m_scene->frameTime);
+    } else {
+        for (auto& [i, sp] : sprites) {
+            sp.GetAnimateFrame(m_scene->frameTime);
+        }
     }
 
     for (auto& [i, sp] : sprites) {
-        const auto& f      = sp.GetAnimateFrame(m_scene->frameTime);
+        const auto& f      = sp.GetCurFrame();
         auto        grot   = WE_GLTEX_ROTATION_NAMES[i];
         auto        gtrans = WE_GLTEX_TRANSLATION_NAMES[i];
         updateOp(grot, std::array { f.xAxis[0], f.xAxis[1], f.yAxis[0], f.yAxis[1] });
