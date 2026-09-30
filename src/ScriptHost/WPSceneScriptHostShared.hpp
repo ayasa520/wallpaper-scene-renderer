@@ -46,9 +46,15 @@ struct SceneRegistrationRange {
 };
 
 struct TextureAnimationState {
-    SpriteAnimation base_animation;
-    SpriteAnimation animation;
-    double          rate { 1.0 };
+    std::shared_ptr<SpritePlayback> shared;
+    std::shared_ptr<SpritePlayback> playback;
+
+    // Mutation separates this owner from the shared texture clock at its current
+    // phase. Keep the shared clock alive so join observes its live state, not the
+    // initial metadata or the detached owner's stopped position.
+    void Detach() {
+        if (playback == shared) playback = std::make_shared<SpritePlayback>(*shared);
+    }
 };
 
 struct AnimationLayerRuntimeState {

@@ -543,6 +543,7 @@ private:
             if (m_scene->scriptHost) {
                 m_scene->scriptHost->FrameBegin(frame_time);
             }
+            m_scene->AdvanceSpriteAnimations();
             // Parallax and puppet state can change the projected size of a text bridge. Advance that
             // resource-affecting state before UpdateCameraFillMode() recomputes backing extents and
             // before a resource-only graph refresh prepares resized framebuffers.

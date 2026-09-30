@@ -579,7 +579,10 @@ public:
     double               textRenderScale { 1.0 };
 
     double elapsingTime { 0.0f }, frameTime { 0.0f };
+    uint64_t frameSerial { 0 };
+    void AdvanceSpriteAnimations();
     void   PassFrameTime(double t) {
+          ++frameSerial;
           frameTime = t;
           elapsingTime += t;
     }

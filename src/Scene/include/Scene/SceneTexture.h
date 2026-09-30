@@ -42,5 +42,6 @@ struct SceneTexture {
     i32             gpuWidth { 0 };
     i32             gpuHeight { 0 };
     SpriteAnimation spriteAnim;
+    std::shared_ptr<SpritePlayback> spritePlayback;
 };
 } // namespace wallpaper

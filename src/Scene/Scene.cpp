@@ -122,8 +122,19 @@ void Scene::RegisterTextureFromHeader(const std::string& name, const ImageHeader
     if (header.isSprite) {
         texture.isSprite   = true;
         texture.spriteAnim = header.spriteAnim;
+        texture.spritePlayback = std::make_shared<SpritePlayback>(header.spriteAnim);
     }
     textures.emplace(name, std::move(texture));
+}
+
+void Scene::AdvanceSpriteAnimations() {
+    // Shared texture timelines continue while an individual owner is hidden. Run this
+    // once after property callbacks so read-only observers see the previous snapshot,
+    // while every draw consumes one coherent current snapshot. Detached timelines are
+    // advanced by their drawing consumers and have the same per-frame serial guard.
+    for (auto& [name, texture] : textures) {
+        if (texture.spritePlayback) texture.spritePlayback->Advance(frameTime, frameSerial);
+    }
 }
 
 void Scene::RefreshImageSourceTextures() {

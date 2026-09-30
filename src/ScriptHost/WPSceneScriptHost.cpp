@@ -2612,16 +2612,21 @@ void EnsureTextureAnimationStatesForNode(WPSceneScriptHost::Opaque* opaque, Scen
     auto&       states   = opaque->texture_states[node];
     const auto& material = *node->Mesh()->Material();
     for (usize slot = 0; slot < material.textures.size(); slot++) {
-        if (states.count(slot) != 0) continue;
         const auto& name = material.Texture(slot);
-        if (name.empty()) continue;
-        if (opaque->scene->textures.count(name) == 0) continue;
+        if (name.empty() || !opaque->scene->textures.contains(name)) {
+            states.erase(slot);
+            continue;
+        }
         const auto& texture = opaque->scene->textures.at(name);
-        if (! texture.isSprite) continue;
+        if (! texture.isSprite) {
+            states.erase(slot);
+            continue;
+        }
+        const auto previous = states.find(slot);
+        if (previous != states.end() && previous->second.shared == texture.spritePlayback) continue;
         states[slot] = TextureAnimationState {
-            .base_animation = texture.spriteAnim,
-            .animation      = texture.spriteAnim,
-            .rate           = 1.0,
+            .shared = texture.spritePlayback,
+            .playback = texture.spritePlayback,
         };
     }
 
@@ -8249,9 +8254,9 @@ JSValue NativeTextureAnimationGet(JSContext* context, JSValueConst, int argc, JS
 
     auto& state = state_it->second;
     if (command == "frameCount")
-        return JS_NewInt32(context, static_cast<int32_t>(state.animation.numFrames()));
-    if (command == "duration") return JS_NewFloat64(context, state.animation.Duration());
-    if (command == "rate") return JS_NewFloat64(context, state.rate);
+        return JS_NewInt32(context, static_cast<int32_t>(state.playback->animation.numFrames()));
+    if (command == "duration") return JS_NewFloat64(context, state.playback->animation.Duration());
+    if (command == "rate") return JS_NewFloat64(context, state.playback->rate);
     return JS_UNDEFINED;
 }
 
@@ -8284,7 +8289,8 @@ JSValue NativeTextureAnimationSet(JSContext* context, JSValueConst, int argc, JS
     if (command == "rate") {
         double rate = 1.0;
         if (JS_ToFloat64(context, &rate, argv[3]) != 0) return JS_FALSE;
-        state.rate = std::max(0.0, rate);
+        state.Detach();
+        state.playback->rate = std::max(0.0, rate);
         return JS_TRUE;
     }
 
@@ -8318,34 +8324,37 @@ JSValue NativeTextureAnimationCall(JSContext* context, JSValueConst, int argc, J
 
     auto& state = state_it->second;
     if (command == "play") {
-        state.animation.Play();
+        state.Detach();
+        state.playback->animation.Play();
         return JS_UNDEFINED;
     }
     if (command == "stop") {
-        state.animation.Stop();
+        state.Detach();
+        state.playback->animation.Stop();
         return JS_UNDEFINED;
     }
     if (command == "pause") {
-        state.animation.Pause();
+        state.Detach();
+        state.playback->animation.Pause();
         return JS_UNDEFINED;
     }
     if (command == "isPlaying") {
-        return JS_NewBool(context, state.animation.IsPlaying());
+        return JS_NewBool(context, state.playback->animation.IsPlaying());
     }
     if (command == "getFrame") {
-        return JS_NewInt32(context, static_cast<int32_t>(state.animation.CurrentFrameIndex()));
+        return JS_NewInt32(context, static_cast<int32_t>(state.playback->animation.CurrentFrameIndex()));
     }
     if (command == "setFrame") {
         if (argc < 4) return JS_UNDEFINED;
         int32_t frame = 0;
         if (JS_ToInt32(context, &frame, argv[3]) == 0) {
-            state.animation.SetCurrentFrame(frame);
+            state.Detach();
+            state.playback->animation.SetCurrentFrame(frame);
         }
         return JS_UNDEFINED;
     }
     if (command == "join") {
-        state.animation = state.base_animation;
-        state.rate      = 1.0;
+        state.playback = state.shared;
         return JS_UNDEFINED;
     }
     return JS_UNDEFINED;
@@ -9509,9 +9518,9 @@ bool WPSceneScriptHost::RegisterPropertyScript(WPSceneScriptRegistration registr
     m_impl->instances.push_back(std::move(instance));
     auto& registered_instance = *m_impl->instances.back();
 
-    // Sprite timelines still begin when their script is registered. Resolve the current resource
-    // here without retaining its drawing node in the script descriptor; material scripts can target
-    // an authored effect pass or a model chunk rather than the owner's base source material.
+    // Registration observes the existing shared texture timeline without detaching it.
+    // Resolve the current resource without retaining its drawing node in the script
+    // descriptor; material scripts can target an effect pass or a model chunk.
     const auto& target = registered_instance.registration;
     if (target.target_kind == WPSceneScriptTargetKind::MaterialUniform) {
         auto prepare = [&](SceneMaterial& material, SceneNode* node) {
@@ -10133,10 +10142,11 @@ void WPSceneScriptHost::ResizeScreen(int32_t width, int32_t height) {
 
 void WPSceneScriptHost::ApplyTextureAnimations(SceneNode* node, sprite_map_t& sprites,
                                                double frame_time) {
-    // A draw consumes either the script-controlled timeline or its own timeline.
-    // Advance only the selected owner of that state, then publish its current frame.
-    // Advancing the copied sprite again in the shader updater makes even an identity
-    // property script change autoplay, because registration creates a controlled state.
+    // Resolve every sprite consumer, including owners without property scripts, against
+    // the scene texture's live shared clock. Rebinding a texture changes that identity.
+    // Shared clocks already advanced at the scene boundary; detached clocks advance
+    // here, with the same serial guard for multiple passes of an owner.
+    if (Ready()) EnsureTextureAnimationStatesForNode(m_impl, node);
     for (auto& [slot, sprite] : sprites) {
         if (Ready() && node != nullptr) {
             const auto states_it = m_impl->texture_states.find(node);
@@ -10144,8 +10154,8 @@ void WPSceneScriptHost::ApplyTextureAnimations(SceneNode* node, sprite_map_t& sp
                 const auto state_it = states_it->second.find(slot);
                 if (state_it != states_it->second.end()) {
                     auto& state = state_it->second;
-                    state.animation.GetAnimateFrame(frame_time * state.rate);
-                    sprite = state.animation;
+                    state.playback->Advance(frame_time, m_scene->frameSerial);
+                    sprite = state.playback->animation;
                     continue;
                 }
             }

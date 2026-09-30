@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstdint>
 #include <array>
+#include <memory>
 
 #include "Core/Literals.hpp"
 
@@ -82,5 +83,21 @@ private:
     bool   m_playing { true };
 
     std::vector<SpriteFrame> m_frames;
+};
+// Runtime playback belongs to a scene texture or a detached script consumer, never
+// to parsed texture metadata. A serial prevents multiple draws of the same playback
+// from consuming the same scene interval more than once.
+struct SpritePlayback {
+    explicit SpritePlayback(const SpriteAnimation& source) : animation(source) {}
+
+    void Advance(double delta, uint64_t serial) {
+        if (last_serial == serial) return;
+        last_serial = serial;
+        animation.GetAnimateFrame(delta * rate);
+    }
+
+    SpriteAnimation animation;
+    double rate { 1.0 };
+    uint64_t last_serial { 0 };
 };
 } // namespace wallpaper
