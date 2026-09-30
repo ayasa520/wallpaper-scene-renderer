@@ -883,8 +883,11 @@ std::optional<std::string> ResolveFontFamily(fs::VFS& vfs, const std::string& fo
     return entry.family;
 }
 
-void ApplyAssetColorFontSelection(PangoLayout* layout, const wpscene::WPTextObject& object) {
-    if (! IsSupportedFontAssetPath(object.font) || object.text.empty()) return;
+void ApplyAssetColorFontSelection(PangoLayout* layout,
+                                 const wpscene::WPTextObject& object,
+                                 const std::string& layout_text) {
+    pango_layout_set_attributes(layout, nullptr);
+    if (! IsSupportedFontAssetPath(object.font) || layout_text.empty()) return;
 
     auto* context = pango_layout_get_context(layout);
     auto* font = pango_context_load_font(context, pango_layout_get_font_description(layout));
@@ -904,10 +907,10 @@ void ApplyAssetColorFontSelection(PangoLayout* layout, const wpscene::WPTextObje
     // selected face for fully covered grapheme clusters, while other clusters retain normal
     // font selection. Cluster boundaries prevent splitting combining characters or sequences
     // between font policies just because their individual code points have different coverage.
-    const auto* text = object.text.c_str();
+    const auto* text = layout_text.c_str();
     const int character_count = static_cast<int>(g_utf8_strlen(text, -1));
     std::vector<PangoLogAttr> boundaries(static_cast<size_t>(character_count) + 1);
-    pango_get_log_attrs(text, static_cast<int>(object.text.size()), -1,
+    pango_get_log_attrs(text, static_cast<int>(layout_text.size()), -1,
                         pango_context_get_language(context), boundaries.data(),
                         static_cast<int>(boundaries.size()));
     auto* attributes = pango_attr_list_new();
@@ -936,7 +939,7 @@ void ApplyAssetColorFontSelection(PangoLayout* layout, const wpscene::WPTextObje
         cluster_start = cluster_end;
         cluster_covered = true;
     }
-    flush_selected(static_cast<guint>(object.text.size()));
+    flush_selected(static_cast<guint>(layout_text.size()));
     pango_layout_set_attributes(layout, attributes);
     pango_attr_list_unref(attributes);
     g_object_unref(font);
@@ -946,7 +949,7 @@ void ConfigureLayout(PangoLayout* layout, const wpscene::WPTextObject& object, i
     if (layout == nullptr) return;
 
     pango_layout_set_text(layout, object.text.c_str(), -1);
-    ApplyAssetColorFontSelection(layout, object);
+    ApplyAssetColorFontSelection(layout, object, object.text);
     pango_layout_set_alignment(layout, ToPangoAlignment(object.horizontalalign));
     pango_layout_set_justify(layout, object.blockalign ? TRUE : FALSE);
     pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
@@ -957,16 +960,41 @@ void ConfigureLayout(PangoLayout* layout, const wpscene::WPTextObject& object, i
         pango_layout_set_width(layout, -1);
     }
 
-    if (object.limitrows) {
-        pango_layout_set_height(layout, -std::max(object.maxrows, 1));
-    } else {
-        pango_layout_set_height(layout, -1);
-    }
+    // Shape the complete text before applying the global row budget. Pango's negative
+    // height limits each paragraph separately, and even a positive height keeps at least
+    // one line per paragraph. Neither can discard later explicit newline paragraphs.
+    // Width controls wrapping independently; it must not implicitly enable ellipsization.
+    pango_layout_set_height(layout, -1);
+    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_NONE);
+    if (! object.limitrows || object.maxrows <= 0 ||
+        pango_layout_get_line_count(layout) <= object.maxrows) return;
 
-    if (object.limituseellipsis || object.limitrows || object.limitwidth) {
+    auto* iterator = pango_layout_get_iter(layout);
+    for (int row = 1; row < object.maxrows; ++row) pango_layout_iter_next_line(iterator);
+    const auto* last_line = pango_layout_iter_get_line_readonly(iterator);
+    PangoRectangle last_bounds {};
+    pango_layout_iter_get_line_extents(iterator, nullptr, &last_bounds);
+    std::string retained = object.text.substr(
+        0, static_cast<size_t>(last_line->start_index + last_line->length));
+    pango_layout_iter_free(iterator);
+    while (! retained.empty() &&
+           (retained.back() == ' ' || retained.back() == '\t' || retained.back() == '\r')) {
+        retained.pop_back();
+    }
+    if (object.limituseellipsis && ! retained.ends_with("\u2026")) retained += "\u2026";
+
+    // Line boundaries are UTF-8 shaping boundaries. Keep the authored text unchanged so
+    // a later row/width update can restore it, and rebuild color-font attributes against
+    // the retained text: the appended marker may select a different face. Measurement
+    // and glyph generation use this same path and therefore share the final layout.
+    pango_layout_set_text(layout, retained.c_str(), static_cast<int>(retained.size()));
+    ApplyAssetColorFontSelection(layout, object, retained);
+    if (object.limituseellipsis) {
+        // Appending the marker can wrap the retained final line once more. The original
+        // line's logical bottom supplies the global height budget in Pango units; later
+        // paragraphs are already removed, so END can fit the marker inside that budget.
+        pango_layout_set_height(layout, last_bounds.y + last_bounds.height);
         pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
-    } else {
-        pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_NONE);
     }
 }
 
