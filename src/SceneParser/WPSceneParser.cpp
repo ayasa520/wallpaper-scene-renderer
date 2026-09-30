@@ -2754,19 +2754,22 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
     }
     // Ordinary autosize consumes the selected primary texture after user bindings resolve.
     // Allocation dimensions describe GPU storage; authored/model size is only the provisional
-    // display size until this materialization boundary. Imported meshes and utility owners keep
-    // their distinct sizing contracts, and sprite geometry is selected by its own frame state.
+    // display size until this materialization boundary. A sprite uses one frame's content
+    // dimensions before alignment, geometry and script initialization observe the owner.
+    // Imported meshes and utility owners keep their distinct sizing contracts.
     const bool source_autosize = wpimgobj.autosize && !wpimgobj.fullscreen &&
         !wpimgobj.config.passthrough && !wpimgobj.projectlayer && !hasAuthoredPuppet;
     auto source_metadata = SceneImageSource::ResolveMetadata(
         *context.scene, material);
-    if (source_autosize && source_metadata && !source_metadata->sprite) {
+    if (source_autosize && source_metadata) {
+        const auto& display_size = source_metadata->sprite
+            ? source_metadata->content_size : source_metadata->display_size;
         LOG_INFO("SceneImageAutosizeInitial: layer=%d texture='%s' previous=[%.3f %.3f] "
                  "size=[%.3f %.3f] allocation=[%d %d]",
                  wpimgobj.id, primary_source_texture.c_str(), wpimgobj.size[0], wpimgobj.size[1],
-                 source_metadata->display_size[0], source_metadata->display_size[1],
+                 display_size[0], display_size[1],
                  source_metadata->allocation_size[0], source_metadata->allocation_size[1]);
-        wpimgobj.size = source_metadata->display_size;
+        wpimgobj.size = display_size;
         context.scene->FindSceneObject(wpimgobj.id)->ImageRuntimeState()->size = wpimgobj.size;
     }
     LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
