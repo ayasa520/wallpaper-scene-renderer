@@ -1739,6 +1739,11 @@ std::optional<nlohmann::json> MaterializeAssetHandleConfig(const Scene*         
     std::string file = ResolveScriptAssetFile(scene, *asset_handle);
     if (file.empty()) return std::nullopt;
 
+    // Sound assets identify their layer through the asset root. Preserve the scalar path
+    // and let the shared sound parser own playback defaults and decoder selection; adding
+    // a filename-derived name here would change the retained initial configuration.
+    if (file.starts_with("sounds/")) return nlohmann::json { { "sound", file } };
+
     if (file.ends_with(".png") || file.ends_with(".jpg") || file.ends_with(".jpeg") ||
         file.ends_with(".webp")) {
         LOG_ERROR("dynamic image layers require the registered image model JSON, not a raw texture "
@@ -1753,11 +1758,6 @@ std::optional<nlohmann::json> MaterializeAssetHandleConfig(const Scene*         
                   file.c_str());
         return std::nullopt;
     }
-    if (file.ends_with(".mp3") || file.ends_with(".wav") || file.ends_with(".ogg")) {
-        LOG_ERROR("dynamic sound layers are not supported yet: %s", file.c_str());
-        return std::nullopt;
-    }
-
     bool inferred = false;
     if (file.starts_with("models/")) {
         config["image"] = file;

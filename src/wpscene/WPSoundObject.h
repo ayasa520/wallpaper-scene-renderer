@@ -54,9 +54,13 @@ struct WPSoundObject {
             }
         }
         GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
-        if (! json.contains("sound") || ! json.at("sound").is_array()) {
+        if (! json.contains("sound") ||
+            (! json.at("sound").is_string() && ! json.at("sound").is_array())) {
             return false;
         }
+        // A sound layer can supply one path directly or an ordered collection of paths.
+        // JSON iteration visits a scalar once, so both forms use the same path conversion
+        // and filtering without changing the authored configuration retained by the scene.
         for (const auto& el : json.at("sound")) {
             std::string name;
             GET_JSON_VALUE(el, name);
