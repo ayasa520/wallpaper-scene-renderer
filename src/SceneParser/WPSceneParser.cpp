@@ -1233,10 +1233,14 @@ LoadMaterial(fs::VFS& vfs, const wpscene::WPMaterial& wpmat, Scene* pScene,
     material.depthTest = wpmat.depthtest == "enabled";
     material.depthWrite = wpmat.depthwrite == "enabled";
 
-    const auto& fragment_unit = sd_units.back();
-    assert(fragment_unit.stage == ShaderType::FRAGMENT);
     for (uint i = 0; i < material.textures.size(); i++) {
-        if (! exists(fragment_unit.preprocess_info.active_tex_slots, i)) {
+        // A material texture can deform vertices before the fragment stage runs. Retain slots
+        // referenced by any active stage; descriptor reflection below remains the final authority
+        // for the selected compiled program, including samplers optimized out by the compiler.
+        const bool active = std::any_of(sd_units.begin(), sd_units.end(), [i](const auto& unit) {
+            return exists(unit.preprocess_info.active_tex_slots, i);
+        });
+        if (!active) {
             material.textures[i].clear();
             material.systemTextureBindings.erase(i);
             material.systemTextureReferences.erase(i);

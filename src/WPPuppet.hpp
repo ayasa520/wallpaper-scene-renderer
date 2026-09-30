@@ -56,6 +56,7 @@ enum class PuppetPoseDomain
 struct PuppetPoseSnapshot {
     std::span<const Eigen::Affine3f> skinning;
     std::span<const float>            opacity;
+    std::span<const std::vector<float>> morph_weights;
     PuppetPoseDomain                  domain { PuppetPoseDomain::AuthoredEnvelope };
     uint64_t                          revision { 0 };
     uint64_t                          frame_serial { 0 };
@@ -136,10 +137,26 @@ public:
     struct BoneFrameCurve {
         std::vector<float> values;
     };
-    struct AnimV4Event {
-        float              time { 0.0f };
-        uint32_t           flags { 0 };
+    struct MorphCurve {
+        uint16_t target_index { 0 };
         std::vector<float> values;
+    };
+    struct MorphAnimationChunk {
+        uint32_t flags { 0 };
+        float parameter { 1.0f };
+        std::vector<MorphCurve> curves;
+    };
+    struct MorphTarget {
+        uint64_t identity { 0 };
+        std::string name;
+        std::vector<int16_t> positions;
+        std::vector<int16_t> normals;
+    };
+    struct MorphChunk {
+        float scale { 0.0f };
+        uint32_t vertex_count { 0 };
+        bool has_normals { false };
+        std::vector<MorphTarget> targets;
     };
     struct AnimEvent {
         uint32_t    time_value { 0 };
@@ -170,7 +187,7 @@ public:
         // as anonymous bytes. The animation AABB is already expressed in puppet-local coordinates.
         std::optional<AnimTrans>        trans;
         std::vector<BoneFrameCurve>     opacity_curves;
-        std::vector<AnimV4Event>        v4_events;
+        std::vector<MorphAnimationChunk> morph_chunks;
         PuppetBounds3D                  authored_pose_bounds;
         AuthoredBoundsSource            authored_bounds_source { AuthoredBoundsSource::None };
         std::vector<BoneFrameCurve>     scalar_curves;
@@ -191,6 +208,7 @@ public:
     };
 
 public:
+    std::vector<MorphChunk> morph_chunks;
     std::vector<Bone>      bones;
     std::vector<Attachment> attachments;
     std::vector<Animation> anims;
@@ -294,6 +312,7 @@ private:
         std::vector<RotationSimulationState> rotation_simulations;
         std::shared_ptr<WPPuppet>        puppet;
         std::span<const Eigen::Affine3f> cached_skinning {};
+        std::vector<std::vector<float>> morph_weights;
         uint64_t cached_frame_serial { std::numeric_limits<uint64_t>::max() };
         uint64_t advanced_frame_serial { std::numeric_limits<uint64_t>::max() };
         uint64_t pose_revision { 0 };

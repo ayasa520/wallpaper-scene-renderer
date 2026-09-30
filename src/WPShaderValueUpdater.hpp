@@ -53,6 +53,7 @@ struct WPUniformInfo {
 
     bool has_BONES { false };
     bool has_BONES_ALPHA { false };
+    bool has_MORPH { false };
     bool has_TIME { false };
     bool has_DAYTIME { false };
     // Cursor feedback shaders need these values as a coherent per-frame set. Tracking them beside
@@ -134,6 +135,7 @@ struct WPShaderValueData {
     // index + name
 
     WPPuppetLayer puppet_layer;
+    std::optional<size_t> morph_chunk_index;
     WPNodeTransformBinding transform_binding {};
     EffectLayerProjectionBinding effect_layer_projection {};
     // Authored text effects inherit the glyph source's color. Keep the stable owner handle:

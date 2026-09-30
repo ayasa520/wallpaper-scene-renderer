@@ -23,6 +23,7 @@ std::string wallpaper::ToString(const TextureFormat& format) {
 
     switch (format) {
         Fmt(RGBA8);
+        Fmt(RGBA16_SNORM);
         Fmt(BC1);
         Fmt(BC2);
         Fmt(BC3);

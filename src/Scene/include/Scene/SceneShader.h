@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <span>
+#include <bit>
 
 #include <Eigen/Dense>
 
@@ -33,6 +34,16 @@ public:
         fromSpan(range);
     }
     ShaderValue(const value_type* ptr, std::size_t num) noexcept { fromSpan({ ptr, num }); }
+
+    static ShaderValue fromUnsigned(std::span<const uint32_t> values) {
+        // Uniform uploads preserve each 32-bit lane verbatim, including reflected scalar-array
+        // padding. Keep unsigned shader values as bits rather than numerically converting them
+        // to float; the storage lane type does not determine the shader's scalar type.
+        std::vector<float> lanes;
+        lanes.reserve(values.size());
+        for (const auto value : values) lanes.push_back(std::bit_cast<float>(value));
+        return ShaderValue(lanes);
+    }
 
     static ShaderValue fromMatrix(const Eigen::Ref<const Eigen::MatrixXf>& mat) {
         return ShaderValue(std::span { mat.data(), (size_t)mat.size() });

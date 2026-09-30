@@ -17,6 +17,7 @@
 #include "WPJson.hpp"
 #include "WPMdlParser.hpp"
 #include "WPTexImageParser.hpp"
+#include "WPSyntheticImageParser.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -162,7 +163,48 @@ void SeedModelCameraUniforms(ParseContext& context, WPShaderInfo& shader_info) {
 struct ModelGeometryChunk {
     std::string material_path;
     std::shared_ptr<SceneMesh> geometry;
+    std::string morph_texture;
+    size_t morph_chunk_index { 0 };
 };
+
+std::shared_ptr<Image> BuildMorphImage(const WPPuppet::MorphChunk& chunk) {
+    const size_t components = chunk.has_normals ? 6 : 3;
+    const size_t component_count = chunk.targets.size() * chunk.vertex_count * components;
+    // The shader reads pairs of RGBA texels to reconstruct triples crossing a texel boundary.
+    // Pad the square allocation so its final look-ahead sample stays within the data image.
+    const size_t texels = (component_count + 3) / 4 + 1;
+    const auto side = static_cast<int32_t>(std::ceil(std::sqrt(static_cast<double>(texels))));
+    auto image = std::make_shared<Image>();
+    auto& header = image->header;
+    header.width = header.height = header.mapWidth = header.mapHeight = side;
+    header.count = header.mipmapCount = 1;
+    header.format = TextureFormat::RGBA16_SNORM;
+    header.type = ImageType::UNKNOWN;
+    for (const auto* component : {"compo1", "compo2", "compo3", "compo4"}) {
+        header.extraHeader[component].val = 1;
+    }
+    header.sample.wrapS = header.sample.wrapT = TextureWrap::CLAMP_TO_EDGE;
+    header.sample.minFilter = header.sample.magFilter = TextureFilter::NEAREST;
+    ImageData mip;
+    mip.width = mip.height = side;
+    mip.size = static_cast<isize>(side) * side * 4 * sizeof(int16_t);
+    mip.data = ImageDataPtr(new uint8_t[mip.size] {}, [](uint8_t* bytes) { delete[] bytes; });
+    size_t cursor = 0;
+    for (const auto& target : chunk.targets) {
+        for (size_t vertex = 0; vertex < chunk.vertex_count; ++vertex) {
+            const auto append = [&](const std::vector<int16_t>& values) {
+                std::memcpy(mip.data.get() + cursor, values.data() + vertex * 3, 3 * sizeof(int16_t));
+                cursor += 3 * sizeof(int16_t);
+            };
+            append(target.positions);
+            if (chunk.has_normals) append(target.normals);
+        }
+    }
+    image->slots.resize(1);
+    image->slots[0].width = image->slots[0].height = side;
+    image->slots[0].mipmaps.push_back(std::move(mip));
+    return image;
+}
 
 struct ModelMaterialSource {
     std::string               path;
@@ -212,6 +254,16 @@ public:
             // array consumed by those attributes on every material chunk.
             WPMdlParser::AddPuppetMatInfo(effective_material, *file_model);
             WPMdlParser::AddPuppetShaderInfo(shader_info, *file_model);
+            if (!chunk.morph_texture.empty()) {
+                const auto& morph = file_model->puppet->morph_chunks[chunk.morph_chunk_index];
+                effective_material.combos["MORPHING"] = 1;
+                effective_material.combos["MORPHING_NORMALS"] = morph.has_normals ? 1 : 0;
+                shader_info.combos["MORPHING"] = "1";
+                shader_info.combos["MORPHING_NORMALS"] = morph.has_normals ? "1" : "0";
+                effective_material.textures.resize(std::max<size_t>(6, effective_material.textures.size()));
+                effective_material.textures[5] = chunk.morph_texture;
+                node_data.morph_chunk_index = chunk.morph_chunk_index;
+            }
         }
         if (! LoadMaterial(*context_.vfs,
                            effective_material,
@@ -619,10 +671,19 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
 
     std::vector<ModelGeometryChunk> chunks;
     chunks.reserve(mdl.static_chunks.size());
-    for (const auto& chunk : mdl.static_chunks) {
+    for (size_t index = 0; index < mdl.static_chunks.size(); ++index) {
+        const auto& chunk = mdl.static_chunks[index];
         auto mesh = std::make_shared<SceneMesh>();
         WPMdlParser::GenStaticMesh(*mesh, chunk);
         chunks.push_back({ ResolveStaticChunkMaterialPath(chunk, model_obj.skin), std::move(mesh) });
+        if (mdl.puppet != nullptr && !mdl.puppet->morph_chunks.empty() &&
+            !mdl.puppet->morph_chunks[index].targets.empty()) {
+            auto& output = chunks.back();
+            output.morph_texture = "__vivid_model_morph/" + mdl.source_path + "/" + std::to_string(index);
+            output.morph_chunk_index = index;
+            auto image = BuildMorphImage(mdl.puppet->morph_chunks[index]);
+            AsSyntheticImageParser(context.scene->imageParser.get())->RegisterImage(output.morph_texture, image);
+        }
     }
     ModelLayerMaterializer(context, model_obj, chunks, &mdl).Materialize();
 }

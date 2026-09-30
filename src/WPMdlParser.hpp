@@ -39,6 +39,7 @@ struct WPMdl {
     std::string source_path;
     std::string mat_json_file;
     struct StaticChunk {
+        uint32_t                            chunk_info { 0 };
         std::string                         material_json_file;
         // Older static model formats can store a prefixed material table before the geometry bytes.
         // Scene model objects select one of those entries through their `skin` index, so the parser

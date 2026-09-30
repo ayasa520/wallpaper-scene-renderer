@@ -805,6 +805,7 @@ bool ReadStaticFlaggedGeometry(fs::IBinaryStream& f, const char* layout, uint32_
     }
 
     chunk.material_json_file = std::move(material_json_file);
+    chunk.chunk_info         = chunk_info;
     chunk.vertex_flag        = vertex_flag;
     chunk.vertex_stride      = vertex_stride;
     chunk.vertex_blob.resize(vertex_size);
@@ -1429,7 +1430,7 @@ bool ParseAnimationTransMainTrack(fs::MemBinaryStream& f, std::vector<float>& va
 
 bool ParseAnimationRecord(fs::MemBinaryStream& f, WPPuppet::Animation& animation,
                           int32_t mdla_version, uint32_t declared_end,
-                          std::string_view path) {
+                          size_t geometry_chunk_count, std::string_view path) {
     if (!CanReadMdla(f, 8, declared_end)) return false;
     animation.id = f.ReadInt32();
     animation.unk_after_id = f.ReadUint32();
@@ -1552,20 +1553,32 @@ bool ParseAnimationRecord(fs::MemBinaryStream& f, WPPuppet::Animation& animation
 
     if (mdla_version >= 4) {
         if (!CanReadMdla(f, 1, declared_end)) return false;
-        const uint8_t has_events = f.ReadUint8();
-        if (has_events > 1) return false;
-        if (has_events == 1) {
-            if (!CanReadMdla(f, 4, declared_end)) return false;
-            const uint32_t event_count = f.ReadUint32();
-            animation.v4_events.resize(event_count);
-            for (auto& event : animation.v4_events) {
-                if (!CanReadMdla(f, 12, declared_end)) return false;
-                event.time = f.ReadFloat();
-                event.flags = f.ReadUint32();
-                const uint32_t byte_size = f.ReadUint32();
-                if (!ReadFloatPayload(f, byte_size, declared_end, event.values,
-                                      "v4-event", path)) {
-                    return false;
+        const uint8_t has_morph = f.ReadUint8();
+        if (has_morph > 1) return false;
+        if (has_morph == 1) {
+            // This section follows geometry order, including chunks without enabled curves.
+            // It has no chunk-count field: consuming one would misalign every later animation.
+            animation.morph_chunks.resize(geometry_chunk_count);
+            for (auto& chunk : animation.morph_chunks) {
+                if (!CanReadMdla(f, 4, declared_end)) return false;
+                chunk.flags = f.ReadUint32();
+                if ((chunk.flags & 1u) == 0) continue;
+                if (!CanReadMdla(f, 6, declared_end)) return false;
+                chunk.parameter = f.ReadFloat();
+                const uint16_t curve_count = f.ReadUint16();
+                chunk.curves.resize(curve_count);
+                for (auto& curve : chunk.curves) {
+                    if (!CanReadMdla(f, 6, declared_end)) return false;
+                    curve.target_index = f.ReadUint16();
+                    const uint32_t byte_size = f.ReadUint32();
+                    if (byte_size != (static_cast<uint64_t>(animation.length) + 1) * sizeof(float) ||
+                        !ReadFloatPayload(f, byte_size, declared_end, curve.values,
+                                          "morph-curve", path)) {
+                        LOG_ERROR("MDLA animation %d has invalid morph curve target=%u bytes=%u: %.*s",
+                                  animation.id, curve.target_index, byte_size,
+                                  static_cast<int>(path.size()), path.data());
+                        return false;
+                    }
                 }
             }
         }
@@ -1626,6 +1639,87 @@ bool ConsumeMdlaZeroPadding(fs::MemBinaryStream& f, uint32_t declared_end,
         }
     }
     return f.Tell() == end;
+}
+
+bool ReadPuppetMorphTargets(fs::MemBinaryStream& f, WPMdl& mdl) {
+    const auto section_start = f.Tell();
+    if (!CanReadBytes(f, 9)) return true;
+    const auto version = ReadVersion("MDMP", f);
+    if (version == 0) {
+        f.SeekSet(section_start);
+        return true;
+    }
+    if (version != 1 || !CanReadBytes(f, 4)) return false;
+    const uint32_t end = f.ReadUint32();
+    if (end < f.Tell() || end > f.Size()) return false;
+    const auto can_read = [&](uint64_t bytes) {
+        return f.Tell() <= end && bytes <= static_cast<uint64_t>(end - f.Tell());
+    };
+    const size_t chunk_count = mdl.static_chunks.empty() ? 1 : mdl.static_chunks.size();
+    auto& chunks = mdl.puppet->morph_chunks;
+    chunks.resize(chunk_count);
+    for (size_t index = 0; index < chunk_count; ++index) {
+        auto& chunk = chunks[index];
+        if (!can_read(2)) return false;
+        const uint16_t count = f.ReadUint16();
+        if (count == 0) continue;
+        const uint32_t info = mdl.static_chunks.empty() ? mdl.chunk_info
+                                                       : mdl.static_chunks[index].chunk_info;
+        constexpr uint32_t kNormalDelta = 1u << 10;
+        constexpr uint32_t kAdditionalMorphStreams = (1u << 11) | (1u << 12) | (1u << 13);
+        if ((info & kAdditionalMorphStreams) != 0) {
+            LOG_ERROR("MDMP chunk %zu has unsupported additional streams info=%u: %s",
+                      index, info, mdl.source_path.c_str());
+            return false;
+        }
+        if (!can_read(8)) return false;
+        chunk.scale = f.ReadFloat();
+        chunk.vertex_count = f.ReadUint32();
+        chunk.has_normals = (info & kNormalDelta) != 0;
+        const size_t geometry_vertices = mdl.static_chunks.empty() ? mdl.vertexs.size()
+            : mdl.static_chunks[index].vertex_blob.size() / mdl.static_chunks[index].vertex_stride;
+        if (chunk.vertex_count != geometry_vertices || !std::isfinite(chunk.scale)) return false;
+        chunk.targets.resize(count);
+        for (auto& target : chunk.targets) {
+            if (!can_read(8)) return false;
+            target.identity = f.ReadUint64();
+            // Names and sized streams must remain inside this section, even when a subsequent
+            // model section contains enough bytes to make an unbounded read appear successful.
+            bool terminated = false;
+            while (can_read(1)) {
+                const char c = static_cast<char>(f.ReadUint8());
+                if (c == '\0') { terminated = true; break; }
+                target.name.push_back(c);
+            }
+            if (!terminated) return false;
+            const auto read_delta = [&](std::vector<int16_t>& values) {
+                if (!can_read(4)) return false;
+                const uint32_t bytes = f.ReadUint32();
+                const uint64_t expected = static_cast<uint64_t>(chunk.vertex_count) * 3 * sizeof(int16_t);
+                if (bytes != expected || !can_read(bytes)) return false;
+                values.resize(bytes / sizeof(int16_t));
+                for (auto& value : values) value = f.ReadInt16();
+                return true;
+            };
+            if (!read_delta(target.positions) ||
+                (chunk.has_normals && !read_delta(target.normals))) return false;
+        }
+    }
+    if (f.Tell() != end) return false;
+    // Animation indices address the target order of their own geometry chunk. Validate after
+    // both sections are available so runtime interpolation never crosses chunk ownership.
+    for (const auto& animation : mdl.puppet->anims) {
+        for (size_t index = 0; index < animation.morph_chunks.size(); ++index) {
+            for (const auto& curve : animation.morph_chunks[index].curves) {
+                if (curve.target_index >= chunks[index].targets.size()) {
+                    LOG_ERROR("MDLA animation %d chunk %zu morph target %u is out of range: %s",
+                              animation.id, index, curve.target_index, mdl.source_path.c_str());
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view path,
@@ -1781,7 +1875,8 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
             const uint32_t animation_count = f.ReadUint32();
             anims.resize(animation_count);
             for (auto& animation : anims) {
-                if (! ParseAnimationRecord(f, animation, mdl.mdla, declared_end, str_path)) {
+                const size_t chunk_count = mdl.static_chunks.empty() ? 1 : mdl.static_chunks.size();
+                if (! ParseAnimationRecord(f, animation, mdl.mdla, declared_end, chunk_count, str_path)) {
                     return false;
                 }
             }
@@ -1789,6 +1884,10 @@ bool ReadPuppetSkeletonAndAnimations(fs::MemBinaryStream& f, std::string_view pa
         }
     }
 
+    if (!ReadPuppetMorphTargets(f, mdl)) {
+        LOG_ERROR("invalid MDMP target section: %s", str_path.c_str());
+        return false;
+    }
     mdl.puppet->prepared();
     ComputePuppetAnimationBounds(mdl);
     if (mdl.mdla == 0) {

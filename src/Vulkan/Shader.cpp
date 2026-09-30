@@ -235,7 +235,10 @@ bool wallpaper::vulkan::GenReflect(std::span<const std::vector<uint>> codes,
 
             for (auto pinput : inputs) {
                 auto& input = *pinput;
-                if (wallpaper::sstart_with(input.name, "gl_")) continue;
+                // System inputs such as VertexIndex have no vertex-buffer location and may
+                // have no debug name. Their SPIR-V decoration, not a source-name prefix,
+                // distinguishes them from attributes supplied by the mesh.
+                if ((input.decoration_flags & SPV_REFLECT_DECORATION_BUILT_IN) != 0) continue;
 
                 if (input.location == std::numeric_limits<decltype(input.location)>::max()) {
                     LOG_ERROR("shader input %s no location", input.name);

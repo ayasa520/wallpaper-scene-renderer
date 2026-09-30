@@ -116,6 +116,32 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
 
     puppet_layer.updateInterpolation(time);
 
+    // Morph channels share the pose's frame interval, but target geometry chunks rather than
+    // bones. Rebuild owner-local weights once per evaluation; every material chunk consumes
+    // this snapshot without advancing time or retaining contributions from a previous frame.
+    runtime.morph_weights.resize(morph_chunks.size());
+    for (size_t chunk_index = 0; chunk_index < morph_chunks.size(); ++chunk_index) {
+        auto& weights = runtime.morph_weights[chunk_index];
+        weights.assign(morph_chunks[chunk_index].targets.size(), 0.0f);
+        for (const auto& layer : runtime.layers) {
+            if (layer.anim == nullptr || !layer.anim_layer.visible || layer.anim->morph_chunks.empty()) continue;
+            const auto& chunk = layer.anim->morph_chunks[chunk_index];
+            const auto& interval = layer.interp_info;
+            const float t = static_cast<float>(interval.t);
+            for (const auto& curve : chunk.curves) {
+                const float sample = curve.values[interval.frame_a] * (1.0f - t) +
+                                     curve.values[interval.frame_b] * t;
+                if (std::abs(sample) < std::numeric_limits<float>::epsilon()) continue;
+                const float contribution = sample * static_cast<float>(layer.anim_layer.blend);
+                auto& weight = weights[curve.target_index];
+                // Signed contributions cannot overshoot the interval between the current
+                // value and the incoming layer value, independent of bone additive mode.
+                weight = std::clamp(weight + contribution, std::min(weight, contribution),
+                                    std::max(weight, contribution));
+            }
+        }
+    }
+
     for (uint i = 0; i < m_final_affines.size(); i++) {
         const auto& bone   = bones[i];
         auto&       affine = m_final_affines[i];
@@ -517,6 +543,7 @@ PuppetPoseSnapshot WPPuppetLayer::PoseSnapshot() const noexcept {
         // hides both channels until the canonical owner evaluates its next pose.
         .opacity = runtime.cached_skinning.empty() ? std::span<const float> {}
                                                    : runtime.puppet->BoneOpacities(),
+        .morph_weights = runtime.morph_weights,
         .domain = runtime.domain,
         .revision = runtime.pose_revision,
         .frame_serial = runtime.cached_frame_serial,
