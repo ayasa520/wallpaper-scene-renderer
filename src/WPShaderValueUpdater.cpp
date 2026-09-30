@@ -476,6 +476,7 @@ void WPShaderValueUpdater::InitUniforms(const SceneDraw& draw, const ExistsUnifo
     info.has_VP = existsOp(G_VP);
 
     info.has_BONES            = existsOp(G_BONES);
+    info.has_BONES_ALPHA      = existsOp(G_BONES_ALPHA);
     info.has_TIME             = existsOp(G_TIME);
     info.has_DAYTIME          = existsOp(G_DAYTIME);
     info.has_FRAMETIME        = existsOp(G_FRAMETIME);
@@ -640,7 +641,7 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
         ? m_nodeDataMap.at(draw.DataKey()).effect_layer_projection.layer : nullptr;
     const bool image_prelighting_source = layer != nullptr &&
         layer->Owner().LayerNode() == pNode && layer->UsesPrelightingSource();
-    if (info.has_BONES) {
+    if (info.has_BONES || info.has_BONES_ALPHA) {
         // Publication is a drawing phase of its authored owner. Read skinning from that
         // owner's canonical node, while keeping the phase's projection/material data separate.
         // Registering a second pose consumer in the animation-advance map would allow a phase
@@ -657,7 +658,10 @@ void WPShaderValueUpdater::UpdateUniforms(const SceneDraw& draw, sprite_map_t& s
             // has a pose serial. No draw is submitted at that boundary; the first PrepareFrame()
             // selects the snapshot before upload. Enforce serial equality once frames have begun.
             assert(m_puppet_frame_serial == 0 || pose.frame_serial == m_puppet_frame_serial);
-            updateOp(G_BONES, ToDxcRowVectorSkinningUniform(pose.skinning));
+            if (info.has_BONES) updateOp(G_BONES, ToDxcRowVectorSkinningUniform(pose.skinning));
+            // Keep scalar values dense here. The shared Vulkan uniform writer scatters scalar
+            // arrays using the reflected member stride, just as it does for audio spectra.
+            if (info.has_BONES_ALPHA) updateOp(G_BONES_ALPHA, ShaderValue(pose.opacity));
             const char* trace_layer = wallpaper::diagnostics::Options().transform_layer;
             if (draw.Phase() != nullptr && trace_layer != nullptr &&
                 std::to_string(draw.LayerId(*m_scene)) == trace_layer &&

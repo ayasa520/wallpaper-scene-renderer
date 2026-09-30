@@ -55,6 +55,7 @@ enum class PuppetPoseDomain
 
 struct PuppetPoseSnapshot {
     std::span<const Eigen::Affine3f> skinning;
+    std::span<const float>            opacity;
     PuppetPoseDomain                  domain { PuppetPoseDomain::AuthoredEnvelope };
     uint64_t                          revision { 0 };
     uint64_t                          frame_serial { 0 };
@@ -160,6 +161,7 @@ public:
 
         struct BoneFrames {
             bool enabled { true };
+            bool opacity_enabled { true };
             std::vector<BoneFrame> frames;
         };
         std::vector<BoneFrames> bframes_array;
@@ -167,7 +169,7 @@ public:
         // Versioned MDLA payloads are retained in their semantic groups instead of being skipped
         // as anonymous bytes. The animation AABB is already expressed in puppet-local coordinates.
         std::optional<AnimTrans>        trans;
-        std::vector<BoneFrameCurve>     blend_curves;
+        std::vector<BoneFrameCurve>     opacity_curves;
         std::vector<AnimV4Event>        v4_events;
         PuppetBounds3D                  authored_pose_bounds;
         AuthoredBoundsSource            authored_bounds_source { AuthoredBoundsSource::None };
@@ -201,11 +203,13 @@ public:
     uint32_t                         FindBoneIndex(std::string_view name) const noexcept;
     const Eigen::Affine3f&           BoneLocalTransform(uint32_t index) const noexcept;
     const Eigen::Affine3f&           BoneModelTransform(uint32_t index) const noexcept;
+    std::span<const float>            BoneOpacities() const noexcept { return m_bone_opacities; }
 
 private:
     std::vector<Eigen::Affine3f> m_final_affines;
     std::vector<Eigen::Affine3f> m_bone_local_affines;
     std::vector<Eigen::Affine3f> m_bone_model_affines;
+    std::vector<float> m_bone_opacities;
 };
 
 class WPPuppetLayer {

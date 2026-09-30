@@ -105,6 +105,7 @@ void WPPuppet::prepared() {
     m_final_affines.resize(bones.size());
     m_bone_local_affines.resize(bones.size());
     m_bone_model_affines.resize(bones.size());
+    m_bone_opacities.assign(bones.size(), 1.0f);
 }
 
 std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
@@ -138,6 +139,8 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
         Vector3f scale = bind_scale;
         Quaterniond quat = bind_quat;
         const Quaterniond ident { Quaterniond::Identity() };
+        auto& opacity = m_bone_opacities[i];
+        opacity = 1.0f;
 
         for (auto& layer : runtime.layers) {
             auto& alayer = layer.anim_layer;
@@ -146,17 +149,36 @@ std::span<const Eigen::Affine3f> WPPuppet::genFrame(WPPuppetLayer& puppet_layer,
             if (i >= layer.anim->bframes_array.size()) continue;
 
             const auto& track = layer.anim->bframes_array[i];
+            const auto& info = layer.interp_info;
+            const double blend = alayer.blend;
+            const float t = static_cast<float>(info.t);
+            // Opacity is an independent animation channel with an opaque bind value. Sample
+            // it at the pose's frame pair before applying this layer's weight; transform-track
+            // participation must not suppress a separately enabled opacity track. Rebuilding
+            // from one on each evaluation also makes seek, visibility and blend edits immediate
+            // without accumulating opacity across frames or across draw phases.
+            if (track.opacity_enabled && !layer.anim->opacity_curves.empty()) {
+                const auto& values = layer.anim->opacity_curves[i].values;
+                const float sampled = values[static_cast<usize>(info.frame_a)] * (1.0f - t) +
+                                      values[static_cast<usize>(info.frame_b)] * t;
+                if (alayer.additive) {
+                    // The additive opacity delta is relative to opaque, and cannot carry the
+                    // accumulated value beyond either endpoint of this layer's contribution.
+                    opacity = std::clamp(opacity + (sampled - 1.0f) * static_cast<float>(blend),
+                                         std::min(opacity, sampled), std::max(opacity, sampled));
+                } else {
+                    opacity = opacity * static_cast<float>(1.0 - blend) +
+                              sampled * static_cast<float>(blend);
+                }
+            }
             // A disabled bone track contributes nothing from this animation layer. Preserve
             // the pose accumulated from earlier layers, or the bind pose when none contributed;
             // its retained frame data must not replace any position, rotation or scale channel.
             if (!track.enabled) continue;
 
-            auto&  info       = layer.interp_info;
             auto&  frame_a    = track.frames[(usize)info.frame_a];
             auto&  frame_b    = track.frames[(usize)info.frame_b];
 
-            const double   blend         = alayer.blend;
-            const float    t             = static_cast<float>(info.t);
             const Vector3f sampled_trans = frame_a.position * (1.0f - t) + frame_b.position * t;
             const Vector3f sampled_scale = frame_a.scale * (1.0f - t) + frame_b.scale * t;
             const Quaterniond sampled_quat = frame_a.quaternion.slerp(info.t, frame_b.quaternion);
@@ -491,6 +513,10 @@ PuppetPoseSnapshot WPPuppetLayer::PoseSnapshot() const noexcept {
     const auto& runtime = Runtime();
     return PuppetPoseSnapshot {
         .skinning = runtime.cached_skinning,
+        // Both views share the skinning snapshot's validity and frame serial. Invalidation
+        // hides both channels until the canonical owner evaluates its next pose.
+        .opacity = runtime.cached_skinning.empty() ? std::span<const float> {}
+                                                   : runtime.puppet->BoneOpacities(),
         .domain = runtime.domain,
         .revision = runtime.pose_revision,
         .frame_serial = runtime.cached_frame_serial,

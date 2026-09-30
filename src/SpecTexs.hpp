@@ -106,6 +106,7 @@ constexpr std::string_view G_POINTERSTATE { "g_PointerState" };
 constexpr std::string_view G_TEXELSIZE { "g_TexelSize" };
 constexpr std::string_view G_TEXELSIZEHALF { "g_TexelSizeHalf" };
 constexpr std::string_view G_BONES { "g_Bones" };
+constexpr std::string_view G_BONES_ALPHA { "g_BonesAlpha" };
 constexpr std::string_view G_SCREEN { "g_Screen" };
 constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
 

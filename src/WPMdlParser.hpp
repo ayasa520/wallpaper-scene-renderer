@@ -100,6 +100,10 @@ struct WPMdl {
         constexpr uint32_t kPrivateChunkMask = 1u << 1;
         return (chunk_info & kPrivateChunkMask) != 0;
     }
+    bool HasImageBoneOpacity() const {
+        constexpr uint32_t kBoneOpacityMask = 1u << 2;
+        return HasImageSkinning() && (chunk_info & kBoneOpacityMask) != 0;
+    }
     bool HasImageSkinning() const {
         // Image skinning requires vertex-layout bit23 and a nonempty live bone vector; the
         // filename or a static image mesh does not enable skinning.
@@ -121,12 +125,14 @@ class SceneMesh;
 
 class WPMdlParser {
 public:
+    enum class PuppetShaderRole { Image, PrelightingSource };
     static bool Parse(std::string_view path, fs::VFS&, WPMdl&);
     static bool ParseStaticModel(std::string_view path, fs::VFS&, WPMdl&,
                                  bool load_animation_data = false);
 
     static void AddPuppetShaderInfo(WPShaderInfo& info, const WPMdl& mdl);
-    static void AddPuppetMatInfo(wpscene::WPMaterial& mat, const WPMdl& mdl);
+    static void AddPuppetMatInfo(wpscene::WPMaterial& mat, const WPMdl& mdl,
+                                 PuppetShaderRole role = PuppetShaderRole::Image);
 
     static void GenPuppetMesh(SceneMesh& mesh, const WPMdl& mdl);
     static void GenStaticMesh(SceneMesh& mesh, const WPMdl::StaticChunk& chunk);

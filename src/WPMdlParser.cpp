@@ -1474,6 +1474,9 @@ bool ParseAnimationRecord(fs::MemBinaryStream& f, WPPuppet::Animation& animation
         // tracks and animation metadata keep their boundaries, and retain participation
         // separately so pose blending does not replace an earlier layer with disabled values.
         track.enabled = (track_flags & 1u) == 0;
+        // Opacity has its own participation bit: a disabled transform track may still supply
+        // scalar animation. Keep the two decisions separate when the frame payload is parsed.
+        track.opacity_enabled = (track_flags & 3u) != 1u;
         auto& frames = track.frames;
         frames.resize(byte_size / singile_bone_frame);
         for (auto& frame : frames) {
@@ -1529,9 +1532,21 @@ bool ParseAnimationRecord(fs::MemBinaryStream& f, WPPuppet::Animation& animation
                       animation.id, trans_flag, static_cast<int>(path.size()), path.data());
             return false;
         }
-        if (!ParseAnimationBoneCurves(f, animation.blend_curves, bone_count, declared_end,
-                                      "blend-curves", path)) {
+        if (!ParseAnimationBoneCurves(f, animation.opacity_curves, bone_count, declared_end,
+                                      "opacity-curves", path)) {
             return false;
+        }
+        // Scalar opacity uses the same frame interval indices as the transform tracks,
+        // including the authored terminal sample. Validate that contract before publishing
+        // the animation so pose evaluation can index both channels without changing timing.
+        for (uint32_t bone_index = 0; bone_index < animation.opacity_curves.size(); ++bone_index) {
+            const auto samples = animation.opacity_curves[bone_index].values.size();
+            if (samples != static_cast<size_t>(animation.length) + 1) {
+                LOG_ERROR("MDLA animation %d bone %u opacity track has %zu samples for length %d: %.*s",
+                          animation.id, bone_index, samples, animation.length,
+                          static_cast<int>(path.size()), path.data());
+                return false;
+            }
         }
     }
 
@@ -2272,10 +2287,17 @@ void WPMdlParser::GenStaticMesh(SceneMesh& mesh, const WPMdl::StaticChunk& chunk
 void WPMdlParser::AddPuppetShaderInfo(WPShaderInfo& info, const WPMdl& mdl) {
     info.combos["SKINNING"]  = "1";
     info.combos["BONECOUNT"] = std::to_string(mdl.puppet->bones.size());
+    if (mdl.HasImageBoneOpacity()) info.combos["SKINNING_ALPHA"] = "1";
 }
 
-void WPMdlParser::AddPuppetMatInfo(wpscene::WPMaterial& mat, const WPMdl& mdl) {
+void WPMdlParser::AddPuppetMatInfo(wpscene::WPMaterial& mat, const WPMdl& mdl,
+                                  PuppetShaderRole role) {
     mat.combos["SKINNING"]  = 1;
     mat.combos["BONECOUNT"] = (i32)mdl.puppet->bones.size();
     mat.use_puppet          = true;
+    // The final image draw applies bone opacity once. Prelighting only supplies the lit
+    // source texture; applying opacity there as well would multiply it again on publication.
+    if (role == PuppetShaderRole::Image && mdl.HasImageBoneOpacity()) {
+        mat.combos["SKINNING_ALPHA"] = 1;
+    }
 }

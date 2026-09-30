@@ -1575,7 +1575,8 @@ bool LoadImagePrelightingSource(
     authored.combos["PRELIGHTING"] = 1;
     const bool skinned = puppet != nullptr && puppet->HasImageSkinning();
     if (skinned) {
-        WPMdlParser::AddPuppetMatInfo(authored, *puppet);
+        WPMdlParser::AddPuppetMatInfo(authored, *puppet,
+                                     WPMdlParser::PuppetShaderRole::PrelightingSource);
         authored.combos["PRELIGHTINGDUALVERTEX"] = 1;
     }
     WPShaderInfo prelighting_info;

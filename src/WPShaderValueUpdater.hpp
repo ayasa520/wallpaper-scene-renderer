@@ -52,6 +52,7 @@ struct WPUniformInfo {
     bool has_VP { false };
 
     bool has_BONES { false };
+    bool has_BONES_ALPHA { false };
     bool has_TIME { false };
     bool has_DAYTIME { false };
     // Cursor feedback shaders need these values as a coherent per-frame set. Tracking them beside
